@@ -21,7 +21,7 @@ import {
 import { attribute, cacheEvent, type RequestState, requestState, type Usage } from "./attribution.ts";
 import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
 import { deleteSession, transaction } from "./store.ts";
-import { delegatedTaskDigest, delegation, referenceIndex, toolFiles } from "./work.ts";
+import { delegatedTaskDigest, delegation, referenceIndex, toolEffect } from "./work.ts";
 
 const USER_TEXT_LIMIT = 2000;
 // A pause longer than the short (5 min) cache lifetime: the cache survives it only if kept warm or long-lived.
@@ -178,10 +178,10 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 	const insertVersion = db.prepare("INSERT OR IGNORE INTO versions (id, sections, tools, first_seen) VALUES (?, ?, ?, ?)");
 	const insertBlob = db.prepare("INSERT OR IGNORE INTO blobs (hash, kind, name, text) VALUES (?, ?, ?, ?)");
 	const insertTool = db.prepare(
-		`INSERT INTO tool_results (session_id, call_id, ts, tool, summary, is_error, duration_ms, tokens, requests_in_context, lifetime_cost, version, referenced_later)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tool_results (session_id, call_id, ts, tool, summary, is_error, duration_ms, tokens, requests_in_context, lifetime_cost, version, referenced_later, mutates)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
-	const insertFile = db.prepare("INSERT OR IGNORE INTO tool_files (session_id, call_id, ts, file) VALUES (?, ?, ?, ?)");
+	const insertFile = db.prepare("INSERT OR IGNORE INTO tool_files (session_id, call_id, ts, file, write) VALUES (?, ?, ?, ?, ?)");
 	const insertDelegation = db.prepare(
 		"INSERT INTO delegations (session_id, call_id, ts, kind, thread_id, task_digest, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
 	);
@@ -210,7 +210,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		let name: string | undefined;
 		// Per tool call: the requests that carried its result, the cost they paid for it, and the version that made the call.
 		const lifetime = new Map<string, { requests: number; tokens: number; cost: number; version?: string }>();
-		const toolCalls = new Map<string, { name: string; args: unknown; summary: string; ts: number; files: string[] }>();
+		const toolCalls = new Map<string, { name: string; args: unknown; summary: string; ts: number; files: string[]; mutates: boolean }>();
 		// What the agent wrote after each point (text, thinking, tool arguments), to tell whether a result was used again.
 		const agentTexts: { ts: number; text: string }[] = [];
 		let promptDigest: string | undefined;
@@ -279,9 +279,9 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 				agentTexts.push({ ts, text: written.join("\n") });
 				for (const part of message.content) {
 					if (part.type !== "toolCall") continue;
-					const files = toolFiles(part.name, part.arguments, header.cwd);
-					toolCalls.set(part.id, { name: part.name, args: part.arguments, summary: summarizeToolInput(part.arguments), ts, files });
-					for (const file of files) insertFile.run(sessionId, part.id, ts, file);
+					const { files, writes, mutates } = toolEffect(part.name, part.arguments, header.cwd);
+					toolCalls.set(part.id, { name: part.name, args: part.arguments, summary: summarizeToolInput(part.arguments), ts, files, mutates });
+					for (const file of files) insertFile.run(sessionId, part.id, ts, file, writes.includes(file) ? 1 : 0);
 					lifetime.set(part.id, { ...(lifetime.get(part.id) ?? { requests: 0, tokens: 0, cost: 0 }), version });
 				}
 				if (answered) turns.push({ ts, promptTokens: attribution.promptTokens, cacheRead: usage.cacheRead, uncachedCost: usage.cost.cacheWrite + usage.cost.input });
@@ -302,7 +302,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 			const used = referenced(resultTs, call?.files ?? []);
 			insertTool.run(sessionId, result.toolCallId, resultTs, result.toolName, call?.summary ?? "",
 				result.isError ? 1 : 0, result.durationMs ?? null, life?.tokens ?? 0,
-				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, used === undefined ? null : used ? 1 : 0);
+				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, used === undefined ? null : used ? 1 : 0, call?.mutates ? 1 : 0);
 			const started = call && !result.isError ? delegation(call.name, call.args, messageText(result.content)) : undefined;
 			if (started) {
 				insertDelegation.run(sessionId, result.toolCallId, call!.ts, started.kind, started.threadId ?? null,

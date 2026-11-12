@@ -4,60 +4,38 @@
 
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, resolve } from "node:path";
+import { type Effect, shellEffect } from "./shell.ts";
+
+export type { Effect } from "./shell.ts";
 
 const PATH_KEYS = ["path", "file_path", "filePath", "notebook_path", "file", "directory", "cwd"];
-// A path-like token in a shell command: has a slash (`src/a`, `docs/`) or a file extension (`a.ts`).
-const COMMAND_PATH = /(?:^|[\s"'=(])((?:~|\.{1,2}|[\w@.-]+)?(?:\/[\w@.+-]+)+\/?|[\w@.+-]+\/|[\w@+-]+(?:\.[\w-]+)*\.[A-Za-z][\w]{0,5})(?=$|[\s"'),;:|&>])/g;
+/** Tools whose path arguments are files they write (Pi's and Claude Code's built-ins). */
+const WRITE_TOOLS = new Set(["edit", "write", "multiedit", "notebookedit"]);
 
 const expand = (path: string, cwd: string) =>
 	resolve(cwd, path === "~" || path.startsWith("~/") ? `${homedir()}${path.slice(1)}` : path);
 
-/** Directories a shell command changes into with `cd`, in order, so later relative paths resolve correctly. */
-function commandCwd(command: string, cwd: string): string {
-	let current = cwd;
-	for (const match of command.matchAll(/(?:^|&&|;|\|\|)\s*cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)/g)) {
-		current = expand(match[1]!.replace(/^["']|["']$/g, ""), current);
-	}
-	return current;
-}
-
 /**
- * A command without the parts that are data rather than arguments: heredoc bodies and quoted
- * strings with whitespace (inline scripts, SQL, messages). Their words would look like paths.
+ * What a tool call worked on: the files and directories it touched (absolute paths), the ones it
+ * wrote, and whether it changed files at all. Path arguments are exact; shell commands are
+ * analysed by `shellEffect` (path-like words, redirections, known writers, inline scripts), which
+ * cannot tell an argument from a pattern that looks like a path.
  */
-function shellWords(command: string): string {
-	return command
-		.replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\s|$)/g, " ")
-		.replace(/"(?:[^"\\]|\\.)*\s(?:[^"\\]|\\.)*"|'[^']*\s[^']*'/g, " ");
-}
-
-/**
- * The files and directories a tool call touched, as absolute paths. Path arguments are exact;
- * for shell commands it is the path-like words, resolved after any leading `cd`: an
- * approximation that finds `sed -n 1,80p src/a.ts` and `rg foo extensions/` but cannot tell an
- * argument from a pattern that looks like a path.
- */
-export function toolFiles(tool: string, args: unknown, cwd: string): string[] {
-	if (!args || typeof args !== "object") return [];
+export function toolEffect(tool: string, args: unknown, cwd: string): Effect {
+	const none: Effect = { files: [], writes: [], mutates: false };
+	if (!args || typeof args !== "object") return none;
 	const record = args as Record<string, unknown>;
-	const files = new Set<string>();
-	for (const key of PATH_KEYS) {
-		const value = record[key];
-		if (typeof value === "string" && value.trim()) files.add(expand(value.trim(), cwd));
+	const name = tool.toLowerCase();
+	if (name === "bash") return typeof record.command === "string" ? shellEffect(record.command, cwd) : none;
+	const files = PATH_KEYS.map((key) => record[key]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => expand(v.trim(), cwd));
+	if (WRITE_TOOLS.has(name)) return { files, writes: files, mutates: true };
+	// pi-lens: rewrites the given paths (or the project) only when applied, otherwise a preview.
+	if (name === "ast_grep_replace" && record.apply === true) {
+		const paths = Array.isArray(record.paths) ? record.paths.filter((p): p is string => typeof p === "string").map((p) => expand(p, cwd)) : [];
+		return { files: [...files, ...paths], writes: paths, mutates: true };
 	}
-	if (tool.toLowerCase() === "bash" && typeof record.command === "string") {
-		const command = record.command;
-		const base = commandCwd(command, cwd);
-		const withoutCd = shellWords(command).replace(/(?:^|&&|;|\|\|)\s*cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)/g, " ");
-		for (const match of withoutCd.matchAll(COMMAND_PATH)) {
-			const word = match[1]!.replace(/\/$/, "");
-			// URLs, flags and version-like numbers are not files.
-			if (/^[\d.]+$/.test(word) || word.includes("://") || word.startsWith("-")) continue;
-			files.add(isAbsolute(word) || word.startsWith("~") ? expand(word, base) : resolve(base, word));
-		}
-	}
-	return [...files];
+	return { files, writes: [], mutates: false };
 }
 
 /** Words in an agent's text that can name a file: runs of file-name characters, trailing dots dropped. */

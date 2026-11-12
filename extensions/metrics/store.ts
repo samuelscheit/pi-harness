@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -55,11 +55,17 @@ CREATE TABLE tool_results (
 	requests_in_context INTEGER NOT NULL, lifetime_cost REAL NOT NULL, version TEXT,
 	-- Whether a later call touched one of its files or the agent later named one (NULL: no files).
 	referenced_later INTEGER,
+	-- Whether the call changed files: an edit/write tool, or a shell command that writes (redirection,
+	-- sed -i, cp/mv/rm, formatters, an inline script writing a file; see shell.ts), also when the
+	-- written files are not known statically. A failed call still counts (join is_error).
+	mutates INTEGER NOT NULL,
 	PRIMARY KEY (session_id, call_id)
 );
 -- The files and directories each tool call touched (see work.ts), for rediscovery and stale context.
 CREATE TABLE tool_files (
 	session_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL, file TEXT NOT NULL,
+	-- 1 when the call wrote, created, moved or deleted the file; 0 when it only named it.
+	write INTEGER NOT NULL,
 	PRIMARY KEY (session_id, call_id, file)
 );
 -- Subagents a session started (delegate_task, linked to the child by sessions.prompt_digest) or

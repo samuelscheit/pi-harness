@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { describe, test } from "node:test";
-import { delegatedTaskDigest, delegation, namedWords, referenceIndex, taskDigest, toolFiles } from "../extensions/metrics/work.ts";
+import { delegatedTaskDigest, delegation, namedWords, referenceIndex, taskDigest, toolEffect } from "../extensions/metrics/work.ts";
 
-describe("toolFiles", () => {
+describe("toolEffect", () => {
 	const cwd = "/repo";
+	const toolFiles = (tool: string, args: unknown, dir: string) => toolEffect(tool, args, dir).files;
 
 	test("path arguments resolve against the session directory", () => {
 		assert.deepEqual(toolFiles("read", { path: "src/a.ts" }, cwd), ["/repo/src/a.ts"]);
@@ -27,6 +28,26 @@ describe("toolFiles", () => {
 	test("calls without arguments or for other tools touch nothing", () => {
 		assert.deepEqual(toolFiles("web_search", { query: "how to use src/a.ts" }, cwd), []);
 		assert.deepEqual(toolFiles("bash", undefined, cwd), []);
+	});
+
+	test("edit and write tools write their path; reads and searches do not", () => {
+		assert.deepEqual(toolEffect("Edit", { file_path: "src/a.ts" }, cwd), { files: ["/repo/src/a.ts"], writes: ["/repo/src/a.ts"], mutates: true });
+		assert.deepEqual(toolEffect("write", { path: "b.md", content: "x" }, cwd).writes, ["/repo/b.md"]);
+		assert.deepEqual(toolEffect("MultiEdit", { file_path: "/x/c.ts", edits: [] }, cwd).writes, ["/x/c.ts"]);
+		assert.deepEqual(toolEffect("NotebookEdit", { notebook_path: "n.ipynb" }, cwd).writes, ["/repo/n.ipynb"]);
+		assert.deepEqual(toolEffect("Read", { file_path: "src/a.ts" }, cwd), { files: ["/repo/src/a.ts"], writes: [], mutates: false });
+		assert.equal(toolEffect("Grep", { pattern: "x", path: "src" }, cwd).mutates, false);
+	});
+
+	test("ast_grep_replace writes only when applied", () => {
+		assert.equal(toolEffect("ast_grep_replace", { pattern: "a", rewrite: "b", apply: false, paths: ["src"] }, cwd).mutates, false);
+		assert.deepEqual(toolEffect("ast_grep_replace", { pattern: "a", rewrite: "b", apply: true, paths: ["src"] }, cwd), { files: ["/repo/src"], writes: ["/repo/src"], mutates: true });
+		assert.deepEqual(toolEffect("ast_grep_replace", { pattern: "a", rewrite: "b", apply: true }, cwd), { files: [], writes: [], mutates: true });
+	});
+
+	test("bash calls report the writes of their command (lowercase and Claude Code's Bash)", () => {
+		assert.deepEqual(toolEffect("Bash", { command: "sed -i '' 's/a/b/' src/a.ts" }, cwd).writes, ["/repo/src/a.ts"]);
+		assert.equal(toolEffect("bash", { command: "rg foo src" }, cwd).mutates, false);
 	});
 });
 
