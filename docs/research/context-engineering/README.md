@@ -10,6 +10,7 @@ Researched 2026-11-12. This file condenses six detailed reports, which together 
 | 04 | [Flows, loops, multi-agent](04-flows-loops-multi-agent.md) | ReAct, plan/act, verify loops, workflow patterns, subagents, long-horizon harnesses, best-of-N |
 | 05 | [Memory and self-improvement](05-memory-and-self-improvement.md) | Letta, mem0, Zep, memory files, ACE playbooks, Reflexion/ExpeL, skill learning, prompt optimisation, memory security |
 | 06 | [Harness implementations](06-harness-implementations.md) | source-level comparison of Pi, Codex, Claude Code, Gemini CLI, opencode, OpenHands, Aider, Cline/Roo, Goose, Continue, Amp, Cursor, Factory, (mini-)SWE-agent, smolagents |
+| 07 | [Evidence from our sessions](07-evidence-from-our-sessions.md) | each candidate measured on 1,616 of our own sessions ($21k): simulations, labelled corrections, recurring rules. **Overrides the ranking below where they disagree.** |
 
 ## The model in one paragraph
 
@@ -172,7 +173,9 @@ Pi already has:
 - handoff/reset primitives;
 - loop hooks (`prepareNextTurn`, `finishTurn`).
 
-Gaps ranked by evidence and effort (details in 02 §12, 03 §0, 04 §10, 06 §gaps):
+> **Read [07](07-evidence-from-our-sessions.md) first.** Measured on our own sessions, observation masking (item 1 below) *loses* 5–27% of spend once prompt caching is priced; the JetBrains result priced its Qwen runs without caching. Compacting earlier (items 2–3) saves a simulated 20–28% with no measurable quality harm. Verify-at-stop (5) shows no observational link to user-reported failures. Tool search and skill budgets (10) cost ≤4% combined. The most repeated correction calls for a turn-end guard: ending while background work runs (22 sessions).
+
+Gaps as the literature ranks them (details in 02 §12, 03 §0, 04 §10, 06 §gaps):
 
 1. **Observation masking** of old tool results, built on `context_edit`, applied in batches, keeping the newest N tokens. This is the strongest measured win for the least work.
 2. **A compaction trigger as a fraction of the effective window or an absolute cap.** Today `window − 16384` fires at 98.4% of a 1M window.
