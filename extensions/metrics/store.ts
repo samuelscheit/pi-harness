@@ -1,13 +1,18 @@
 // The metrics index: a SQLite database rebuilt from Pi's session files.
 //
 // Session files are the source of truth; this database only makes them queryable. A schema
-// change bumps SCHEMA_VERSION, which drops every table and re-indexes all sessions.
+// change bumps SCHEMA_VERSION, which drops every table and re-indexes all sessions. What a store
+// imported besides Pi's sessions (Claude Code transcripts, see claude.ts) is remembered across that
+// rebuild in `meta`, so the next index imports it again (see `importedClaude`).
 
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
+
+/** Meta key set once Claude Code transcripts were imported; it survives schema rebuilds. */
+const CLAUDE_IMPORTED = "claude_imported";
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -15,6 +20,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE files (path TEXT PRIMARY KEY, session_id TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms REAL NOT NULL);
 CREATE TABLE sessions (
 	-- name: the session's own title when it has one (Pi's session name, Claude Code's custom title).
+	-- parent_session: the id of the session this one was forked from or started by (Pi records a path; resolved to the id).
 	id TEXT PRIMARY KEY, file TEXT NOT NULL, cwd TEXT NOT NULL, parent_session TEXT, name TEXT,
 	-- 'pi', or 'claude-code' for sessions imported for analysis only (see claude.ts).
 	source TEXT NOT NULL DEFAULT 'pi',
@@ -61,6 +67,8 @@ CREATE TABLE tool_results (
 	-- sed -i, cp/mv/rm, formatters, an inline script writing a file; see shell.ts), also when the
 	-- written files are not known statically. A failed call still counts (join is_error).
 	mutates INTEGER NOT NULL,
+	-- Whether the tool reached its goal, for tools that report one (details.ok; fix_loop: the check passed). NULL otherwise.
+	ok INTEGER,
 	PRIMARY KEY (session_id, call_id)
 );
 -- The files and directories each tool call touched (see work.ts), for rediscovery and stale context.
@@ -71,7 +79,8 @@ CREATE TABLE tool_files (
 	PRIMARY KEY (session_id, call_id, file)
 );
 -- Subagents a session started (delegate_task, linked to the child by sessions.prompt_digest) or
--- messaged again (t3_thread_send, linked by thread_id).
+-- messaged again (t3_thread_send, linked by thread_id), and child sessions a tool ran in this
+-- process (kind 'tool', thread_id = the child's session id from details.childSession, title = tool).
 CREATE TABLE delegations (
 	session_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL,
 	thread_id TEXT, task_digest TEXT, title TEXT,
@@ -130,13 +139,32 @@ export function openStore(path: string): DatabaseSync {
 		? (db.prepare("SELECT value FROM meta WHERE key = 'schema'").get() as { value: string } | undefined)?.value
 		: undefined;
 	if (current !== String(SCHEMA_VERSION)) {
+		const claude = current !== undefined && heldClaude(db);
 		const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
 		for (const { name } of tables) db.exec(`DROP TABLE IF EXISTS "${name}"`);
 		db.exec(TABLES);
 		db.prepare("INSERT INTO meta (key, value) VALUES ('schema', ?)").run(String(SCHEMA_VERSION));
+		if (claude) markClaudeImported(db);
 	}
 	return db;
 }
+
+/** Whether a store of any earlier schema held Claude Code sessions: its flag, or (before the flag existed) its rows. */
+function heldClaude(db: DatabaseSync): boolean {
+	const flag = db.prepare("SELECT value FROM meta WHERE key = ?").get(CLAUDE_IMPORTED);
+	if (flag) return true;
+	try {
+		return db.prepare("SELECT 1 FROM sessions WHERE source = 'claude-code' LIMIT 1").get() !== undefined;
+	} catch {
+		// No sessions table or no source column: nothing was imported.
+		return false;
+	}
+}
+
+export const markClaudeImported = (db: DatabaseSync) => db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')").run(CLAUDE_IMPORTED);
+
+/** Whether Claude Code transcripts were imported into this store (also before its last rebuild). */
+export const importedClaude = (db: DatabaseSync) => db.prepare("SELECT 1 FROM meta WHERE key = ?").get(CLAUDE_IMPORTED) !== undefined;
 
 export function deleteSession(db: DatabaseSync, sessionId: string): void {
 	for (const table of SESSION_TABLES) {

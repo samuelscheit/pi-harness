@@ -65,3 +65,44 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Why:** `single-edit` can only act on `edit` calls, which `edit-tool` adds; their effects are not independent, so the per-experiment B − A alone would hide that.
 
 **Revert:** remove `interacts` from the file (the comparison code stays harmless), or revert the commit.
+
+## 2026-11-13 — experiments can switch tools; metrics follow tool children
+
+**Change:**
+
+- An experiment file may name tools in its frontmatter (`tools: fix_loop` or a list); the body becomes optional. Arm B gets the tools active, arm A not (`toolSwitches` in `extensions/lib/experiments.ts`, applied by `extensions/prompt` to `selectedTools` on every run). The tools are registered inactive; a forced arm switches them from the next run, a stopped experiment turns them off for everyone. The arms' harness versions differ exactly in these tool definitions.
+- Comparisons add, per tool an experiment switches: share of sessions and of turns calling it, share of calls reaching their goal (tools reporting `details.ok`), share of file-changing calls after which the agent read a changed file again. A session's cost includes the child sessions its tools ran (`childCostPerSession` shows that part), so an arm that moves work into cheaper children is not counted as saving all of it.
+- Index (schema 10): tool results add what they report beyond their arguments: nested calls (codemode scripts, defined tools) and `details.changedFiles` count as the call's files, `details.ok` as `tool_results.ok`, `details.childSession` as a `delegations` row of kind `tool`. `sessions.parent_session` is the parent's id (Pi records a file path; forks were not linked before).
+- Fix: a schema rebuild dropped the imported Claude Code sessions (2,158) and the rebuilt index did not import them again until a view asked for that source. The store now remembers the import in `meta` across rebuilds (and recognises older stores by their rows), and the next index imports them again.
+
+**Revert:** revert the commit; experiments without `tools` behave as before.
+
+## 2026-11-13 — experiment: fix-loop (`fix_loop` tool)
+
+**Change:** new tool `fix_loop` (`extensions/fix-loop`) and experiment `prompt/experiments/fix-loop.md` (arm B: the tool and one paragraph on when to hand a failing check to it). `fix_loop(goal, files, check, context?, maxRounds = 6, model = anthropic/claude-sonnet-5-5)` runs the check, then a child session in the same process (SDK, read/bash/edit/write, no parent history, own session file naming the parent) until the check exits 0 or the rounds run out; the tool runs the check itself after each round, so green is the exit code. edit/write outside `files` are refused; other changes outside `files` (shell) are put back after each round and named to the child and the parent. Returns green or not, rounds, the diff of the changed files (cut, full diff in a temp file), the last failure when not green, and the child's cost and tokens.
+
+**Evidence:** law-formalization, 863 Claude Code sessions ($11.3k): repair chains (failed check → … → green) cost 17% ($1,944): 59% cache reads, 23% output, 18% writes and input; median context per chain turn 379k. A cheaper model with a short context could save up to ~12% of the project's cost (upper bound). First live run (probe repo, two bugs in one function): green after 1 round, child $0.028 (Sonnet 5.5, 15k cache read), parent $0.13 + $0.01 for the two turns around it.
+
+**Judged by:** cost per session and per package with the children included (from `costPerSession`), `fix_loop` usage, its goal rate (`fix_loop:ok`) and how often the parent rereads the changed files afterwards (`fix_loop:reread`: high means the diff in the result is not enough); guardrails: tool error rate, turns per package.
+
+**Revert:** `/harness experiment fix-loop stop`, or delete the file (the tool then stays inactive).
+
+## 2026-11-13 — experiment: define-tool (`define_tool` tool)
+
+**Change:** new tool `define_tool` (`extensions/define-tool`) and experiment `prompt/experiments/define-tool.md`. The agent defines a named tool from a shell template with `{{parameter}}` placeholders (string or number parameters, optional defaults, output filter, last-lines limit, cwd); each value is inserted as one single-quoted shell word, placeholders inside quotes are refused. The tool is registered at once and runs through the session's bash tool. Definitions are custom entries (`harness-defined-tool`) and come back when the session resumes; `scope: project` also writes `<repo>/.pi/tools/<name>.json` for later sessions. Names of other tools are refused, redefinition replaces. Defined tools are active exactly when `define_tool` is, so arm A never sees project tools from arm B.
+
+**Evidence:** 16% of long bash commands resemble an earlier one of the same session, but they are only ~0.6% of the cost: the expected gain is reliability (quoting, the same output filter every time), not cost. Live-SWE-agent (arXiv 2511.13646): tools created at runtime raised SWE-bench Verified from 70.6% to 75.4%.
+
+**Judged by:** `define_tool` usage per arm, tool error rate, turns per package; then calls of defined tools (by name in the session's tool results).
+
+**Revert:** `/harness experiment define-tool stop`, or delete the file; remove `.pi/tools/` from projects to drop shared tools.
+
+## 2026-11-13 — experiment: codemode
+
+**Change:** experiment `prompt/experiments/codemode.md` activates Pi's built-in `codemode` tool in arm B (`codemode.mode` stays `on`: the other tools stay declared) with one paragraph on when to script several calls. Declares `interacts: parallel-tools`, which targets the same batching.
+
+**Evidence:** 94–99% of turns carry one tool call while every turn re-reads the whole context (see the parallel-tools entry); a script runs several calls and returns only their filtered result.
+
+**Judged by:** turns per package, cost and cache-read cost per session, `codemode` usage; guardrail: tool error rate. File effects of calls made from scripts count through Pi's nested-call records.
+
+**Revert:** `/harness experiment codemode stop`, or delete the file.

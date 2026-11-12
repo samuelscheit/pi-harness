@@ -17,7 +17,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { IndexResult } from "./indexer.ts";
 import { idlePauses } from "./indexer.ts";
-import { deleteSession, transaction } from "./store.ts";
+import { deleteSession, markClaudeImported, transaction } from "./store.ts";
 import { delegatedTaskDigest, delegation, type Effect, referenceIndex, taskDigest, toolEffect } from "./work.ts";
 
 type Entry = Record<string, any>;
@@ -118,6 +118,7 @@ export function indexClaudeSessions(db: DatabaseSync, projectsDir: string): Inde
 	const files = transcriptFiles(projectsDir);
 	const known = db.prepare("SELECT size, mtime_ms FROM files WHERE path = ?");
 	const result: IndexResult = { files: files.length, indexed: 0, failed: [] };
+	markClaudeImported(db);
 	const present = new Set(files);
 	for (const { path, session_id } of db.prepare("SELECT f.path, f.session_id FROM files f JOIN sessions s ON s.id = f.session_id WHERE s.source = 'claude-code'").all() as { path: string; session_id: string }[]) {
 		if (present.has(path)) continue;

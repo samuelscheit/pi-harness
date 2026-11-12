@@ -38,6 +38,41 @@ export function toolEffect(tool: string, args: unknown, cwd: string): Effect {
 	return { files, writes: [], mutates: false };
 }
 
+/** Both effects together. */
+export const mergeEffects = (a: Effect, b: Effect): Effect => ({
+	files: [...new Set([...a.files, ...b.files])],
+	writes: [...new Set([...a.writes, ...b.writes])],
+	mutates: a.mutates || b.mutates,
+});
+
+/** What a tool's result reports about its own work, beyond its arguments. */
+export interface ReportedWork {
+	effect: Effect;
+	/** Whether the tool reached its goal (details.ok). */
+	ok?: boolean;
+	/** A session the tool ran as its child (details.childSession). */
+	childSession?: string;
+}
+
+/**
+ * The work a tool result reports: the effects of the tools it called (Pi's `nestedCalls`, as
+ * codemode scripts and tools built on other tools make them) and, from its details, the files it
+ * changed (`changedFiles`, absolute or relative to cwd), whether it reached its goal (`ok`) and
+ * the session it ran as its child (`childSession`).
+ */
+export function reportedWork(nested: readonly { name: string; arguments?: unknown }[] | undefined, details: unknown, cwd: string): ReportedWork {
+	let effect: Effect = { files: [], writes: [], mutates: false };
+	for (const call of nested ?? []) effect = mergeEffects(effect, toolEffect(call.name, call.arguments, cwd));
+	const record = (details && typeof details === "object" ? details : {}) as Record<string, unknown>;
+	const changed = Array.isArray(record.changedFiles) ? record.changedFiles.filter((f): f is string => typeof f === "string" && f !== "").map((f) => expand(f, cwd)) : [];
+	if (changed.length) effect = mergeEffects(effect, { files: changed, writes: changed, mutates: true });
+	return {
+		effect,
+		...(typeof record.ok === "boolean" ? { ok: record.ok } : {}),
+		...(typeof record.childSession === "string" && record.childSession ? { childSession: record.childSession } : {}),
+	};
+}
+
 /** Words in an agent's text that can name a file: runs of file-name characters, trailing dots dropped. */
 export function namedWords(text: string): string[] {
 	return text.split(/[^\w.-]+/).map((word) => word.replace(/\.+$/, "")).filter((word) => word.length >= 3);

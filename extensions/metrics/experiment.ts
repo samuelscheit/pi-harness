@@ -86,6 +86,7 @@ export function experimentStatus(files: Experiment[], sessionId: string, recorde
 	const blocks = files.map((e) => {
 		const state = e.problem ? `ignored: ${e.problem}` : e.status;
 		const lines = [`## ${e.name} (${state}${e.frontmatter.started ? `, started ${String(e.frontmatter.started)}` : ""})`];
+		if (e.tools.length) lines.push(`tools in arm B: ${e.tools.join(", ")}`);
 		if (!e.problem && e.status === "running") lines.push(sessionLine(e, sessionId, recorded));
 		const result = singles.get(e.name);
 		lines.push(result ? renderComparison(result) : "no sessions recorded yet");
@@ -139,12 +140,15 @@ export interface ExperimentContext {
 	now?: Date;
 }
 
-const compareFromIndex = (groups?: string[][]) => withIndex((db) => experiments(new Scope(db, {}), groups));
+/** The comparisons from the index, with the usage of the tools each experiment file switches. */
+const compareFromIndex = (files: Experiment[]) => (groups?: string[][]) =>
+	withIndex((db) => experiments(new Scope(db, {}), groups, (name) => files.find((f) => f.name === name)?.tools ?? []));
 
 /** Run `/harness experiment <args>`; returns the text to show and its level. */
 export function experimentCommand(args: string[], context: ExperimentContext): { text: string; level: "info" | "warning" } {
-	const { dir = EXPERIMENTS_DIR, compare = compareFromIndex } = context;
+	const { dir = EXPERIMENTS_DIR } = context;
 	const files = listExperiments(dir);
+	const compare = context.compare ?? compareFromIndex(files);
 	const crossed = crossedGroups(files);
 	if (args.length === 0) {
 		const results = [...compare(), ...(crossed.length ? compare(crossed) : [])];
