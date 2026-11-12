@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -15,6 +15,10 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE files (path TEXT PRIMARY KEY, session_id TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms REAL NOT NULL);
 CREATE TABLE sessions (
 	id TEXT PRIMARY KEY, file TEXT NOT NULL, cwd TEXT NOT NULL, parent_session TEXT, name TEXT,
+	-- 'pi', or 'claude-code' for sessions imported for analysis only (see claude.ts).
+	source TEXT NOT NULL DEFAULT 'pi',
+	-- The cost the client itself reported for the session, when it does (Claude Code), to check ours.
+	reported_cost REAL,
 	-- Digest of the delegated task when a parent's delegate_task started this session (see delegations).
 	prompt_digest TEXT,
 	started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL,

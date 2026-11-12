@@ -11,6 +11,8 @@ export interface Scope {
 	cwd?: string;
 	/** Only sessions started at or after this time (ms). */
 	since?: number;
+	/** Which sessions: Pi's (default), imported Claude Code ones (analysis only), or all. */
+	source?: "pi" | "claude-code" | "all";
 }
 
 
@@ -31,6 +33,10 @@ export function report(db: DatabaseSync, scope: Scope = {}): string {
 	if (scope.since !== undefined) {
 		where.push("s.started_at >= ?");
 		params.push(scope.since);
+	}
+	if ((scope.source ?? "pi") !== "all") {
+		where.push("s.source = ?");
+		params.push(scope.source ?? "pi");
 	}
 	const sessionFilter = where.length ? `WHERE ${where.join(" AND ")}` : "";
 	const all = (sql: string) => db.prepare(sql).all(...params) as Row[];
@@ -167,7 +173,7 @@ export function report(db: DatabaseSync, scope: Scope = {}): string {
 		`SELECT r.version, MIN(s.cwd) cwd, MIN(r.ts) first, COUNT(DISTINCT r.session_id) sessions, COUNT(*) turns, SUM(r.cost) cost,
 		SUM(r.cache_read) read, SUM(r.prompt_tokens) prompt, SUM(r.stop_reason = 'aborted') aborted
 		FROM requests r JOIN sessions s ON s.id = r.session_id
-		WHERE r.kind = 'turn' AND r.session_id IN (${scoped}) GROUP BY r.version ORDER BY cwd, first`,
+		WHERE r.kind = 'turn' AND r.version IS NOT NULL AND r.session_id IN (${scoped}) GROUP BY r.version ORDER BY cwd, first`,
 	);
 	const toolErrors = new Map(
 		all(`SELECT version, AVG(is_error) rate FROM tool_results WHERE session_id IN (${scoped}) GROUP BY version`).map((r) => [r.version, Number(r.rate)]),
@@ -196,7 +202,7 @@ export function report(db: DatabaseSync, scope: Scope = {}): string {
 			changed.length > 70 ? `${changed.slice(0, 69)}…` : changed,
 		];
 	});
-	out.push(`Harness versions (prompt sections and initial tools)\n${table(["version", ...(multipleProjects ? ["project"] : []), "first seen", "sessions", "requests", "per request", "cache", "tool errors", "interrupted", "changed"], versionRows)}`);
+	if (versionRows.length) out.push(`Harness versions (prompt sections and initial tools)\n${table(["version", ...(multipleProjects ? ["project"] : []), "first seen", "sessions", "requests", "per request", "cache", "tool errors", "interrupted", "changed"], versionRows)}`);
 
 	for (const section of [subagentReport(db, all, scoped), contextReport(db, all, scoped)]) if (section) out.push(section);
 

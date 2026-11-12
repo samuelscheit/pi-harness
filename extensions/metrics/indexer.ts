@@ -21,7 +21,7 @@ import {
 import { attribute, cacheEvent, type RequestState, requestState, type Usage } from "./attribution.ts";
 import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
 import { deleteSession, transaction } from "./store.ts";
-import { delegatedTaskDigest, delegation, mentions, toolFiles } from "./work.ts";
+import { delegatedTaskDigest, delegation, referenceIndex, toolFiles } from "./work.ts";
 
 const USER_TEXT_LIMIT = 2000;
 // A pause longer than the short (5 min) cache lifetime: the cache survives it only if kept warm or long-lived.
@@ -105,7 +105,9 @@ export function indexSessions(db: DatabaseSync, sessionsDir: string): IndexResul
 	const known = db.prepare("SELECT session_id, size, mtime_ms FROM files WHERE path = ?");
 	const result: IndexResult = { files: files.length, indexed: 0, failed: [] };
 	const present = new Set(files);
-	for (const { path, session_id } of db.prepare("SELECT path, session_id FROM files").all() as { path: string; session_id: string }[]) {
+	// Pi's files only: imported Claude Code transcripts are pruned by their own indexer.
+	const indexed = db.prepare("SELECT f.path, f.session_id FROM files f JOIN sessions s ON s.id = f.session_id WHERE s.source = 'pi'");
+	for (const { path, session_id } of indexed.all() as { path: string; session_id: string }[]) {
 		if (present.has(path)) continue;
 		transaction(db, () => {
 			deleteSession(db, session_id);
@@ -290,31 +292,20 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 			}
 		}
 
-		// The last time each file was touched by a call or named by the agent: a result was used again
-		// when one of its files appears after it.
-		const lastTouched = new Map<string, number>();
-		for (const call of toolCalls.values()) for (const file of call.files) lastTouched.set(file, Math.max(lastTouched.get(file) ?? 0, call.ts));
-		const lastNamed = new Map<string, number>();
-		for (const file of lastTouched.keys()) {
-			const named = agentTexts.findLast((text) => mentions(text.text, file));
-			if (named) lastNamed.set(file, named.ts);
-		}
+		const referenced = referenceIndex([...toolCalls.values()], agentTexts);
 		for (const entry of entries) {
 			if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
 			const result = (entry as SessionMessageEntry).message as Extract<SessionMessageEntry["message"], { role: "toolResult" }>;
 			const life = lifetime.get(result.toolCallId);
 			const call = toolCalls.get(result.toolCallId);
 			const resultTs = time(entry);
-			const files = call?.files ?? [];
-			const referenced = files.length === 0
-				? null
-				: files.some((f) => (lastTouched.get(f) ?? 0) > resultTs || (lastNamed.get(f) ?? 0) > resultTs);
+			const used = referenced(resultTs, call?.files ?? []);
 			insertTool.run(sessionId, result.toolCallId, resultTs, result.toolName, call?.summary ?? "",
 				result.isError ? 1 : 0, result.durationMs ?? null, life?.tokens ?? 0,
-				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, referenced === null ? null : referenced ? 1 : 0);
+				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, used === undefined ? null : used ? 1 : 0);
 			const started = call && !result.isError ? delegation(call.name, call.args, messageText(result.content)) : undefined;
 			if (started) {
-				insertDelegation.run(sessionId, result.toolCallId, resultTs, started.kind, started.threadId ?? null,
+				insertDelegation.run(sessionId, result.toolCallId, call!.ts, started.kind, started.threadId ?? null,
 					started.taskDigest ?? null, started.title ?? null);
 			}
 		}

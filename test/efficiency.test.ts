@@ -61,6 +61,17 @@ describe("bestCompaction", () => {
 		assert.ok(best.index > 0 && best.index < 99);
 	});
 
+	test("a later real compaction caps the saving: requests after it carried little", () => {
+		// 300k for 10 requests, then the session compacted itself to 30k for 50 more.
+		const turns = [...Array.from({ length: 10 }, () => turn(300_000)), ...Array.from({ length: 50 }, () => turn(30_000))];
+		const best = bestCompaction(turns)!;
+		assert.equal(best.index, 0);
+		// After request 0: nine requests save 277k each; the 50 small ones save only their 7k above the kept 23k.
+		const haiku = INPUT * 0.2;
+		const cost = 300_000 * haiku + 3_000 * haiku * 5 + 23_000 * WRITE;
+		assert.ok(Math.abs(best.saving - (9 * 277_000 * READ + 50 * 7_000 * READ - cost)) < 1e-9);
+	});
+
 	test("compacting right before the end does not pay for itself", () => {
 		// Haiku reading 200k, a summary and writing the kept 23k (~$0.36) beats one cheaper read ($0.09).
 		assert.equal(bestCompaction([turn(200_000), turn(201_000)]), undefined);
