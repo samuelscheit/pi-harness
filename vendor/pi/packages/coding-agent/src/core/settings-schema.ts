@@ -31,10 +31,16 @@ const CompactionSettingsSchema = Type.Object({
 				minSaving: Type.Optional(
 					Type.Number({ minimum: 0, description: "Compact only when the expected saving is at least this many dollars." }),
 				),
+				warm: Type.Optional(
+					Type.Boolean({
+						description:
+							"Also compact while the prompt cache is warm. Off by default: what a summary loses is not priced, only the cache cost.",
+					}),
+				),
 			},
 			{
 				description:
-					"Before each run, compact when carrying a smaller context over the expected rest of the session (or not writing an expired cache again) saves more than compacting costs. Off when unset.",
+					"Before a run whose prompt cache expired (and with `warm`, before any run), compact when that saves more than it costs: not writing the whole context again, and carrying a smaller one over the expected rest of the session. Off when unset.",
 			},
 		),
 	),

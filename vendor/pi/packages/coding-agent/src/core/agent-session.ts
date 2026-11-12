@@ -846,7 +846,9 @@ export class AgentSession {
 	}
 
 	/**
-	 * Compact before a run when that is cheaper over the expected rest of the session.
+	 * Compact before a run when that is cheaper over the expected rest of the session: always
+	 * considered when the prompt cache expired, with a warm cache only when `compaction.economic.warm`
+	 * is set (what a summary loses is not priced, only the cache cost).
 	 *
 	 * The next requests would carry the whole context at the read price, or write it again when
 	 * the cache expired. Compacting with `compaction.economic.model` costs one uncached read and a
@@ -862,6 +864,7 @@ export class AgentSession {
 		const streamOptions = { cacheRetention: this.settingsManager.getCacheRetention() };
 		const ttlMs = getPromptCacheTtlMs(model, streamOptions);
 		const cold = isPromptCacheCold(branch, ttlMs, Date.now());
+		if (!cold && !economic.warm) return;
 		// Anthropic bills a one-hour cache write at twice the input price (see calculateCost).
 		const writePerMillion = resolvePromptCacheRetention(streamOptions) === "long" ? model.cost.input * 2 : model.cost.cacheWrite;
 		const saving = compactionSaving({

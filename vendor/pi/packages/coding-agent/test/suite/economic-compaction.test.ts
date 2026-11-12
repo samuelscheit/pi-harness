@@ -11,14 +11,14 @@ const SUMMARY_COST = { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 };
 const BIG = "word ".repeat(32_000);
 
 /** A session on `main` that compacts with `summary` when that saves at least `minSaving` dollars. */
-async function economicHarness(minSaving: number | undefined): Promise<Harness> {
+async function economicHarness(minSaving: number | undefined, warm = true): Promise<Harness> {
 	const harness = await createHarness({
 		models: [
 			{ id: "main", cost: MAIN_COST },
 			{ id: "summary", cost: SUMMARY_COST },
 		],
 		// Five-minute cache, whatever PI_CACHE_RETENTION the environment sets.
-		settings: { cacheRetention: "short", compaction: { keepRecentTokens: 1_000, ...(minSaving === undefined ? {} : { economic: { model: "faux/summary", minSaving } }) } },
+		settings: { cacheRetention: "short", compaction: { keepRecentTokens: 1_000, ...(minSaving === undefined ? {} : { economic: { model: "faux/summary", minSaving, warm } }) } },
 	});
 	for (const model of harness.models) (model as Model<string>).promptCache = { short: 300, long: 3600 };
 	return harness;
@@ -74,6 +74,19 @@ describe("economic compaction", () => {
 		expect(compactions(warm)).toHaveLength(0);
 
 		const cold = await economicHarness(1.2);
+		harnesses.push(cold);
+		await run(cold, FIVE_MINUTES + 1000);
+		expect(compactions(cold).map((entry) => entry.reason)).toEqual(["cold"]);
+	});
+
+	it("without `warm`, a warm cache is never compacted, an expired one still is", async () => {
+		const warm = await economicHarness(0, false);
+		harnesses.push(warm);
+		await run(warm, 1000);
+		vi.restoreAllMocks();
+		expect(compactions(warm)).toHaveLength(0);
+
+		const cold = await economicHarness(0, false);
 		harnesses.push(cold);
 		await run(cold, FIVE_MINUTES + 1000);
 		expect(compactions(cold).map((entry) => entry.reason)).toEqual(["cold"]);

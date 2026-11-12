@@ -893,14 +893,14 @@ export class SettingsManager {
 	}
 
 	/** Economic compaction (see `compaction.economic`), or undefined when it is off or invalid. */
-	getEconomicCompaction(): { minSaving: number; model: { provider: string; id: string } } | undefined {
+	getEconomicCompaction(): { minSaving: number; warm: boolean; model: { provider: string; id: string } } | undefined {
 		const economic = this.settings.compaction?.economic;
 		if (!this.getCompactionEnabled() || !economic || typeof economic.model !== "string") return undefined;
 		const slash = economic.model.indexOf("/");
 		if (slash <= 0 || slash === economic.model.length - 1) return undefined;
 		const minSaving = economic.minSaving ?? 0;
 		if (!Number.isFinite(minSaving) || minSaving < 0) return undefined;
-		return { minSaving, model: { provider: economic.model.slice(0, slash), id: economic.model.slice(slash + 1) } };
+		return { minSaving, warm: economic.warm === true, model: { provider: economic.model.slice(0, slash), id: economic.model.slice(slash + 1) } };
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {

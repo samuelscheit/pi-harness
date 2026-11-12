@@ -760,9 +760,10 @@ describe("SettingsManager", () => {
 			});
 			expect(set.getCacheRetention()).toBe("long");
 			expect(set.getCacheWarmingIdleMs()).toBe(60 * 60_000);
-			expect(set.getEconomicCompaction()).toEqual({ minSaving: 0.1, model: { provider: "anthropic", id: "claude-haiku-5-5" } });
-			expect(SettingsManager.inMemory({ compaction: { economic: { model: "a/b" } } }).getEconomicCompaction()).toEqual({
+			expect(set.getEconomicCompaction()).toEqual({ minSaving: 0.1, warm: false, model: { provider: "anthropic", id: "claude-haiku-5-5" } });
+			expect(SettingsManager.inMemory({ compaction: { economic: { model: "a/b", warm: true } } }).getEconomicCompaction()).toEqual({
 				minSaving: 0,
+				warm: true,
 				model: { provider: "a", id: "b" },
 			});
 		});
