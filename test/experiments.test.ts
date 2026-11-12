@@ -16,9 +16,9 @@ import {
 	sectionName,
 	stopExperiment,
 } from "../extensions/lib/experiments.ts";
-import { experimentCommand, renderComparison } from "../extensions/metrics/experiment.ts";
+import { crossedGroups, experimentCommand, renderComparison } from "../extensions/metrics/experiment.ts";
 import { indexSessions } from "../extensions/metrics/indexer.ts";
-import { type ArmSession, bootstrapDiff, compareArms, experiments, Scope } from "../extensions/metrics/queries/index.ts";
+import { type ArmSession, bootstrapContrast, cellsOf, compareCells, contrastWeight, experiments, Scope } from "../extensions/metrics/queries/index.ts";
 import { openStore } from "../extensions/metrics/store.ts";
 import prompt from "../extensions/prompt/index.ts";
 
@@ -133,6 +133,24 @@ describe("experiment files", () => {
 		assert.match(byName.get("broken")!.problem!, /unreadable frontmatter/);
 		assert.equal(byName.get("stopped")!.status, "stopped");
 		assert.deepEqual(runningExperiments(at).map((e) => e.name), ["good", "plain"]);
+	});
+
+	test("interacts names other experiments, as a name or a list", () => {
+		const at = experimentFile("one", "---\ninteracts: two\n---\ntext");
+		experimentFile("many", "---\ninteracts: [one, two]\n---\ntext", at);
+		experimentFile("none", "text", at);
+		experimentFile("self", "---\ninteracts: self\n---\ntext", at);
+		experimentFile("number", "---\ninteracts: [3]\n---\ntext", at);
+		experimentFile("invalid", "---\ninteracts: Not A Name\n---\ntext", at);
+		experimentFile("object", "---\ninteracts: {a: b}\n---\ntext", at);
+		const byName = new Map(listExperiments(at).map((e) => [e.name, e]));
+		assert.deepEqual(byName.get("one")!.interacts, ["two"]);
+		assert.deepEqual(byName.get("many")!.interacts, ["one", "two"]);
+		assert.deepEqual(byName.get("none")!.interacts, []);
+		for (const name of ["self", "number", "invalid", "object"]) assert.match(byName.get(name)!.problem!, /interacts must name other experiments/, name);
+		assert.deepEqual(runningExperiments(at).map((e) => e.name), ["many", "none", "one"]);
+		// Each pair once, the declaring experiment first; experiments with a problem declare nothing.
+		assert.deepEqual(crossedGroups(listExperiments(at)), [["many", "one"], ["many", "two"], ["one", "two"]]);
 	});
 
 	test("a missing directory has no experiments", () => {
@@ -258,11 +276,30 @@ describe("comparison", () => {
 	const T = Date.parse("2026-11-13T10:00:00Z");
 	const MIN = 60_000;
 
-	/** Insert a session with arm rows and turns (minute, tool calls, cost, read cost), tool results and user messages. */
-	function addSession(db: DatabaseSync, s: { id: string; cwd: string; arm: Arm; forced?: boolean; assigned?: number; ended?: number; turns: [number, number, number, number][]; errors?: [number, boolean][]; users?: [number, string][]; experiment?: string }) {
+	interface ArmRow {
+		experiment?: string;
+		arm: Arm;
+		forced?: boolean;
+		assigned?: number;
+		ended?: number;
+	}
+
+	/**
+	 * Insert a session with arm rows (its own in experiment x, plus `arms`), turns (minute, tool
+	 * calls, cost, read cost), tool results, file-changing tool calls (minute, tool, files written;
+	 * none for a shell write whose files are unknown) and user messages.
+	 */
+	function addSession(db: DatabaseSync, s: ArmRow & { id: string; cwd: string; arms?: ArmRow[]; turns: [number, number, number, number][]; errors?: [number, boolean][]; changes?: [number, string, string[]][]; users?: [number, string][] }) {
 		db.prepare("INSERT INTO sessions (id, file, cwd, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0)").run(
 			s.id, `/${s.id}.jsonl`, s.cwd, T, T + 100 * MIN);
-		db.prepare("INSERT INTO experiment_arms VALUES (?, ?, ?, ?, ?, ?)").run(s.id, s.experiment ?? "x", s.arm, s.forced ? 1 : 0, T + (s.assigned ?? 0) * MIN, s.ended === undefined ? null : T + s.ended * MIN);
+		for (const a of [s, ...(s.arms ?? [])]) {
+			db.prepare("INSERT INTO experiment_arms VALUES (?, ?, ?, ?, ?, ?)").run(s.id, a.experiment ?? "x", a.arm, a.forced ? 1 : 0, T + (a.assigned ?? 0) * MIN, a.ended === undefined ? null : T + a.ended * MIN);
+		}
+		(s.changes ?? []).forEach(([minute, tool, files], i) => {
+			db.prepare(`INSERT INTO tool_results (session_id, call_id, ts, tool, summary, is_error, tokens, requests_in_context, lifetime_cost, mutates)
+				VALUES (?, ?, ?, ?, '', 0, 0, 0, 0, 1)`).run(s.id, `c${i}`, T + minute * MIN, tool);
+			for (const file of files) db.prepare("INSERT INTO tool_files VALUES (?, ?, ?, ?, 1)").run(s.id, `c${i}`, T + minute * MIN, file);
+		});
 		s.turns.forEach(([minute, calls, cost, read], i) => {
 			db.prepare(`INSERT INTO requests (session_id, entry_id, ts, kind, provider, model, input, output, cache_read, cache_write, prompt_tokens, cost, message_count,
 				cost_input, cost_output, cost_read, cost_write, trigger_tokens, cache_lost, cache_waste, tool_calls)
@@ -292,9 +329,10 @@ describe("comparison", () => {
 		addSession(db, { id: "E", cwd: "/p", arm: "A", turns: [] });
 		addSession(db, { id: "O", cwd: "/p", arm: "B", experiment: "other", turns: [[1, 1, 1, 1]] });
 
-		const [x] = experiments(new Scope(db, {}), "x");
+		const [x] = experiments(new Scope(db, {}), [["x"]]);
 		assert.deepEqual({ ...x, metrics: undefined }, {
-			experiment: "x",
+			experiments: ["x"],
+			cells: ["A", "B"],
 			sessions: { A: 2, B: 2 },
 			turns: { A: 4, B: 2 },
 			forced: 1,
@@ -303,71 +341,154 @@ describe("comparison", () => {
 			metrics: undefined,
 		});
 		const m = Object.fromEntries(x!.metrics.map((metric) => [metric.key, metric]));
-		assert.equal(m.toolCallsPerTurn!.a, 3 / 4);
-		assert.equal(m.toolCallsPerTurn!.b, 5 / 2);
-		assert.equal(m.toolCallsPerTurn!.diff, 5 / 2 - 3 / 4);
-		assert.equal(m.batchedTurns!.a, 0);
-		assert.equal(m.batchedTurns!.b, 1);
-		assert.equal(m.turnsPerPackage!.a, 4 / 2, "steers are no package");
-		assert.equal(m.turnsPerPackage!.b, 2 / 2, "B1's first message came before its assignment");
-		assert.equal(m.turnsPerSession!.a, 2);
-		assert.equal(m.costPerSession!.a, 3);
-		assert.equal(m.costPerSession!.b, 1);
-		assert.equal(m.readCostPerSession!.b, 0.2);
-		assert.equal(m.costPerTurn!.a, 6 / 4);
-		assert.equal(m.readCostPerTurn!.a, 3 / 4);
-		assert.equal(m.toolErrorRate!.a, 1 / 3);
-		assert.equal(m.toolErrorRate!.b, 1 / 5);
+		assert.equal(m.toolCallsPerTurn!.values.A, 3 / 4);
+		assert.equal(m.toolCallsPerTurn!.values.B, 5 / 2);
+		assert.equal(m.toolCallsPerTurn!.effect, 5 / 2 - 3 / 4);
+		assert.equal(m.batchedTurns!.values.A, 0);
+		assert.equal(m.batchedTurns!.values.B, 1);
+		assert.equal(m.turnsPerPackage!.values.A, 4 / 2, "steers are no package");
+		assert.equal(m.turnsPerPackage!.values.B, 2 / 2, "B1's first message came before its assignment");
+		assert.equal(m.turnsPerSession!.values.A, 2);
+		assert.equal(m.costPerSession!.values.A, 3);
+		assert.equal(m.costPerSession!.values.B, 1);
+		assert.equal(m.readCostPerSession!.values.B, 0.2);
+		assert.equal(m.costPerTurn!.values.A, 6 / 4);
+		assert.equal(m.readCostPerTurn!.values.A, 3 / 4);
+		assert.equal(m.toolErrorRate!.values.A, 1 / 3);
+		assert.equal(m.toolErrorRate!.values.B, 1 / 5);
 		assert.ok(m.toolCallsPerTurn!.ci, "two sessions per arm give an interval");
 
-		assert.deepEqual(experiments(new Scope(db, {})).map((e) => e.experiment), ["other", "x"]);
+		assert.deepEqual(experiments(new Scope(db, {})).map((e) => e.experiments), [["other"], ["x"]]);
 		// The time window applies on top: only minutes 0–5 leave A's sessions and none of B's.
-		const early = experiments(new Scope(db, { end: T + 5 * MIN }), "x")[0]!;
+		const early = experiments(new Scope(db, { end: T + 5 * MIN }), [["x"]])[0]!;
 		assert.deepEqual(early.sessions, { A: 0, B: 0 }, "B has no turns before 5, so /p has one arm only");
 		assert.equal(early.unmatched, 3);
 		// The project filter keeps /q only: one arm, nothing compared.
-		assert.deepEqual(experiments(new Scope(db, { project: "/q" }), "x")[0]!.sessions, { A: 0, B: 0 });
+		assert.deepEqual(experiments(new Scope(db, { project: "/q" }), [["x"]])[0]!.sessions, { A: 0, B: 0 });
 		const text = renderComparison(x!);
-		assert.match(text, /x: 2 sessions \/ 4 turns in A, 2 \/ 2 in B \(1 project with both arms\)/);
-		assert.match(text, /left out: 1 forced, 1 in projects with one arm only/);
+		assert.match(text, /^x: A 2 sessions \/ 4 turns, B 2 \/ 2 \(1 project with every arm\)$/m);
+		assert.match(text, /left out: 1 forced, 1 in projects missing an arm/);
 		assert.match(text, /tool calls per turn\s+0\.75\s+2\.50\s+\+1\.75/);
 		db.close();
 	});
 
+	test("crosses two experiments over the time a session was in both, with the edit metrics", () => {
+		const db = openStore(join(dir, "metrics.db"));
+		const y = (arm: Arm, row: Omit<ArmRow, "arm" | "experiment"> = {}): ArmRow[] => [{ experiment: "y", arm, ...row }];
+		const turn = (minute: number): [number, number, number, number] => [minute, 1, 1, 0];
+		// AA: shell writes only (one with unknown files).
+		addSession(db, { id: "aa", cwd: "/p", arm: "A", arms: y("A"), turns: [turn(1), turn(2)], changes: [[1, "bash", ["/p/a.ts"]], [2, "bash", []]] });
+		// AB: half the changes via edit, three edits on one file.
+		addSession(db, { id: "ab", cwd: "/p", arm: "A", arms: y("B"), turns: [turn(1)], changes: [[1, "edit", ["/p/a.ts"]], [1, "edit", ["/p/a.ts"]], [1, "edit", ["/p/a.ts"]], [1, "bash", []], [1, "bash", []], [1, "bash", []]] });
+		// BA: y started at minute 5, so x-only turns and changes before it do not count; edits on two files.
+		addSession(db, { id: "ba", cwd: "/p", arm: "B", arms: y("A", { assigned: 5 }), turns: [turn(1), turn(6)], changes: [[1, "bash", []], [6, "edit", ["/p/a.ts"]], [6, "edit", ["/p/b.ts"]], [6, "write", ["/p/c.ts"]]] });
+		// BB: x ended at minute 10, y never; later turns do not count.
+		addSession(db, { id: "bb", cwd: "/p", arm: "B", ended: 10, arms: y("B"), turns: [turn(1), turn(11)], changes: [[1, "edit", ["/p/a.ts"]], [1, "edit", ["/p/b.ts"]], [11, "bash", []]] });
+		// y ended (minute 3) before x started (minute 4): no time in both, no turns.
+		addSession(db, { id: "gap", cwd: "/p", arm: "B", assigned: 4, arms: y("B", { ended: 3 }), turns: [turn(1), turn(5)] });
+		// Only in x: not part of the crossed comparison. Forced in y: left out.
+		addSession(db, { id: "xonly", cwd: "/p", arm: "A", turns: [turn(1)] });
+		addSession(db, { id: "forced", cwd: "/p", arm: "A", arms: y("B", { forced: true }), turns: [turn(1)] });
+
+		const [crossed] = experiments(new Scope(db, {}), [["x", "y"]]);
+		assert.deepEqual(crossed!.sessions, { AA: 1, AB: 1, BA: 1, BB: 1 });
+		assert.deepEqual(crossed!.turns, { AA: 2, AB: 1, BA: 1, BB: 1 });
+		assert.equal(crossed!.forced, 1);
+		assert.equal(crossed!.unmatched, 0);
+		const m = Object.fromEntries(crossed!.metrics.map((metric) => [metric.key, metric]));
+		assert.deepEqual(m.toolMutationShare!.values, { AA: 0, AB: 0.5, BA: 1, BB: 1 });
+		assert.equal(m.toolMutationShare!.effect, (1 - 1) - (0.5 - 0));
+		assert.deepEqual(m.editCallsPerFile!.values, { AA: null, AB: 3, BA: 1, BB: 1 }, "write calls are no edits");
+		assert.equal(m.editCallsPerFile!.effect, null);
+		// The crossed order is the caller's: the cells swap their letters.
+		const [swapped] = experiments(new Scope(db, {}), [["y", "x"]]);
+		assert.deepEqual(swapped!.metrics.find((x) => x.key === "toolMutationShare")!.values, { AA: 0, AB: 1, BA: 0.5, BB: 1 });
+		// x alone sees every session in it over its own time: xonly, forced (forced in y only) and gap
+		// count, and ba's minute-1 change does.
+		const [alone] = experiments(new Scope(db, {}), [["x"]]);
+		assert.deepEqual(alone!.sessions, { A: 4, B: 3 });
+		assert.equal(alone!.metrics.find((x) => x.key === "toolMutationShare")!.values.B, (3 + 2) / (4 + 2));
+		db.close();
+	});
+
 	test("an experiment without sessions or with one arm only reports no metrics", () => {
-		const empty = compareArms("x", []);
+		const empty = compareCells(["x"], []);
 		assert.deepEqual(empty.sessions, { A: 0, B: 0 });
-		assert.ok(empty.metrics.every((m) => m.a === null && m.b === null && m.diff === null && m.ci === null));
+		assert.ok(empty.metrics.every((m) => m.values.A === null && m.values.B === null && m.effect === null && m.ci === null));
 		assert.match(renderComparison(empty), /no comparable sessions yet/);
 	});
 
-	test("the bootstrap interval covers the difference, is deterministic and needs two sessions per arm", () => {
-		const session = (calls: number, turns: number): [number, number] => [calls, turns];
-		const a = Array.from({ length: 40 }, (_, i) => session(10 + (i % 5), 10));
-		const b = Array.from({ length: 40 }, (_, i) => session(20 + (i % 5), 10));
-		const ci = bootstrapDiff(a, b)!;
-		assert.ok(ci[0] > 0.8 && ci[1] < 1.2 && ci[0] <= 1 && ci[1] >= 1, `ci ${ci}`);
-		assert.deepEqual(bootstrapDiff(a, b), ci);
-		assert.equal(bootstrapDiff(a.slice(0, 1), b), null);
-		// No difference: the interval spans zero.
-		const same = bootstrapDiff(a, a.map(([n, d]) => [n, d] as [number, number]))!;
-		assert.ok(same[0] < 0 && same[1] > 0);
-		// Zero denominators everywhere: no ratio, no interval.
-		assert.equal(bootstrapDiff([[0, 0], [0, 0]], [[1, 0], [1, 0]]), null);
+	test("cells and contrast weights: B − A for one experiment, the interaction for two", () => {
+		assert.deepEqual(cellsOf(1), ["A", "B"]);
+		assert.deepEqual(cellsOf(2), ["AA", "AB", "BA", "BB"]);
+		assert.equal(cellsOf(3).length, 8);
+		assert.deepEqual(cellsOf(1).map(contrastWeight), [-1, 1]);
+		assert.deepEqual(cellsOf(2).map(contrastWeight), [1, -1, -1, 1]);
+		// Every contrast sums to zero: a constant metric has no effect.
+		assert.equal(cellsOf(3).map(contrastWeight).reduce((x, y) => x + y), 0);
 	});
 
-	test("compareArms weighs sessions by their turns (ratio of sums)", () => {
-		const s = (id: string, arm: Arm, turns: number, toolCalls: number): ArmSession => ({
-			session: id, project: "/p", arm, forced: false, turns, toolCalls, batchedTurns: 0, packages: 1, cost: 0, readCost: 0, toolResults: 0, toolErrors: 0,
-		});
-		const c = compareArms("x", [s("a1", "A", 100, 100), s("a2", "A", 1, 5), s("b1", "B", 10, 20)]);
-		assert.equal(c.metrics[0]!.a, 105 / 101);
+	test("the bootstrap interval covers the contrast, is deterministic and needs two sessions per group", () => {
+		const group = (base: number, weight: number) => ({ pairs: Array.from({ length: 40 }, (_, i): [number, number] => [base + (i % 5), 10]), weight });
+		const [a, b] = [group(10, -1), group(20, 1)];
+		const ci = bootstrapContrast([a, b])!;
+		assert.ok(ci[0] > 0.8 && ci[1] < 1.2 && ci[0] <= 1 && ci[1] >= 1, `ci ${ci}`);
+		assert.deepEqual(bootstrapContrast([a, b]), ci);
+		assert.equal(bootstrapContrast([{ ...a, pairs: a.pairs.slice(0, 1) }, b]), null);
+		// No difference: the interval spans zero.
+		const same = bootstrapContrast([a, { ...a, weight: 1 }])!;
+		assert.ok(same[0] < 0 && same[1] > 0);
+		// Zero denominators everywhere: no ratio, no interval.
+		assert.equal(bootstrapContrast([{ pairs: [[0, 0], [0, 0]], weight: -1 }, { pairs: [[1, 0], [1, 0]], weight: 1 }]), null);
+		// Interaction: B adds 1 under A of the first experiment and 3 under its B, so the interaction is 2.
+		const cells = [group(10, 1), group(20, -1), group(10, -1), group(40, 1)];
+		const interaction = bootstrapContrast(cells)!;
+		assert.ok(interaction[0] > 1.6 && interaction[1] < 2.4 && interaction[0] <= 2 && interaction[1] >= 2, `interaction ${interaction}`);
+		// Same effect of B under both arms: the interval spans zero.
+		const additive = bootstrapContrast([group(10, 1), group(20, -1), group(30, -1), group(40, 1)])!;
+		assert.ok(additive[0] < 0 && additive[1] > 0, `additive ${additive}`);
+	});
+
+	const armSession = (id: string, cell: string, turns: number, toolCalls: number): ArmSession => ({
+		session: id, project: "/p", cell, forced: false, turns, toolCalls, batchedTurns: 0, packages: 1, cost: 0, readCost: 0, toolResults: 0, toolErrors: 0,
+		mutatingCalls: 0, toolMutatingCalls: 0, editCalls: 0, editedFiles: 0,
+	});
+
+	test("compareCells weighs sessions by their turns (ratio of sums)", () => {
+		const c = compareCells(["x"], [armSession("a1", "A", 100, 100), armSession("a2", "A", 1, 5), armSession("b1", "B", 10, 20)]);
+		assert.equal(c.metrics[0]!.values.A, 105 / 101);
 		assert.equal(c.metrics[0]!.ci, null, "one session in B");
+	});
+
+	test("compareCells for two experiments: the interaction of the cells, projects need every cell", () => {
+		const sessions = [
+			armSession("aa", "AA", 10, 10), armSession("ab", "AB", 10, 20),
+			armSession("ba", "BA", 10, 10), armSession("bb", "BB", 10, 40),
+			// /q has three cells only: left out.
+			{ ...armSession("q", "AA", 10, 90), project: "/q" }, { ...armSession("q2", "AB", 10, 90), project: "/q" }, { ...armSession("q3", "BB", 10, 90), project: "/q" },
+		];
+		const c = compareCells(["one", "two"], sessions);
+		assert.deepEqual(c.cells, ["AA", "AB", "BA", "BB"]);
+		assert.deepEqual(c.sessions, { AA: 1, AB: 1, BA: 1, BB: 1 });
+		assert.deepEqual(c.projects, ["/p"]);
+		assert.equal(c.unmatched, 3);
+		const calls = c.metrics.find((m) => m.key === "toolCallsPerTurn")!;
+		assert.deepEqual(calls.values, { AA: 1, AB: 2, BA: 1, BB: 4 });
+		assert.equal(calls.effect, (4 - 1) - (2 - 1));
+		assert.equal(calls.ci, null, "one session per cell");
+		// A metric undefined in one cell has no effect.
+		assert.equal(c.metrics.find((m) => m.key === "editCallsPerFile")!.effect, null);
+		const text = renderComparison(c);
+		assert.match(text, /^one × two: AA 1 session \/ 10 turns, AB 1 \/ 10, BA 1 \/ 10, BB 1 \/ 10 \(1 project with every cell\)$/m);
+		assert.match(text, /^cells: arm in one, then two; interaction = how much two's B − A differs between the arms of one$/m);
+		assert.match(text, /left out: 0 forced, 3 in projects missing a cell/);
+		assert.match(text, /metric\s+AA\s+AB\s+BA\s+BB\s+interaction\s+95% CI/);
+		assert.match(text, /tool calls per turn\s+1\.00\s+2\.00\s+1\.00\s+4\.00\s+\+2\.00\s+–/);
 	});
 });
 
 describe("/harness experiment", () => {
-	const result = compareArms("x", []);
+	const result = compareCells(["x"], []);
 
 	function context(at: string, recorded = new Map()) {
 		const appended: ArmEntryData[] = [];
@@ -380,9 +501,9 @@ describe("/harness experiment", () => {
 		const at = experimentFile("x", "---\nstarted: 2026-11-13\n---\nVariant.");
 		experimentFile("empty", "", at);
 		const { ctx } = context(at);
-		const status = experimentCommand([], { ...ctx, compare: () => [result, compareArms("gone", [])] });
+		const status = experimentCommand([], { ...ctx, compare: () => [result, compareCells(["gone"], [])] });
 		assert.equal(status.level, "info");
-		assert.match(status.text, /## x \(running, started 2026-11-13\)\nthis session: B \(variant\) from its next run\nx: 0 sessions/);
+		assert.match(status.text, /## x \(running, started 2026-11-13\)\nthis session: B \(variant\) from its next run\nx: A 0 sessions/);
 		assert.match(status.text, /## empty \(ignored: empty variant\)/);
 		assert.match(status.text, /## gone \(file removed\)/);
 		const forced = experimentCommand([], { ...ctx, recorded: recordedArms([armEntry({ experiment: "x", arm: "A", forced: true })]) });
@@ -406,9 +527,33 @@ describe("/harness experiment", () => {
 		assert.equal(listExperiments(at)[0]!.status, "stopped");
 		const log = readFileSync(changelog, "utf8");
 		assert.match(log, /^## 2026-11-20 — experiment stopped: x$/m);
-		assert.match(log, /```\nx: 0 sessions/);
+		assert.match(log, /```\nx: A 0 sessions/);
 		assert.match(experimentCommand(["x", "stop"], ctx).text, /already stopped/);
 		assert.match(experimentCommand(["x", "on"], ctx).text, /already stopped/);
+	});
+
+	test("declared interactions add the crossed comparison to the status and the stop entry", () => {
+		const at = experimentFile("x", "---\ninteracts: y\n---\nVariant.");
+		experimentFile("y", "---\ninteracts: x\n---\nOther.", at);
+		experimentFile("z", "Unrelated.", at);
+		const { ctx, changelog } = context(at);
+		const asked: (string[][] | undefined)[] = [];
+		const compare = (groups?: string[][]) => {
+			asked.push(groups);
+			return (groups ?? [["x"], ["y"], ["z"]]).map((group) => compareCells(group, []));
+		};
+		const status = experimentCommand([], { ...ctx, compare });
+		assert.deepEqual(asked, [undefined, [["x", "y"]]], "the pair once, though both declare it");
+		assert.match(status.text, /## x \(running\)\n.*\nx: A 0 sessions.*\nno comparable sessions yet\n\nx × y: AA 0 sessions/);
+		assert.equal(status.text.match(/x × y/g)!.length, 1, "only under the experiment that comes first");
+		assert.doesNotMatch(status.text.slice(status.text.indexOf("## z")), /×/);
+
+		asked.length = 0;
+		experimentCommand(["y", "stop"], { ...ctx, compare });
+		assert.deepEqual(asked, [[["y"], ["x", "y"]]]);
+		assert.match(readFileSync(changelog, "utf8"), /```\ny: A 0 sessions[^`]*\n\nx × y: AA 0 sessions[^`]*```/);
+		// Stopped experiments keep their declared pairs: the data stays comparable.
+		assert.deepEqual(crossedGroups(listExperiments(at)), [["x", "y"]]);
 	});
 
 	test("rejects unknown experiments, ignored ones and bad arguments", () => {

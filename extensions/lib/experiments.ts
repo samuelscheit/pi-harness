@@ -12,6 +12,9 @@
 //   status:  running (default) | stopped. A stopped experiment assigns no arms and adds no section.
 //   started: date the experiment started (informational).
 //   stopped: when `/harness experiment <name> stop` ended it.
+//   interacts: an experiment name, or a list of them, whose arms this one's effect may depend on
+//              (one changes how much the other can act). `/harness experiment` then also compares
+//              the crossed cells (AA, AB, BA, BB) and their interaction.
 // Other keys are kept as they are. An experiment with an empty body has nothing to test and is
 // ignored (listed with a problem), like one whose name is not a valid section name.
 //
@@ -49,12 +52,14 @@ export interface Experiment {
 	frontmatter: Record<string, unknown>;
 	/** The variant's prompt text. */
 	body: string;
+	/** Experiments whose arms to cross with this one's in the comparison (frontmatter `interacts`). */
+	interacts: string[];
 	/** Why the experiment cannot run (invalid name, empty body, unreadable frontmatter). */
 	problem?: string;
 }
 
 export function readExperiment(file: string, name: string): Experiment {
-	const base = { name, file, status: "running" as const, frontmatter: {}, body: "" };
+	const base = { name, file, status: "running" as const, frontmatter: {}, body: "", interacts: [] };
 	if (!NAME.test(name)) return { ...base, problem: `invalid name (use ${NAME.source})` };
 	let parsed: { frontmatter: Record<string, unknown>; body: string };
 	try {
@@ -64,8 +69,13 @@ export function readExperiment(file: string, name: string): Experiment {
 	}
 	const status = parsed.frontmatter.status ?? "running";
 	if (status !== "running" && status !== "stopped") return { ...base, problem: `unknown status ${JSON.stringify(status)}` };
+	const raw = parsed.frontmatter.interacts ?? [];
+	const interacts = typeof raw === "string" ? [raw] : raw;
+	if (!Array.isArray(interacts) || !interacts.every((other) => typeof other === "string" && NAME.test(other) && other !== name)) {
+		return { ...base, problem: `interacts must name other experiments, got ${JSON.stringify(raw)}` };
+	}
 	const body = parsed.body.trim();
-	return { name, file, status, frontmatter: parsed.frontmatter, body, ...(body ? {} : { problem: "empty variant" }) };
+	return { name, file, status, frontmatter: parsed.frontmatter, body, interacts, ...(body ? {} : { problem: "empty variant" }) };
 }
 
 /** Every experiment file, by name. */

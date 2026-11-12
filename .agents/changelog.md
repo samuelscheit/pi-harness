@@ -57,3 +57,11 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Judged by:** share of mutating calls through `edit`/`write` (from 7–18%); then first check run after edits failing (law-formalization Claude Code baseline 34%), cost of repair chains, turns and cost per package; guardrails: edit error rate, tool error rate. Interacts with `single-edit` (independent arms; the 2×2 cells can be compared).
 
 **Revert:** `/harness experiment edit-tool stop`, or delete the file.
+
+## 2026-11-13 — experiments: crossed comparison (interacts)
+
+**Change:** an experiment file can declare `interacts: <name>` (or a list). `/harness experiment` then also compares the crossed cells AA/AB/BA/BB over the time a session was in both experiments, with the interaction (BB − BA) − (AB − AA) and a bootstrap interval; the stop entry includes it. `edit-tool` declares `interacts: single-edit`. Two metrics added to every comparison: share of file changes via `edit`/`write`, and edit calls per edited file.
+
+**Why:** `single-edit` can only act on `edit` calls, which `edit-tool` adds; their effects are not independent, so the per-experiment B − A alone would hide that.
+
+**Revert:** remove `interacts` from the file (the comparison code stays harmless), or revert the commit.
