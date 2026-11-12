@@ -957,6 +957,12 @@ interface BeforeAgentStartEventBase {
 	readonly systemPrompt: string;
 	/** Mutable prompt sections. Later handlers observe mutations made by earlier handlers. */
 	systemPromptOptions: NormalizedBuildSystemPromptOptions;
+	/**
+	 * Set when the run is not starting but continuing after a reload at a turn boundary
+	 * (`pi.requestReload()`): the reloaded handlers rebuild the run's prompt options and tools for
+	 * its remaining turns. Messages they return are ignored, since the run already started.
+	 */
+	reloaded?: boolean;
 }
 
 /** A run started by a submitted prompt, RPC prompt, or `pi.sendUserMessage()`. */
@@ -1829,6 +1835,16 @@ export interface ExtensionAPI {
 	 */
 	setActiveTools(toolNames: string[]): void;
 
+	/**
+	 * Reload extensions, skills, prompts and settings at the next safe point: at once when the
+	 * session is idle, else at the next turn boundary of the running agent run (after the turn's
+	 * tool results, before the next model request), else when the run settles. A run continues on
+	 * the reloaded tools and prompt; a tool call executing at the time finishes on the old code.
+	 * Repeated requests before the reload are one. Like `ctx.reload()`, this extension instance is
+	 * stale afterwards.
+	 */
+	requestReload(): void;
+
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
 
@@ -2191,6 +2207,8 @@ export type SetActiveToolsHandler = (toolNames: string[]) => void;
 
 export type RefreshToolsHandler = () => void;
 
+export type RequestReloadHandler = () => void;
+
 export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
 
 export type GetThinkingLevelHandler = () => ThinkingLevel;
@@ -2249,6 +2267,7 @@ export interface ExtensionActions {
 	getAllTools: GetAllToolsHandler;
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
+	requestReload: RequestReloadHandler;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
