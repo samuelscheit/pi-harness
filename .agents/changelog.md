@@ -132,3 +132,21 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Judged by:** turns and cost per session (children included), `workflow` usage and goal rate, saved workflows created and called; guardrails: tool error rate, corrections. Crossed with `codemode`.
 
 **Revert:** `/harness experiment workflow stop`; saved workflows then stay inactive. `fix_loop` follows its own experiment.
+
+## 2026-11-13 — harness: releases and hot reload of running sessions
+
+**Change:**
+
+- Pi loads the harness from `~/.pi/agent/harness/current`, a link to a snapshot of one commit of this repository's deployed branch (`main`): `git archive` without `vendor/`, with links back to `vendor/` (Pi itself and pi-lens, not hot-swappable), `node_modules` and `dashboard/node_modules`, and `.release.json` (commit, source, branch). `extensions/lib/release.ts`.
+- `extensions/release`: every Pi process running a release watches the branch (ref file times every 3 s). A new commit is deployed by the first process that sees it, under a lock, after every extension entry point imports in a fresh Node process; a commit that does not load is reported once per session and stays undeployed, the running release keeps running. The link switches atomically; the current release and the five newest others are kept (going back is switching the link). Each session reloads into the deployed release when idle (`ctx.reload()` through the `/harness-reload` command; a busy session after its run settles), says `Harness reloaded: old → new subject`, and once per process when a release changed `vendor/pi` (needs a restart). The process that deployed restarts a running dashboard of an older release.
+- Writes go to the repository, not the release: the harness backlog, the changelog, a stopped experiment's file (`SOURCE_ROOT`, `inSource`). Running a release, `/harness experiment <name> stop` commits its two files (`git commit --only`), so the stop is deployed like any commit.
+- The metrics index refuses to be opened by older code than the one that built it (`cf0aedf38`), so a session that has not reloaded yet cannot downgrade it.
+- `scripts/install.mjs` deploys the current branch and points `packages` at the link.
+
+**Why:** running sessions kept the code they started with for hours (an old process could rebuild the metrics index at an old schema), and reloading from the working tree would hand half-finished edits of any agent to every session: during this change the working tree had a broken `fix_loop` import for a while.
+
+**Verified:** `test/release.test.ts` (committed content only, uncommitted and other-branch commits stay out, broken import / syntax error / throwing module refused once, lock and stale lock, pruning and going back, `commitToSource` leaves other staged work, the extension reloads idle sessions at once and busy ones after settling, reports failures once, announces reloads and Pi changes once). Live in RPC mode with Haiku against a clone: an idle session reloaded 3.5 s after a commit, a commit during a turn reloaded 2 s after it settled, the new prompt text reached the next request as an appended section update (cached prefix kept), a broken commit gave one warning and no reload.
+
+**Effect:** uncommitted edits to prompts, experiments and extensions no longer reach sessions; they take effect on commit (seconds later, at the next idle moment).
+
+**Revert:** point `packages` in `~/.pi/agent/settings.json` back at the repository (the release extension then does nothing), or revert the commit.

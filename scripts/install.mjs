@@ -10,7 +10,10 @@
 // vendor/pi/node_modules, so its scripts, tests and type checks resolve the vendored packages.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
-// - settings.json: this repo and the vendored pi-lens as packages, Opus 5.5 as the startup model, and context
+// - harness/:      releases of this repo (extensions/lib/release.ts): Pi loads the harness from
+//                  harness/current, a snapshot of the current branch's latest commit; running
+//                  sessions reload into each new commit when idle (extensions/release).
+// - settings.json: the current harness release and the vendored pi-lens as packages, Opus 5.5 as the startup model, and context
 //                  cost control: a one-hour cache, kept warm while idle for up to CACHE_WARMING_IDLE_MINUTES, and
 //                  compaction with Haiku before a run whose cache expired, when that costs less than writing the
 //                  context again (`warm` compaction stays off until its effect on quality is measured).
@@ -29,6 +32,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync,
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { currentLink, deploy } from "../extensions/lib/release.ts";
 import { patchApp } from "./patch-t3.ts";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
@@ -110,12 +114,18 @@ const keyFromKeychain = { type: "api_key", key: `!security find-generic-password
 writeJson(authFile, { ...readJson(authFile), anthropic: keyFromKeychain, gateway: keyFromKeychain });
 chmodSync(authFile, 0o600);
 
+// The first release: the committed state of the current branch (uncommitted edits are not deployed).
+const branch = execFileSync("git", ["-C", root, "branch", "--show-current"], { encoding: "utf8" }).trim();
+if (!branch) throw new Error(`${root} is not on a branch; check out the branch to deploy`);
+const deployed = await deploy({ source: root, branch, agentDir });
+if (deployed.status === "failed") throw new Error(`harness commit ${deployed.commit} does not load:\n${deployed.error}`);
+
 const settingsFile = join(agentDir, "settings.json");
 const settings = readJson(settingsFile);
 writeJson(settingsFile, {
 	...settings,
 	// The harness first: its lens extension points pi-lens at the layered config before pi-lens loads.
-	packages: [root, vendoredLens],
+	packages: [currentLink(agentDir), vendoredLens],
 	defaultProvider: "anthropic",
 	defaultModel: "claude-opus-5-5",
 	cacheRetention: "long",
@@ -126,4 +136,4 @@ writeJson(settingsFile, {
 	},
 });
 
-console.log(`${agentDir}: harness ${root}, gateway ${origin} (${gatewayModels.length} non-Claude models), default anthropic/claude-opus-5-5`);
+console.log(`${agentDir}: harness ${root} (${branch} at ${deployed.commit.slice(0, 9)}, ${currentLink(agentDir)}), gateway ${origin} (${gatewayModels.length} non-Claude models), default anthropic/claude-opus-5-5`);

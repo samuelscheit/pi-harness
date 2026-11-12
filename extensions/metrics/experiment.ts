@@ -19,13 +19,13 @@ import {
 	listExperiments,
 	stopExperiment,
 } from "../lib/experiments.ts";
-import { HARNESS_ROOT } from "../lib/repository.ts";
+import { SOURCE_ROOT } from "../lib/repository.ts";
 import { money, percent, table } from "./format.ts";
 import { type CellMetric, type ExperimentComparison, experiments, Scope } from "./queries/index.ts";
 import { indexAll, metricsPath } from "./stats.ts";
 import { openStore } from "./store.ts";
 
-export const CHANGELOG = join(HARNESS_ROOT, ".agents/changelog.md");
+export const CHANGELOG = join(SOURCE_ROOT, ".agents/changelog.md");
 
 const value = (unit: CellMetric["unit"], v: number | null, signed = false): string => {
 	if (v === null) return "–";
@@ -138,6 +138,11 @@ export interface ExperimentContext {
 	/** The comparisons from the index of the given groups of experiments (every recorded experiment alone when undefined). */
 	compare?: (groups?: string[][]) => ExperimentComparison[];
 	now?: Date;
+	/**
+	 * Commit files written to the harness repository, when Pi runs a release of it: a stop takes
+	 * effect once committed (then deployed and reloaded). Returns what to tell the user.
+	 */
+	publish?: (paths: string[], message: string) => string;
 }
 
 /** The comparisons from the index, with the usage of the tools each experiment file switches. */
@@ -163,9 +168,11 @@ export function experimentCommand(args: string[], context: ExperimentContext): {
 	if (action === "stop") {
 		const at = context.now ?? new Date();
 		const results = compare([[name], ...crossed.filter((group) => group.includes(name))]);
-		stopExperiment(experiment, at);
-		appendFileSync(context.changelog ?? CHANGELOG, stopEntry(results, name, at));
-		return { text: `Stopped ${name}; result logged in the changelog.\n${results.map(renderComparison).join("\n\n")}`.trim(), level: "info" };
+		const file = stopExperiment(experiment, at);
+		const changelog = context.changelog ?? CHANGELOG;
+		appendFileSync(changelog, stopEntry(results, name, at));
+		const published = context.publish ? `\n${context.publish([file, changelog], `chore(experiments): stop ${name}`)}` : "";
+		return { text: `Stopped ${name}; result logged in the changelog.${published}\n${results.map(renderComparison).join("\n\n")}`.trim(), level: "info" };
 	}
 	const arm: Arm = action === "on" ? "B" : "A";
 	context.appendEntry({ experiment: name, arm, forced: true });

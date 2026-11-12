@@ -33,7 +33,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
-import { HARNESS_ROOT } from "./repository.ts";
+import { HARNESS_ROOT, inSource } from "./repository.ts";
 
 export const EXPERIMENTS_DIR = join(HARNESS_ROOT, "prompt/experiments");
 /** The custom entry type that records arms in session files. */
@@ -196,8 +196,14 @@ export function armUpdates(sessionId: string, recorded: Map<string, ArmState>, r
 	return updates;
 }
 
-/** Mark an experiment stopped in its file: it stays in git history and can be restarted by setting `status: running`. */
-export function stopExperiment(experiment: Experiment, at = new Date()): void {
+/**
+ * Mark an experiment stopped in its file in the harness repository (the source of a release, see
+ * repository.ts): it stays in git history and can be restarted by setting `status: running`.
+ * Returns the file written.
+ */
+export function stopExperiment(experiment: Experiment, at = new Date()): string {
 	const frontmatter = { ...experiment.frontmatter, status: "stopped", stopped: at.toISOString() };
-	writeFileSync(experiment.file, `---\n${stringify(frontmatter)}---\n\n${experiment.body}\n`);
+	const file = inSource(experiment.file);
+	writeFileSync(file, `---\n${stringify(frontmatter)}---\n\n${experiment.body}\n`);
+	return file;
 }
