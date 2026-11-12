@@ -2,8 +2,8 @@
 // switching, locking, pruning, and sessions reloading into a new release when idle.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
@@ -104,14 +104,77 @@ describe("deploy", () => {
 		assert.deepEqual(await deployMain(), { status: "current", commit: main });
 	});
 
-	test("a held lock makes others wait; a stale one is taken over", async () => {
-		mkdirSync(harnessDir(agentDir), { recursive: true });
-		mkdirSync(join(harnessDir(agentDir), ".lock"));
+	/** A pid no process has: a short-lived child that has exited. */
+	const deadPid = () => {
+		const child = spawnSync(process.execPath, ["-e", ""]);
+		return child.pid!;
+	};
+	const lockDir = () => join(harnessDir(agentDir), ".lock");
+	const holdLock = (pid: number, touchedMsAgo = 0) => {
+		mkdirSync(lockDir(), { recursive: true });
+		writeFileSync(join(lockDir(), "pid"), String(pid));
+		const at = new Date(Date.now() - touchedMsAgo);
+		utimesSync(lockDir(), at, at);
+	};
+
+	test("a lock held by a live process with a fresh heartbeat makes others wait", async () => {
+		holdLock(process.pid);
 		assert.equal((await deployMain()).status, "busy");
-		const old = new Date(Date.now() - 10 * 60_000);
-		utimesSync(join(harnessDir(agentDir), ".lock"), old, old);
+		assert.equal(existsSync(lockDir()), true, "a live holder's lock stays");
+	});
+
+	test("a lock whose holder died is taken over at once, also with a fresh heartbeat", async () => {
+		holdLock(deadPid());
 		assert.equal((await deployMain()).status, "deployed");
-		assert.equal(existsSync(join(harnessDir(agentDir), ".lock")), false, "released after deploying");
+		assert.equal(existsSync(lockDir()), false, "released after deploying");
+		assert.deepEqual(readdirSync(harnessDir(agentDir)).filter((n) => n.startsWith(".lock")), [], "nothing moved aside is left");
+	});
+
+	test("a lock without a heartbeat for 15 s is taken over even if its pid runs (reused or hung)", async () => {
+		holdLock(process.pid, 20_000);
+		assert.equal((await deployMain()).status, "deployed");
+		mkdirSync(lockDir());
+		assert.equal((await deployMain(async () => {})).status, "current", "a deployed commit needs no lock");
+		rmSync(lockDir(), { recursive: true });
+		holdLock(process.pid, 10_000);
+		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "next";\n');
+		commit("next");
+		assert.equal((await deployMain()).status, "busy", "10 s without a touch is not yet abandoned");
+	});
+
+	test("a lock just created, its pid not yet written, makes others wait", async () => {
+		mkdirSync(lockDir(), { recursive: true });
+		assert.equal((await deployMain()).status, "busy");
+	});
+
+	test("the holder touches the lock while deploying, so a slow deploy is not taken over", async () => {
+		const touches: number[] = [];
+		const result = await deployMain(async () => {
+			const first = statSync(lockDir()).mtimeMs;
+			await new Promise((r) => setTimeout(r, 4_500));
+			touches.push(first, statSync(lockDir()).mtimeMs);
+			assert.equal(readFileSync(join(lockDir(), "pid"), "utf8"), String(process.pid));
+		});
+		assert.equal(result.status, "deployed");
+		assert.ok(touches[1]! > touches[0]!, "touched during the validation");
+	});
+
+	test("builds left by dead processes are removed; a live process's build stays", async () => {
+		const releases = join(harnessDir(agentDir), "releases");
+		const orphan = join(releases, `.${"a".repeat(40)}.${deadPid()}`);
+		const running = join(releases, `.${"b".repeat(40)}.${process.ppid}`);
+		mkdirSync(orphan, { recursive: true });
+		mkdirSync(running, { recursive: true });
+		assert.equal((await deployMain()).status, "deployed");
+		assert.equal(existsSync(orphan), false);
+		assert.equal(existsSync(running), true);
+	});
+
+	test("two deploys at once: one deploys, the other waits; one release results", async () => {
+		const results = await Promise.all([deployMain(), deployMain()]);
+		assert.deepEqual(results.map((r) => r.status).sort(), ["busy", "deployed"]);
+		assert.equal(readdirSync(join(harnessDir(agentDir), "releases")).filter((n) => !n.startsWith(".")).length, 1);
+		assert.equal((await deployMain()).status, "current");
 	});
 
 	test("keeps the current release and the five newest others", async () => {
