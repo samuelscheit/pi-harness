@@ -202,16 +202,13 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 		const session = await open();
 		const lease = mode && (await workspaceLock(env.root ?? env.cwd).acquire(mode, allowed ?? [], env.signal));
 		const abort = () => void session.abort();
-		env.signal.addEventListener("abort", abort, { once: true });
-		// An abort while the session was created or the lease awaited fired before the listener.
-		if (env.signal.aborted) {
-			env.signal.removeEventListener("abort", abort);
-			lease?.release();
-			throw env.signal.reason;
-		}
 		const before = allowed && (await snapshot(env.root!));
 		let reverted: string[] = [];
 		try {
+			// No await between this check and prompt(): an abort fired earlier (while the session was
+			// created, the lease or the snapshot awaited) would reach a session not running yet and be lost.
+			if (env.signal.aborted) throw env.signal.reason;
+			env.signal.addEventListener("abort", abort, { once: true });
 			env.progress(`${label} · running`);
 			await session.prompt(message);
 		} finally {
