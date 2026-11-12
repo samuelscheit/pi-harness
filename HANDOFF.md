@@ -52,7 +52,10 @@ A Pi-based coding harness that runs inside t3 and improves itself over time:
   - `settings.json`: this repo as the only package; default `anthropic/claude-opus-5-5`.
   - `models.json`: the built-in `anthropic` provider routed to the gateway origin with `compat.supportsMessageThreads`, and a `gateway` provider (`openai-responses`) for every non-Claude model from the gateway's `/v1/models`.
   - `auth.json`: both providers read their key with `!security find-generic-password -ws 'pi-harness-gateway'` (Keychain). Needed because t3 starts Pi without shell variables.
-- `npm test` (node:test, `test/metrics.test.ts`), `npm run check` (tsc).
+- `extensions/ask-user`: `ask_user`, Codex's asynchronous `request_user_input_async` (same description and schema) on Pi dialogs: returns `{"accepted":true}` at once, answers arrive later as an `ask_user` custom message (steer, or a new turn). In t3 each question is a question card that also takes typed text; in the TUI a "Type an answer…" option opens an input.
+- `extensions/web`: `web_search` / `web_fetch`. Pi drops server-tool blocks, so each call is its own Messages request (claude-haiku-5-5) with `web_search_20250305` / `web_fetch_20250910` through the gateway passthrough, like Claude Code's WebSearch. Results report their usage (+$0.01 per search); the metrics count it as `tool: <name>` side calls. The 2026 tool versions ran out of tool calls on simple queries through the gateway.
+- Vendored Pi patch: `bridgeCacheLookback` in `vendor/pi/packages/ai/src/api/anthropic-messages.ts` (test `anthropic-cache-lookback.test.ts`). A turn adding ≥ 20 blocks (tool search loading many tools as `tool_addition`s, many parallel results) put the previous cache entry out of Anthropic's 20-block lookback, so the whole conversation was rewritten. Upstream candidate.
+- `npm test` (node:test, `test/*.test.ts`), `npm run check` (tsc).
 
 Verified: Pi runs in t3 (this handoff's second session ran in it); t3's MCP tools (`delegate_task`, thread tools, `html_render`) load; `/harness` is discovered through RPC `get_commands` and its report arrives as `notify`. Vendored 1.5.2 with threads through the gateway: no thread fallbacks, cache reads as before. `before_provider_request` still sees the full request (Pi trims it for the thread afterwards).
 
@@ -82,7 +85,10 @@ Verified: Pi runs in t3 (this handoff's second session ran in it); t3's MCP tool
 
 ## Next steps (in order)
 
-1. **Tools.** `ask_user` (ctx.ui select/input; then test t3 dialogs), LSP via `/harness init` (detect languages, write the project LSP config; vendor pi-lens), a `t3-adapt` extension (hide, re-describe or wrap `mcp__t3-code__*` tools), web search/fetch as Anthropic server tools passed through the gateway.
+1. **Tools.** Done: `ask_user`, web search/fetch. Open, waiting on the user's choice:
+   - LSP: pi-lens (github.com/apmantza/pi-lens, MIT, peer-depends on `@earendil-works/pi-coding-agent`) is ~300k lines of runtime code (526 files) doing far more than LSP: linters, formatters, autofix, read-before-edit and git guards, turn-end finding injections, background scans, auto-installs. Options: vendor it and turn off all but LSP diagnostics; install it as a package first and judge it with the metrics; or a small own `lsp` extension (`/harness init` writes `.pi/lsp.json`, diagnostics appended to edit/write results, a navigation tool).
+   - `t3-adapt`: which `mcp__t3-code__*` tools to hide, re-describe or wrap. Measured: t3's tool definitions and its `t3_code_orchestration` section cost ~1–2% per request; `orchestrator_capabilities` results are 1.6k tokens and stay in context ~75 requests.
+   - Check `ask_user` cards in a real t3 thread (verified over RPC only).
 2. **Self-improvement.**
    - `note_improvement` writes to `.agents/improvements.md` (project) or this repo's backlog (global).
    - Dreaming as a t3 scheduled task: reads the backlog, sessions and `metrics.db`; classifies `user_messages` (follow-up, steer, after interrupt) into corrections with a cheap model; makes small playbook edits (ACE style); commits each change with its hypothesis and target metric; switches a share of new sessions to it; promotes or reverts on the target metric plus guardrails (corrections, tool errors). Compare by harness version (`requests.version`).
