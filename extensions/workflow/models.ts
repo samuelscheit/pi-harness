@@ -2,6 +2,14 @@
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
+/**
+ * Prompt cache retention of every workflow request (llm() and agent() children). Their requests come
+ * seconds apart, so the 5-minute cache (write 1.25x input) always suffices; the 1-hour one costs 2x.
+ * Set explicitly: unset, Pi falls back to PI_CACHE_RETENTION, so the cost would depend on how Pi
+ * was started.
+ */
+export const CACHE_RETENTION = "short";
+
 export const THINKING = ["off", "minimal", "low", "medium", "high"] as const;
 export type Thinking = (typeof THINKING)[number];
 

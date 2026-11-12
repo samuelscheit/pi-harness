@@ -427,3 +427,13 @@ When a run is about to settle (`agent_before_settle`), the extension runs one `p
 **Limits:** a process that leaves its group (`setsid`, a daemonizing server) is not seen. Windows is not covered.
 
 **Revert:** delete `extensions/background`.
+
+## 2026-11-13 — workflow: llm() and agent() children always use the 5-minute prompt cache
+
+**Change:** `extensions/workflow/models.ts` defines `CACHE_RETENTION = "short"`; `agent.ts` puts it into the child sessions' settings and `llm.ts` into every `completeSimple` request. Before, neither set a retention, so Pi fell back to `PI_CACHE_RETENTION`: started from a shell with `PI_CACHE_RETENTION=long`, every cheap child (including `fix_loop`) paid the 1-hour cache-write rate.
+
+**Evidence:** the fix_loop live probe ran with `PI_CACHE_RETENTION=long` and wrote its cache at the 1-hour rate. Workflow requests come seconds apart, so the 5-minute cache always hits; writes cost 1.25× input there versus 2× for the 1-hour cache. Pi's idle cache warming covers checks longer than 5 minutes.
+
+**Judged by:** `cost_write` per token of workflow child sessions (sessions with `parent_session` from `workflow`/`fix_loop`) at the 1.25× rate; cache-read share unchanged.
+
+**Revert:** remove `CACHE_RETENTION` and its two uses.
