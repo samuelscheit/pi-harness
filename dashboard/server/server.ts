@@ -1,5 +1,5 @@
-// The usage dashboard's local server: node:http on 127.0.0.1, the JSON API under /api/ and the
-// built frontend (dashboard/dist) for every other path.
+// The usage dashboard's server: node:http on every interface (this machine and its LAN), the JSON
+// API under /api/ and the built frontend (dashboard/dist) for every other path.
 //
 // It indexes Pi's sessions on start and on POST /api/refresh, in a worker; Claude Code
 // transcripts are imported only once a refresh asks for a source that includes them. Responses
@@ -7,6 +7,8 @@
 
 import { readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
+import { hostname, networkInterfaces } from "node:os";
 import { extname, join, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -19,7 +21,27 @@ import { ApiError, route } from "./api.ts";
 
 export const APP = "pi-harness-dashboard";
 export const DEFAULT_PORT = 4317;
+/** Where this machine reaches the server; it listens on every interface. */
 export const HOST = "127.0.0.1";
+
+/**
+ * Whether a Host header names this server: an IP address, localhost, or this machine's own name.
+ * Any other name could be a page on another site that rebound its DNS to us.
+ */
+export function allowedHost(header: string, machine = hostname()): boolean {
+	const name = header.toLowerCase().replace(/:\d+$/, "");
+	if (name.startsWith("[") && name.endsWith("]")) return isIP(name.slice(1, -1)) === 6;
+	const own = machine.toLowerCase().replace(/\.local$/, "");
+	return isIP(name) === 4 || name === "localhost" || name === own || name === `${own}.local`;
+}
+
+/** The dashboard's URLs on this machine's external IPv4 addresses (LAN, VPN). */
+export function lanUrls(port: number, interfaces = networkInterfaces()): string[] {
+	return Object.values(interfaces)
+		.flatMap((addresses) => addresses ?? [])
+		.filter((address) => address.family === "IPv4" && !address.internal)
+		.map((address) => `http://${address.address}:${port}`);
+}
 export const DIST = fileURLToPath(new URL("../dist", import.meta.url));
 
 export interface IndexStatus {
@@ -138,7 +160,9 @@ export interface Dashboard {
 	server: Server;
 	db: DatabaseSync;
 	indexer: Indexer;
+	/** On this machine, and on its LAN addresses. */
 	url: string;
+	lan: string[];
 	close: () => Promise<void>;
 }
 
@@ -149,9 +173,8 @@ export async function startDashboard({ port = DEFAULT_PORT, agentDir = getAgentD
 	const indexer = new Indexer({ path, agentDir, claudeDir, onDone: () => cache.clear() });
 
 	const handle = async (req: IncomingMessage, res: ServerResponse) => {
-		// Only this machine's browser, by name: a page on another site cannot rebind its DNS to us.
 		const host = req.headers.host ?? "";
-		if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(host)) return sendJson(res, 403, { error: "forbidden host" });
+		if (!allowedHost(host)) return sendJson(res, 403, { error: "forbidden host" });
 		const url = new URL(req.url ?? "/", `http://${host}`);
 		if (!url.pathname.startsWith("/api/")) {
 			if (req.method !== "GET" && req.method !== "HEAD") return sendJson(res, 405, { error: "method not allowed" });
@@ -185,16 +208,18 @@ export async function startDashboard({ port = DEFAULT_PORT, agentDir = getAgentD
 	const server = createServer((req, res) => void handle(req, res));
 	await new Promise<void>((ready, fail) => {
 		server.once("error", fail);
-		server.listen(port, HOST, () => ready());
+		server.listen(port, () => ready());
 	});
 	const address = server.address();
-	const url = `http://${HOST}:${typeof address === "object" && address ? address.port : port}`;
+	const bound = typeof address === "object" && address ? address.port : port;
+	const url = `http://${HOST}:${bound}`;
 	if (indexOnStart) void indexer.refresh(false);
 	return {
 		server,
 		db,
 		indexer,
 		url,
+		lan: lanUrls(bound),
 		close: () =>
 			new Promise((closed) => {
 				server.closeAllConnections();

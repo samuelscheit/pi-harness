@@ -6,6 +6,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { launch } from "../../dashboard/server/launch.ts";
+import { DEFAULT_PORT, lanUrls } from "../../dashboard/server/server.ts";
 import { stats } from "./stats.ts";
 
 const USAGE = "Usage: /harness stats [all] | /harness dashboard";
@@ -23,7 +24,9 @@ export default function metrics(pi: ExtensionAPI) {
 				ctx.ui.notify("Starting the usage dashboard…", "info");
 				try {
 					const { url, started } = await launch();
-					ctx.ui.notify(`Usage dashboard ${started ? "started" : "running"}: ${url}/?project=${encodeURIComponent(ctx.cwd)} (all projects: ${url})`, "info");
+					const project = `/?project=${encodeURIComponent(ctx.cwd)}`;
+					const lan = lanUrls(new URL(url).port === "" ? DEFAULT_PORT : Number(new URL(url).port)).map((at) => `${at}${project}`);
+					ctx.ui.notify([`Usage dashboard ${started ? "started" : "running"}: ${url}${project} (all projects: ${url})`, ...lan.map((at) => `LAN: ${at}`)].join("\n"), "info");
 				} catch (error) {
 					ctx.ui.notify(`Could not start the usage dashboard: ${error instanceof Error ? error.message : String(error)}`, "error");
 				}
