@@ -226,7 +226,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 				insertCompaction.run(sessionId, entry.id, ts, entry.reason ?? null, entry.tokensBefore, entry.usage?.cost.total ?? 0);
 				if (entry.reason === "cold") coldCompactions.push(ts);
 				if (entry.usage) {
-					sideCall(entry.id, ts, "compaction", "", "", entry.usage);
+					sideCall(entry.id, ts, "compaction", entry.provider ?? "", entry.model ?? "", entry.usage);
 					cost += entry.usage.cost.total;
 				}
 			} else if (entry.type === "usage") {
