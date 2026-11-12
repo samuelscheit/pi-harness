@@ -3,6 +3,7 @@
 
 export * from "./cache.ts";
 export * from "./compaction.ts";
+export * from "./experiments.ts";
 export * from "./overview.ts";
 export * from "./scope.ts";
 export * from "./sessions.ts";

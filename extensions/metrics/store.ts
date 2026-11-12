@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -39,6 +39,8 @@ CREATE TABLE requests (
 	trigger TEXT, trigger_tokens INTEGER NOT NULL, cache_event TEXT, cache_lost INTEGER NOT NULL, cache_waste REAL NOT NULL,
 	-- Dollars per token this request paid (turns only), and whether it wrote its cache for one hour.
 	input_rate REAL, read_rate REAL, write_rate REAL, long_retention INTEGER NOT NULL DEFAULT 0,
+	-- Tool calls the assistant message made (Pi turns; NULL for imported Claude Code turns).
+	tool_calls INTEGER,
 	PRIMARY KEY (session_id, entry_id)
 );
 -- What each request's cost paid for, by content category and billing rate.
@@ -96,6 +98,14 @@ CREATE TABLE idle_pauses (
 	prompt_tokens INTEGER NOT NULL, resume_cost REAL NOT NULL,
 	PRIMARY KEY (session_id, start_ts)
 );
+-- A/B experiment arms recorded in the session (see extensions/lib/experiments.ts): the arm, whether
+-- it was ever set by hand (left out of the random comparison), when the session was first assigned
+-- and when the experiment last ended for it (NULL while it runs). Turns count in [assigned_at, ended_at).
+CREATE TABLE experiment_arms (
+	session_id TEXT NOT NULL, experiment TEXT NOT NULL, arm TEXT NOT NULL, forced INTEGER NOT NULL,
+	assigned_at INTEGER NOT NULL, ended_at INTEGER,
+	PRIMARY KEY (session_id, experiment)
+);
 -- Harness versions: the prompt sections and tool definitions a request ran with, as hashes.
 CREATE TABLE versions (id TEXT PRIMARY KEY, sections TEXT NOT NULL, tools TEXT NOT NULL, first_seen INTEGER NOT NULL);
 -- The text behind each section and tool hash, to diff versions.
@@ -108,7 +118,7 @@ CREATE INDEX sessions_prompt ON sessions (prompt_digest);
 CREATE INDEX delegations_task ON delegations (task_digest);
 `;
 
-const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "tool_files", "delegations", "user_messages", "compactions", "idle_pauses"];
+const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "tool_files", "delegations", "user_messages", "compactions", "idle_pauses", "experiment_arms"];
 
 export function openStore(path: string): DatabaseSync {
 	mkdirSync(dirname(path), { recursive: true });
