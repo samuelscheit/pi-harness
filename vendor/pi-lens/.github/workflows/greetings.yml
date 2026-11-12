@@ -1,0 +1,49 @@
+name: Greetings
+
+on:
+  # Greeting-only; never checks out or executes PR code.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened]
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  # #5112: 1,446 runner minutes in 30 days, almost all for an action that found
+  # an author who was not new and posted nothing. Pull requests are the bulk,
+  # and GitHub already says who is new in the payload (`author_association`),
+  # so a pull request from anyone else is skipped at job level, on no runner.
+  # Issues are not gated: an author with commits (CONTRIBUTOR) can open a first
+  # issue, and the association does not say that, so actions/first-interaction
+  # keeps checking the history. The check is not a required context
+  # (scripts/lib/ci-checks.mjs lists it as advisory). The job has no checkout
+  # and runs no repository code.
+  greeting:
+    permissions:
+      issues: write
+      pull-requests: write
+    if: >-
+      github.event_name == 'issues' ||
+      github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR' ||
+      github.event.pull_request.author_association == 'FIRST_TIMER'
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 71s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d # v3.1.0
+        with:
+          # v3 renamed the inputs from hyphenated to underscored (#405 bumped
+          # first-interaction 1→3). The old names fail with "Input required and
+          # not supplied: issue_message".
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          issue_message: >
+            Thanks for opening your first issue! Please check
+            [`CONTRIBUTING.md`](../blob/master/CONTRIBUTING.md) for issue
+            templates and guidelines. A maintainer will triage this soon.
+          pr_message: >
+            Thanks for your first pull request! A maintainer will review it
+            soon. Please make sure CI passes and the PR template is filled out.

@@ -1,0 +1,608 @@
+// #3801: scripts/ci-changed-files.mjs decides whether ci.yml's heavy jobs skip
+// (a docs-only pull request) and whether TLA+ runs. Every case names the
+// recurrence it keeps out; the direction of every doubt must be the FULL suite.
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { describe, expect, it } from "vitest";
+import { stripSource } from "../support/sweep-kit.js";
+import {
+	classifyChangedFiles,
+	parseArgs,
+	pathsFromPrFiles,
+	HOT_PATH_PATHS,
+	PR_FILES_API_CAP,
+	PR_SMOKE_PATHS,
+	ghPrFiles,
+	run,
+} from "../../scripts/ci-changed-files.mjs";
+
+const docsOnly = (paths: string[]) =>
+	classifyChangedFiles(paths).code === false;
+
+describe("classifyChangedFiles: the strict docs allowlist", () => {
+	it.each([
+		["README.md"],
+		["AGENTS.md"],
+		["CHANGELOG.md"],
+		["docs/pi-lens-fixer.md"],
+		["docs/img/diagram.png"],
+		[".changelog/3801-heavy.md"],
+	])("treats %s as docs", (file) => {
+		expect(docsOnly([file])).toBe(true);
+	});
+
+	// Recurrence: an over-wide glob. `*.md` is ROOT-level only, because agent
+	// contracts (.claude/agents/*.md), shipped skills (skills/**/SKILL.md) and
+	// rule docs are behavior, not prose; a docs-only read of them skips every
+	// test that reads them.
+	it.each([
+		[".claude/agents/pi-lens-fixer.md"],
+		["skills/pi-lens/SKILL.md"],
+		["rules/ast-grep-rules/README.md"],
+		["tests/fixtures/notes.md"],
+		[".github/workflows/ci.yml"],
+		["formal/file-locks/FileLock.tla"],
+		["scripts/ci-verdict.mjs"],
+		["clients/index.ts"],
+		["package.json"],
+		["package-lock.json"],
+		["docs-extra/file.md"],
+		[".changelogx/file.md"],
+		["README.MD"],
+		["notes.markdown"],
+	])("treats %s as code", (file) => {
+		expect(docsOnly([file])).toBe(false);
+	});
+
+	// Recurrence: one code file hiding among docs. A single non-docs path makes
+	// the whole diff code.
+	it("makes a diff code when one path is not docs", () => {
+		const result = classifyChangedFiles([
+			"docs/a.md",
+			"README.md",
+			".changelog/x.md",
+			"scripts/lib/ci-checks.mjs",
+		]);
+		expect(result.code).toBe(true);
+		expect(result.reason).toContain("scripts/lib/ci-checks.mjs");
+	});
+
+	// Recurrence: a path that walks out of an allowlisted prefix.
+	it.each([["docs/../clients/index.ts"], ["docs/./../package.json"]])(
+		"does not let %s ride the docs prefix",
+		(file) => {
+			expect(docsOnly([file])).toBe(false);
+		},
+	);
+
+	// Recurrence: doubt must run everything (AGENTS.md shape 48): a truncated or
+	// empty listing is not evidence of a docs-only diff.
+	it("runs everything for an empty list and for a list at the API cap", () => {
+		expect(classifyChangedFiles([])).toMatchObject({
+			code: true,
+			formal: true,
+		});
+		const capped = Array.from(
+			{ length: PR_FILES_API_CAP },
+			(_, i) => `docs/f${i}.md`,
+		);
+		expect(classifyChangedFiles(capped)).toMatchObject({
+			code: true,
+			formal: true,
+		});
+		expect(
+			classifyChangedFiles(capped.slice(0, PR_FILES_API_CAP - 1)).code,
+		).toBe(false);
+	});
+
+	// Recurrence: TLA+ skipped when only what runs it changed (checker, job).
+	it.each([
+		[["formal/file-locks/FileLock.tla"], true],
+		[["formal/x/y.cfg", "docs/a.md"], true],
+		[["scripts/check-tla-models.mjs"], true],
+		// #4714 F2: a table-only diff (a regeneration PR) changes the recorded
+		// state counts the ratchet compares, so it must run the model shards.
+		[["scripts/tla-model-costs.json"], true],
+		[[".github/workflows/ci.yml"], true],
+		[["clients/index.ts"], false],
+		[["docs/formal-notes.md"], false],
+		[["README.md"], false],
+	])("formal for %j is %s", (paths, formal) => {
+		expect(classifyChangedFiles(paths as string[]).formal).toBe(formal);
+	});
+});
+
+// #4291: `smoke` decides install-smoke.yml's deep run (every pi-load cell and
+// the LSP handshake) on a pull request. Recurrence: #4409 passed its PR run on
+// one pnpm-global cell and broke the npm-global, bun-global and curl legs on
+// master. Doubt resolves to the deep run, like `code`.
+describe("classifyChangedFiles: the deep install smoke (#4291)", () => {
+	const smoke = (paths: string[]) => classifyChangedFiles(paths).smoke;
+
+	// Recurrence: a list entry the matcher cannot read, so the path it names
+	// never turns the deep smoke on. A `dir/**` entry is probed with a file
+	// under it.
+	it.each(PR_SMOKE_PATHS)("turns on for the listed path %s", (entry) => {
+		const file = entry.endsWith("/**") ? `${entry.slice(0, -2)}x/y.ts` : entry;
+		expect(smoke([file])).toBe(true);
+		expect(smoke(["docs/a.md", file])).toBe(true);
+	});
+
+	// Recurrence: an over-wide filter (index.ts alone is 37 of 690 merges in 30
+	// days) that makes the deep run the default instead of the exception.
+	it.each([
+		["index.ts"],
+		["clients/lsp/index.ts"],
+		["clients/lsp/client.ts"],
+		["clients/dispatch/runners/lsp.ts"],
+		["clients/installer-notes.ts"],
+		["tests/clients/foo.test.ts"],
+		["docs/a.md"],
+		["scripts/rpc-load-check.d.mts"],
+		["clients/installer/../index.ts"],
+		["clients/installer"],
+	])("stays off for %s", (file) => {
+		expect(smoke([file])).toBe(false);
+	});
+
+	// Recurrence: a rename that moves a listed file away reads as its new path
+	// only; `pathsFromPrFiles` carries the old path and the matcher reads it.
+	it("counts the old path of a rename out of a listed file", () => {
+		const paths = pathsFromPrFiles([
+			{
+				filename: "clients/project-trust-moved.ts",
+				previous_filename: "clients/project-trust.ts",
+			},
+		]);
+		expect(smoke(paths)).toBe(true);
+	});
+
+	// Recurrence: doubt must run the deep smoke (AGENTS.md shape 48), exactly as
+	// it runs the full suite for `code`.
+	it("turns on for an empty list and for a list at the API cap", () => {
+		expect(smoke([])).toBe(true);
+		const capped = Array.from(
+			{ length: PR_FILES_API_CAP },
+			(_, i) => `docs/f${i}.md`,
+		);
+		expect(smoke(capped)).toBe(true);
+		expect(smoke(capped.slice(0, PR_FILES_API_CAP - 1))).toBe(false);
+	});
+});
+
+// #4363: `hotpath` decides whether hot-path-latency.yml times anything on a
+// pull request. The lane becomes a required check, and a required check that
+// a path filter skips stays "Expected" forever, so the workflow always starts
+// and reads this verdict instead. Recurrence it keeps out: a docs-only PR
+// blocked on a check that never reports; and, in the other direction, a hot
+// file whose PR reads `false` and is never timed. Doubt resolves to timing.
+describe("classifyChangedFiles: the hot-path latency lane (#4363)", () => {
+	const hotpath = (paths: string[]) => classifyChangedFiles(paths).hotpath;
+
+	// Recurrence: a list entry the matcher cannot read, so the path it names
+	// never turns the lane on. A `dir/**` entry is probed with a file under it,
+	// a `*` entry with a name the glob must match.
+	it.each(HOT_PATH_PATHS)("turns on for the listed path %s", (entry) => {
+		const file = entry.endsWith("/**")
+			? `${entry.slice(0, -2)}x/y.ts`
+			: entry.replaceAll("*", "-foo");
+		expect(hotpath([file])).toBe(true);
+		expect(hotpath(["docs/a.md", file])).toBe(true);
+	});
+
+	// Recurrence: the docs-only PR that sat at "Expected"; the lane must read
+	// false for it. Also the tests/scripts neighbours that look hot but are not
+	// on the list, and a `*` that must not cross a directory.
+	it.each([
+		["docs/a.md"],
+		["README.md"],
+		[".changelog/4363-x.md"],
+		["tests/clients/foo.test.ts"],
+		["scripts/ci-verdict.mjs"],
+		["scripts/lib/latency-log-phases.mjs"],
+		["package.json"],
+		["docs/tsconfig.json"],
+		["tsconfig.json.bak"],
+		// Recurrence (review r1 F2): `*` widened to `.*` would cross a directory;
+		// an unescaped `.` would match any character.
+		["tsconfig/x/y.json"],
+		["tsconfigXjson"],
+		["clients"],
+		["clients-extra/a.ts"],
+		["clients/../docs/a.md"],
+		[".github/workflows/ci.yml"],
+	])("stays off for %s", (file) => {
+		expect(hotpath([file])).toBe(false);
+	});
+
+	// Recurrence: a rename out of a hot file reads as its new path only.
+	it("counts the old path of a rename out of a hot file", () => {
+		const paths = pathsFromPrFiles([
+			{ filename: "docs/moved.md", previous_filename: "clients/old-name.ts" },
+		]);
+		expect(hotpath(paths)).toBe(true);
+	});
+
+	// Recurrence: doubt must time the lane (AGENTS.md shape 48), exactly as it
+	// runs the full suite for `code`.
+	it("turns on for an empty list and for a list at the API cap", () => {
+		expect(hotpath([])).toBe(true);
+		const capped = Array.from(
+			{ length: PR_FILES_API_CAP },
+			(_, i) => `docs/f${i}.md`,
+		);
+		expect(hotpath(capped)).toBe(true);
+		expect(hotpath(capped.slice(0, PR_FILES_API_CAP - 1))).toBe(false);
+	});
+});
+
+// #5112: `install` decides whether an `Install test (<os>)` leg of ci.yml
+// installs anything on a pull request, and whether install-smoke's `smoke` job
+// starts. The three legs are required checks, so each always reports and reads
+// this verdict (the hot-path shape). The Install test cost 10,875 runner
+// minutes in 30 days with 0 real catches (#3995 slice A). Recurrence it keeps
+// out: an install-path PR that reads `false` and ships a broken tarball or
+// lifecycle script to master unrun; and, in the other direction, a docs or
+// test-only PR that pays three runners for nothing. Doubt resolves to installing.
+describe("classifyChangedFiles: the Install test lane (#5112)", () => {
+	const install = (paths: string[]) => classifyChangedFiles(paths).install;
+
+	// Recurrence (#5112 review r1 F1, F2): the first roster test iterated
+	// INSTALL_PATHS itself, so deleting an entry deleted its own case, and the
+	// list had already lost the prepare chain's `exec-isolation.mjs` (the Windows
+	// only spawn failure class recorded in scripts/build-dist-tsc.mjs) and
+	// `tsconfig.build.json`. This derives the expected set from package.json
+	// alone: the install-lifecycle scripts and every `npm run` they chain, the
+	// script and tsconfig files those commands name, the relative imports of
+	// those scripts, the `extends` and scripts `include` of those tsconfigs, and
+	// the `files` entries that are scripts. The rest of `files` is content
+	// (docs, rules, skills, config, banners, generated grammars), not code that
+	// runs at install.
+	describe("the install roster is derived from package.json", () => {
+		const root = path.resolve(import.meta.dirname, "../..");
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(root, "package.json"), "utf8"),
+		) as { scripts: Record<string, string>; files: string[] };
+
+		const lifecycle = (name: string, seen = new Set<string>()): string[] => {
+			const command = pkg.scripts[name];
+			if (command === undefined || seen.has(name)) return [];
+			seen.add(name);
+			const chained = [...command.matchAll(/npm run ([\w:-]+)/g)].flatMap(
+				(match) => lifecycle(match[1] ?? "", seen),
+			);
+			return [command, ...chained];
+		};
+		const imports = (file: string): string[] => {
+			const code = stripSource(fs.readFileSync(path.join(root, file), "utf8"), {
+				strings: "keep",
+			});
+			return [
+				...code.matchAll(/(?:from|import\()\s*["'](\.{1,2}\/[^"']+)["']/g),
+			]
+				.map((match) =>
+					path.posix.join(path.posix.dirname(file), match[1] ?? ""),
+				)
+				.filter((target) => fs.existsSync(path.join(root, target)));
+		};
+		const derive = (): Set<string> => {
+			const commands = [
+				"preinstall",
+				"install",
+				"postinstall",
+				"prepare",
+				"prepack",
+				"postpack",
+			].flatMap((name) => lifecycle(name));
+			const named = commands.flatMap((command) => [
+				...(command.match(/scripts\/[\w./-]+\.(?:m?js)/g) ?? []),
+				...(command.match(/tsconfig[\w.-]*\.json/g) ?? []),
+			]);
+			const roster = new Set<string>([
+				"package.json",
+				"package-lock.json",
+				...named,
+				...pkg.files.filter((entry) => /^scripts\/[^*]+\.m?js$/.test(entry)),
+			]);
+			// Close over imports and tsconfig links until nothing new appears.
+			for (const file of roster) {
+				if (/\.m?js$/.test(file)) {
+					for (const target of imports(file)) roster.add(target);
+				} else if (/tsconfig[\w.-]*\.json$/.test(file)) {
+					const config = fs.readFileSync(path.join(root, file), "utf8");
+					for (const match of config.matchAll(/"extends":\s*"\.\/([^"]+)"/g))
+						roster.add(match[1] ?? "");
+					for (const match of config.matchAll(/"(scripts\/[^"*]+\.m?js)"/g))
+						roster.add(match[1] ?? "");
+				}
+			}
+			return roster;
+		};
+
+		it("derives the files the review found missing, so the derivation is not empty", () => {
+			const roster = derive();
+			for (const file of [
+				"scripts/lib/exec-isolation.mjs",
+				"tsconfig.build.json",
+				"scripts/strip-dev-deps-for-pack.mjs",
+				"scripts/bundle-dist.mjs",
+				// One file per derivation arm that no other arm reaches (#5117 verify
+				// V2): the package.json `files` arm and the tsconfig `include` arm.
+				// Dropping either arm leaves the roster test green without these.
+				"scripts/analyze-pi-lens-logs.mjs",
+				"scripts/lib/process-scan.mjs",
+			])
+				expect(roster.has(file), file).toBe(true);
+			expect(roster.size).toBeGreaterThan(15);
+		});
+
+		it("classifies every derived file as an install path", () => {
+			const missing = [...derive()].filter((file) => !install([file]));
+			expect(missing).toEqual([]);
+		});
+
+		// Recurrence: a directory entry whose matcher the roster above never
+		// probes (it only names files).
+		it.each([["bin/pi-lens"], ["clients/installer/registry.ts"]])(
+			"turns on for the directory entry %s",
+			(file) => {
+				expect(install([file])).toBe(true);
+			},
+		);
+	});
+
+	// Recurrence: the PRs the 10,875-minute lane exists to skip, plus neighbours
+	// that look like install paths but are not on the list (a sibling script, a
+	// nested package.json, a prefix collision).
+	it.each([
+		["docs/a.md"],
+		["README.md"],
+		[".changelog/5112-x.md"],
+		["clients/dispatch/runners/foo.ts"],
+		["tests/clients/foo.test.ts"],
+		["scripts/ci-verdict.mjs"],
+		["scripts/lib/safe-rm.mjs"],
+		["docs/package.json"],
+		["tests/fixtures/x/package.json"],
+		["package.json.bak"],
+		["package-lock.jsonl"],
+		["clients/installer-notes.ts"],
+		["clients/bootstrap.test.ts"],
+		["binx/a.mjs"],
+		["clients/../docs/a.md"],
+		[".github/workflows/lint.yml"],
+		[".github/workflows/hot-path-latency.yml"],
+	])("stays off for %s", (file) => {
+		expect(install([file])).toBe(false);
+	});
+
+	// Recurrence: a rename out of an install path reads as its new path only.
+	it("counts the old path of a rename out of an install path", () => {
+		const paths = pathsFromPrFiles([
+			{ filename: "docs/moved.md", previous_filename: "package-lock.json" },
+		]);
+		expect(install(paths)).toBe(true);
+	});
+
+	// Recurrence: doubt must install (AGENTS.md shape 48), exactly as it runs the
+	// full suite for `code`.
+	it("turns on for an empty list and for a list at the API cap", () => {
+		expect(install([])).toBe(true);
+		const capped = Array.from(
+			{ length: PR_FILES_API_CAP },
+			(_, i) => `docs/f${i}.md`,
+		);
+		expect(install(capped)).toBe(true);
+		expect(install(capped.slice(0, PR_FILES_API_CAP - 1))).toBe(false);
+	});
+});
+
+// N2 (#3861): the per-line parse `ghPrFiles` wraps is the ONE place a
+// `pulls/{n}/files` body is read; a malformed `--jq` line must throw (the
+// full-suite direction) rather than read as an empty list. `exec` is the
+// process boundary, so the fake stands in for `gh`, not for the parse.
+describe("ghPrFiles: one JSON object per gh --jq line (#3861 N2)", () => {
+	it("parses every non-empty line and carries a rename's previous path", () => {
+		const exec = () =>
+			'{"filename":"clients/a.ts"}\n\n{"filename":"docs/b.md","previous_filename":"clients/c.ts"}\n';
+		expect(ghPrFiles("acme/repo", "1", exec)).toEqual([
+			"clients/a.ts",
+			"docs/b.md",
+			"clients/c.ts",
+		]);
+	});
+
+	it("throws on a malformed line, never reads it as an empty file list", () => {
+		const exec = () => '{"filename":"clients/a.ts"}\nnot json\n';
+		expect(() => ghPrFiles("acme/repo", "1", exec)).toThrow(
+			/malformed gh api --jq line/,
+		);
+	});
+
+	// #3861 A1: only a whitespace-only line is a blank `--jq` separator; the
+	// trim must catch tabs and a bare carriage return too, so none of them
+	// reaches `JSON.parse`.
+	it("skips whitespace-only and carriage-return-only lines", () => {
+		const exec = () =>
+			'{"filename":"clients/a.ts"}\n   \n\t\n\r\n{"filename":"docs/b.md"}\n';
+		expect(ghPrFiles("acme/repo", "1", exec)).toEqual([
+			"clients/a.ts",
+			"docs/b.md",
+		]);
+	});
+
+	// #3861 A2: the error excerpt is bounded to 200 characters; a longer
+	// malformed line must not carry its tail into the message.
+	it("caps the malformed-line excerpt at 200 characters", () => {
+		const exec = () => `${"Z".repeat(250)}TRAILING\n`;
+		let message = "";
+		try {
+			ghPrFiles("acme/repo", "1", exec);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("malformed gh api --jq line");
+		expect(message.endsWith("Z".repeat(200))).toBe(true);
+	});
+});
+
+describe("run (the CLI the changes job calls)", () => {
+	function withOutput(
+		test: (files: { output: string; summary: string }) => void,
+	) {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-changed-files-"),
+		);
+		try {
+			test({
+				output: path.join(dir, "output"),
+				summary: path.join(dir, "summary"),
+			});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+	const prArgs = [
+		"--event",
+		"pull_request",
+		"--repo",
+		"apmantza/pi-lens",
+		"--pr",
+		"3807",
+	];
+	const outputs = (file: string) =>
+		Object.fromEntries(
+			fs
+				.readFileSync(file, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => line.split("=")),
+		);
+
+	it("writes code=false for a docs-only pull request and reads the PR it was given", () => {
+		withOutput((files) => {
+			const seen: string[][] = [];
+			const code = run(prArgs, {
+				env: {
+					GITHUB_OUTPUT: files.output,
+					GITHUB_STEP_SUMMARY: files.summary,
+				},
+				fetchFiles: (repo: string, pr: string) => {
+					seen.push([repo, pr]);
+					return ["docs/a.md", ".changelog/b.md"];
+				},
+				log: () => {},
+			});
+			expect(code).toBe(0);
+			expect(seen).toEqual([["apmantza/pi-lens", "3807"]]);
+			expect(outputs(files.output)).toEqual({
+				code: "false",
+				formal: "false",
+				smoke: "false",
+				hotpath: "false",
+				install: "false",
+			});
+			expect(fs.readFileSync(files.summary, "utf8")).toMatch(
+				/^changes: code=false formal=false smoke=false hotpath=false install=false -- docs-only diff/,
+			);
+		});
+	});
+
+	// Recurrence: master losing the full suite when a non-PR event was read as
+	// docs-only. Only a pull_request is ever classified; every other event runs
+	// everything and never reads the API.
+	it.each(["push", "merge_group", "workflow_dispatch", "schedule"])(
+		"runs everything for a %s event without reading the API",
+		(event) => {
+			withOutput((files) => {
+				const code = run(["--event", event], {
+					env: { GITHUB_OUTPUT: files.output },
+					fetchFiles: () => {
+						throw new Error("must not be called");
+					},
+					log: () => {},
+				});
+				expect(code).toBe(0);
+				expect(outputs(files.output)).toEqual({
+					code: "true",
+					formal: "true",
+					smoke: "true",
+					hotpath: "true",
+					install: "true",
+				});
+			});
+		},
+	);
+
+	// Recurrence: an API failure reading as docs-only (skipping the suite on an
+	// unread diff) or crashing the job red. It must run everything and exit 0.
+	it("runs everything when the file list cannot be read", () => {
+		withOutput((files) => {
+			const code = run(prArgs, {
+				env: { GITHUB_OUTPUT: files.output },
+				fetchFiles: () => {
+					throw new Error("HTTP 502: bad gateway\nsecond line");
+				},
+				log: () => {},
+			});
+			expect(code).toBe(0);
+			expect(outputs(files.output)).toEqual({
+				code: "true",
+				formal: "true",
+				smoke: "true",
+				hotpath: "true",
+				install: "true",
+			});
+		});
+	});
+
+	// Recurrence: a rename CODE -> docs deleting a code file. The API lists the
+	// new path as `filename` and the old one only as `previous_filename`.
+	it("counts a rename's previous path", () => {
+		const paths = pathsFromPrFiles([
+			{ filename: "docs/moved.md", previous_filename: "clients/old-name.ts" },
+			{ filename: "docs/plain.md" },
+		]);
+		expect(paths).toEqual([
+			"docs/moved.md",
+			"clients/old-name.ts",
+			"docs/plain.md",
+		]);
+		expect(classifyChangedFiles(paths).code).toBe(true);
+		expect(classifyChangedFiles(["docs/moved.md", "docs/plain.md"]).code).toBe(
+			false,
+		);
+	});
+
+	it("rejects bad arguments with exit 2 and writes nothing", () => {
+		withOutput((files) => {
+			for (const args of [
+				[],
+				["--event", "pull_request"],
+				["--event", "pull_request", "--repo", "nope", "--pr", "1"],
+				["--event", "pull_request", "--repo", "a/b", "--pr", "x1"],
+				["--event", "push", "--bogus", "1"],
+			]) {
+				expect(
+					run(args, {
+						env: { GITHUB_OUTPUT: files.output },
+						fetchFiles: () => ["docs/a.md"],
+						log: () => {},
+					}),
+				).toBe(2);
+			}
+			expect(fs.existsSync(files.output)).toBe(false);
+		});
+	});
+
+	it("parses the workflow's exact argument shape (an empty --pr on a push)", () => {
+		expect(
+			parseArgs(["--event", "push", "--repo", "apmantza/pi-lens", "--pr", ""]),
+		).toEqual({
+			event: "push",
+			repo: "apmantza/pi-lens",
+			pr: "",
+		});
+	});
+});

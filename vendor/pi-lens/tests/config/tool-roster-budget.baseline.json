@@ -1,0 +1,140 @@
+{
+	"pi": {
+		"budget": 20767,
+		"descriptionTotal": 3783,
+		"schemaTotal": 15096,
+		"tools": {
+			"ast_grep_outline": {
+				"description": 357,
+				"schema": 1280
+			},
+			"ast_grep_replace": {
+				"description": 124,
+				"schema": 1180
+			},
+			"ast_grep_search": {
+				"description": 94,
+				"schema": 1590
+			},
+			"effective_config": {
+				"description": 308,
+				"schema": 398
+			},
+			"lens_diagnostic_mark": {
+				"description": 303,
+				"schema": 1066
+			},
+			"lens_diagnostics": {
+				"description": 258,
+				"schema": 2203
+			},
+			"lsp_navigation": {
+				"description": 307,
+				"schema": 2205
+			},
+			"module_report": {
+				"description": 505,
+				"schema": 1677
+			},
+			"pi_lens_activate_tools": {
+				"description": 97,
+				"schema": 302
+			},
+			"project_report": {
+				"description": 456,
+				"schema": 528
+			},
+			"read_enclosing": {
+				"description": 275,
+				"schema": 922
+			},
+			"read_symbol": {
+				"description": 260,
+				"schema": 593
+			},
+			"symbol_search": {
+				"description": 439,
+				"schema": 1152
+			}
+		}
+	},
+	"mcp": {
+		"budget": 20908,
+		"descriptionTotal": 3878,
+		"schemaTotal": 15129,
+		"tools": {
+			"pilens_analyze": {
+				"description": 98,
+				"schema": 823
+			},
+			"pilens_ast_grep_replace": {
+				"description": 106,
+				"schema": 1269
+			},
+			"pilens_ast_grep_search": {
+				"description": 92,
+				"schema": 1679
+			},
+			"pilens_diagnostics": {
+				"description": 258,
+				"schema": 2292
+			},
+			"pilens_effective_config": {
+				"description": 308,
+				"schema": 487
+			},
+			"pilens_health": {
+				"description": 86,
+				"schema": 33
+			},
+			"pilens_latency": {
+				"description": 68,
+				"schema": 190
+			},
+			"pilens_lsp_navigation": {
+				"description": 257,
+				"schema": 2294
+			},
+			"pilens_module_report": {
+				"description": 554,
+				"schema": 1773
+			},
+			"pilens_project_report": {
+				"description": 491,
+				"schema": 617
+			},
+			"pilens_project_scan": {
+				"description": 101,
+				"schema": 401
+			},
+			"pilens_read_enclosing": {
+				"description": 296,
+				"schema": 1011
+			},
+			"pilens_read_symbol": {
+				"description": 288,
+				"schema": 689
+			},
+			"pilens_rebuild": {
+				"description": 102,
+				"schema": 33
+			},
+			"pilens_session_end": {
+				"description": 134,
+				"schema": 33
+			},
+			"pilens_session_start": {
+				"description": 81,
+				"schema": 56
+			},
+			"pilens_symbol_search": {
+				"description": 467,
+				"schema": 1248
+			},
+			"pilens_turn_end": {
+				"description": 91,
+				"schema": 201
+			}
+		}
+	}
+}

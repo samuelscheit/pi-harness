@@ -1,0 +1,523 @@
+# Configuring pi-lens
+
+There are **two** pi-lens config files:
+
+| File | Scope | Notes |
+| --- | --- | --- |
+| `.pi-lens.json` | the project | Committed or not, your call. Nearest one wins **per field** — a package can override one setting without restating the repo root's. |
+| `~/.pi-lens/config.json` | the machine | Your defaults across every project. The winning global location is selected by the [global-location table](#global-config-location); see [environment variables](environment-variables.md) for the knobs. |
+
+Both files have the same shape, with one exception noted below the example:
+everything LSP-related lives under an `lsp` namespace inside them.
+
+LSP fields from a project config are admitted without trust only when they
+are on a short list. On an `lsp.servers.<id>` entry an untrusted project may
+set `name` and nothing else. It may not set `command`, `args`, `extensions`,
+`rootMarkers`, `env`, `initializationOptions`, `covers`, `enabled`, `role`, or
+any field pi-lens does not recognise; on `lsp.serverOverrides.<id>` it may set
+none of `command`, `env`, `initializationOptions`, or any other field. Those
+fields need pi to have marked the project trusted. An untrusted project that
+sets one of them on an `lsp.servers.<id>` entry disables that server for the
+project: pi-lens does not start it, rather than start it on a configuration
+where the project's value replaced one you set in your global config. Under
+`serverOverrides.<id>`, the project's fields are dropped and your global
+override for that built-in applies field by field: a global wrapper `command`
+stays, a global value the project replaced comes back, and a field you did not
+set globally runs on the pi-lens default. The built-in server stays on. Look
+for the `lsp-registry-decision` record: its reason reads "project LSP <field>
+refused for <id>: pi project trust is <state>; the <id> entry is not applied
+for this project" for a server, or "...; the project's <id> override is not
+applied" for an override. An `lsp.servers.<id>` entry with no `extensions`
+list is not registered, since no file can select it. An untrusted or older host
+is fail-closed and emits one bounded notice telling you to mark the project
+trusted in pi or upgrade pi. Global config remains trusted, and a project can
+always disable a server. pi-lens does not maintain a second trust setting.
+
+The editor-facing JSON Schema is published at
+[`docs/schema/pi-lens-config-v1.json`](schema/pi-lens-config-v1.json). LSP
+server entries also accept canonical argv arrays, optional `name` (defaulting
+to the map id), `enabled`, `role` (`language` or `auxiliary`), `args`, and
+`rootMarkers`. A `command` is either a bare string (launched with `args`,
+default `["--stdio"]`) or an argv array whose first element is the program;
+the array's remaining elements come before `args`, and no `--stdio` is added to
+it. A `command` that is neither, or an empty or non-string array, fails at
+launch with a message naming the field. These new fields are experimental;
+reserved role, root-policy, and timing semantics are inert until their planned
+catalog slices land, so this schema slice does not change server launch
+behavior.
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/apmantza/pi-lens/master/docs/schema/pi-lens-config-v1.json",
+  "ignore": ["dist/**"],
+  "maxProjectFiles": 8000,
+  "rules": { "high-complexity": { "threshold": 25 } },
+  "lsp": {
+    "disabledServers": ["typos"],
+    "warmFiles": ["src/main.rs"],
+    "servers": {
+      "my-server": {
+        "name": "My Custom LSP",
+        "extensions": [".myext"],
+        "command": ["my-lsp-server", "--stdio"],
+        "covers": ["shellcheck"]
+      }
+    },
+    "serverOverrides": {
+      "rust": {
+        "initializationOptions": { "check": { "command": "clippy" } }
+      }
+    }
+  }
+}
+```
+
+`initializationOptions` take the shape the server itself reads. rust-analyzer
+reads them flat (`check`, `cargo`), as above. pyright and basedpyright read
+only their pulled settings, so nest the override under the section they ask
+for: `{ "python": { "analysis": { "typeCheckingMode": "strict" } } }`. pi-lens
+answers each
+`workspace/configuration` request from that section of the merged options and
+returns `{}` for a section the options do not carry.
+
+An override may also provide an experimental launcher `command` and `env`.
+The built-in server ID and strategy remain in force; only the launcher is
+replaced, and project-sourced launcher fields follow the same pi trust gate.
+
+Each model-facing tool accepts `tools.<name>.enabled` in the config file. Valid
+names include `ast_grep_search`, `ast_grep_replace`, `ast_grep_outline`,
+`lsp_navigation`, `lens_diagnostics`,
+`lens_diagnostic_mark`, `symbol_search`, `module_report`, `project_report`,
+`read_symbol`, `read_enclosing`, `effective_config`, `analyze`, `health`,
+`latency`, `project_scan`, and `rebuild`. The activation loader and MCP
+lifecycle tools `session_start`, `turn_end`, and `session_end` remain enabled
+because their host protocols require them. A `tools.<name>` key that
+names no tool (`tools.lazy` aside), or names a required one, is dropped with
+`PILENS_CFG_0009`.
+
+To see the resolved tool surface, use `/lens-health`; the `effective_config`
+tool provides the full configuration provenance. Bundled skills are managed by
+pi's package-manifest filters.
+
+### Session-start orientation
+
+The session-start orientation names only the tools pi-lens actually registered.
+A tool disabled with `tools.<name>.enabled: false` is never advertised, so the
+orientation cannot direct the agent to a tool it cannot call. The tool roster is
+the same registry that drives registration; there is no second list.
+
+`contextInjection.requirePreExistingFixes` (default `true`) controls one
+sentence in that orientation: whether pre-existing blocking errors must be
+fixed. Set it to `false` when the task's scope excludes pre-existing debt. The
+orientation then requires fixes only for blocking errors the agent's own edits
+introduce; pre-existing ones are reported, not demanded. It is a global setting,
+like every `contextInjection` key.
+
+### `lsp.servers.<id>.covers` — declaring which runners a custom server subsumes
+
+A custom server entry accepts an optional `covers` array naming dispatch
+runner ids the server subsumes: while that server is a file's selected primary
+language server, the runners it names defer to the warm lane instead of also
+running as CLI scans. `covers: ["shellcheck"]` on a shell LSP, for example,
+makes the ShellCheck runner report a skip (`covered-by-primary`) for the files
+that server covers instead of double-reporting the same findings.
+
+- Values are runner ids (`shellcheck`, `shfmt`, `taplo`, … — the dispatch
+  registry's ids). A member pi-lens does not recognize is dropped with a
+  `PILENS_CFG_0005` warning naming the entry; the server itself still
+  registers and runs its language-server lane.
+- An empty `covers` array claims nothing and is recorded as configured.
+- Across files, the nearest tier that sets the field supplies the whole
+  array — a project value replaces the user-level value for that server;
+  fields are never united across tiers.
+
+**Some settings are global-only.** A handful of switches — `lsp.enabled`
+(`--no-lsp`), `tests.enabled`, `delta.enabled` and the other session-wide
+toggles — are decided once for the machine, not per project, so writing one in a
+`.pi-lens.json` does nothing. It is not ignored quietly: the project loader says
+so, naming the key. `docs/settings.md` lists which flags are which.
+
+## Which file wins
+
+One order, lowest precedence first. A later tier replaces an earlier tier's
+value **for that field only** — objects are merged field-wise, never replaced
+whole, so setting one key never silently drops the rest of a section.
+
+1. **global** — `~/.pi-lens/config.json`.
+2. **project root** — the outermost `.pi-lens.json` at or above your working
+   directory.
+3. **nested-project** — every `.pi-lens.json` between that root and your working
+   directory, outermost first. The nearest file wins, per field.
+
+For the project settings read through the project config loader (`autofix`,
+`maxProjectFiles`, `tools.*`, `trivy`, `helm`, `ignore` and the rest), that walk
+stops at the git root: a `.pi-lens.json` in a folder above your repository is never merged into
+it, so permission keys such as `trivy.enabled` and
+`helm.renderValidation.enabled` come from the repository alone (#5291). A
+checkout with no `.git` entry anywhere above the working directory keeps the
+`$HOME` ceiling instead. A repository with no `.pi-lens.json` of its own still
+inherits the nearest one above it, whole, as before. The language-server
+section and the dispatch policy's turn-off lists are read by their own loaders,
+which still walk to the `$HOME` ceiling.
+
+Those three are the tiers the config **files** resolve through, and they are the
+only ones this resolution populates. Four more tiers are reserved in the
+precedence table — `builtin` below them, and `env`, `cli`, `host` above — and
+nothing writes into them yet; #2427 (env/CLI) and #2416 (host and project trust)
+are what fill them in.
+
+Until they do, environment variables and CLI flags are read by their own
+accessors rather than through this resolution, and their effective precedence
+for a pi-lens toggle is:
+
+1. a `PI_LENS_*` environment variable set to `1` — checked first, and it wins
+   outright;
+2. the matching `--lens-*` / `--no-*` CLI flag;
+3. the nearest project `.pi-lens.json`, then the outer ones (project-scoped
+   settings only);
+4. `~/.pi-lens/config.json`;
+5. the built-in default.
+
+Subsystem-specific env overrides follow the same shape: a
+`PI_LENS_REVIEW_GRAPH_MAX_FILES` beats a `.pi-lens.json`'s
+`reviewGraph.maxFiles`. `docs/environment-variables.md` and `docs/settings.md`
+are the per-setting references.
+
+### Global config location
+
+The global file is selected by this order, highest precedence first. The
+canonical default is still `~/.pi-lens/config.json`; `PI_LENS_HOME` relocates
+machine-generated data and state, not this file. This is the complete truth
+table for the three existence axes.
+
+| `PI_LENS_CONFIG_PATH` | `~/.pi-lens/config.json` exists | `PI_CODING_AGENT_DIR` set and `extensions/pi-lens.json` exists | Winner |
+| --- | --- | --- | --- |
+| unset | no | no | `~/.pi-lens/config.json` (canonical default) |
+| unset | no | yes | `$PI_CODING_AGENT_DIR/extensions/pi-lens.json` |
+| unset | yes | no | `~/.pi-lens/config.json` (grandfathered existing file) |
+| unset | yes | yes | `~/.pi-lens/config.json` (the host file is shadowed; shadowed file reported once per session (#3299)) |
+| set | no | no | the explicit `PI_LENS_CONFIG_PATH` file |
+| set | no | yes | the explicit `PI_LENS_CONFIG_PATH` file |
+| set | yes | no | the explicit `PI_LENS_CONFIG_PATH` file |
+| set | yes | yes | the explicit `PI_LENS_CONFIG_PATH` file |
+
+If an existence probe for a recognized candidate errors (for example,
+`ENOTDIR`, `EACCES`, or `ELOOP`), that candidate's tier is retained rather
+than falling through to a lower location. The subsequent read reports the
+degraded config under `PILENS_CFG_0001`; a probe error is not treated as
+absence.
+
+pi-lens does not write this file. Create or edit it yourself, then start a new
+process. For an XDG-like setup, put generated data and state at a durable data
+root and choose one config surface:
+
+```sh
+export PI_LENS_HOME="$HOME/.local/share/pi-lens"
+
+# XDG-shaped host: use its config directory.
+export PI_CODING_AGENT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pi"
+mkdir -p "$PI_CODING_AGENT_DIR/extensions"
+```
+
+For hosts without `PI_CODING_AGENT_DIR`, use an explicit config path instead:
+
+```sh
+export PI_LENS_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/pi-lens/config.json"
+mkdir -p "$(dirname "$PI_LENS_CONFIG_PATH")"
+```
+
+When migrating an existing `~/.pi-lens/config.json`, create the new file first
+and delete the old file second. While both exist, the old file wins by design;
+deleting it first would leave the process without the intended settings. Copy
+the file (or hand-author it, since pi-lens has no writer), verify the new
+location, then run `rm "$HOME/.pi-lens/config.json"` to opt out of
+grandfathering. If the new host file is later deleted, the old file wins again
+while it exists; with neither file present, the canonical default path is used.
+
+See also the [environment-variable reference](environment-variables.md#config-location)
+and [settings overview](settings.md#the-three-ways-to-configure-pi-lens).
+
+### One exception: `lsp.disabledServers` is a denial, not a value
+
+Ordinary settings are last-tier-wins. A **denial** is not, because the tier
+that made it is usually the one you control and the tier that would override it
+is usually one that arrived with somebody else's checkout.
+
+`lsp.disabledServers` resolves as the **union of every tier's entries**. A
+project `.pi-lens.json` can add to it and can never subtract from it, so a
+repository cannot re-enable a server you turned off in
+`~/.pi-lens/config.json`. There is no vocabulary for un-denying an entry: if
+you change your mind, edit the file that denied. The provenance reports, per
+denied server, the tier that contributed it.
+
+```console
+$ # which servers run for this file, and why
+$ pilens_effective_config path=src/main.rs
+  ✗ typos — disabled-by-config (global ~/.pi-lens/config.json → /lsp/disabledServers/0)
+```
+
+The union spans **both spellings**: a document's deprecated root keys
+(`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) are read
+into the `lsp` namespace before any tier is merged, so one setting is resolved
+once no matter which spelling each file uses. Migrating does not change the
+answer, staying un-migrated is not a way around the denial, and a half-migrated
+pair of files merges rather than one clobbering the other.
+
+An entry must name a server pi-lens knows: a built-in server id or a server
+declared under `lsp.servers`. An entry that names neither is dropped and
+reported with one `PILENS_CFG_0005` notice per distinct id, which quotes the
+entry and says it is not a recognized LSP server id. Without that notice a
+misspelled id would match no server, so the server you meant to turn off would
+keep running. Entries that are not strings are kept as written and match no
+server.
+
+Denying a file's **language server** (its primary, such as `json` or
+`typescript`) leaves that file unchecked for the language itself. Every
+diagnostics route then reports a file with no findings as **unconfirmed**, not
+clean, with a "Primary LSP (…): not available" note that says it is disabled in
+config. On write-time checks the note appears once per server per session, and
+a later write of such a file shows a one-line "unconfirmed" status instead of
+"clean". When the denied server has a fallback (`deno` for `typescript`) that
+cannot start either, the note says so. Cross-file (cascade) checks name the
+server once per session. Auxiliary scanners such as `typos` still run and
+report their own findings.
+
+Two rules make the rest of the table unambiguous:
+
+- **The search stops at `$HOME`.** pi-lens never reads a config file in your
+  home directory or above it. A stray `pi-lens.json` in `$HOME` (or at `C:\`)
+  is not adopted by every project on the machine. The machine-global file is
+  read by its own path, so it is unaffected.
+- **The canonical spelling wins.** Where a legacy file or a legacy key means the
+  same thing as the canonical one, the canonical one is used — otherwise the
+  migration below could never be completed.
+
+### `dispatch.disabledRunners` — turning a dispatch runner off
+
+`lsp.disabledServers` switches off a language server. A dispatch **runner**
+(a linter, type-checker, or build such as `dotnet-build`, `javac`, or
+`rust-clippy`) has its own denial list, with the same semantics:
+
+```jsonc
+// ~/.pi-lens/config.json (or a project .pi-lens.json)
+{ "dispatch": { "disabledRunners": ["dotnet-build"] } }
+```
+
+- **Union across tiers.** Like `lsp.disabledServers`, the list is the union of
+  `~/.pi-lens/config.json`, the project `.pi-lens.json`, and any nested
+  `.pi-lens.json`. A project can add a runner and can never re-enable one a
+  farther tier denied.
+- **The tool never spawns.** The dispatcher skips a disabled runner before its
+  precondition and before it runs, so no availability probe, no `dotnet build`,
+  nothing. The skip is recorded with the reason `disabled-by-config`
+  (`latency.log`, `skipReason`). It is an operator decision, not a failure: it
+  raises no blocker and no "tool failed" notice, and a `fallback` group (such as
+  C#'s `lsp`, then `dotnet-build`) simply moves on to its next member. The other
+  runners of the group, the language server included, run as before.
+- **Unknown ids are dropped, not ignored silently.** An entry that names no
+  registered runner is dropped with a `PILENS_CFG_0005` warning that quotes the
+  entry, so a typo does not read as a runner that was turned off.
+- **Edits apply on the next dispatch.** The list is resolved for each dispatch,
+  so a change to the file needs no restart.
+- **The nearest config owns the file.** A nested `.pi-lens.json` governs the
+  files under it, so a denial there applies to those files only. `rules` reads
+  the same per-file resolution (see below).
+- **Disabling the only checker leaves the file unconfirmed.** Turning off a
+  runner that was the sole check for a file kind produces a notice that names
+  `dispatch.disabledRunners` (once per session, then the status line alone)
+  rather than a clean result. When another runner of the file is missing,
+  timed out, or failed as well, the notice says so and names the denial beside
+  it.
+
+`pilens_effective_config path=Program.cs` reports the runner as denied, with the
+tier and file that denied it, while the language server stays selected:
+
+```console
+$ pilens_effective_config path=src/Program.cs
+  tools:
+    lsp          selected
+    dotnet-build ✗ disabled-by-config (global ~/.pi-lens/config.json → /dispatch/disabledRunners/0)
+```
+
+`dispatch.runnerTimeoutFloorMs`, the other `dispatch` key, stays global-only.
+Putting it in a project `.pi-lens.json` logs the usual one-time "global-only"
+notice.
+
+### `rules.<id>` — read from each file's own config
+
+`rules.<id>.threshold`, `disable`, `select`, and `ignorePaths` are resolved for
+each file from the nearest directory at or above it that holds a `.pi-lens.json`,
+up to the workspace root. That resolution layers the global file, the workspace
+root's file, and every nested file between, by the field-wise order above. So a
+nested `.pi-lens.json` governs the files under it and no others, and the
+workspace root's policy still reaches them. Every surface that filters by rule
+policy reads it this way: the per-edit dispatch, `lens_diagnostics`,
+`lsp_diagnostics`, and the turn-end advisories. A threshold is a value, not a
+denial: for a rule the nearest file that sets a number supplies it, and a file
+that sets none inherits the farther file's. A value that is not a finite number,
+such as a string, `null`, or `1e999`, is dropped when the file is read, so the
+farther file's value still applies. A number of `0` or less is kept: the rule's
+own default applies, and the farther file's value does not come back.
+
+`rules.<id>.disable` is a denial, like `lsp.disabledServers`: it resolves as the
+union of every tier's list. A project or nested file can add rules to what the
+global or root file disabled and can never re-enable one. `select` is an
+allowlist, not a denial: per grouping key, the nearest file that sets it supplies
+the whole list. Lists under different keys are unioned, so a global `k.select:
+[x]` and a nearer file's `k2.select: [y]` keep both `x` and `y`.
+
+In both lists a member that is not a string, or a value that is not an array,
+is dropped and the valid members keep their effect. A string member is trimmed
+before it is matched, so `" ra "` names `ra`, and a blank member is dropped. The
+global file reports
+each one with a `PILENS_CFG_0005` notice. A project or nested file reports a
+value that is not an array, or a list whose members are all dropped, with the
+same notice; a non-string member beside a valid string is dropped without one.
+A `select` array whose members are all dropped still sets that key's list: it
+is empty, so it lifts a farther file's allowlist for the key, as `select: []`
+does. A `select` that is not an array is ignored, and the farther list stands.
+
+`ignorePaths` entries follow the same gitignore rules as the `ignore` field. Each entry is
+relative to the directory of the file that declares it: a global entry, and an entry in the
+workspace root's own file, match against the workspace root, and an entry in `pkg/.pi-lens.json`
+matches under `pkg/`:
+
+```jsonc
+// pkg/.pi-lens.json — carves out pkg/legacy/** except pkg/legacy/keep.ts; nothing at the root
+{ "rules": { "no-eval": { "ignorePaths": ["legacy/**", "!legacy/keep.ts"] } } }
+```
+
+- The last matching entry wins, so `!` re-includes a file an earlier entry carved out, and an
+  entry placed after a `!` ignores it again.
+- A leading `/` roots the entry at the declaring file's directory: `/legacy/**` is `legacy/**`
+  there and nowhere deeper.
+- A trailing `/` names a directory: `legacy/` carves out every directory named `legacy` at any
+  depth below the file, and everything in it.
+- An entry with no slash matches at any depth below the file: `*.gen.ts` carves out
+  `pkg/a.gen.ts` and `pkg/src/b.gen.ts`. To carve out a whole directory, end the entry with `/` or
+  `/**`: a bare `legacy` names a file called `legacy`, not the files inside a directory of that name.
+- An entry that climbs out of the declaring directory, such as `../other/**`, matches nothing.
+  A file outside the workspace root is never carved out.
+- A line starting with `#` is a comment, as in `.gitignore`, and is dropped.
+
+The files are a union: a path is carved out when any file's entries carve it out. A nearer file
+adds carve-outs and never lifts one, so a `!` entry re-includes only against the entries of its
+own file, and a project `!` cannot clear a carve-out the global config declared. Unlike the
+`ignore` field, `ignorePaths` has no cross-file lift: a nearer file's `!` can lift a path that a
+parent file's `ignore` line hid, but never a path that a parent file's `ignorePaths` entry carves out.
+
+## Legacy locations (still read; being removed)
+
+These are read for their deprecation window and then **removed**. Each one you
+still have produces one warning per setting, naming exactly where to move it —
+carrying the stable code `PILENS_CFG_0003` (a deprecated file) or
+`PILENS_CFG_0002` (a deprecated key), so you can match or suppress on the code
+rather than on the prose.
+
+| Legacy | Move it to | Code |
+| --- | --- | --- |
+| `.pi-lens/lsp.json` | `.pi-lens.json` → `lsp.*` | `PILENS_CFG_0003` |
+| `pi-lsp.json` | `.pi-lens.json` → `lsp.*` | `PILENS_CFG_0003` |
+| `pi-lens.json` (undotted) | `.pi-lens.json` | `PILENS_CFG_0003` |
+| `~/.pi-lens/lsp.json` | `~/.pi-lens/config.json` → `lsp.*` | `PILENS_CFG_0003` |
+| `servers` at the file root | `lsp.servers` | `PILENS_CFG_0002` |
+| `serverOverrides` at the file root | `lsp.serverOverrides` | `PILENS_CFG_0002` |
+| `disabledServers` at the file root | `lsp.disabledServers` | `PILENS_CFG_0002` |
+| `warmFiles` at the file root | `lsp.warmFiles` | `PILENS_CFG_0002` |
+
+**Deprecated since 4.1.4. Read for the last time before 5.0.0.** The window is
+declared as data in `clients/config-diagnostic-codes.ts`
+(`DEPRECATED_CONFIG_SURFACES`) and enforced by test, so the schedule above and
+the code cannot drift apart. `docs/public-api-stability.md` describes the policy
+these dates instantiate.
+
+A `.pi-lens.json` that mixes both spellings is fine while you migrate: the
+canonical key wins, and the keys you have not moved yet keep working.
+
+For project settings the same rule reaches across directories (#5291): a legacy
+`pi-lens.json` still supplies its values whole while it is the only config
+file in the chain from your working directory upward, and once a canonical
+`.pi-lens.json` sits anywhere in that chain the legacy file only produces its
+migration notices — its fields are not merged in, and the canonical files
+layer per field as above. Move the settings; the notices name the file.
+
+Only keys pi-lens actually recognizes get "move it to …" advice. A key in a
+legacy file that is not a pi-lens setting at all — a typo, or a leftover from
+another tool — cannot be migrated anywhere, so it gets the ordinary
+unrecognized-key notice (`PILENS_CFG_0004`) and is counted in ONE whole-file
+`PILENS_CFG_0003` notice for the file rather than being told to move.
+
+## When a config is ignored
+
+A file that is unreadable, unparsable, or not a JSON object is **ignored, never
+partially applied** — pi-lens runs on defaults for it and says so once, with the
+code `PILENS_CFG_0001`. A field whose value does not match its declared type is
+dropped on its own (`PILENS_CFG_0005`), and an unrecognized field is dropped
+with a message naming the key (`PILENS_CFG_0004`). If resolving a file fails
+internally the whole file is ignored and said so under its own code
+(`PILENS_CFG_0008`), so "one field went missing" and "none of this file is in
+effect" are never the same code. Nothing about your config is ever ignored
+silently.
+
+The number of notices one file can produce is bounded PER NOTICE LIST, because
+the number of keys in a file is not. There are two lists, split by who composes
+them rather than by what they say — both are about values that were rejected:
+
+- what **resolving** the file produced — the per-field rejections
+  (`PILENS_CFG_0004`, `PILENS_CFG_0005`, `PILENS_CFG_0006`) together with the
+  deprecation notices (`PILENS_CFG_0002`, `PILENS_CFG_0003`), which share this
+  list;
+- what the **loader** reading the file produced on its own — unknown top-level
+  keys (`PILENS_CFG_0004`) and values it refused (`PILENS_CFG_0005`).
+
+Each list is bounded at 20 records: up to 19 notices plus, when the bound bit,
+a single `PILENS_CFG_0007` summary giving the count that was suppressed, so a
+truncated list always says that it is truncated. That summary is about the
+LIST, not about the file: a config whose every setting was applied can still
+overflow the bound, so it is worded and recorded as a summary rather than as an
+ignored config.
+
+One notice is never suppressed by that bound: `PILENS_CFG_0008`, which says the
+whole file is out of effect. It is not one more rejected key competing for a
+slot — it is what tells you the rejections above it are no longer the whole
+story — so it is kept however full the list already was.
+
+## Asking what is actually in effect
+
+You never have to reconstruct the table above by hand. `pilens_effective_config`
+(MCP) and `effective_config` (pi) return the resolved configuration with the
+provenance of **every** leaf — the tier, the file, the key, and the trust
+decision that applied — plus, for a file you name, its language, every LSP
+server with the reason it was selected or denied, and the runners that would
+dispatch. That is the answer to "why is this running" and to "why is this *not*
+running", without reading a log.
+
+Naming a file (the `path` argument) resolves the configuration **at that file's own directory**,
+which is where the runtime decides from — so a nested `repo/sub/.pi-lens.json`
+layer contributes to the answer, appears in the reported document list, and is
+named as the file behind any decision it made. The walk runs upward and is
+**confined to `cwd`**: a `path` that resolves outside `cwd` — including a
+sibling package in the same monorepo — is rejected rather than answered from
+its own unrelated tree, because the per-file answer is only ever correct when
+it is a superset of the workspace's own; the rejection names the `cwd` it was
+measured against and the remedy is to re-query with `cwd` set to that file's
+own workspace. A confined `path` always passes back through the workspace's
+own documents on its way up, so they are always included too.
+
+It reports **sources, never values**. Environment values never appear, a custom
+server's command line is cut to the binary itself, and every path is rewritten
+`~`-relative. There is no un-redacted mode: the un-redacted data is the config
+file you already have.
+
+`pilens_health` embeds the same provenance as **counts per tier** — how many
+settings each source decided, and which `PILENS_CFG_*` notices the resolution
+produced — so a session's config posture is visible without the detail.
+
+## See also
+
+- `docs/globalconfig.md` — every key of `~/.pi-lens/config.json`, in detail.
+- `docs/settings.md` — the CLI flags and what they map to.
+- `docs/environment-variables.md` — the `PI_LENS_*` tier.
+- `docs/features.md` — the Python interpreter and syntax-level declarations pi-lens reads from a project (`VIRTUAL_ENV`, `requires-python`, `target-version`, `.python-version`).
+- `docs/public-api-stability.md` — what `x-stability`, the `PILENS_CFG_*` codes,
+  and the deprecation windows commit pi-lens to.

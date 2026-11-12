@@ -1,0 +1,1025 @@
+/**
+ * #1783 — the disk-drift backstop, end to end through LSPService.
+ *
+ * Reproduces the 2026-08-20 dogfood forensics: a file is opened through the
+ * normal sync path, then a bash-tool bulk edit rewrites it on disk. No
+ * `didChange` is sent, so the server keeps answering from the pre-edit
+ * content. Before the fix nothing ever compared disk against what the server
+ * holds, and the stale view survived for the life of the server.
+ *
+ * The second half of this file covers the coverage contract that the first
+ * round got wrong: one record per FILE is a claim about EVERY server holding
+ * that file, so it may only be stamped when the sync reached all of them.
+ */
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const getServersForFileWithConfig = vi.fn();
+const createLSPClient = vi.fn();
+const loadReverseDependencyIndexFromSnapshot = vi.fn(() => null);
+const getReverseDepsFromIndex = vi.fn(() => [] as string[]);
+
+vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
+	createLSPClient,
+}));
+vi.mock("../../../clients/reverse-deps.js", () => ({
+	loadReverseDependencyIndexFromSnapshot,
+	getReverseDepsFromIndex,
+}));
+
+function makeFakeProcess() {
+	return {
+		process: {
+			killed: false,
+			kill: vi.fn(),
+			on: vi.fn(),
+			removeListener: vi.fn(),
+		},
+		stdin: { on: vi.fn(), off: vi.fn(), write: vi.fn() },
+		stdout: { on: vi.fn(), off: vi.fn(), pipe: vi.fn() },
+		stderr: { on: vi.fn(), off: vi.fn() },
+		pid: 999,
+	};
+}
+
+function makeServer(
+	root: string,
+	id = "typescript",
+	role: "language" | "auxiliary" = "language",
+	extensions = [".ts"],
+) {
+	return {
+		id,
+		name: id,
+		role,
+		extensions,
+		root: async () => root,
+		spawn: vi.fn(async () => ({ process: makeFakeProcess(), source: "test" })),
+	};
+}
+
+/**
+ * A client that remembers the LAST content it was given — the fake stand-in
+ * for the language server's in-memory document view.
+ */
+function makeClient(
+	openDocuments: Set<string>,
+	behaviour: {
+		onOpen?: (filePath: string, content: string) => Promise<void> | void;
+	} = {},
+	serverId = "typescript",
+) {
+	const received: string[] = [];
+	return {
+		received,
+		serverId,
+		isAlive: () => true,
+		shutdown: vi.fn(async () => {}),
+		isDocumentOpen: (filePath: string) =>
+			openDocuments.has(path.resolve(filePath)),
+		getWorkspaceDiagnosticsSupport: () => ({
+			advertised: false,
+			mode: "push-only" as const,
+			diagnosticProviderKind: "none" as const,
+		}),
+		getOperationSupport: () => ({}),
+		getAdvertisedCommands: () => [],
+		getRawCapabilityKeys: () => [],
+		diagnosticsVersion: 0,
+		getDiagnostics: vi.fn(() => []),
+		notify: {
+			announceCreated: () => undefined,
+			open: vi.fn(async (filePath: string, content: string) => {
+				await behaviour.onOpen?.(filePath, content);
+				openDocuments.add(path.resolve(filePath));
+				received.push(content);
+			}),
+			change: vi.fn(async () => {}),
+			watchedFileChange: vi.fn(),
+		},
+		waitForDiagnostics: vi.fn(async () => undefined),
+	};
+}
+
+const ORIGINAL = "export const answer = 42;\nconst unused = 1;\n";
+/** Longer than ORIGINAL: the size half of the drift key moves. */
+const BULK_EDITED = "export const answer = 42;\nexport const extra = 7;\n";
+/** EXACTLY as long as ORIGINAL: only the mtime half of the key can see it. */
+const SAME_LENGTH_EDIT = "export const answer = 41;\nconst unused = 2;\n";
+
+describe("LSPService disk-drift backstop (#1783)", () => {
+	let dir: string;
+	let file: string;
+
+	beforeEach(async () => {
+		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
+		getServersForFileWithConfig.mockReset();
+		createLSPClient.mockReset();
+		loadReverseDependencyIndexFromSnapshot.mockReset().mockReturnValue(null);
+		getReverseDepsFromIndex.mockReset().mockReturnValue([]);
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-lens-drift-"));
+		file = path.join(dir, "stdio.ts");
+		await fs.writeFile(file, ORIGINAL, "utf-8");
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	async function primeService() {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		loadReverseDependencyIndexFromSnapshot.mockReturnValue(null);
+		getReverseDepsFromIndex.mockReturnValue([]);
+		createLSPClient.mockResolvedValue(client);
+		// The normal sync path: content read from disk, pushed to the server.
+		await service.touchFile(file, ORIGINAL, {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		expect(client.received).toEqual([ORIGINAL]);
+		return { service, client, openDocuments };
+	}
+
+	/** The untracked bulk edit: content, size and mtime all move on disk. */
+	async function bulkEditOnDisk(content = BULK_EDITED) {
+		await fs.writeFile(file, content, "utf-8");
+		const future = new Date(Date.now() + 5_000);
+		await fs.utimes(file, future, future);
+	}
+
+	it("resynchronizes a document a bash bulk edit moved behind the server", async () => {
+		const { service, client } = await primeService();
+
+		await bulkEditOnDisk();
+		// The stale state the forensics captured: the server's view is pre-edit
+		// and no notification carried the new bytes.
+		expect(client.received).toEqual([ORIGINAL]);
+
+		const result = await service.sweepDocumentDrift({ force: true });
+
+		expect(result?.candidates).toBe(1);
+		expect(result?.resynced).toBe(1);
+		expect(client.received).toEqual([ORIGINAL, BULK_EDITED]);
+		// #3481 round 1: the heal carries its read stamp, so an older stamped
+		// read that arrives after it is dropped instead of undoing the heal.
+		const lastOpen = client.notify.open.mock.calls.at(-1) as unknown[];
+		expect(lastOpen[6]).toEqual(expect.any(Number));
+	});
+
+	it("resynchronizes an open document from the recovered Git-change seam", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		createLSPClient.mockResolvedValue(client);
+		await service.touchFile(file, await fs.readFile(file, "utf-8"), {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		const originalStat = await fs.stat(file);
+		await fs.writeFile(file, SAME_LENGTH_EDIT, "utf-8");
+		await fs.utimes(file, originalStat.atime, originalStat.mtime);
+
+		await service.resyncGitChangedFiles([file]);
+
+		// This is the recurrence of #2817: the stat-key drift backstop cannot see
+		// a same-size, same-mtime Git checkout, but the Git seam has the path set.
+		expect(client.received).toEqual([ORIGINAL, SAME_LENGTH_EDIT]);
+	});
+
+	it("resyncs a non-TypeScript importer from language-neutral import facts", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const changed = path.join(dir, "dependency.go");
+		const importer = path.join(dir, "consumer.py");
+		await fs.writeFile(changed, "package sample\n", "utf-8");
+		await fs.writeFile(importer, "from dependency import value\n", "utf-8");
+		const client = makeClient(openDocuments, {}, "python");
+		const server = makeServer(dir, "python", "language", [".go", ".py"]);
+		getServersForFileWithConfig.mockReturnValue([server]);
+		loadReverseDependencyIndexFromSnapshot.mockReturnValue({} as any);
+		getReverseDepsFromIndex.mockReturnValue([importer]);
+		createLSPClient.mockResolvedValue(client);
+		await service.touchFile(changed, await fs.readFile(changed, "utf-8"), {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		await service.touchFile(importer, await fs.readFile(importer, "utf-8"), {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		await fs.writeFile(changed, "package sample\n\n", "utf-8");
+		await fs.writeFile(
+			importer,
+			"from dependency import value\n# changed\n",
+			"utf-8",
+		);
+
+		await service.resyncGitChangedFiles([changed]);
+
+		expect(client.received).toHaveLength(4);
+		expect(client.received).toContain("package sample\n\n");
+		expect(client.received).toContain(
+			"from dependency import value\n# changed\n",
+		);
+	});
+
+	// #3828 r3: the drain's held-only resync is a save for the file it wrote
+	// and for nothing else. Recurrences: VERIFY r2 F6 (the late resync sent no
+	// didSave, so a save-triggered server kept the pre-format diagnostics), and
+	// the storm the `saved` docblock forbids if the save rode onto the
+	// importers this seam adds.
+	it("carries a save on the changed path only, never on its importers, and names its disposition (#3828 r3)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const changed = path.join(dir, "dependency.ts");
+		const importer = path.join(dir, "consumer.ts");
+		await fs.writeFile(changed, "export const v = 1;\n", "utf-8");
+		await fs.writeFile(
+			importer,
+			"import { v } from './dependency';\n",
+			"utf-8",
+		);
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		loadReverseDependencyIndexFromSnapshot.mockReturnValue({} as any);
+		getReverseDepsFromIndex.mockReturnValue([importer]);
+		createLSPClient.mockResolvedValue(client);
+		for (const target of [changed, importer]) {
+			await service.touchFile(target, await fs.readFile(target, "utf-8"), {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+		}
+		// Both moved on disk, so neither push is a debounced repeat.
+		await fs.writeFile(changed, "export const v = 2;\n", "utf-8");
+		await fs.writeFile(importer, "import { v } from './dependency'; // 2\n");
+		const before = client.notify.open.mock.calls.length;
+
+		const dispositions = await service.resyncGitChangedFiles([changed], {
+			saved: true,
+		});
+
+		const saves = Object.fromEntries(
+			(client.notify.open.mock.calls as unknown[][])
+				.slice(before)
+				.map((call) => [path.basename(String(call[0])), call[5]]),
+		);
+		expect(saves).toEqual({ "dependency.ts": true, "consumer.ts": false });
+		expect(Object.fromEntries(dispositions)).toEqual({ [changed]: "resynced" });
+	});
+
+	it("reads a target a joined pass never reached as deferred, and sends its save on the next pass (#3828 r3)", async () => {
+		const { service, client } = await primeService();
+		const late = path.join(dir, "late.ts");
+		await fs.writeFile(late, "export const late = 1;\n", "utf-8");
+		await service.touchFile(late, "export const late = 1;\n", {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		// Same length, mtime in the past: only the queue can reach it, never
+		// the stat backstop of the pass below.
+		await fs.writeFile(late, "export const late = 2;\n", "utf-8");
+		const past = new Date(Date.now() - 60_000);
+		await fs.utimes(late, past, past);
+		// A pass already running when the drain's resync arrives: it is parked
+		// in its push of another drifted document, past its queue snapshot.
+		await bulkEditOnDisk();
+		let parked!: () => void;
+		const isParked = new Promise<void>((resolve) => {
+			parked = resolve;
+		});
+		let release!: () => void;
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		client.notify.open.mockImplementationOnce(async () => {
+			parked();
+			await released;
+		});
+		let forcedSweeps = 0;
+		let joined!: () => void;
+		const isJoined = new Promise<void>((resolve) => {
+			joined = resolve;
+		});
+		const sweep = service.sweepDocumentDrift.bind(service);
+		vi.spyOn(service, "sweepDocumentDrift").mockImplementation((options) => {
+			if (options?.force && ++forcedSweeps === 2) joined();
+			return sweep(options);
+		});
+		const running = service.sweepDocumentDrift({ force: true });
+		await isParked;
+		const resync = service.resyncGitChangedFiles([late], { saved: true });
+		await isJoined;
+		release();
+		await running;
+
+		expect(Object.fromEntries(await resync)).toEqual({ [late]: "deferred" });
+		const before = client.notify.open.mock.calls.length;
+		await sweep({ force: true });
+		const next = (client.notify.open.mock.calls as unknown[][]).slice(before);
+		expect(
+			next.map((call) => [path.basename(String(call[0])), call[5]]),
+		).toEqual([["late.ts", true]]);
+	});
+
+	it("emits a bounded record naming the file and the drift age", async () => {
+		const { service } = await primeService();
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../../../clients/degradation-ledger.js");
+		resetDegradationLedger();
+
+		await bulkEditOnDisk();
+		await service.sweepDocumentDrift({ force: true });
+
+		const summary = getDegradationSummary();
+		const group = summary.find((entry) => entry.kind === "lsp-document-drift");
+		expect(group).toBeDefined();
+		expect(
+			group?.latestReasons.some((e) => e.subject.endsWith("stdio.ts")),
+		).toBe(true);
+		expect(
+			group?.latestReasons.some((e) => /untracked disk drift/.test(e.reason)),
+		).toBe(true);
+	});
+
+	it("re-stamps without notifying when the mtime moved but the bytes did not", async () => {
+		const { service, client } = await primeService();
+
+		const future = new Date(Date.now() + 5_000);
+		await fs.utimes(file, future, future);
+
+		const result = await service.sweepDocumentDrift({ force: true });
+
+		expect(result?.candidates).toBe(1);
+		expect(result?.unchanged).toBe(1);
+		expect(result?.resynced).toBe(0);
+		// The distinction the ledger must preserve: touched is not changed.
+		expect(client.received).toEqual([ORIGINAL]);
+	});
+
+	it("never resyncs a document no live client still holds open", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		createLSPClient.mockResolvedValue(client);
+		await service.touchFile(file, ORIGINAL, {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		// The server closed the document (eviction, shutdown, rename).
+		openDocuments.clear();
+
+		await bulkEditOnDisk();
+		const result = await service.sweepDocumentDrift({ force: true });
+
+		expect(result?.unheld).toBe(1);
+		expect(result?.resynced).toBe(0);
+		expect(client.received).toEqual([ORIGINAL]);
+	});
+
+	it("fires the sweep from touchFile, so no explicit call is needed", async () => {
+		const previous = process.env.PI_LENS_LSP_DRIFT_CHECK_MS;
+		process.env.PI_LENS_LSP_DRIFT_CHECK_MS = "1";
+		try {
+			const { service, client } = await primeService();
+			await bulkEditOnDisk();
+			// A touch of ANOTHER file is enough: the backstop is not keyed to the
+			// file being touched.
+			const other = path.join(dir, "other.ts");
+			await fs.writeFile(other, "export const x = 1;\n", "utf-8");
+			await service.touchFile(other, "export const x = 1;\n", {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+			// The sweep is deliberately not awaited by touchFile; drain the
+			// microtask/IO turns it needs.
+			await vi.waitFor(() => {
+				expect(client.received).toContain(BULK_EDITED);
+			});
+		} finally {
+			if (previous === undefined) delete process.env.PI_LENS_LSP_DRIFT_CHECK_MS;
+			else process.env.PI_LENS_LSP_DRIFT_CHECK_MS = previous;
+		}
+	});
+
+	it("records documents opened through openFile, not only touchFile", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		createLSPClient.mockResolvedValue(client);
+
+		await service.openFile(file, ORIGINAL);
+		expect(client.received).toEqual([ORIGINAL]);
+
+		await bulkEditOnDisk();
+		const result = await service.sweepDocumentDrift({ force: true });
+
+		expect(result?.resynced).toBe(1);
+		expect(client.received).toEqual([ORIGINAL, BULK_EDITED]);
+	});
+
+	it("clears every record when the service resets", async () => {
+		const { service } = await primeService();
+		expect(service._driftTrackedCountForTests()).toBe(1);
+
+		await service.shutdown();
+
+		expect(service._driftTrackedCountForTests()).toBe(0);
+	});
+
+	describe("coverage contract (review round 1, F1/F2)", () => {
+		/** Primary + auxiliary, both holding the same document. */
+		async function primeTwoServers() {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const primaryOpen = new Set<string>();
+			const auxOpen = new Set<string>();
+			const primary = makeClient(primaryOpen);
+			const aux = makeClient(auxOpen);
+			getServersForFileWithConfig.mockReturnValue([
+				makeServer(dir, "typescript", "language"),
+				makeServer(dir, "opengrep", "auxiliary"),
+			]);
+			createLSPClient
+				.mockResolvedValueOnce(primary)
+				.mockResolvedValueOnce(aux)
+				.mockResolvedValue(primary);
+			await service.touchFile(file, ORIGINAL, {
+				diagnostics: "none",
+				clientScope: "all",
+				source: "lsp_sync",
+			});
+			expect(primary.received).toEqual([ORIGINAL]);
+			expect(aux.received).toEqual([ORIGINAL]);
+			return { service, primary, aux };
+		}
+
+		it("resyncs the AUXILIARY view too, not only the primary", async () => {
+			const { service, primary, aux } = await primeTwoServers();
+
+			await bulkEditOnDisk();
+			const result = await service.sweepDocumentDrift({ force: true });
+
+			expect(result?.resynced).toBe(1);
+			expect(primary.received).toEqual([ORIGINAL, BULK_EDITED]);
+			// The face the first round got wrong: a primary-scoped resync left this
+			// view on the pre-edit content forever while the record read "in sync".
+			expect(aux.received).toEqual([ORIGINAL, BULK_EDITED]);
+		});
+
+		it("reports the healed file as in sync on the following pass", async () => {
+			const { service } = await primeTwoServers();
+
+			// A real bash edit stamps mtime = now, so the heal's own record —
+			// stamped after it — settles the file. (The other tests push mtime into
+			// the future to isolate the mtime half of the key; that deliberately
+			// never settles.)
+			await fs.writeFile(file, BULK_EDITED, "utf-8");
+			const first = await service.sweepDocumentDrift({ force: true });
+			expect(first?.resynced).toBe(1);
+
+			const second = await service.sweepDocumentDrift({ force: true });
+
+			expect(second?.candidates).toBe(0);
+			expect(second?.resynced).toBe(0);
+		});
+
+		it("does not stamp a record when a server outside the touch holds the document", async () => {
+			const { service, primary, aux } = await primeTwoServers();
+			const V2 = "export const answer = 43;\nexport const two = 2;\n";
+			await fs.writeFile(file, V2, "utf-8");
+
+			// A primary-scoped touch. The auxiliary still holds the document, so
+			// this content did NOT reach every view and the record must not claim it.
+			await service.touchFile(file, V2, {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+			expect(primary.received).toEqual([ORIGINAL, V2]);
+			expect(aux.received).toEqual([ORIGINAL]);
+
+			// The stale ORIGINAL record survives, so the sweep still sees drift and
+			// heals the auxiliary at full scope.
+			const result = await service.sweepDocumentDrift({ force: true });
+
+			expect(result?.resynced).toBe(1);
+			expect(aux.received).toEqual([ORIGINAL, V2]);
+		});
+
+		it("does not stamp a record when one server's write fails", async () => {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const primaryOpen = new Set<string>();
+			const auxOpen = new Set<string>();
+			const primary = makeClient(primaryOpen);
+			const aux = makeClient(auxOpen);
+			aux.notify.open = vi.fn(async () => {
+				throw new Error("notify write rejected");
+			});
+			getServersForFileWithConfig.mockReturnValue([
+				makeServer(dir, "typescript", "language"),
+				makeServer(dir, "opengrep", "auxiliary"),
+			]);
+			createLSPClient
+				.mockResolvedValueOnce(primary)
+				.mockResolvedValueOnce(aux)
+				.mockResolvedValue(primary);
+
+			await service.touchFile(file, ORIGINAL, {
+				diagnostics: "none",
+				clientScope: "all",
+				source: "lsp_sync",
+			});
+
+			expect(primary.received).toEqual([ORIGINAL]);
+			// One server never got the content, so the file-level record would be a
+			// claim about a view that does not hold it.
+			expect(service._driftTrackedCountForTests()).toBe(0);
+		});
+
+		it("detects an untracked edit made INSIDE the sync window", async () => {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const openDocuments = new Set<string>();
+			// The bash edit lands while the notify write is still in flight. The
+			// edit keeps the byte length identical, so only the mtime half of the
+			// key can catch it — and it can only catch it if `syncedAt` is anchored
+			// at the START of the sync, not at the moment the write landed.
+			const client = makeClient(openDocuments, {
+				onOpen: async () => {
+					await new Promise((resolve) => setTimeout(resolve, 30));
+					await fs.writeFile(file, SAME_LENGTH_EDIT, "utf-8");
+					await new Promise((resolve) => setTimeout(resolve, 30));
+				},
+			});
+			getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+			createLSPClient.mockResolvedValue(client);
+
+			await service.touchFile(file, ORIGINAL, {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+			expect(SAME_LENGTH_EDIT.length).toBe(ORIGINAL.length);
+
+			const result = await service.sweepDocumentDrift({ force: true });
+
+			expect(result?.candidates).toBe(1);
+			expect(result?.resynced).toBe(1);
+			expect(client.received).toEqual([ORIGINAL, SAME_LENGTH_EDIT]);
+		});
+
+		it("does not stamp a record when an auxiliary resync is DEFERRED", async () => {
+			// Third face of the coverage defect. The #1459 gate defers an auxiliary
+			// whose previous write is still outstanding: that server returns from
+			// the write loop EARLY, so it never reaches notifyWriteTimedOutServerIds
+			// and a gate reading only that list stamps full coverage for a view that
+			// received nothing.
+			const previousBudget = process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS;
+			process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = "50";
+			try {
+				const { LSPService } = await import("../../../clients/lsp/index.js");
+				const service = new LSPService();
+				const primaryOpen = new Set<string>();
+				const auxOpen = new Set<string>();
+				const primary = makeClient(primaryOpen);
+				let wedged = false;
+				const aux = makeClient(auxOpen, {
+					onOpen: async () => {
+						if (wedged) await new Promise(() => {});
+					},
+				});
+				getServersForFileWithConfig.mockReturnValue([
+					makeServer(dir, "typescript", "language"),
+					makeServer(dir, "opengrep", "auxiliary"),
+				]);
+				createLSPClient
+					.mockResolvedValueOnce(primary)
+					.mockResolvedValueOnce(aux)
+					.mockResolvedValue(primary);
+
+				// C1 lands on both views: a legitimate full-coverage record.
+				await service.touchFile(file, ORIGINAL, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+				expect(service._driftTrackedCountForTests()).toBe(1);
+
+				// The auxiliary's next write never settles, so it keeps the #1459
+				// resync slot claimed.
+				wedged = true;
+				const C2 = "export const answer = 2;\n";
+				await fs.writeFile(file, C2, "utf-8");
+				await service.touchFile(file, C2, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+
+				// With the slot occupied and no time left to queue, THIS touch's
+				// auxiliary write is deferred rather than attempted.
+				const C3 = "export const answer = 3;\nexport const three = 3;\n";
+				await fs.writeFile(file, C3, "utf-8");
+				await service.touchFile(file, C3, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+					maxClientWaitMs: 0,
+				});
+
+				// The auxiliary still holds C1, so the record must still describe C1
+				// and the sweep must still see this file as drifted.
+				expect(aux.received).toEqual([ORIGINAL]);
+				const result = await service.sweepDocumentDrift({ force: true });
+
+				expect(result?.candidates).toBe(1);
+				// The heal cannot complete while that scanner is wedged, and it says
+				// so rather than laundering the record.
+				expect(result?.resynced).toBe(0);
+				expect(result?.failed).toBe(1);
+			} finally {
+				if (previousBudget === undefined) {
+					delete process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS;
+				} else {
+					process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = previousBudget;
+				}
+			}
+		});
+
+		it("paces a 20-file bulk edit even with the wider two-server scope", async () => {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const primaryOpen = new Set<string>();
+			const auxOpen = new Set<string>();
+			const primary = makeClient(primaryOpen);
+			const aux = makeClient(auxOpen);
+			getServersForFileWithConfig.mockReturnValue([
+				makeServer(dir, "typescript", "language"),
+				makeServer(dir, "opengrep", "auxiliary"),
+			]);
+			createLSPClient
+				.mockResolvedValueOnce(primary)
+				.mockResolvedValueOnce(aux)
+				.mockResolvedValue(primary);
+
+			const files: string[] = [];
+			for (let i = 0; i < 20; i++) {
+				const target = path.join(dir, `bulk-${i}.ts`);
+				await fs.writeFile(target, `export const v${i} = 0;\n`, "utf-8");
+				files.push(target);
+				await service.touchFile(target, `export const v${i} = 0;\n`, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+			}
+			// One bulk operation across all 20.
+			for (const [i, target] of files.entries()) {
+				await fs.writeFile(
+					target,
+					`export const v${i} = 1; // edited\n`,
+					"utf-8",
+				);
+			}
+
+			const before = primary.received.length + aux.received.length;
+			const first = await service.sweepDocumentDrift({ force: true });
+
+			// The per-pass cap counts FILES, so the wider scope multiplies writes by
+			// the number of held servers, not by the number of files.
+			expect(first?.resynced).toBe(4);
+			expect(first?.deferred).toBe(16);
+			expect(primary.received.length + aux.received.length - before).toBe(8);
+
+			// The remainder heals in later passes, four files at a time.
+			let healed = first?.resynced ?? 0;
+			let passes = 1;
+			while (healed < 20 && passes < 12) {
+				healed +=
+					(await service.sweepDocumentDrift({ force: true }))?.resynced ?? 0;
+				passes += 1;
+			}
+			expect(healed).toBe(20);
+			expect(passes).toBe(5);
+		});
+
+		it("reports a failed resync as failed, never as healed", async () => {
+			const { service, client } = await primeService();
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+			client.notify.open = vi.fn(async () => {
+				throw new Error("server died");
+			});
+
+			await bulkEditOnDisk();
+			const result = await service.sweepDocumentDrift({ force: true });
+
+			expect(result?.resynced).toBe(0);
+			expect(result?.failed).toBe(1);
+			const group = getDegradationSummary().find(
+				(entry) => entry.kind === "lsp-document-drift",
+			);
+			expect(
+				group?.latestReasons.some((e) => /resync FAILED/.test(e.reason)),
+			).toBe(true);
+		});
+	});
+
+	/**
+	 * #4956 F6. Recurrence: the aggregate door dropped every opt-in auxiliary
+	 * (fallow) from the touch, so the drift resync never reached a fallow client
+	 * the per-edit door had started, and `recordFullyCoveredSync` refused to
+	 * stamp while that untargeted client held the document. Every pass then
+	 * reported the file `failed`, wrote "resync FAILED ... view still stale", and
+	 * fallow kept the pre-edit bytes until the next edit through the per-edit
+	 * door. The second case pins the other half of the rule: a door that does
+	 * not name an opt-in server reaches a client already holding THIS root and
+	 * never starts one anywhere else.
+	 */
+	describe("an opt-in auxiliary the per-edit door started (#4956 F6)", () => {
+		/** fallow is opt-in by its profile; each directory is its own root. */
+		function primaryAndFallow() {
+			return [
+				makeServer(dir, "typescript", "language"),
+				{
+					...makeServer(dir, "fallow", "auxiliary"),
+					root: async (filePath: string) =>
+						path.dirname(path.resolve(filePath)),
+				},
+			];
+		}
+
+		async function primeWithFallow() {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+			const primary = makeClient(new Set<string>());
+			const fallow = makeClient(new Set<string>(), {}, "fallow");
+			const fallowStarts: string[] = [];
+			getServersForFileWithConfig.mockReturnValue(primaryAndFallow());
+			createLSPClient.mockImplementation(
+				async (args: { serverId: string; root: string }) => {
+					if (args.serverId !== "fallow") return primary;
+					fallowStarts.push(args.root);
+					return fallow;
+				},
+			);
+			// The per-edit door: the runner names fallow because the operator
+			// turned it on, so this touch starts it beside the primary.
+			await service.touchFile(file, ORIGINAL, {
+				diagnostics: "none",
+				clientScope: "with-auxiliary",
+				auxiliaryServerIds: ["fallow"],
+				source: "lsp_sync",
+			});
+			expect(primary.received).toEqual([ORIGINAL]);
+			expect(fallow.received).toEqual([ORIGINAL]);
+			expect(fallowStarts).toHaveLength(1);
+			return { service, primary, fallow, fallowStarts };
+		}
+
+		it("the drift resync reaches the held fallow view and stamps the record", async () => {
+			const { service, primary, fallow } = await primeWithFallow();
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+
+			await fs.writeFile(file, BULK_EDITED, "utf-8");
+			const first = await service.sweepDocumentDrift({ force: true });
+
+			expect(first?.resynced).toBe(1);
+			expect(first?.failed).toBe(0);
+			expect(primary.received).toEqual([ORIGINAL, BULK_EDITED]);
+			expect(fallow.received).toEqual([ORIGINAL, BULK_EDITED]);
+			const reasons =
+				getDegradationSummary()
+					.find((entry) => entry.kind === "lsp-document-drift")
+					?.latestReasons.map((entry) => entry.reason) ?? [];
+			expect(reasons.some((reason) => /resync FAILED/.test(reason))).toBe(
+				false,
+			);
+			// The record advanced, so the next pass has nothing to heal.
+			const second = await service.sweepDocumentDrift({ force: true });
+			expect(second?.candidates).toBe(0);
+		});
+
+		it("a sync touch reaches fallow only where its client holds the root, and never starts it", async () => {
+			const { service, fallow, fallowStarts } = await primeWithFallow();
+			// A sibling root: a NESTED directory with no project marker would
+			// reuse the held ancestor client, which is the registry's own rule.
+			const otherRoot = await fs.mkdtemp(
+				path.join(os.tmpdir(), "pi-lens-drift-other-"),
+			);
+			try {
+				const elsewhere = path.join(otherRoot, "b.ts");
+				await fs.writeFile(elsewhere, ORIGINAL, "utf-8");
+
+				// A content sync for a file under another root, with no exclusions:
+				// no fallow client holds that root, so the door must not start one.
+				await service.touchFile(elsewhere, ORIGINAL, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+				expect(fallowStarts).toHaveLength(1);
+				expect(fallow.notify.open.mock.calls.map((call) => call[0])).toEqual([
+					file,
+				]);
+
+				// The same door for the file whose root the client holds reaches it.
+				await service.touchFile(file, BULK_EDITED, {
+					diagnostics: "none",
+					clientScope: "all",
+					source: "lsp_sync",
+				});
+				expect(fallow.received).toEqual([ORIGINAL, BULK_EDITED]);
+				expect(fallowStarts).toHaveLength(1);
+			} finally {
+				await fs.rm(otherRoot, { recursive: true, force: true });
+			}
+		});
+
+		it("a collecting all-server touch never consults the held fallow client", async () => {
+			const { service, primary, fallow } = await primeWithFallow();
+
+			// `getDiagnostics`, the sweep and `lsp_diagnostics` ask this door for
+			// answers; fallow is not named there, so a warm client must not change
+			// who answers. The record stays unstamped and the drift pass heals it.
+			await service.touchFile(file, BULK_EDITED, {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				clientScope: "all",
+				source: "lsp_diagnostics",
+			});
+			expect(primary.received).toEqual([ORIGINAL, BULK_EDITED]);
+			expect(fallow.received).toEqual([ORIGINAL]);
+		});
+	});
+
+	// #4503: the record cap evicted by INSERTION order alone, so a workspace
+	// sweep (one touch per project file, every document still held) unbound the
+	// earliest files. The server kept answering from their pre-edit bytes and no
+	// record was left to compare disk against, so an untracked edit to them could
+	// never heal for the life of the server.
+	it("keeps the drift record of a held document past the record cap (#4503)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const { DRIFT_TRACK_CAP } =
+			await import("../../../clients/lsp/document-drift.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		createLSPClient.mockResolvedValue(client);
+
+		// The document this test holds open, stamped first, so it is the oldest
+		// record the cap reaches for.
+		await service.touchFile(file, ORIGINAL, {
+			diagnostics: "none",
+			clientScope: "primary",
+			source: "lsp_sync",
+		});
+		// One workspace sweep's worth of touches: `DRIFT_TRACK_CAP` more, every
+		// one of those documents still open on the server.
+		for (let i = 0; i < DRIFT_TRACK_CAP; i++) {
+			const swept = path.join(dir, `swept-${i}.ts`);
+			const content = `export const swept${i} = 0;\n`;
+			await fs.writeFile(swept, content, "utf-8");
+			await service.touchFile(swept, content, {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+		}
+		expect(openDocuments.has(path.resolve(file))).toBe(true);
+		expect(client.received).toContain(ORIGINAL);
+
+		// The untracked bulk edit: no didChange, so only the drift backstop can
+		// compare the server's view against disk.
+		await bulkEditOnDisk();
+
+		const result = await service.sweepDocumentDrift({ force: true });
+
+		expect(result?.candidates).toBe(1);
+		expect(result?.resynced).toBe(1);
+		expect(client.received).toContain(BULK_EDITED);
+	});
+
+	// #4503 acceptance 2: the tracked set is bounded by the held-document count,
+	// so it can stand above the cap. That growth is named once per session in the
+	// real sink rather than only being observable in memory.
+	it("names the cap crossing once when every tracked record is held (#4503)", async () => {
+		const previousTestMode = process.env.PI_LENS_TEST_MODE;
+		// latency.log writes are off under test mode; the row is read back from
+		// the real sink, as the HEAD-move witness does.
+		process.env.PI_LENS_TEST_MODE = "0";
+		try {
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const { DRIFT_TRACK_CAP } =
+				await import("../../../clients/lsp/document-drift.js");
+			const { flushLatencyLog } =
+				await import("../../../clients/latency-logger.js");
+			const { getGlobalPiLensLogDir } =
+				await import("../../../clients/probe-home-state.js");
+			const service = new LSPService();
+			const client = makeClient(new Set<string>());
+			getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+			createLSPClient.mockResolvedValue(client);
+
+			for (let i = 0; i < DRIFT_TRACK_CAP + 2; i++) {
+				const swept = path.join(dir, `capped-${i}.ts`);
+				const content = `export const capped${i} = 0;\n`;
+				await fs.writeFile(swept, content, "utf-8");
+				await service.touchFile(swept, content, {
+					diagnostics: "none",
+					clientScope: "primary",
+					source: "lsp_sync",
+				});
+			}
+			expect(service._driftTrackedCountForTests()).toBe(DRIFT_TRACK_CAP + 2);
+
+			await flushLatencyLog();
+			const log = path.join(getGlobalPiLensLogDir(), "latency.log");
+			const rows = (await fs.readFile(log, "utf-8"))
+				.split("\n")
+				.filter((line) => line.includes('"lsp_document_drift_cap"'))
+				.map(
+					(line) => JSON.parse(line) as { metadata: Record<string, unknown> },
+				);
+
+			// One row for the crossing, not one per insert past the cap.
+			expect(rows.map((row) => row.metadata)).toEqual([
+				{ tracked: DRIFT_TRACK_CAP + 1, cap: DRIFT_TRACK_CAP },
+			]);
+		} finally {
+			if (previousTestMode === undefined) {
+				delete process.env.PI_LENS_TEST_MODE;
+			} else {
+				process.env.PI_LENS_TEST_MODE = previousTestMode;
+			}
+		}
+	});
+
+	it("paces a large recovered Git change through the existing four-file scheduler (#2817 round 2 F1)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const openDocuments = new Set<string>();
+		const client = makeClient(openDocuments);
+		const files: string[] = [];
+		for (let i = 0; i < 5; i++) {
+			const target = path.join(dir, `git-bulk-${i}.ts`);
+			await fs.writeFile(target, `export const v${i} = 0;\n`, "utf-8");
+			files.push(target);
+		}
+		getServersForFileWithConfig.mockReturnValue([makeServer(dir)]);
+		createLSPClient.mockResolvedValue(client);
+		for (const target of files) {
+			await service.touchFile(target, await fs.readFile(target, "utf-8"), {
+				diagnostics: "none",
+				clientScope: "primary",
+				source: "lsp_sync",
+			});
+		}
+
+		for (let i = 0; i < files.length; i++) {
+			await fs.writeFile(files[i]!, `export const v${i} = 1;\n`, "utf-8");
+		}
+		const before = client.received.length;
+		await service.resyncGitChangedFiles(files);
+		const afterFirstPass = client.received.length - before;
+		// #2817 round 2 F1: a 500-file recovery used to Promise.all every target.
+		// The existing drift scheduler's four-file budget must remain the bound.
+		expect(afterFirstPass).toBe(4);
+		const next = await service.sweepDocumentDrift({ force: true });
+		expect(next?.resynced).toBe(1);
+		expect(client.received).toHaveLength(before + 5);
+	});
+});

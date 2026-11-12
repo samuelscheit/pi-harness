@@ -1,0 +1,4001 @@
+/**
+ * #2523 AC1: no NEW unbounded `await` on a pi hook path, and no NEW
+ * hand-rolled timeout race anywhere in the shipped tree.
+ *
+ * ## The defect this guards
+ *
+ * `wrapSessionEventHandler` (`clients/session-event-guard.ts`) absorbs a
+ * stale-ctx throw and adds NO deadline and NO abort. Every bound in the
+ * codebase lived at a LEAF — a spawn timeout, an LSP wait — so a dependency
+ * that wedged BEFORE reaching the leaf was unreachable by all of them.
+ * #2523's probes against the real handlers measured the consequence: a wedged
+ * dependency on `turn_end` never returned (400 000 ms harness ceiling), and
+ * with the ambient abort fired at t=2 s exactly as `index.ts` wires it,
+ * `still-blocked after 30011ms` — Escape does not release the hook.
+ *
+ * `bounded()` (`clients/deadline-utils.ts`) is the fix primitive: it takes
+ * BOTH bounds and its type refuses one without the other. This sweep is what
+ * makes the primitive load-bearing rather than optional.
+ *
+ * ## Two families, one table
+ *
+ * 1. **`hook-await`** — every `await` in `index.ts`, `clients/runtime-*.ts`,
+ *    `mcp/server.ts` and `clients/mcp/session.ts`, the four places a
+ *    registered hook handler and its direct deps live. Wrapped in
+ *    `bounded()`, or written down here.
+ * 2. **`hand-rolled-race`** — every `Promise.race([...])` whose own arms
+ *    include a `setTimeout` or an `AbortSignal.timeout`, anywhere in
+ *    `clients/`, `index.ts`, `mcp/` or `tools/`, outside `deadline-utils.ts`
+ *    itself. `bounded()` must become THE one bound primitive rather than a
+ *    new sibling of the scattered idioms, so a NEW hand-rolled race is
+ *    forbidden from today even though the existing ones are not migrated in
+ *    this slice.
+ *
+ * ## Why the await scan over-includes, deliberately
+ *
+ * Not every `await` in those four groups is hook-reachable: a slash command
+ * in `index.ts` and an MCP tool-request handler in `mcp/server.ts` are not. A
+ * real reachability walk was considered and rejected for slice 1.
+ * `tests/support/session-state-scan.ts` already documents why an unrestricted
+ * call-graph walk answers a different question ("walking EVERY call out of
+ * `handleSessionStart` would drag in most of the codebase"), and a walk that
+ * follows only SOME edges — bare calls but not methods, not callbacks, not
+ * dynamic imports — produces false NEGATIVES, which for a guard is the
+ * direction that fails silently.
+ *
+ * So the scan over-includes WITHIN the files it walks, and the table records
+ * the judgement. Each entry names WHICH hook's budget the await spends, or
+ * says that none applies and why. That is a fact a reviewer can check against
+ * the source; a reachability heuristic's silence is not.
+ *
+ * ## The walked file set, and the widening slice 2 added
+ *
+ * Round 1's header claimed "over-inclusion is the safe direction for a guard"
+ * without saying that the FILE SET was a partial walk of its own (#2530 review
+ * F6): hook work reached through a helper MODULE left the scan's view
+ * entirely. Slice 2's first attempt at closing that listed SIX module names by
+ * hand — which is defect shape 34, a guard that enumerates spellings. The
+ * reviewer planted 18 unbounded awaits in `clients/observed-mutation.ts` and
+ * 148 in `clients/lsp/index.ts` — modules that same PR labelled hook-reached —
+ * and the sweep stayed green (#2557 review F4).
+ *
+ * The set is now DERIVED from the import graph: {@link hookHelperModules}
+ * resolves every relative specifier in the four hook-handler groups and
+ * returns what they reach in ONE hop. That is **202** modules today, holding
+ * **1255** unbounded awaits, against the six hand-picked modules' 100 — and
+ * the hand-picked list included `clients/dispatch/dispatcher.ts`, which is not
+ * even a one-hop import (it is reached through `clients/dispatch/
+ * integration.ts`), so it was both under- and mis-inclusive.
+ *
+ * {@link HELPER_UNBOUNDED} pins every one of those modules that holds at least
+ * one, exactly, through the kit's own `auditSymbolCounts`. Zero-count modules
+ * are not listed and do not need to be: one gaining an await appears in the
+ * measured map and fails as an unaccounted entry. The granularity is
+ * per-MODULE rather than per-occurrence deliberately — 1255 `EXEMPT_SITES`
+ * entries whose `reason` would all read "slice 3 owns bounding this" is the
+ * hand-maintained mirror AGENTS.md's single-source rule exists to prevent —
+ * and the trade is stated in {@link SWEEP_HEURISTIC_LIMITS}: a count cannot
+ * tell "bounded one, added one" from "changed nothing". The table shrinks to
+ * nothing as #2523 threads the hook signal into the deps types, which is the
+ * structural answer a file list only approximates.
+ *
+ * ## A third family: every `bounded()` call, and where its signal comes from
+ *
+ * `bounded()`'s `signal` is a REQUIRED property typed `AbortSignal |
+ * undefined` — the key must be written, so a deadline-only call cannot
+ * compile, but a seam holding an optional signal may pass it straight through
+ * and then run on ONE live bound whenever the caller genuinely had none.
+ * {@link BOUNDED_CALL_SITES} registers every shipped call with the provenance
+ * of its signal, so that set cannot grow without someone writing down why. It
+ * replaces round 1's `NEVER_ABORTED` sentinel, which enumerated the same fact
+ * by making callers name a constant — a SECOND concept for behaviour
+ * `bounded()` already had, on an issue whose premise is that one primitive
+ * replaces the private copies (#2557 review F2).
+ *
+ * ## The table is a BASELINE, deliberately
+ *
+ * Every entry below is today's tree, owned by `#2523 slice 2` — the slice
+ * that actually bounds these awaits and folds the hand-rolled races into
+ * `bounded()` (AC3-AC8). Slice 1 changes no hook's behavior. The value
+ * shipped here is the RATCHET: entry N+1 cannot be added silently. #2523 says
+ * it in as many words — "slice 1's red output is the worklist".
+ *
+ * Keys are content-derived, never line numbers (#2487): a line inserted
+ * elsewhere in `index.ts` must not re-key 29 exemptions, and a textual merge
+ * of two such re-keys can land a WRONG number with no conflict marker. The
+ * key IS `stableOccurrenceKey` — the kit's own function over the RAW lines —
+ * with one neighbourhood suffix; see {@link awaitOccurrenceKey} for what that
+ * suffix buys and what it costs.
+ */
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import {
+	type HookBudgetKey,
+	HOOK_WALL_BUDGET_MS,
+	isHookBudgetKey,
+} from "../../clients/hook-budgets.js";
+import {
+	awaitOccurrenceKey,
+	DEFINITION_FILE,
+	findBoundedCallLines,
+	findHandRolledRaceLines,
+	findUnboundedAwaitLines,
+	hookHelperModules,
+	hookPathFiles,
+	localImportTargets,
+	scanFiles,
+	shippedSourceFiles,
+} from "../support/hook-await-scan.js";
+import {
+	auditRegistry,
+	auditSymbolCounts,
+	assertSortedRegistry,
+	codeMatches,
+	relativePosix,
+	stripSource,
+} from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
+
+const REPO_ROOT = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../..",
+);
+
+/**
+ * Whose budget an unbounded await spends.
+ *
+ * A {@link HookBudgetKey} is the load-bearing case: it asserts the await runs
+ * under that hook, and the assertion is checked — every value here must be a
+ * key of `HOOK_WALL_BUDGET_MS`, so a renamed hook family breaks this table
+ * instead of leaving it quietly wrong.
+ *
+ * The two non-hook cases are stated rather than smuggled in as an invented
+ * budget:
+ * - `"off-hook"` — not reachable from any registered hook handler at all: a
+ *   slash-command body, an MCP tool-REQUEST handler, a CLI entry point. The
+ *   await scan over-includes on purpose (see the header); this is where that
+ *   shows. Every `hand-rolled-race` entry is `off-hook` unless the race sits
+ *   on a hook path.
+ * - `"unbudgeted-hook"` — reachable from a registered hook that #2523's
+ *   contract gives no wall budget (`tool_call`, `resources_discover`,
+ *   `message_end`). Recorded as a gap, not papered over with a number nobody
+ *   agreed to.
+ */
+type AwaitSite = HookBudgetKey | "off-hook" | "unbudgeted-hook";
+
+interface SweepExemption {
+	/** Which scan flagged it. */
+	family: "hook-await" | "hand-rolled-race";
+	/** Which hook's budget it spends. */
+	site: AwaitSite;
+	/** Why it is still unbounded. Checked for length by `auditRegistry`. */
+	reason: string;
+	/** The issue that owns closing it. */
+	owner: string;
+}
+
+/**
+ * Known imprecision, stated rather than hidden — the
+ * `SWEEP_HEURISTIC_LIMITS` convention from
+ * `tests/support/session-state-scan.ts`.
+ */
+export const SWEEP_HEURISTIC_LIMITS = [
+	"Line-granular, not expression-granular. A line carrying two awaits is ONE " +
+		"flagged occurrence, and it counts as bounded only if EVERY await on it " +
+		"is (the strict direction: `await bounded(a) + await raw()` stays red).",
+	"No reachability walk. Every await in the four scanned file groups is a " +
+		"candidate; whether a site is actually on a hook path is recorded in the " +
+		"exemption table's `site` field, which a reviewer checks against the " +
+		"source. Over-inclusion WITHIN those files is the safe direction.",
+	"The helper walk is ONE import hop from the four hook-handler groups, not " +
+		"the transitive closure. index.ts alone reaches most of clients/ " +
+		"transitively, so the closure is 'the codebase' — a whole-repo " +
+		"unbounded-await ratchet, a much larger promise than #2523's and one " +
+		"whose numbers no reviewer could check. One hop is the set a hook " +
+		"handler calls DIRECTLY, which is where the work a hook awaits lives. A " +
+		"module reached only at two hops (clients/dispatch/dispatcher.ts, via " +
+		"clients/dispatch/integration.ts) is therefore NOT counted here.",
+	"The helper family is keyed per-MODULE COUNT, not per occurrence. A count " +
+		"cannot tell 'bounded one, added one' from 'changed nothing' — only the " +
+		"four hook-handler groups get per-line keys. The trade buys a table of " +
+		"~75 numbers instead of ~1255 exemption entries whose reason would all " +
+		"read 'slice 3 owns bounding this', which is the hand-maintained mirror " +
+		"the single-source rule exists to prevent. #2523's deps-type threading " +
+		"removes the need for the coarser half.",
+	"A whole `import type …` / `export type …` DECLARATION is excluded from " +
+		"the helper walk (#2557 review friction) — a type edge is not a call. " +
+		'A MIXED clause (`import { type A, b } from "…"`) is NOT excluded: the ' +
+		"declaration itself does not start with `type`, and `b` is a real value " +
+		"import, so the module genuinely is called into. The detector does not " +
+		"walk INSIDE a multi-line clause for a per-specifier `type` modifier — " +
+		"only the declaration's own leading keyword decides it, which is the " +
+		"same 'over-inclusion within a file is the safe direction' trade the " +
+		"line-granular limit above states: a mixed clause with every named " +
+		'specifier `type`-prefixed (`import { type A, type B } from "…"`, no ' +
+		"plain specifier at all) still counts as reached, because nothing here " +
+		"parses the specifier list.",
+	"The `bounded()` call registry does NOT decide whether a call's `signal` " +
+		"argument can be `undefined`. That is a type question, and a regex for " +
+		"`??`/`||`/`undefined` would call `signal: options.signal` — the " +
+		"bootstrap seam, whose parameter is optional and which is the single " +
+		"most important site — clean, the false-negative direction a guard must " +
+		"never take. EVERY call is registered instead, and its entry states " +
+		"where its signal comes from.",
+	"`bounded()` is recognised SYNTACTICALLY, by call shape. A helper that " +
+		"wraps `bounded()` one level down reads as unbounded here and needs an " +
+		"exemption naming the wrapper — mechanically visible, unlike a walk that " +
+		"would silently call it clean.",
+	"Exactly ONE call shape counts as bounded: `bounded(...)` (#2530 round 3 " +
+		"F1). Round 1 also accepted a `withDeadline`/`withTimeout`/`withBudget`/" +
+		"`withinRemaining` call whenever the word `signal` appeared anywhere in " +
+		"its own parentheses — but none of those helpers takes a `signal` " +
+		"parameter at all, so the match was pure text: `withBudget(sweep(cwd, " +
+		"{ signal }), 500)` read as bounded because `signal` named the WRAPPED " +
+		"work's argument, not anything reaching the race that decides how long " +
+		"this await waits. That is the exact deadline-only hole #2523 exists to " +
+		"close, reopened by substring. Zero sites in the scanned tree relied on " +
+		"it (measured: the flagged set is identical with or without the " +
+		"allowance). A bare `Promise.race`/`Promise.any` is NOT accepted even " +
+		"when `signal` appears in it: a signal-only race is the mirror image " +
+		"of the deadline-only defect this guard exists for, and a new race is " +
+		"forbidden by the hand-rolled-race family anyway.",
+	"A module reached only through ANOTHER helper is still outside both scans, " +
+		"so a hook whose work moves two hops out leaves the guard's view until " +
+		"someone widens the walk. #2523's deps-type threading is the structural " +
+		"answer — it follows the work across module boundaries in a way an " +
+		"import-graph radius cannot — and until it lands the one-hop set is the " +
+		"screen.",
+	"The hand-rolled-race scan matches `Promise.race(` AND `Promise.any(` " +
+		"(#2530 round 3 F3: `Promise.any([work, delay])` is the same " +
+		"first-settlement-wins shape as `race` with a timer arm, and round 1 " +
+		"matched only `race`) and reads the call's own parentheses PLUS the 25 " +
+		"lines above it, because the dominant spelling hoists the timer arm into " +
+		"a named local. A timer built further away, in a helper, or in another " +
+		"module is invisible to it; a `setTimeout` within 25 lines of an " +
+		"unrelated race is a false positive, which is a table entry rather than " +
+		"a silent hole. A bare `new Promise` + `setTimeout` with no race at all " +
+		"is a delay, not a bound, and is not flagged.",
+	"Comments and string literals are blanked first (`stripSource`), so an " +
+		"`await` or a `Promise.race` named in prose or inside a string is not a " +
+		"call.",
+] as const;
+
+/**
+ * {@link occurrenceKeys} output -> the judgement about that exact occurrence.
+ *
+ * When a genuine edit to a flagged line invalidates a key (not a line
+ * inserted elsewhere — that churn is what content keying removes), the
+ * failing test prints the key the scan now computes; paste it in with a
+ * reason, or wrap the call in `bounded()` and delete the entry.
+ *
+ * A merge that shifts many keys at once (a line inserted near several
+ * flagged sites) does not have to be re-keyed by hand: run
+ * `node scripts/rekey-hook-await-exemptions.mjs` — it recomputes every
+ * entry's key from the live scan and rewrites only keys whose
+ * `rel[#symbol]:hash` head (everything before `~context`) still matches
+ * exactly one current occurrence; anything else — a genuinely changed line,
+ * a removed one, or an ambiguous duplicate — is refused and left for a
+ * human (#2530 round 3 F6, tightened round 4 F1: a head match, not a
+ * count-matched zip, is what makes a rewrite safe).
+ */
+const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
+	"clients/mcp/session.ts#getMcpSessionContext:3ab92062~01e3e700": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"MCP host parity (#2523 AC8): `getMcpSessionContext` awaits the " +
+			"analyzer bootstrap that both `runSessionStart` and " +
+			"`runTurnEnd` go through. The MCP adapter calls the same " +
+			"handlers index.ts does and needs the same bounds.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runSessionStartImpl:1304e7b3~e7e844f0": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"MCP host parity (AC8): the standalone MCP server's " +
+			"session_start entry calls `handleSessionStart` with no " +
+			"deadline and no signal, exactly like index.ts:2151.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runSessionStartImpl:fceb216b~fb5d3323": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"MCP host parity (AC8): the standalone MCP server's " +
+			"session_start entry calls `handleSessionStart` with no " +
+			"deadline and no signal, exactly like index.ts:2151.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runTurnEnd:94e0a7e1~4be0ece0": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP host parity (AC8): the queued `runTurnEnd` wrapper awaits " +
+			"`runTurnEndNow`; the queue's wait bound is an admission bound, " +
+			"not a work bound.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runTurnEndForIpcNow:6bfa417c~ce21a427": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP host parity (AC8): the IPC turn-end entry reached from " +
+			"mcp/server.ts's socket handler; the same unbounded " +
+			"`handleTurnEnd` sits beneath it.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runTurnEndForIpcNow:fceb216b~1d78168d": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP host parity (AC8): the IPC turn-end entry reached from " +
+			"mcp/server.ts's socket handler; the same unbounded " +
+			"`handleTurnEnd` sits beneath it.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runTurnEndNowImpl:e40e5ae4~fdec1c2f": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP host parity (AC8): `runTurnEndNow` calls `handleTurnEnd` " +
+			"unbounded. `TURN_END_QUEUE_WAIT_MS` bounds ADMISSION to the " +
+			"queue, not the work it admits — #2523 says so explicitly.",
+		owner: "#2523 slice 2",
+	},
+	"clients/mcp/session.ts#runTurnEndNowImpl:fceb216b~047d1dce": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP host parity (AC8): `runTurnEndNow` calls `handleTurnEnd` " +
+			"unbounded. `TURN_END_QUEUE_WAIT_MS` bounds ADMISSION to the " +
+			"queue, not the work it admits — #2523 says so explicitly.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:0e5eaed5~b2556cb0": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`resyncLspFile` after a deferred write: the LSP touch has its " +
+			"own wait bound, the resync above it does not. #3528 r1 F1 and " +
+			"#3576 run it through the drain's session and LSP-service guard " +
+			"(`syncDrainWrite`, same await).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:1f35703b~52cc4490": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`applyConservativeActionableWarningFixes` — #2523's " +
+			"agent_settled list (runtime-agent-end.ts:871): count-capped at " +
+			"5 fixes, with no time bound at all.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:3595d62d~d453dc5f": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`resyncLspFile` after a deferred write: the LSP touch has its " +
+			"own wait bound, the resync above it does not. #3528 r1 F1 and " +
+			"#3576 run it through the drain's session and LSP-service guard " +
+			"(`syncDrainWrite`, same await).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:458b366b~893f7563": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit `resyncLspFile` of a fresh stamped read, run only " +
+			"while the drain's session (#3528 r1 F1) and LSP service (#3576) " +
+			"are current, inside a `void`-launched task the hook never awaits " +
+			"(it starts after `agent_settled`'s `bounded()` gave up on the " +
+			"phase). The resync races its own touch against the LSP sync " +
+			"budget. #3576 re-keyed it: the same await, through `syncDrainWrite`.",
+		owner: "#3529",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:70abab7e~0e2c385e": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`getAutofixClients()` -> `loadBootstrapClients()` — #2523 " +
+			"names this exact site (runtime-agent-end.ts:347) as " +
+			"agent_settled's unbounded analyzer bootstrap.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:846909f2~82252dcb": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"The format phase (`runFormatPhase` per file, joined by " +
+			"`Promise.all`) — #2523 AC6's aggregate formatter budget lands " +
+			"here. `runFormattersWithConcurrency` is a sequential loop with " +
+			"per-item 30s timers, no aggregate cap and no signal in the " +
+			"race; the 3-wedged-formatter probe measured `still-blocked " +
+			"after 45011ms`.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:aeec4a09~51275360": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`runAutofix` on the deferred drain: per-runner spawn timeouts " +
+			"exist at the leaf, nothing bounds the phase above them. #3506 " +
+			"hands it a hold on pi's per-file mutation queue, which each " +
+			"fixer branch enters after its resolver (same await, same key).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:b8100bef~7c97ebe3": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"#3576 R1: once the drain's session or LSP service was replaced, " +
+			"`syncDrainWrite` resyncs only a document a live client of the " +
+			"current service already holds (`resyncGitChangedFiles`): it never " +
+			"builds a service or spawns, and each resync is one bounded notify " +
+			"write, at most four per drift pass. The pass above it has no " +
+			"aggregate bound, like the live resync it replaces.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:f0b9e5ad~c7623832": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"The format phase (`runFormatPhase` per file, joined by " +
+			"`Promise.all`) — #2523 AC6's aggregate formatter budget lands " +
+			"here. `runFormattersWithConcurrency` is a sequential loop with " +
+			"per-item 30s timers, no aggregate cap and no signal in the " +
+			"race; the 3-wedged-formatter probe measured `still-blocked " +
+			"after 45011ms`.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-coordinator.ts#RuntimeCoordinator:f1693e28~c40c7404": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"The turn-end cascade settle race: bounded at 5000ms with NO " +
+			"abort arm — #2523's `bounded but no abort race` list. 5000ms " +
+			"alone also exceeds turn_end's whole 3000ms budget.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#buildOrRefreshWordIndex:0ae65eec~ea7fbd17": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Word-index build/refresh on session_start (#162): a dynamic " +
+			"import plus an O(project-files) build. `buildWordIndexAsync` " +
+			"yields cooperatively (WORD_INDEX_BUILD_YIELD_BUDGET_MS 8ms) " +
+			"but has no total bound.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#buildOrRefreshWordIndex:2ab50d76~c76a94fd": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Word-index build/refresh on session_start (#162): a dynamic " +
+			"import plus an O(project-files) build. `buildWordIndexAsync` " +
+			"yields cooperatively (WORD_INDEX_BUILD_YIELD_BUDGET_MS 8ms) " +
+			"but has no total bound.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#buildOrRefreshWordIndex:9cf28eab~131af13f": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Word-index build/refresh on session_start (#162): a dynamic " +
+			"import plus an O(project-files) build. `buildWordIndexAsync` " +
+			"yields cooperatively (WORD_INDEX_BUILD_YIELD_BUDGET_MS 8ms) " +
+			"but has no total bound.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#buildOrRefreshWordIndex:9cf28eab~ae5bd070": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Word-index build/refresh on session_start (#162): a dynamic " +
+			"import plus an O(project-files) build. `buildWordIndexAsync` " +
+			"yields cooperatively (WORD_INDEX_BUILD_YIELD_BUDGET_MS 8ms) " +
+			"but has no total bound.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#buildOrRefreshWordIndex:b0d4d07b~184f95fd": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Word-index build/refresh on session_start (#162): a dynamic " +
+			"import plus an O(project-files) build. `buildWordIndexAsync` " +
+			"yields cooperatively (WORD_INDEX_BUILD_YIELD_BUDGET_MS 8ms) " +
+			"but has no total bound.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#collectTodoBaselineItems:1662b38a~5fce0ef1": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"TODO-baseline collection on session_start. `yieldIfOverBudget` " +
+			"yields the event loop so the host stays responsive; it does " +
+			"not bound how long the scan takes.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#collectTodoBaselineItems:8f714b6e~2567c228": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"TODO-baseline collection on session_start. `yieldIfOverBudget` " +
+			"yields the event loop so the host stays responsive; it does " +
+			"not bound how long the scan takes.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#collectTodoBaselineItems:c41e7059~85944564": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"TODO-baseline collection on session_start. `yieldIfOverBudget` " +
+			"yields the event loop so the host stays responsive; it does " +
+			"not bound how long the scan takes.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#demandBootstrapDeps:87590bfa~8bddbc42": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`demandBootstrapDeps` — the analyzer-bootstrap request every " +
+			"session_start scan goes through.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:2a60d0e5~dbbbc4f4": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:2c3fa403~ec8628b8": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Session-start summary: go and rust availability probes, 3000ms " +
+			"each and sequential, re-armed on every full session_start " +
+			"(#2523's `bounded but no abort race` list).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:41aec4d4~502541ac": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:54759b53~eacdc51d": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:55cb0cea~03812217": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:709d55d3~8ab15d67": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:76793e0f~10f7b86c": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:78322ab0~6c959e54": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:957b92e7~45615f2b": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`handleSessionStart`'s own body: startup-scan context, " +
+			"language profile, word index, LSP config load and the two warm " +
+			"ignitions, awaited in sequence with no aggregate bound. This " +
+			"IS the 5000ms budget's contents.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:bbb6aaed~a993503c": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Session-start summary: go and rust availability probes, 3000ms " +
+			"each and sequential, re-armed on every full session_start " +
+			"(#2523's `bounded but no abort race` list).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:cd0c710f~652f281b": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`readSequenceAndHydrateFreshSnapshot` from the full-mode path: its " +
+			"only await, of `readSequenceWithBudget`, runs under `bounded()` " +
+			"inside the helper (registered in BOUNDED_CALL_SITES); a wrapper " +
+			"one level down reads as unbounded to this line scan.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:d7493ff5~a42f4a7e": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`readSequenceAndHydrateFreshSnapshot` from the quick-mode " +
+			"snapshot-root path: its only await, of `readSequenceWithBudget`, " +
+			"runs under `bounded()` inside the helper (registered in " +
+			"BOUNDED_CALL_SITES); a wrapper one level down reads as unbounded " +
+			"to this line scan.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#handleSessionStart:e20461cb~6148cbdf": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Session-start summary: go and rust availability probes, 3000ms " +
+			"each and sequential, re-armed on every full session_start " +
+			"(#2523's `bounded but no abort race` list).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:4140740f~7a6aab16": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:45016495~3dad128f": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:65b03ede~e98aab9b": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:82953f32~eca16c1c": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:8e313ae2~75f282db": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:bd07d2d4~f4ffd883": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteDominantLanguageWarm:fe862775~29288f8c": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteWarmFiles:4140740f~ebb30080": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteWarmFiles:65b03ede~d9e1b333": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#igniteWarmFiles:f243aec9~ea3bd76b": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"LSP warm ignition on session_start (`igniteWarmFiles` / " +
+			"`igniteDominantLanguageWarm`): file collection, dynamic " +
+			"imports and per-file `touchFile` calls, none bounded above " +
+			"their leaves.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#probePrettierInstall:d21c1bff~ff3e8c00": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Managed-tool refresh and the prettier-install probe, scheduled " +
+			"from session_start with no wall bound above the spawn.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#readSequenceWithBudget:31d18ec3~501c4d30": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`readSequenceWithBudget`'s `withBudget` wait: a real budget with " +
+			"NO abort arm. The caller's own `bounded()` at the same budget is " +
+			"the abort backstop (see handleSessionStart); the hand-rolled " +
+			"race itself is folded onto `withBudget`.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#scheduleDeferredToolProbes:ca89b6b8~8ef90162": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Deferred tool probes scheduled from session_start. The go/rust " +
+			"availability probes are 3000ms each, sequential, and re-armed " +
+			"on every full session_start — #2523's `bounded but no abort " +
+			"race` list.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#scheduleDeferredToolProbesWithClients:4666a6c4~0bb843d4":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"Deferred tool probes scheduled from session_start. The go/rust " +
+				"availability probes are 3000ms each, sequential, and re-armed " +
+				"on every full session_start — #2523's `bounded but no abort " +
+				"race` list.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleDeferredToolProbesWithClients:645f350d~bd859216":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"Deferred tool probes scheduled from session_start. The go/rust " +
+				"availability probes are 3000ms each, sequential, and re-armed " +
+				"on every full session_start — #2523's `bounded but no abort " +
+				"race` list.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleManagedToolRefresh:2c87cafc~00391a5a": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Managed-tool refresh and the prettier-install probe, scheduled " +
+			"from session_start with no wall bound above the spawn.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#scheduleManagedToolRefresh:8dbae112~49fd40bd": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Managed-tool refresh and the prettier-install probe, scheduled " +
+			"from session_start with no wall bound above the spawn.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#scheduleStartupScans:3ca5dbcc~76bb3e52": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`scheduleStartupScans` / `scheduleStartupScansWithClients`: " +
+			"the session_start scan fan-out and its bootstrap-dependency " +
+			"resolution.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:0558e1b7~bc03be78":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:07db9a50~8a50c30d":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:156451e5~c3519908":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:19f6a911~bc03be78":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:2c64a178~b262f927":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:3373bfda~b262f927":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:498f59ca~b262f927":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:4bdb1922~447b8e6b":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:5b570c81~8a50c30d":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:6059719b~a69fa0e5":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:79639cbb~7cf260f9":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:81d86b10~69884346":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:a7ab4c28~6ee68efd":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"`scheduleStartupScans` / `scheduleStartupScansWithClients`: " +
+				"the session_start scan fan-out and its bootstrap-dependency " +
+				"resolution.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:b29e379c~bc03be78":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:d6f3308b~7e7b1d10":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:d7c597d6~b67d7877":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:dce32182~306f23d3":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:e28354af~0280fe82":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:e8384622~b262f927":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:eb2411d7~0401ab41":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:f0b9e5ad~b7a44067":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:f1d60b5f~a664d1bb":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:f3e39dfa~b262f927":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:f67cf7ff~95882549":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-session.ts#scheduleStartupScansWithClients:f72b8c48~6555f454":
+		{
+			family: "hook-await",
+			site: "session_start",
+			reason:
+				"One heavyweight startup analyzer per await (knip, jscpd, " +
+				"govulncheck, gitleaks, opengrep, madge, trivy, ast-grep, " +
+				"review graph, call graph, codebase model, word index). Each " +
+				"has a spawn-level timeout at the leaf and none has a wall " +
+				"bound above it; together they are session_start's 5000ms " +
+				"budget many times over.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-tool-call.ts#captureOpaqueBaseline:1b678fc6~6558e937": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no wall budget " +
+			"for tool_call, so this await has no number to be measured against. It is " +
+			"the pre-command opaque baseline: the command has not run yet, so the read " +
+			"cannot be taken later, and each leaf bounds itself (`isGitWorktree` 3s, " +
+			"`captureGitDirtyPaths` 5s, the stat walk's own budget).",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-call.ts#captureOpaqueBaseline:39656d5c~6f0651b7": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no wall budget " +
+			"for tool_call, so this await has no number to be measured against. It is " +
+			"the pre-command opaque baseline: the command has not run yet, so the read " +
+			"cannot be taken later, and each leaf bounds itself (`isGitWorktree` 3s, " +
+			"`captureGitDirtyPaths` 5s). The stat walk is bounded by its file cap and " +
+			"entry budget, not by `budgetMs` (that only paces its yields, #4905); a " +
+			"home root is refused, and an over-cap root answers from a memo after " +
+			"its first walk. A root over the entry budget is not memoized and " +
+			"still walks on every call.",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-call.ts#captureOpaqueBaseline:98e63c47~d6d00a8b": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no wall budget " +
+			"for tool_call, so this await has no number to be measured against. It is " +
+			"the pre-command opaque baseline: the command has not run yet, so the read " +
+			"cannot be taken later, and each leaf bounds itself (`isGitWorktree` 3s, " +
+			"`captureGitDirtyPaths` 5s, the stat walk's own budget).",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-call.ts#handleToolCall:a2e5cf7a~ab927364": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:0c4f0c61~51275360": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:1f887b0e~81c1d77f": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:3f848c4d~b3c7028c": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"`requestBootstrapClients` passing `getAmbientAbortSignal()` — " +
+			"#2523 AC4's dead-signal site: `setAmbientAbortSignal` is only " +
+			"ever called from tool_result, so the signal read here is " +
+			"ALWAYS undefined. Fixing it is AC4's job, not slice 1's.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:58e74e03~28736675": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:6845dabe~79a8d019": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no wall budget " +
+			"for tool_call, so this await has no number to be measured against. It is " +
+			"the pre-command opaque baseline: the command has not run yet, so the read " +
+			"cannot be taken later, and each leaf bounds itself (`isGitWorktree` 3s, " +
+			"`captureGitDirtyPaths` 5s, the stat walk's own budget).",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:750505ab~c899dd87": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:909658e3~f13da445": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-call.ts#handleToolCallImpl:d7b23cdc~630803e2": {
+		family: "hook-await",
+		site: "unbudgeted-hook",
+		reason:
+			"On the `tool_call` path. #2523's contract table declares no " +
+			"wall budget for tool_call, so this await has no number to be " +
+			"measured against yet; recorded as the gap rather than assigned " +
+			"an invented one.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-result.ts#dispatchPipelineAnalysis:52da0ba3~78ccd40a": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"`dispatchPipelineAnalysis` awaits the pipeline promise. Runner " +
+			"timeouts are per-runner leaves (RUNNER_TIMEOUT_MS 30000), " +
+			"which is 3x the edit budget on its own.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-result.ts#flushDebouncedToolResults:f0b9e5ad~07c5adfc":
+		{
+			family: "hook-await",
+			site: "tool_result_edit",
+			reason:
+				"`flushDebouncedToolResults` joins every debounced pipeline " +
+				"with `Promise.all` and no aggregate bound. It is awaited from " +
+				"agent_end (index.ts:2670) and turn_end (index.ts:2872) as " +
+				"well, so its cost lands in three budgets.",
+			owner: "#2523 slice 2",
+		},
+	"clients/runtime-tool-result.ts#handleToolResult:023b0a2a~aacaac3b": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside `handleToolResult`, the same-HEAD discard comparison " +
+			"(#4502): one `git status --porcelain` with its own 5s timeout, " +
+			"compared against the baseline `tool_call` recorded. The publish it " +
+			"feeds is awaited under `bounded(resyncHeadMove(...))` with the " +
+			"edit budget and `deps.signal` one statement below; this read is the " +
+			"population that publish carries, so it cannot move inside the " +
+			"bound without reading the tree after the look's own bound began.",
+		owner: "#4502",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:3558e68d~2dc0b6be": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside the edit `tool_result` body — the one path #2523 lets block the " +
+			"host, under the 10000ms edit budget. It is the recovery this result's " +
+			"dispatch consumes, and each leaf bounds itself (`git status` 5s, the stat " +
+			"walk's own budget), so the aggregate is the dispatch's work, not a wait.",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:39fdd082~e70743cd": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Classified-mutation join and the second dispatch on the edit " +
+			"path; same leaf-bounded, aggregate-unbounded shape as the " +
+			"observed path above.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:3c46b254~67153899": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside the edit `tool_result` body — the one path #2523 lets block the " +
+			"host, under the 10000ms edit budget. It is the recovery this result's " +
+			"dispatch consumes, and each leaf bounds itself (`git status` 5s, the stat " +
+			"walk's own budget), so the aggregate is the dispatch's work, not a wait.",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:734a21b6~69a83146": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Observed-mutation settle and dispatch on the edit path. " +
+			"`OBSERVED_TURN_BUDGET_MS` (600ms) bounds the CAPTURE, not this " +
+			"join.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:a1bef279~57385903": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"The edit tool_result body — the ONE path #2523's contract " +
+			"allows to block the host, and only for 10000ms. Measured write " +
+			"p90 2614ms / edit p90 3199ms today, so the budget is a ceiling " +
+			"rather than a change.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:a8a6946a~c0d9adaf": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside `handleToolResult`, the chunked bash-write publish (#4535 " +
+			"slice 2, round 3). The `Promise.all` of per-root publishes IS the " +
+			"`primaryPhase` the hook awaits under bounded() with the edit budget " +
+			"and `deps.signal`, so this await is bounded one frame up; the " +
+			"line-granular scan cannot see a caller's bound.",
+		owner: "#4535",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:bf707aea~937f45e8": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside the edit `tool_result` body — the one path #2523 lets block the " +
+			"host, under the 10000ms edit budget. It is the recovery this result's " +
+			"dispatch consumes, and each leaf bounds itself (`git status` 5s, the stat " +
+			"walk's own budget), so the aggregate is the dispatch's work, not a wait.",
+		owner: "#2050",
+	},
+	"clients/runtime-tool-result.ts#handleToolResult:e3ea8f2d~5f4c11fd": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"#5120: the partial-apply entry re-enters `handleToolResult` once " +
+			"with the pending record taken, so the awaited body is this same " +
+			"edit `tool_result` body under the same 10000ms edit budget; the " +
+			"re-entry carries `_partialApply`, so it cannot recurse again.",
+		owner: "#5120",
+	},
+	"clients/runtime-tool-result.ts#lookAtHead:6c9224dd~45cd3f56": {
+		family: "hook-await",
+		site: "tool_result_read_only",
+		reason:
+			"Inside `lookAtHead`, the chunked publish of a HEAD move's delta " +
+			"and its same-HEAD discard (#4535 slice 2, round 3). Both callers " +
+			"await the whole look under bounded() with the read-only " +
+			"tool_result budget and the hook's signal, so this await is " +
+			"bounded one frame up; the line-granular scan cannot see a " +
+			"caller's bound.",
+		owner: "#4535",
+	},
+	"clients/runtime-tool-result.ts#lookAtHead:a910e0e6~bf56e184": {
+		family: "hook-await",
+		site: "tool_result_read_only",
+		reason:
+			"Inside `lookAtHead`, the delta listing of a move (#4493, #4502 " +
+			"round 3 reads it only when HEAD moved). Both callers await the " +
+			"whole look under bounded() with its own hook budget " +
+			"and the hook's signal (the bash tool_result and the tool_call " +
+			"look), so this await is bounded one frame up; the line-granular " +
+			"scan cannot see a caller's bound.",
+		owner: "#4493",
+	},
+	"clients/runtime-tool-result.ts#lookAtHead:ba45e194~865d8f07": {
+		family: "hook-await",
+		site: "tool_result_read_only",
+		reason:
+			"Inside `lookAtHead`, the body of `resyncHeadMove` (#4493). Both " +
+			"callers await it under bounded() with its own hook " +
+			"budget and the hook's signal (the bash tool_result and the " +
+			"tool_call look), so this await is bounded one frame up; the " +
+			"line-granular scan cannot see a caller's bound.",
+		owner: "#4493",
+	},
+	"clients/runtime-tool-result.ts#lookAtHead:cf85f0b1~dfd2c795": {
+		family: "hook-await",
+		site: "tool_result_read_only",
+		reason:
+			"Inside `lookAtHead`, the body of `resyncHeadMove` (#4493). Both " +
+			"callers await it under bounded() with its own hook " +
+			"budget and the hook's signal (the bash tool_result and the " +
+			"tool_call look), so this await is bounded one frame up; the " +
+			"line-granular scan cannot see a caller's bound.",
+		owner: "#4493",
+	},
+	"clients/runtime-tool-result.ts#publishDriftPass:02371281~d0ca4f7e": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside `publishDriftPass` (#4535 slice 2, review round 2 F2, " +
+			"round 3 p3-3; #4612 r4 moved its chunk loop onto " +
+			"`publishDiskChangeChunked`; slice 3 runs the settled sweep's drift " +
+			"through the same chain with `void` at `agent_settled`): the bash tool_result hands the recovered set to this " +
+			"chain with `void`, after its own bounded primary phase, exactly as " +
+			"the base branch `void`ed the detached `resyncGitChangedFiles` " +
+			"pass. Nothing awaits the chain, so it holds no hook and must not be " +
+			"cut by a hook budget or signal (the auxiliaries heal after the hook " +
+			"returns); the hook's own awaits are the `bounded()` primary phase it " +
+			"does await.",
+		owner: "#4535",
+	},
+	"clients/runtime-tool-result.ts#publishDriftPass:832d990f~51c52f98": {
+		family: "hook-await",
+		site: "tool_result_edit",
+		reason:
+			"Inside `publishDriftPass` (#4535 slice 2, review round 2 F2, " +
+			"round 3 p3-3): the same detached chain, awaiting one chunk's drift " +
+			"pass before publishing the next chunk, so the chunks resync in " +
+			"order instead of racing each other, and a rejection records the " +
+			"chunk it drops and lets the next chunk run (#4612 r4). Detached " +
+			"for the same reason as the publish above.",
+		owner: "#4535",
+	},
+	"clients/runtime-tool-result.ts#resyncHeadMove:301d8f0a~1bf32683": {
+		family: "hook-await",
+		site: "tool_result_read_only",
+		reason:
+			"The body of `resyncHeadMove` (#4476, #4493): both callers (the " +
+			"bash tool_result and the tool_call look) await it under bounded() " +
+			"with its own hook budget and the hook's signal, so " +
+			"this await is bounded one frame up; the line-granular scan cannot " +
+			"see a caller's bound.",
+		owner: "#4476",
+	},
+	"clients/runtime-tool-result.ts#resyncHeadMove:53bad99d~539bb4dc": {
+		family: "hook-await",
+		site: "tool_result_read_only",
+		reason:
+			"The body of `resyncHeadMove` (#4476, #4493, #4535): both callers " +
+			"(the bash tool_result and the tool_call look) await it under bounded() " +
+			"with its own hook budget and the hook's signal, so " +
+			"this await is bounded one frame up; the line-granular scan cannot " +
+			"see a caller's bound.",
+		owner: "#4476",
+	},
+	"clients/runtime-turn.ts#handleTurnEnd:156451e5~bf99fb9e": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"Dynamic import of the call-graph analyzer on the turn_end " +
+			"path. Module load is unbounded, and #1974's 31.7s warmup was a " +
+			"module-compilation cost of exactly this shape.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-turn.ts#handleTurnEnd:3bc6dd13~bff396df": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`buildActionableWarningsReport` on turn_end. #2509 moved its " +
+			"DELIVERY off-hook (`publishActionableWarningsReport`); the " +
+			"build itself still runs inside the hook.",
+		owner: "#2523 slice 2",
+	},
+	// #1892 + #3274: the composer awaits the govulncheck lane's `collect`.
+	//
+	// The SYNC-READ ADMISSION this entry carried (added by #3273's review,
+	// H3273-1, after the first version claimed "no I/O" and was false) is GONE
+	// because the property it admitted is gone: `collect` no longer runs
+	// `CacheManager.readCache("govulncheck")` during argument evaluation. It
+	// awaits `ctx.readScannerCache`, which is the composer's memo over
+	// `readCacheAsync` under `bounded()` — registered as
+	// `call:clients/runtime-turn.ts#2b57f8b9~67c7ff0d` with the turn_end budget
+	// and `deps.signal`. The bound is one level down, which this syntactic scan
+	// cannot see, so the await still needs an entry; what it says is now a
+	// pointer to a real bound instead of an admission that none was possible.
+	//
+	// The `sync-hook-read` population below is what keeps that honest: a
+	// regression to the synchronous read raises `clients/runtime-turn.ts` from
+	// 11 to 12 and reds, so the removal of this admission cannot outlive the
+	// change that earned it.
+	"clients/runtime-turn.ts#handleTurnEnd:400606a9~53729fa2": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"The govulncheck lane's `collect` awaits the composer's memoized " +
+			"scanner-store read, which IS bounded — `bounded()` inside " +
+			"`readScannerCache` with `HOOK_WALL_BUDGET_MS.turn_end` and " +
+			"`deps.signal`, registered in BOUNDED_CALL_SITES. Wrapping this await " +
+			"in a second `bounded()` would spend the turn_end budget twice for one " +
+			"read, the same double-count the secrets lane's entry below avoids.",
+		owner: "#3274",
+	},
+	"clients/runtime-turn.ts#handleTurnEnd:756411f6~249e7096": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`readCachedDiagnosticsForServers` — #2523's turn_end list " +
+			"(runtime-turn.ts:2882).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-turn.ts#handleTurnEnd:9167ea7d~7f6889da": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"Dynamic import of the call-graph analyzer on the turn_end " +
+			"path. Module load is unbounded, and #1974's 31.7s warmup was a " +
+			"module-compilation cost of exactly this shape.",
+		owner: "#2523 slice 2",
+	},
+	// #1892: the composer awaits the secrets lane's `collect`, which replaced an
+	// inline `await bounded(classifyAndFilterFindings, …)` at this very position.
+	// The bound did not move out of the turn: it moved INTO the lane, where it
+	// is registered as
+	// `call:clients/turn-end/lanes/secrets.ts#blockingGitleaksFindings:…` with
+	// the same `HOOK_WALL_BUDGET_MS.turn_end` and the same signal, threaded
+	// through `TurnEndLaneContext.signal`. Wrapping the composer's await in a
+	// second `bounded()` would double-count the same budget. (#1892 govulncheck
+	// round: the occurrence key's trailing hash moved `360b2af5` → `e4101d9d`
+	// because the govulncheck lane's `collect` now precedes this await; the
+	// site, the bound and the reason are unchanged.)
+	"clients/runtime-turn.ts#handleTurnEnd:bfc0f48e~e4101d9d": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"The secrets lane's store read plus its gitleaks classification, " +
+			"bounded inside the lane by the registered bounded() call that this " +
+			"await's own predecessor was; no second wrap, or the turn_end budget " +
+			"is spent twice for one pass.",
+		owner: "#1892",
+	},
+	// #3274: the composer's OWN trivy read, for the CVE/license tiers and the
+	// age label. It awaits the same memo the secrets lane does — one read, one
+	// TTL boundary, one budget for the store both tiers report on.
+	"clients/runtime-turn.ts#handleTurnEnd:ddb4eaee~e99d3bf9": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`readScannerCache('trivy')` — the composer awaiting its own memo. " +
+			"Bounded inside that memo by the registered `bounded()` call " +
+			"(`call:clients/runtime-turn.ts#2b57f8b9~67c7ff0d`), which holds the " +
+			"turn_end budget and `deps.signal`; a second wrap here would " +
+			"double-count one budget, and on the second consumer of a store it " +
+			"would bound a promise that has already settled.",
+		owner: "#3274",
+	},
+	"clients/runtime-turn.ts#handleTurnEnd:ebaaaabd~de3a52db": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"madge dependency-check on turn_end behind a flag: " +
+			"`ensureAvailable` and the batch check are both unbounded above " +
+			"their spawns.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-turn.ts#handleTurnEnd:fde4167d~c3e1d7c1": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`sweepInlineBlockerFreshness` — #2523's turn_end list " +
+			"(runtime-turn.ts:789): unconditional, no `signal` parameter, " +
+			"uncapped population.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-turn.ts#runTestTargetsBounded:7307dda7~99843961": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`runTestTargetsBounded`'s per-target loop. Its batch budget " +
+			"(TEST_RUNNER_BATCH_BUDGET_MS, 90000ms) is 30x turn_end's " +
+			"total; test-runner delivery already has an off-hook channel " +
+			"(#2366) and #2522 owns selection.",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-turn.ts#runTestTargetsBounded:a0d413d5~f6c4b650": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`await stamp` settles with the run it stamps; the batch's own " +
+			"wall budget and batchAbort bound it; wrapping it in bounded() " +
+			"would add a second timer per target.",
+		owner: "#2523 slice 3",
+	},
+	"index.ts#activateExtension:1946ceb9~8beff560": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`ensureLSPConfigInitialized` — #2523's session_start list " +
+			"(index.ts:2131).",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:1c47f42a~879e01ba": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:2b868994~aa492d94": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`runDeferredMutationDrain`, called from `onAgentSettled` " +
+			"(index.ts:3138). Its `getAutofixClients` closure is the " +
+			"`loadBootstrapClients()` #2523 names under agent_settled; " +
+			"runtime-agent-end.ts:347 is the consumer.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:2c2d49c9~70299538": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`onAgentSettled` awaits its three phases in sequence with no " +
+			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
+			"per-phase allowance. #3521 re-keyed it: the drain now takes " +
+			"the settle's branch epoch. #3620 re-keyed it: the sweep call " +
+			"above it wraps. #3676 re-keyed it: the drain no longer takes " +
+			"the settle's epoch (its quick fix credits its report's).",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:2ccc914e~d8df7429": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`configureWarmAttach` — one of the four unbounded " +
+			"session_start awaits #2523 names (index.ts:2060).",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:2dc4f4e6~f95b2c48": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:38efb539~455b59f1": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"Reached from `onAgentSettled` (index.ts:3137/3143): the " +
+			"observed-mutation settled sweep and its ledger refresh. " +
+			"agent_settled is the designated place for settled-time work " +
+			"and carries the widest non-edit budget (10000ms), but nothing " +
+			"enforces it today.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:3e43f4ed~4e890232": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`adoptHandoff` (#3612): the session stores' hand-off, which " +
+			"reads this session's or its parent's sidecar and reconciles the " +
+			"widget with disk (`dropStaleFiles`, up to 1024 concurrent " +
+			"`fs.stat`). The same sidecar I/O as #2523's session_start list " +
+			"(`loadSessionState`, `dropStaleFiles`), moved here from the " +
+			"read-guard and widget restore blocks, unbounded for the same reason.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:41d6e96f~455b59f1": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"Reached from `onAgentSettled` (index.ts:3137/3143): the " +
+			"observed-mutation settled sweep and its ledger refresh. " +
+			"agent_settled is the designated place for settled-time work " +
+			"and carries the widest non-edit budget (10000ms), but nothing " +
+			"enforces it today.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:4846f0dd~0f433171": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`loadBootstrapClients()` on turn_end — the same analyzer " +
+			"bootstrap the read-only tool_result path awaits, with the same " +
+			"absence of a timeout and a signal.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:51210408~9af17d2e": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:5e46a749~e2db26e6": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`onAgentSettled` awaits its three phases in sequence with no " +
+			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
+			"per-phase allowance. #3521 re-keyed it: the sweep now takes " +
+			"the settle's branch epoch. #3620 re-keyed it: the sweep also " +
+			"takes the settle's lineage handle.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:6222076d~12152939": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`readSessionHeaderId` (#3521, moved by #3612): the parent session " +
+			"file's header line, read only when the hand-off falls back to the " +
+			"parent's sidecar; the same file I/O as the `adoptHandoff` entry.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:65b51dab~a327124f": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:69dd02da~0e26f7e0": {
+		family: "hook-await",
+		site: "agent_end",
+		reason:
+			"`flushDebouncedToolResults` — #2523's agent_end entry " +
+			"(index.ts:2670): it re-enters the full pipeline unbounded, and " +
+			"agent_end's measured p90 is 10043ms against a 1000ms budget.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:69dd02da~fa7a23dd": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`flushDebouncedToolResults` on the turn_end path: the same " +
+			"unbounded pipeline re-entry as the agent_end copy, under the " +
+			"3000ms turn_end budget.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:6cb74f81~1f6fe236": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`onAgentSettled` awaits its three phases in sequence with no " +
+			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
+			"per-phase allowance. #3576 re-keyed the refresh: the same await, " +
+			"through the settle's session guard.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:7cf4ec4b~c1d0dbef": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"/lens-health lazily loads lens-engine and reads the existing effective-config view inside one signal-less deadline; the command is not a lifecycle hook and has no host hook signal to thread",
+		owner: "#1416",
+	},
+	"index.ts#activateExtension:889073a2~ebe0e096": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"Installer `ensureTool` for a managed tool during " +
+			"session_start. The spawn has a leaf timeout; the dynamic " +
+			"module load and resolution above it have none.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:a5c3de37~231f1f06": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:c70fadbc~d53e4145": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`runDeferredMutationDrain`, called from `onAgentSettled` " +
+			"(index.ts:3138). Its `getAutofixClients` closure is the " +
+			"`loadBootstrapClients()` #2523 names under agent_settled; " +
+			"runtime-agent-end.ts:347 is the consumer.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:d628f09d~02fe26af": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:e40e5ae4~44b2f503": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`handleTurnEnd` itself: the entire turn_end body under one " +
+			"await, measured p50 3687ms / p90 14246ms against a 3000ms " +
+			"budget. Slice 2 bounds it at the registered handler.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#activateExtension:ea09dcdf~609209be": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"Slash-command body (`/lens-*`): the user typed the command and " +
+			"is waiting for its answer, so no hook budget applies. Flagged " +
+			"only because the await scan covers whole files rather than " +
+			"walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	// #2518 re-keyed this occurrence: the neighbourhood suffix hashes the
+	// lines around the await, and the memo check above it became a
+	// `shouldInitializeSessionRoot` call. Same await, same reason, new key.
+	"index.ts#ensureLSPConfigInitialized:a10dd3b9~ad96a95f": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`initLSPConfig` inside `ensureLSPConfigInitialized`, reached " +
+			"from session_start (index.ts:2131) and from tool_call. #2523 " +
+			"names it in the session_start list of unbounded awaits.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:09e7e2f1~960fbcc1": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`pilens_turn_end` tool request: the MCP mirror of the turn_end " +
+			"hook (AC8), unbounded exactly like its index.ts twin.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:355aebb4~f9eb7744": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:4b0b855d~76e20372": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:5c4ca6a0~4f3f69c0": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:6d8e2d74~7661145d": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:73e6f55a~29980017": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-request handler (LSP navigation/diagnostics) and the " +
+			"request dispatcher itself. An agent is waiting on its own " +
+			"request; no pi hook budget applies.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:73e6f55a~f86001c7": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-request handler (LSP navigation/diagnostics) and the " +
+			"request dispatcher itself. An agent is waiting on its own " +
+			"request; no pi hook budget applies.",
+		owner: "#2523 slice 2",
+	},
+	// #5104 and #5135 moved the surrounding handler text, so the occurrence key
+	// moved with it; the awaited `symbolSearch` call is the same off-hook request.
+	"mcp/server.ts#callTool:8392a6e9~5041cd90": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:8b574bae~7f0e398e": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`pilens_session_start` tool request: the MCP mirror of the " +
+			"session_start hook (AC8), unbounded exactly like its index.ts " +
+			"twin.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:97fa6c9a~d4940394": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:b7d6cff5~6e3e2098": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:b81286d9~e49fada2": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:c56f3208~1b9a2dec": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d0096ea8~399bce43": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d0096ea8~3ba64d0e": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-request handler (LSP navigation/diagnostics) and the " +
+			"request dispatcher itself. An agent is waiting on its own " +
+			"request; no pi hook budget applies.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d0096ea8~47b872f7": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d0096ea8~6d4f5f60": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"`pilens_turn_end` tool request: the MCP mirror of the turn_end " +
+			"hook (AC8), unbounded exactly like its index.ts twin.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d0096ea8~ba799d41": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d0096ea8~cf386b8b": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`pilens_session_start` tool request: the MCP mirror of the " +
+			"session_start hook (AC8), unbounded exactly like its index.ts " +
+			"twin.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d42985f0~048b6116": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d5bcaa8e~be1a6327": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d6342815~dae8ad93": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:d7e00d53~dea419fd": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_* tool for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#callTool:e0f71170~52c6c9d7": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-REQUEST handler (`callTool`): an agent asked a " +
+			"pilens_symbol_search for an answer and is waiting for it. No pi hook " +
+			"is involved, so no hook budget applies; the await scan covers " +
+			"whole files rather than walking reachability. #5371 added it when " +
+			"the shared `paths` reader became async to expand a glob entry " +
+			"(clients/path-globs.ts) — the same await every pi-tool `paths` " +
+			"reader now has, registered once here for the MCP mirror. Re-keyed " +
+			"at #5393 r2: the same await, its call text gained `filterOnly`.",
+		owner: "#5371",
+	},
+	"mcp/server.ts#ensureReady:9d37dcc9~2d2d543a": {
+		family: "hook-await",
+		site: "session_start",
+		reason:
+			"`ensureLspConfig` inside `ensureReady`, the MCP server's lazy " +
+			"init. Reached from the session_start and turn_end IPC entries " +
+			"as well as from every tool request (AC8).",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#handleRequest:3543a7ce~154cbab1": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"MCP tool-request handler (LSP navigation/diagnostics) and the " +
+			"request dispatcher itself. An agent is waiting on its own " +
+			"request; no pi hook budget applies. " +
+			"(Key re-derived on #2800 item 7: the callTool await's occurrence " +
+			"hash moved when the stale-warning block was hoisted above it.)",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#startIpcServer:3c5e37d1~30036a6f": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP IPC socket handler: `ensureReady` plus `runTurnEndForIpc` " +
+			"per inbound turn-end request. This is the MCP mirror of pi's " +
+			"turn_end hook (AC8) and carries the same 3000ms contract.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#startIpcServer:69da6a7d~346d0967": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP IPC socket handler: `ensureReady` plus `runTurnEndForIpc` " +
+			"per inbound turn-end request. This is the MCP mirror of pi's " +
+			"turn_end hook (AC8) and carries the same 3000ms contract.",
+		owner: "#2523 slice 2",
+	},
+	"mcp/server.ts#startIpcServer:8fc63658~fa9af389": {
+		family: "hook-await",
+		site: "turn_end",
+		reason:
+			"MCP IPC socket handler: `ensureReady` plus `runTurnEndForIpc` " +
+			"per inbound turn-end request. This is the MCP mirror of pi's " +
+			"turn_end hook (AC8) and carries the same 3000ms contract.",
+		owner: "#2523 slice 2",
+	},
+	"race:clients/dispatch/integration.ts#computeCascadeForFile:7c47013c~8d42d097":
+		{
+			family: "hand-rolled-race",
+			site: "off-hook",
+			reason:
+				"Cascade-computation race in the dispatch integration layer; a " +
+				"hand-rolled timer arm, no abort arm. Slice 2's fold worklist.",
+			owner: "#2523 slice 2",
+		},
+	"race:clients/lsp/index.ts#LSPService:41c0b191~56c015fc": {
+		family: "hand-rolled-race",
+		site: "off-hook",
+		reason:
+			"LSP wait race with a hand-rolled timer arm (the `maxWaitMs` " +
+			"family #2523's inventory names). Slice 2's fold worklist.",
+		owner: "#2523 slice 2",
+	},
+	"race:clients/lsp/index.ts#LSPService:d7953776~763e332c": {
+		family: "hand-rolled-race",
+		site: "off-hook",
+		reason:
+			"The 3-way client-wait race (`withBudget()` acquisition, the " +
+			"known-slow sentinel, a timer sentinel). It spells `Promise.race<` " +
+			"with type arguments, which this scan did not read until the " +
+			"detector learned the generic call head; the fold needs a boxed " +
+			"`withDeadline` over the inner race and a cell through the real " +
+			"client-wait path.",
+		owner: "#2523 slice 2",
+	},
+	"race:clients/runtime-coordinator.ts#RuntimeCoordinator:f1693e28~c40c7404": {
+		family: "hand-rolled-race",
+		site: "turn_end",
+		reason:
+			"The turn-end cascade settle race (5000ms, no abort arm) as a " +
+			"hand-rolled race. Its await is separately exempted in the " +
+			"hook-await family; both entries close together in slice 2.",
+		owner: "#2523 slice 2",
+	},
+};
+
+/**
+ * The one reason every {@link HELPER_UNBOUNDED} entry carries, written once.
+ *
+ * It is genuinely ONE fact for all 75 modules — none of them can be bounded
+ * from here, because bounding a helper's await needs the hook's signal to have
+ * been threaded into the deps type that reaches it, which is #2523 AC4 and has
+ * not landed. Repeating that sentence 75 times with a module name substituted
+ * in would be the hand-maintained mirror the single-source rule exists to
+ * prevent, not 75 reasons.
+ */
+const HELPER_EXEMPTION_REASON =
+	"Unbounded awaits in a module a registered hook handler imports directly. " +
+	"None can be bounded without the hook's own signal reaching them, which is " +
+	"#2523 AC4's deps-type threading (TurnEndDeps / AgentEndDeps / " +
+	"SessionStartDeps gain a required `signal`, both hosts pass ctx.signal) and " +
+	"is not in this PR. This pin is the measured slice-3 worklist: the number " +
+	"may only change with a stated reason, so an await added here fails loudly " +
+	"and one bounded here is recorded rather than absorbed.";
+
+/**
+ * Every one-hop helper module holding at least one unbounded await, and how
+ * many (#2557 review F4).
+ *
+ * The SET is derived by {@link hookHelperModules} from the import graph, never
+ * spelled — see this file's header for what the hand-written six-name list
+ * missed. Modules measuring ZERO are deliberately absent: one that gains an
+ * await appears in the measured map and fails as an unaccounted entry, so
+ * listing 127 zeroes would add churn without adding a guard.
+ *
+ * Pinned through `auditSymbolCounts`, the kit's own file-count mechanism
+ * (#1817), rather than a bespoke comparison — same machinery the session-state
+ * sweep pins ~72 files with.
+ *
+ * Round-3 deltas (2026-09-03), all measured, none hand-picked:
+ *
+ * - `clients/actionable-warnings.ts` 12 → 14. Review F-A's fix adds an outer
+ *   `await withDeadline(inner, …)` deadline-only cap around the existing
+ *   `await bounded(…)` call in `boundedLspCall`, so the loop's own shrinking
+ *   residual budget stops reaching the ledger as a false
+ *   `hook-await-exceeded`. `isBoundedAwait` only recognizes the literal
+ *   `bounded(` call head (by design — see its own doc comment on why
+ *   `withDeadline` was deliberately dropped from that list in round 1), so
+ *   the new deadline-only await is honestly unbounded by this heuristic even
+ *   though it composes correctly with the still-present `bounded()` call.
+ * - `clients/formatters.ts` 118 → 115, from `origin/master`'s #2514
+ *   (`05df8268`..`4cd8bdb6`, folding formatters' tool-bin walkers onto one
+ *   ceilinged walker), merged into this branch — not a change this PR made.
+ * - Eight modules REMOVED entirely (their one-hop edge was ONLY an `import
+ *   type`, per the friction fix above): `clients/biome-client.ts` (9),
+ *   `clients/complexity-client.ts` (1), `clients/dependency-checker.ts` (21),
+ *   `clients/jscpd-client.ts` (4), `clients/knip-client.ts` (6),
+ *   `clients/lsp/client.ts` (75), `clients/opengrep-client.ts` (2),
+ *   `clients/ruff-client.ts` (6) — 8 modules, 124 awaits, measured with
+ *   `scripts/.probe-measure-helpers.mjs` (not committed) against this
+ *   branch's `hookHelperModules`. Every one of these is a linter/analyzer
+ *   CLIENT class only reached from a hook handler for its exported TYPE
+ *   (`clients/runtime-turn.ts`'s `import type { DependencyChecker,
+ *   MadgeBatchStats } from "./dependency-checker.js"`, confirmed by hand for
+ *   this entry); the actual VALUE-level construction is `bootstrap.ts`'s
+ *   dynamic `await import(...)` inside `requestBootstrapClients`, which is
+ *   TWO hops from a hook handler (hook handler → `bootstrap.ts` →
+ *   the client) and correctly outside the one-hop walk. 202 modules / 1255
+ *   awaits (the PR's round-1 baseline) is now 190 modules / 1130 awaits.
+ */
+const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
+	"clients/actionable-warnings.ts": 14,
+	// #5417: 15 -> 17. The two apply paths await `applyRewrite` (the queued
+	// `--update-all`) in place of the bare runner call; an apply is an
+	// `ast_grep_replace` tool call, bounded by the tool-call lifecycle, not a hook.
+	"clients/ast-grep-client.ts": 17,
+	// #4346: 13 -> 14. `extractForwardImportPaths` awaits its memoized parse
+	// (`forwardImportSources`) before resolving; the parse's own two awaits
+	// moved with it unchanged.
+	"clients/blocker-freshness.ts": 14,
+	// #5086: 23 -> 22. The dead metrics client's `await import(...)` load is gone.
+	"clients/bootstrap.ts": 22,
+	// #3274: `readCacheAsync`'s two `await readJsonCacheAsync(...)` — the meta
+	// envelope and then the data — which are the whole point of the method: the
+	// synchronous `readCache` beside it cannot be bounded because it never
+	// suspends. Neither can be bounded HERE (the manager holds no hook signal);
+	// the bound belongs at the composer, where `readScannerCache` registers it
+	// in BOUNDED_CALL_SITES with the turn_end budget and `deps.signal`.
+	"clients/cache-manager.ts": 2,
+	"clients/cooperative-budget.ts": 3,
+	"clients/dead-code-client.ts": 4,
+	// #4535 slice 2: the publisher and its subscriber registry became
+	// one-hop helpers when the HEAD look and the bash write path stopped
+	// naming the LSP service and published instead. `disk-changes.ts` awaits
+	// each subscriber inside `fanOut` and the fan-out inside
+	// `publishDiskChange`; `disk-change-subscribers.ts` awaits the held-
+	// document pass it calls, the two service calls, and the two file
+	// reads that decide which held documents are stale. None can be bounded
+	// here for the same reason as the rest of this table: the hook signal
+	// lives in the detector, which bounds the whole publish one frame up
+	// (#2523 AC4).
+	"clients/disk-change-subscribers.ts": 5,
+	// #4502 round 3: 2 -> 5. `publishDiskChangeChunked` awaits one publish per
+	// chunk (two awaits: the unlistable branch and the loop) and then its
+	// caller's per-chunk hook, so the recovered set's drift pass still settles
+	// before the next chunk publishes. None can be bounded here: the hook
+	// signal lives in the detector, which bounds the whole publish one frame
+	// up (#2523 AC4), and a second timer here would double that deadline.
+	"clients/disk-changes.ts": 5,
+	// `bounded()` itself awaits the raced work; this is the shared primitive's
+	// implementation await, not an additional hook-path await at the caller.
+	"clients/deadline-utils.ts": 1,
+	// #4485: 20 -> 21. The cascade's silent-push wait,
+	// `touchedClient.waitForDiagnostics(path, SILENT_PUSH_WAIT_MS, ...)`, which
+	// carries its own 1000 ms deadline as an argument (the client resolves it
+	// on timeout); a bounded() race around it would add a second timer for the
+	// same deadline.
+	// 21 -> 22 (#4483): `capturePreEditLinterFindings` awaits its linter-only
+	// `dispatchForFile`; its only hook caller, the tool_call capture, holds it
+	// under bounded() with ctx.signal and PRE_EDIT_CAPTURE_BUDGET_MS, so a
+	// second bound here would add a timer for the same deadline.
+	"clients/dispatch/integration.ts": 22,
+	// 2 → 3 (#4484 review F5): `settlePendingRunnerFindingsForTests` awaits
+	// the store's runs so a test joins a collect-later settle without polling.
+	// Only tests call it; no hook handler reaches it.
+	"clients/dispatch/pending-runner-findings.ts": 3,
+	"clients/dispatch/runners/psscriptanalyzer.ts": 7,
+	"clients/dispatch/runners/utils/lazy-installer.ts": 2,
+	// 32 → 37 (#2140): the probe resolver now asks the installer for a
+	// release-managed binary (`~/.pi-lens/bin`) before falling back to PATH, so
+	// probe and spawn resolve through one definition. The five added awaits are
+	// `fs.access` stats and the managed-shim verification that already carries
+	// its own 5s spawn budget (MANAGED_VERIFY_TIMEOUT_MS) — the same shape as
+	// the npm-shim rung beside them, and none can take a hook's signal until
+	// #2523 AC4 threads it through the deps types.
+	// 37 → 35 (#2660): evidence now reuses the resolver's rung instead of
+	// awaiting a second managed-binary lookup, removing the resolver's two
+	// unbounded awaits (the lookup and its caller-side reconstruction).
+	// 36 -> 37 (#4193): the isolated npx fallback now awaits the probe with
+	// its owned spawn options; this is still bounded by the probe's 5s timeout,
+	// but no hook signal reaches this helper until #2523 AC4 threads it through.
+	// #3968: +1 — `coveringLaneAvailable` awaits each covering gate command
+	// (`ctx.hasTool`), whose probe carries the dispatcher's own 5s budget; the
+	// loop is bounded by the fact's fixed gate list, but like every sibling
+	// here it stays unbounded from the hook's signal until #2523 AC4.
+	// #5345: 37 -> 30 — the deleted module-level ast-grep sweep carried seven
+	// unbounded awaits (two spawns in `probeAstGrepCommandAsync`, four of its
+	// call sites and `findGlobalBinary` in `isSgAvailableAsync`); the worklist
+	// shrinks with the sweep, nothing new is unbounded.
+	// #5410: 30 -> 31 — a project shim whose probe says it is broken falls
+	// through to the managed and PATH rungs (`findBeyondProject`), at most
+	// once per probe; those rungs stat and verify under their own probe
+	// budget, unbounded from the hook signal like the first resolution.
+	// #5410 slice 2: 31 -> 32 — `resolveInstalledToolCommand` awaits the
+	// checker's probe (`isAvailableAsync`), the formatters' no-install ladder.
+	// Unbounded from the hook signal like `resolveToolCommandWithInstallFallback`.
+	// #5492 r2: 32 -> 33 — the formatter ladder's PATH-before-managed order
+	// splits the managed rungs into `findManagedRung` and routes the fall-through
+	// through `nextRung`; one more await, under the same probe budget and
+	// equally unbounded from the hook signal.
+	"clients/dispatch/runners/utils/runner-helpers.ts": 33,
+	// #5087: the edit's re-measure plus its one default-branch read (9 in
+	// all; 10 -> 9 when the first touch took its table from the analyzer's
+	// own measure, #5443 review F6). Its awaits are the shared parser (init,
+	// parse) and two leaf-bounded `git` spawns (GIT_TIMEOUT_MS); its hook
+	// caller holds the whole delta under bounded() with the hook's signal, so
+	// a second bound here would add a timer for the same deadline.
+	"clients/metrics/complexity-baseline.ts": 9,
+	// #4238 R8: the shutdown drain is intentionally owned by the shared NDJSON
+	// writer registry. Its per-writer awaits cannot receive pi's hook signal;
+	// the caller applies the session_shutdown wall bound around the whole drain.
+	"clients/ndjson-logger.ts": 15,
+	// #3541: `withHostFileMutationQueues` awaits the realpath of each path an
+	// LSP workspace edit names, which keys it the way pi keys its queue. It
+	// runs inside `applyWorkspaceEdit`, which the agent_settled actionable fix
+	// already awaits without a bound (#2523 slice 2's row for
+	// `applyConservativeActionableWarningFixes`); no hook signal reaches it.
+	"clients/file-mutation-queue.ts": 1,
+	// #1129: +4 — `sweepDeadEphemeralDataDirs` awaits the bounded directory
+	// read (opendir, read, close) and each dead-pid removal. session_start
+	// fires it with `void` and never awaits it, so no hook waits on these.
+	"clients/file-utils.ts": 5,
+	// #3598: the pre-run hash of a whole-package fixer's files (stat and read per
+	// file, batched), the settle's compare-and-restore, and the wrapper's
+	// awaits. Each is a local file operation on a file of at most 1 MiB, inside a
+	// run that already waits on the fixer's own spawn; none can take the hook's
+	// signal until #2523 AC4 threads it, so this records the increase. 9 -> 11
+	// (#3741 round 2): the settle stats the file before reading it and again just
+	// before the write, so a newer edit is never written over.
+	// 11 -> 10 (#3830), recorded rather than absorbed: the restore reads the file
+	// inside pi's queue entry for it and re-reads it before the write instead of
+	// statting twice (the stat's identity was blind to a same-size edit inside
+	// one mtime tick), and the wrapper awaits the caller's scan (`afterRun`) but
+	// no longer `finish()`. One await is the per-file queue entry, which a hook
+	// signal cannot reach until #2523 AC4. 10 -> 11 (round 2): native call
+	// expectations are carried through the restore decision and add one await.
+	"clients/fix-run-restore.ts": 11,
+	"clients/format-service.ts": 4,
+	// #2767: managed formatter resolution uses the installer's bounded probes;
+	// keep the measured count pinned until the formatter seam carries signals.
+	// 114 → 113 (#3038), recorded rather than absorbed: `hasEditorConfig` folded
+	// its single-directory `await fs.access` onto the synchronous
+	// `findNearestContaining` seam (`clients/path-utils.ts`), which walks
+	// ancestors, so one unbounded await left this module.
+	// then 113 → 115 (#3037): `typstyleFormatter` adds the same two PATH probes every
+	// managed-smart-default formatter beside it already holds — `await
+	// which("typstyle")` in `resolveCommand` and the same call inside its
+	// `managedToolDetect` availability closure. Neither can take `bounded()`
+	// today: `FormatterInfo.resolveCommand(filePath)` and `detect(cwd)` carry no
+	// `AbortSignal`, so there is no hook signal at the seam — #2523 AC4's
+	// deps-type threading is what lowers this whole family, not a per-caller
+	// wrap. Both spend the module's own `which()`, a latched
+	// `safeSpawnAsync("which"|"where", …, { timeout: WHICH_BUDGET_MS })` whose
+	// leaf spawn budget and availability latch already cap it — the same leaf
+	// the other 43 `await which(...)` sites in this module spend, which is
+	// exactly the "bound at the leaf, unreachable from the hook" shape this
+	// pin exists to keep visible rather than to bless.
+	// then 115 → 116 (#3558): `formatFile` awaits entering pi's per-file
+	// mutation queue (`enter`) once the command is resolved, where
+	// `runFormatPhase` used to await it before the resolution (pipeline.ts
+	// below loses that await). The wait is the fix: an agent edit of the same
+	// file finishes first. The run is inside the format service's `bounded()`.
+	// 116 → 118 (#4268): `resolveNpxFallback` resolves a cache-only npx fallback
+	// to a pi-lens-managed binary before the run, so it awaits the lazy installer
+	// import and `ensureTool`. Neither can take a hook signal: the resolver runs
+	// inside the format service's own `bounded()` call, and the formatter seam
+	// carries no `AbortSignal` until #2523 AC4 threads it through.
+	// 118 -> 113 (#5410 slice 2): not a bound. The PATH-first
+	// `await which(...)` / `await findInVenv(...)` lines in `resolveCommand`
+	// bodies are gone; the ladder call that replaces them sits once in
+	// `resolveManagedSmartDefaultCommand` / `resolveFormatterToolCommand`.
+	"clients/formatters.ts": 113,
+	// 4 -> 3 and 2 -> 1 (#4984): not a bound. The two `await safeSpawnAsync`
+	// calls moved into `SecurityScanClient.runReportScan`, which the one-hop set
+	// does not walk, so the hook path's unbounded awaits are unchanged.
+	"clients/gitleaks-client.ts": 3,
+	// #1892: the turn-end secrets LANE, extracted out of `runtime-turn.ts` with
+	// no behaviour change. Its one unbounded await is `collect`'s
+	// `await blockingGitleaksFindings(...)`, whose own inner await IS the
+	// registered `bounded(classifyAndFilterFindings, …)` call below — the outer
+	// await inherits that bound, and there is no second thing to wrap. The
+	// number is the measured count, not a blessing: a NEW await in a lane fails
+	// this pin loudly, which is the point of extracting lanes into their own
+	// files.
+	// #3274: 1 → 2. `collect` now awaits the composer's memoized scanner read
+	// (one `await Promise.all([gitleaks, trivy])`) beside its existing
+	// `await blockingGitleaksFindings(...)`. The new await IS bounded — by the
+	// `bounded()` call inside `readScannerCache` (clients/runtime-turn.ts),
+	// registered in BOUNDED_CALL_SITES — but one level down, which this
+	// syntactic scan cannot see (SWEEP_HEURISTIC_LIMITS: "a helper that wraps
+	// bounded() one level down reads as unbounded here").
+	"clients/turn-end/lanes/secrets.ts": 2,
+	// #3274: `collect` awaits the same memoized, bounded scanner read for the
+	// govulncheck store. Same one-level-down invisibility as the secrets lane
+	// above; the lane itself adds no unbounded work.
+	"clients/turn-end/lanes/govulncheck.ts": 1,
+	"clients/govulncheck-client.ts": 6,
+	// 192 → 194 (#2722), in two steps, both registered rather than absorbed:
+	//   +1  `verifyNpmPackageEntry` reads the installed package's own
+	//       `package.json` to verify a managed npm LSP server from the tree on
+	//       disk instead of spawning `--version` at it — one `await
+	//       fs.readFile` of a few KB on a path the same function then
+	//       `statSync`s.
+	//   +1  (review round 2, F2) `installNpmTool` awaits that SAME function
+	//       once more, as the gate deciding whether an inconclusive probe keeps
+	//       the installation or lets the cleanup branch repair it. No new I/O
+	//       shape, no new file: the second await is the same manifest read.
+	// The rung both replace on this path was a `--version` spawn with a 10s
+	// budget and up to three attempts, so the hook path got shorter, not longer.
+	// Like every other entry here neither can take a hook's signal until #2523
+	// AC4 threads it through the deps types.
+	// #2916 adds fourteen awaits across the pipx, venv, normal-user, and
+	// private-prefix candidate loops, including PATH and binary probes.
+	// 197 → 198 (#2894): `verifyAstGrepProbePath` traded a hand-rolled
+	// `new Promise` around a raw `spawn` — which awaited nothing, and whose
+	// `timeout` killed only the direct child — for one `await probeToolAsync`.
+	// `getAllToolStatuses`'s version probe made the same trade and is await-
+	// neutral (its `await new Promise` became `await probeToolAsync`), so the
+	// module gains exactly one. The await it gains is the seam's, with the
+	// tree-kill teardown the raw spawn never had; like every other entry here
+	// it cannot take a hook's signal until #2523 AC4 threads it through the
+	// deps types.
+	// #3020 adds six unbounded helper awaits for ZIP wrapper-root stripping and
+	// archive extraction cleanup. They remain on the existing intentionally
+	// unbounded worklist until #2523 AC4 threads hook signals through installer
+	// dependencies; this records the measured increase rather than hiding it.
+	// #3221 adds githubApiAuthHeaders' await of resolveGitHubToken. Its cold
+	// branch is intrinsically bounded by one safeSpawnAsync gh auth token probe
+	// with GH_TOKEN_PROBE_TIMEOUT_MS=5000; the session latch suppresses repeat
+	// probes and is reset at session_start. The helper deliberately ignores the
+	// ambient hook signal, so wrapping here would duplicate the wall bound
+	// without adding cancellation and would misstate the credential contract.
+	// #3311 adds four: the resolution ladder's PATH rung now awaits
+	// verifyToolBinary (itself bounded by getToolVerificationTimeout through
+	// safeSpawnAsync, default 10s) and the pip ladder awaits
+	// pipConstraintEnvFor plus its mkdir/writeFile of one small constraints
+	// file under PI_LENS_HOME. Each is intrinsically bounded or a local write;
+	// none can take the hook's signal until #2523 AC4 threads it, so this
+	// records the measured increase rather than hiding it.
+	// 225 → 216 (#3476): acquireInstallLock takes the install lock with the
+	// synchronous generation lock, so its awaited mkdir, open, write, close,
+	// read, stat and removes are gone; only its 100 ms retry wait remains.
+	// 216 → 219 (#3400): installArchiveTool awaits one `fs.stat` of the extracted
+	// launcher and, on the refusal branch, one `fs.rm` of the scratch tree (local
+	// disk, ms); installTool awaits `isCommandAvailable` for an archive's
+	// `runtime` (a PATH walk of statSync calls, no spawn, before the download).
+	// All three are intrinsically bounded local work on the install path; none
+	// can take the hook's signal until #2523 AC4 threads it, so this records the
+	// measured increase rather than hiding it.
+	// 219 → 221 (#4530): the Python user-base probe and the archive command
+	// runner moved from hand-built child promises onto safeSpawnAsync, so each
+	// is now an awaited seam call, bounded by its own timeout
+	// (USER_BASE_PROBE_TIMEOUT_MS=5000, ARCHIVE_COMMAND_TIMEOUT_MS=120000) and
+	// no longer hanging on a child that never exits.
+	// 221 → 222 (#4937 review F1): `settleProbeCacheForTests` awaits one
+	// `flushProbeCache` so the tier-2 teardown can reject on a flush that did not
+	// land. Only the test helper registry calls it; no hook handler reaches it.
+	"clients/installer/index.ts": 222,
+	// 29 -> 56 (#4765): refreshOpengrepRulePack (the background registry-pack
+	// refresh) awaits the pack download, its temp-file write, the
+	// `opengrep --validate` spawn, a stat/read/rename of the cached file and a
+	// scratch `rm`. It runs on the managed-tool refresh timer, never inline in a
+	// hook, and each network/spawn await carries its own timeout
+	// (PACK_FETCH_TIMEOUT_MS, PACK_VALIDATE_TIMEOUT_MS); none can take the hook's
+	// signal until #2523 AC4 threads it, so this records the measured increase.
+	"clients/installer/managed-tool-refresh.ts": 56,
+	// #3538/#3539 add five in each. The reaper reads start times and owner
+	// tags before its backstop decision and asks again before every signal
+	// (the identity query, its re-check, and the kill's own confirm await);
+	// the registry reads this process's start once per mutation and a new
+	// child's start. Each is a process-table query under
+	// BACKSTOP_SCAN_TIMEOUT_MS with the reaper's tree-kill on timeout, or a
+	// synchronous /proc read on Linux; none can take the hook's signal until
+	// #2523 AC4 threads it. Review round 1 (F2) adds one more in the reaper:
+	// the re-check also re-reads the owner tag, the same bounded query.
+	"clients/instance-reaper.ts": 32,
+	// 28 → 33 (#3498): the removal deregisterInstance queues when its sync
+	// wait cannot take the lock adds four (this process's start, the lock, the
+	// read, the write), and writeRegistryWithRetry's read and write now sit on
+	// two lines so a registration whose session ended can skip the write. The
+	// queued removal runs on the registry tail, never awaited by a hook; each
+	// is a local file operation or the registry lock's own bounded wait, and
+	// none can take the hook's signal until #2523 AC4 threads it.
+	// 33 → 37 (#3587): deregisterInstanceRootAfterHolder, the queued fallback
+	// deregisterInstanceRoot's own sync-wait failure now falls back to, adds
+	// the same four awaits deregisterInstance's #3498 fallback did (this
+	// process's start, the lock, the read, the write). Same reasoning as
+	// #3498's four: this op runs on the registry tail, never awaited by a
+	// hook; each is a local file operation or the registry lock's own
+	// bounded wait, and none can take the hook's signal until #2523 AC4
+	// threads it.
+	"clients/instance-registry.ts": 37,
+	"clients/language-profile.ts": 3,
+	// 1 → 2 (#1634): `projectScan` now awaits the cheap project scan it used
+	// to return unawaited, to pass its rows through the finding policy before
+	// `pilens_project_scan` renders them. The same scan, the same unbounded
+	// wait its MCP caller already had; no hook awaits projectScan.
+	"clients/lens-engine.ts": 2,
+	"clients/lens-map.ts": 2,
+	"clients/lsp-budget.ts": 1,
+	"clients/lsp-document-symbols.ts": 2,
+	"clients/lsp/cascade-tier.ts": 2,
+	"clients/lsp/config.ts": 4,
+	// #2817 round 2 F5: Git recovery now awaits the existing drift scheduler
+	// and its per-server root resolution. This remains an intentionally
+	// unbounded helper count until #2523 AC4 threads hook signals into the LSP
+	// service dependencies; the scheduler itself bounds each recovery pass.
+	// #2878: the late auxiliary re-promotion observer resolves the server root,
+	// adding one real async seam. clients/lsp/index.ts goes 158 -> 159; the
+	// new await belongs to the late-runner identity lookup. clients/lsp/server.ts
+	// went 111 -> 112 for the new
+	// `await server.root` inside resolveLspServerCwd. Neither number is the
+	// old bare probe being removed.
+	"clients/lsp/index.ts": 159,
+	// #4299: 112 -> 116, net four local-filesystem awaits for canonical
+	// compiler/package validation and candidate admission, after deleting the
+	// wrapper-relative fallback. Each is a local stat/realpath/read before
+	// launch; hook-signal threading remains #2523 AC4, as for existing lookup
+	// awaits. This records the actual census rather than hiding a new lookup.
+	// #4414: 116 -> 119. `findTsserverPath` resolves a bare PATH `tsc` before
+	// the tsserver lookup: one await on the resolver around each of the two
+	// `ensureTool("typescript")` calls, and one on `findCommandAsync`, which
+	// carries its own 5 s spawn timeout. Hook-signal threading stays #2523 AC4.
+	// #4414 round 2: 119 -> 121, the local `stat` of the typescript package
+	// directories beside a resolved `tsc` and the await on that helper, which
+	// tell a shim (no package) from a package whose version is unreadable.
+	// #4638: 121 -> 123. The jedi spawn resolves the project's interpreter once
+	// (`detectPythonEnvironment`) and reads the tool environment once, instead of
+	// its old single `detectPythonVenv`; the second `resolveAndLaunch` arm is the
+	// fall-through when no project environment is admitted. Each await is a local
+	// filesystem probe before launch, and hook-signal threading stays #2523 AC4.
+	// #4728: 123 -> 122; remove the early-return exclusion probe and use the
+	// existing loop's probe for the starting directory too.
+	// #4806: 122 -> 124. `declinesProjectlessRoot` awaits `markerExists` and the
+	// shared directory reader once per directory of its bounded (128) search.
+	// Both are local reads on the spawn-policy path of `spawnClient`, which no
+	// hook awaits; hook-signal threading stays #2523 AC4.
+	// #4914: 124 -> 129. The effect-tsgo launch awaits the `@effect/tsgo`
+	// manifest read, the bin `access` probe, the finder, and the launch pair
+	// (`getToolEnvironment`, `launchLSP`). All sit on the same spawn path as the
+	// native launch, which no hook awaits; hook-signal threading stays #2523 AC4.
+	// #5123: 129 -> 132. The built-in Groovy row awaits `resolveJavaRuntimeEnv`,
+	// the PATH launcher's `resolveAndLaunch` and the `java -jar` `launchLSP`. All
+	// sit on the same spawn path as the jdtls and Kotlin rows, which no hook
+	// awaits; hook-signal threading stays #2523 AC4.
+	"clients/lsp/server.ts": 132,
+	"clients/map-with-concurrency.ts": 2,
+	"clients/observed-mutation.ts": 18,
+	// #4493: 10 -> 12, the `git rev-parse` in readGitHead and the `git diff`
+	// in listGitHeadDelta, each with its own spawn timeout; both run inside
+	// the HEAD look its hook callers bound with bounded().
+	// #4502 round 3: 12 -> 15. One `git status` read moved into
+	// `readGitStatusEntries` (so the recovery and the discard comparison share
+	// one parser), and two callers now await it: `captureGitDirtyPaths` at
+	// tool_call and `readSameHeadDiscards` at tool_result. Each is one
+	// safeSpawnAsync with its own 5s timeout, and the look the second one feeds
+	// is bounded one frame up.
+	"clients/opaque-mutation-scan.ts": 15,
+	// #4476: new to the one-hop set. The out-of-band look: the root listing
+	// and the stat of each install stamp it holds, the declaration walk's
+	// directory reads and stats, the per-root chain, and the restart of a
+	// root's primary clients. It runs only inside the HEAD look, which both
+	// hook callers bound with bounded().
+	// #4532: 9 -> 10. The install stamp's `node_modules` symlink lane adds
+	// `await fsp.lstat(...)` beside the marker stats; #2523 AC4's deps-type
+	// threading is what would bound it, and `lookForOutOfBandChanges` is called
+	// from inside `bounded()` at the hook, not here.
+	// #4532 gap 3: 10 -> 12. The lockfile-less venv install stamp reads the
+	// venv's `site-packages` identities — one `readdir` of `<venv>/lib` to find
+	// the interpreter directories and one directory stat per `site-packages` —
+	// in the same round as the lockfile and marker stats above. Both are
+	// ordinary filesystem reads inside the look, which both hook callers bound
+	// with `bounded()` one frame up; #2523 AC4's deps-type threading is what
+	// would bound them here.
+	"clients/out-of-band-changes.ts": 12,
+	"clients/package-manager.ts": 8,
+	// #4689 batch 10: 0 -> 1. `realpathOrResolveAsync` awaits the kernel
+	// `realpath` of the step the identity walk is on, the async form of the seam
+	// the host mutation queue and the LSP workspace-edit preflight now need.
+	// This module is a pure path utility and takes no `AbortSignal`, and neither
+	// caller holds one when it asks (the queue entry and the workspace-edit
+	// preflight run inside the handler's `bounded()`, below this seam), so there
+	// is nothing for `bounded()` to take here: one filesystem syscall per walk
+	// step, and #2523 AC4's deps-type threading is what bounds it.
+	// 1 -> 4 (#4689 r2 F-CR1): the seam separates the identity from the fact a
+	// containment decision reads (`kernelPathIdentityAsync` awaits the walk), and
+	// a walk whose tail folded a `.`/`..` is resolved once more, because the fold
+	// can move a component the kernel refused into a position it then resolves.
+	// That is one await in the public wrapper, two in the identity entry (the
+	// walk and the settle walk) and the one syscall per step inside the driver.
+	// Still a pure path utility with no `AbortSignal`; both callers sit inside
+	// the handler's `bounded()`.
+	// 4 -> 5 (#4877): an `ENOENT` step also `lstat`s its candidate, because a
+	// dangling link answers `ENOENT` while a write through it leaves the root.
+	"clients/path-utils.ts": 5,
+	"clients/performance-report.ts": 8,
+	// #3506: 45 -> 61. `runPipeline` awaits its body inside the try whose
+	// finally releases pi's per-file mutation queue (1), `runFormatPhase`
+	// awaits entering that queue before the formatter (1), and each of the
+	// fourteen fixer branches of `runAutofix` awaits entering it after its
+	// own resolver and before its writer (14; review round 1 moved the entry
+	// below the availability probes and installs, so those never hold pi's
+	// edits back). The queue wait is the fix (an agent edit of the same file
+	// must finish first); the pipeline itself stays inside the handler's
+	// bounded(). #3576: 61 -> 63. `resyncHeldLspDocument` awaits the lazy LSP
+	// module (1) and the held-only resync (1) of a drain whose session or LSP
+	// service was replaced; it replaces a skipped resync, never spawns, and
+	// each resync is one bounded notify write.
+	// 63 -> 62 (#3558): `runFormatPhase` no longer enters the queue before the
+	// formatter; `formatters.formatFile` enters it after the command
+	// resolution (formatters.ts above gains that await).
+	// 62 -> 63 (#3598): each whole-package fixer awaits its restore-wrapped
+	// spawn, and the outcome helper awaits the project diff once where the two
+	// branches awaited it separately (net +1). The fixer's spawn was already
+	// awaited under the same hold and the restore is bounded local file work.
+	// 63 -> 64 (#3858): `chainLateFormatResync` is #3828's late-resync
+	// continuation moved out of `handleAgentEnd` (its exemption row is gone) so
+	// the in-band pipeline shares it: a detached reaction on the abandoned
+	// formatter's settlement that parks no awaiting task and holds no queue
+	// entry or timer, so a formatter that never settles leaves it inert. It
+	// reaches the LSP only through `resyncHeldLspDocument`: a document a live
+	// client of the current service already holds, one bounded notify write
+	// (a save, #3828 r3), never a spawn; its answer is the late row's outcome.
+	"clients/pipeline.ts": 64,
+	"clients/project-changes.ts": 2,
+	// 2 → 3 (#4937 review F1): `settleProjectSnapshotPersistsForTests` awaits the
+	// bounded persist wait, then rejects if work remains. Only the test helper
+	// registry calls it; no hook handler reaches it.
+	"clients/project-snapshot.ts": 3,
+	// #3871 r3: runtime-turn imports only the synchronous
+	// `hasAmbientPythonEnvironment`, which this one-hop walk cannot tell apart.
+	// The four awaits are `detectPythonEnvironment`'s filesystem probes, which
+	// turn_end already reached two hops away through test-runner-client.ts.
+	// #4638: 4 -> 10. `detectPythonTargetVersion` reads one small declaration
+	// file per ancestor directory (pyproject, the one ruff config it would use,
+	// pyrightconfig.json, `.python-version`); the tool handlers that call it
+	// carry their own signal, but this module is also imported directly by a
+	// hook handler, so hook-signal threading stays #2523 AC4.
+	// 10 -> 13: the declarer walk was split into one function per tier (Sonar
+	// S3776, cognitive complexity 35 -> under the limit), so the same five reads
+	// now cost three extra `await` expressions at the tier calls. No new I/O, no
+	// new unbounded operation; the probes themselves are unchanged.
+	// 13 -> 11 (#4638 r3 N1): each tier now returns its declaration together
+	// with whether it closed the walk, and one per-directory function drives the
+	// four tiers, so the tier awaits sit in one loop instead of in the walker.
+	// Fewer awaits, the same declaration-file reads, no new unbounded operation.
+	"clients/python-environment.ts": 11,
+	"clients/quiet-window.ts": 5,
+	"clients/read-expansion.ts": 2,
+	// 5 -> 3 (#3612): `resolveReadGuardStartState`'s two sidecar awaits moved
+	// to the session-scope hand-off (`adoptHandoff`, below).
+	"clients/read-guard-branch.ts": 3,
+	// #5377: 8 -> 6. The fold deleted the hand-rolled write helper, so the
+	// append's `await readRecentTouchesAsync(...)` and its
+	// `await writeFileAtomicAsync(...)` are gone; the commit's awaited lock +
+	// publication is one `await commitDurableStoreAsync(...)` in `appendRecentTouches`
+	// and the `mkdir` await moved with the helper. None can be bounded here for
+	// the same reason as the rest of this table: the producer is the
+	// fire-and-forget `publishFilesTouched` path, which holds no hook signal.
+	"clients/recent-touches.ts": 6,
+	// #4346: 41 -> 42. `updateGraphFiles` re-extracts each importer a newly
+	// created file resolves, the same per-file extraction await its update
+	// loop already pins.
+	"clients/review-graph/builder.ts": 42,
+	// #5289: 9 -> 8. `safeSpawnBatch` (deleted, no caller) held the module's
+	// `await Promise.all(...)`; the other eight awaits are unchanged.
+	// #5413: 8 -> 9. `safeSpawnAsync` awaits its own spawn promise to arm the
+	// timeout cooldown after the child settles; that promise is bounded by the
+	// spawn's own timeout, the same budget it already carried.
+	"clients/safe-spawn.ts": 9,
+	// #3612: `adoptHandoff` awaits the own and parent sidecar loads and each
+	// store's restore: the session_start sidecar I/O that read-guard-branch.ts
+	// and index.ts held before.
+	"clients/session-scope.ts": 3,
+	"clients/session-state-store.ts": 4,
+	"clients/shared-checkout-guard.ts": 7,
+	"clients/source-filter.ts": 2,
+	"clients/startup-scan.ts": 3,
+	"clients/test-runner-client.ts": 4,
+	// #2507. Unlike every other entry here, this one is unbounded ON PURPOSE
+	// and must stay that way: it is `await inner.apply(...)` around a TOOL
+	// call, taken so the call holds the event loop for its own lifetime.
+	// Bounding it would abandon the tool's result mid-flight — the opposite of
+	// what the await exists for. The count may only ever fall to 0 (the wrapper
+	// removed), never rise.
+	"clients/tool-definition.ts": 1,
+	"clients/tree-sitter-shared.ts": 1,
+	// 2 -> 1 (#4984): moved into `runReportScan`, not bounded; see gitleaks above.
+	"clients/trivy-client.ts": 1,
+	// #4645: 9 -> 10. The incumbent awaits its own membership probe (the
+	// existing non-spawning read-only probe channel) and sends the answer beside
+	// the raw rows. The probe runs under `withinRemaining(…, req.deadlineAt -
+	// WARM_REPLY_SEND_RESERVE_MS)`, so it settles before the reply's send
+	// reserve; that helper is deadline-only (no hook signal exists in this
+	// socket server to hand `bounded`), so the await counts here.
+	"clients/warm-attach.ts": 10,
+	// 3 -> 4 (#3612): the widget store's restore awaits `dropStaleFiles` for a
+	// sidecar source, the reconciliation index.ts's rehydrate block awaited.
+	"clients/widget-state.ts": 4,
+	"clients/word-index.ts": 24,
+	"clients/zizmor-config.ts": 2,
+	"tools/ast-grep-outline.ts": 3,
+	"tools/ast-grep-replace.ts": 4,
+	// #2800: dump mode adds one awaited AstGrepClient.dumpAst call to the
+	// existing search handler; it shares the handler's availability/abort path.
+	// #5371: +1, the one await on the shared `paths` reader (see the #5371 note
+	// under `tools/shared.ts`).
+	"tools/ast-grep-search.ts": 7,
+	"tools/effective-config.ts": 1,
+	// #5417: 2 -> 4. The suppress write now awaits `writeSourceFile` (pi's
+	// per-file queue) and the read-verify-write step inside it; both belong to
+	// the `lens_diagnostic_mark` tool call, bounded by its lifecycle, not a hook.
+	"tools/lens-diagnostic-mark.ts": 4,
+	// #2846/#2800: the folded LSP probe adds one awaited internal tool path;
+	// it remains bounded by the tool call lifecycle.
+	// #3573: `getProjectDiagnosticsSnapshotForFullMode` now awaits the fresh
+	// scan it used to return, to reconcile it before its rows reach the
+	// widget. The same promise `formatFullMode`'s `Promise.all` already
+	// awaited, under the same signal: no new wait.
+	// 15 -> 19 -> 20 (#4638 review F1/F6/F10): the full-mode sweep walks the
+	// declaration through the shared bounded pool, then the full-mode merge and the
+	// session store write each resolve one file's level before applying the owner
+	// rule. The three sites now share one helper, whose own await plus the three
+	// guarded calls make 20; the helper skips the walk entirely for a file without
+	// jedi's row, so the count is calls, not new I/O.
+	// #5371: 20 -> 22, the two awaits on the shared `paths` reader (the caller's
+	// list, and the one `path` read folded into it). See the #5371 note under
+	// `tools/shared.ts`.
+	"tools/lens-diagnostics.ts": 22,
+	// #2598 lowered both by one: `collectDiagnosticsForFile` and
+	// `openFileBestEffort` each dropped their `await lspService.openFile(…)`
+	// arm — the fallback for "a service shape without touchFile", which the
+	// real `LSPService` never was.
+	"tools/lsp-diagnostics.ts": 29,
+	// #4638: 32 -> 34, the two probes that must hand the sync finding-policy seam
+	// a prepared Python declaration: the path read resolves it once, and the
+	// tracked-snapshot read resolves one per file before its synchronous map.
+	// 34 -> 35 (#4638 review F10): the per-file declaration walks now run through the
+	// shared bounded pool, so one `await` on the pool replaces the per-file await in
+	// the loop; the walks themselves are unchanged.
+	// 35 -> 36 (#4532 gap 13): the file-path `workspaceDiagnostics` read awaits one
+	// full forced `sweepDocumentDrift` before it opens the file. The await is
+	// bounded by the pass's own work (one stat per tracked document and one serial
+	// resync per changed document through the per-server notify budget, with
+	// `diagnostics: "none"` so no publish wait), not by a hook signal; the cost is
+	// accepted by the maintainer (2026-10-27), see PR #4924 Accepted residuals.
+	"tools/lsp-navigation.ts": 36,
+	"tools/module-report.ts": 3,
+	"tools/project-report.ts": 1,
+	// #5371 (this table's five `tools/*` bumps and this new row share one
+	// cause): `readPathsArgument` now AWaits its glob expansion, because a glob
+	// entry is answered by a directory walk and the walk must yield — the sync
+	// twin measured 1279 ms over this repository's 107,682 entries (probe on the
+	// 2026-11-08 head), which is the #1137 stall this repo forbids on an
+	// interactive path. Every tool that reads `paths` therefore gained exactly
+	// the one await that calls the reader. None is a hook await: the reader is
+	// reached only from a tool `execute` handler and from the MCP `callTool`
+	// mirror, where an agent is waiting on its own request (the fact the
+	// `mcp/server.ts#callTool` `off-hook` entries state); the scan counts per
+	// module and cannot see that. `bounded()` is not the remedy here — it needs a
+	// `HOOK_WALL_BUDGET_MS` number and a hook signal, and this path has neither,
+	// while swallowing a `paths` refusal into `undefined` would turn a named
+	// refusal into a silent empty scope (shape 10).
+	"tools/shared.ts": 1,
+	"tools/symbol-search.ts": 2,
+};
+
+/**
+ * Every shipped `bounded()` CALL, and where its `signal` comes from (#2557
+ * review F2).
+ *
+ * `bounded()` takes a REQUIRED `signal` whose type admits `undefined`: the key
+ * must be written, so a deadline-only call cannot compile, but a seam holding
+ * an optional signal passes it straight through and then runs on ONE live
+ * bound whenever the caller genuinely had none. That is weaker than #2523's
+ * contract, so it is not forbidden — it is written down, here, per call site.
+ *
+ * Keyed on the call's `signal` line (`findBoundedCallLines`), so changing WHICH
+ * signal a call passes re-keys it and forces the claim below to be re-stated
+ * rather than silently inherited.
+ */
+const BOUNDED_CALL_SITES: Readonly<Record<string, string>> = {
+	"call:clients/actionable-warnings.ts#boundedLspCall:2b57f8b9~9137fb1a":
+		"`LspEnrichmentDeps.signal`. ALWAYS live on the deferred loop (built " +
+		"from the turn signal combined with the deferral controller's). Optional " +
+		"for the in-band loop, which passes `args.signal` — present on every " +
+		"turn_end path and absent only in a unit harness. Deadline half is live " +
+		"either way, and is itself the per-trip minimum of the loop's remaining " +
+		"budget and the per-pull timeout.",
+	"call:clients/blocker-freshness.ts#detectSelfDrift:31ccd4b2~6f51ea0e":
+		"`BlockerFreshnessOptions.signal`, threaded from `TurnEndDeps.signal` by " +
+		"`runtime-turn.ts`'s sweep call. Live on every turn_end path. Absent only " +
+		"in unit harnesses that drive the sweep directly, where the wall-clock " +
+		"half still applies; accepted because the self axis's failure direction " +
+		"is `unverifiable` (change nothing), never a demotion (#2982).",
+	"call:clients/blocker-freshness.ts#detectSelfDrift:a28359f5~facb5902":
+		"Same `BlockerFreshnessOptions.signal` as the stat above. This is the " +
+		"hash tier's whole-file read, reached only when the size tier cannot " +
+		"separate a same-length edit from a `touch`; it is additionally capped by " +
+		"the per-sweep hash budget so the aggregate read is " +
+		"bounded on the count axis too (#2982, defect shape 9).",
+	"call:clients/blocker-freshness.ts#sweepInlineBlockerFreshness:b262cffc~b69fb70f":
+		"Same `BlockerFreshnessOptions.signal`. Wraps the whole per-entry " +
+		"`detectSelfDrift` call so an expiry maps to `unverifiable` at one place " +
+		"rather than leaving a half-finished verdict; the inner bounds above are " +
+		"the leaf budgets (#2982).",
+	"call:clients/bootstrap.ts#requestBootstrapClients:076f54d7~878c680d":
+		"`options.signal`, GENUINELY absent for the three session-start demands: " +
+		"`SessionBootstrapAccess.request` takes no signal on purpose (#1394 — a " +
+		"session_start can land mid-turn, and binding the outgoing turn's signal " +
+		"cancelled every startup scan with no retry). Two live bounds even then, " +
+		"because this call supplies the seam's own `bootstrapShutdownController` " +
+		"as `shutdownSignal`. The tool_call demand passes the ambient signal.",
+	"call:clients/format-service.ts#FormatService:6ec6083f~f49a0718":
+		"The formatter aggregate receives the edit pipeline's live signal. The " +
+		"signal may be absent only in direct unit callers; the edit wall budget " +
+		"and the per-formatter leaf timer remain active in that harness.",
+	"call:clients/installer/managed-tool-refresh.ts#executeManagedToolRefresh:8d9498e9~773eca34":
+		"`undefined` is intentional: the unref'd timer runs after session_start " +
+		"returns, so no live turn signal belongs to this background refresh. The " +
+		"session_start wall budget still bounds the best-effort alias stamp, and " +
+		"the required signal field makes this absence an explicit decision.",
+	"call:clients/lsp/index.ts#LSPService:4da1e4ca~3228bbca":
+		"`getAmbientAbortSignal()` carries the active turn abort when touchFile runs " +
+		"inside a hook and is absent only in a bare unit harness. The LSP service's " +
+		"shutdown signal supplies the second live bound for retired generations; the " +
+		"hook budget remains live in either case.",
+	"call:clients/lsp/index.ts#LSPService:55b587e6~3997fa51":
+		"`signal` parameter, defaulting to `getAmbientAbortSignal()`. Caller-supplied " +
+		"on the pre-dispatch resync path (passing the turn's ambient signal so Escape mid-turn " +
+		"abandons auxiliary warmup without gating the edit hook) and defaulted to the " +
+		"ambient signal on the touchFile with-auxiliary path. LSP_SPAWN_BUDGET_MS wall-clock " +
+		"bound is live per server.",
+	"call:clients/lsp/server.ts#NearestRoot:1969971c~30941cd1":
+		"`undefined`, and that is the whole decision: `RootFunction` is " +
+		"`(file: string) => Promise<string | undefined>`, so no hook signal reaches " +
+		"the root detector at all until #2523 AC4 threads one through the LSP deps. " +
+		"The wall clock is the live half, on the edit `tool_result` budget — the " +
+		"hook the per-file touch path runs under, and the only one the contract " +
+		"lets block the host. This is the memo's freshness read: a fired bound " +
+		"resolves `undefined`, which the caller treats as NOT fresh, so the worst " +
+		"case is the marker walk it was trying to skip (#3412 review round 1).",
+	"call:clients/lsp/server.ts#NearestRoot:7cc367bc~c3bf473d":
+		"Same `undefined` signal and the same edit `tool_result` budget as the " +
+		"freshness read above, for the walk's own per-step directory-mtime " +
+		"recording. A fired bound here records the step's directories as " +
+		"unreadable rather than dropping them, so the walk still answers and its " +
+		"answer is simply not memoized — never a partial signature that would hide " +
+		"a later change in the missing directory (#3412 review round 1).",
+	"call:clients/mcp/session.ts#runSessionStart:8d9498e9~c78f4265":
+		"The public MCP session_start result fallback is also wall-bounded; " +
+		"its signal is explicitly absent because MCP has no host abort signal.",
+	"call:clients/mcp/session.ts#runSessionStartImpl:8d9498e9~c78f4265":
+		"MCP session_start lifecycle wrapper. MCP has no host abort signal, so " +
+		"the required signal key is explicitly undefined; the shared session_start " +
+		"wall budget remains live and the same handler owns deferred delivery.",
+	"call:clients/mcp/session.ts#runTurnEndNow:8d9498e9~67c7ff0d":
+		"MCP turn_end lifecycle wrapper. MCP has no host abort signal, so the " +
+		"required signal key is explicitly undefined; the shared turn_end wall " +
+		"budget remains live and the transaction retains late findings.",
+	"call:clients/observed-mutation.ts#withBounds:6ec6083f~67028b50":
+		"`withBounds(work, ms, signal, site)`'s third parameter, threaded from " +
+		"`ArmObservationArgs.signal` / `SettledSweepArgs.signal`. Optional in the " +
+		"type; filled by every production hook path (tool_call arm, " +
+		"tool_result_edit settle, agent_settled sweeps). The fallback is " +
+		"fail-safe, not the normal case, and the wall budget is live regardless.",
+	"call:clients/persistent-reverify.ts#runPersistentReverify:1e569f4c~7408bac3":
+		"`deps.signal` — the turn-end abort signal, passed through the wiring " +
+		"conditionally (#3176 round: `deps.signal === undefined ? {} : {signal}`). " +
+		"OPTIONAL by design: the pass runs on the turn_end hook, and bounded() " +
+		"reads a missing signal as one that never aborts — the wall budget " +
+		"(budgetMs/REVERIFY_BUDGET_MS) and the per-touch floor (250ms) still " +
+		"bound every call. The optionality is a written decision: the re-verify " +
+		"is best-effort by contract (an unconfirmed touch is kept verbatim and " +
+		"labeled, never a false clean), so a wall-clock-only run degrades " +
+		"honestly rather than blocking the hook.",
+	"call:clients/persistent-reverify.ts#runPersistentReverify:df18bffa~a607d75c":
+		"`deps.signal` — the same turn-end abort signal as the touch site above; " +
+		"this is the outer await around `enrichFileFromLsp` (the producer " +
+		"pipeline's own internals are deadline-bounded). OPTIONAL by design, " +
+		"same written decision as the touch site: the pass is best-effort by " +
+		"contract, and the wall budget plus the per-touch floor still bound " +
+		"every call.",
+	"call:clients/pipeline.ts#resyncLspFile:194d22cb~34c8c753":
+		"The AMBIENT turn abort signal, set for the whole tool_result path and " +
+		"absent only in a bare unit harness. PI_LENS_LSP_SYNC_BUDGET_MS is the " +
+		"bound that is always live.",
+	"call:clients/project-trust.ts#readAdoptedProjectTrust:8d9498e9~136c8ea4":
+		"#5469 F1: no owning hook signal at registry; explicit undefined plus " +
+		"registry retirement shutdownSignal and the read-only analysis wall bound host SDK loading.",
+	"call:clients/runtime-agent-end.ts#handleAgentEnd:6ec6083f~93eae0ad":
+		"AgentEndDeps.signal is the agent_settled ctx.signal passed by index.ts; " +
+		"it can be absent in a standalone harness. The shared agent_settled " +
+		"wall budget remains live. Only the restore wait is bounded; the original " +
+		"restore and its single loss-delivery continuation still settle later.",
+	"call:clients/runtime-agent-end.ts#handleAgentEnd:fc644b89~26fd2489":
+		"The drain's post-exit resync of a formatter its own bound gave up on " +
+		"runs OFF the hook (the `void`-launched task starts only after " +
+		"`agent_settled`'s bound gave up), so it carries the same " +
+		"`ambientSignal` the in-hook bound does: the hook's `ctx.signal`, or " +
+		"the ambient slot in a standalone harness, absent only there. The " +
+		"wall-clock half is always live, capped by `DEFERRED_FORMAT_BUDGET_MS`.",
+	"call:clients/runtime-agent-end.ts#handleAgentEnd:fc644b89~93eae0ad":
+		"The deferred formatter drain receives AgentEndDeps.signal, or the " +
+		"ambient signal in a standalone harness; agent_settled bounds the wait.",
+	"call:clients/runtime-session.ts#readSequenceAndHydrateFreshSnapshot:8d9498e9~c78f4265":
+		"No signal: `SessionStartDeps` carries none, so the key is written as " +
+		"`undefined` and this await runs on the wall clock alone, capped at " +
+		"`HOOK_WALL_BUDGET_MS.session_start`. The signal half is held one frame up: " +
+		"index.ts awaits the whole `handleSessionStart` under `bounded()` with the " +
+		"hook's `ctx.signal`, so Escape releases the handler there. This bound is " +
+		"the registered census site for this await and the backstop if the inner " +
+		"cap regresses: `sequenceReadBudgetMs()` caps the inner race at the same " +
+		"wall budget and its timer is armed first, so the inner arm ends the wait " +
+		"and owns the recovery (the deferred reseed and the #1785 hydration).",
+	"call:clients/runtime-tool-call.ts#handleToolCallImpl:2dc2d1e2~37e44a1d":
+		"The document-symbol enrichment uses the tool_call's ctx.signal, absent " +
+		"only in a harness. Its inner LSP budget and the outer EXPANSION_BUDGET_MS " +
+		"wall bound are both live; the outer bound also releases the hook on Escape.",
+	"call:clients/runtime-tool-call.ts#handleToolCallImpl:2dc2d1e2~ce33f035":
+		"The pre-edit linter capture (#4483) uses the tool_call's ctx.signal, " +
+		"absent only in a harness. #2523 gives tool_call no budget of its own, " +
+		"so the capture carries PRE_EDIT_CAPTURE_BUDGET_MS (500 ms, measured " +
+		"in the PR); that wall bound is always live, and a capture it abandons " +
+		"installs nothing once the host has written.",
+	"call:clients/runtime-tool-call.ts#handleToolCallImpl:c06d5cf4~a6535d16":
+		"The HEAD-move look before a tool runs (#4493) uses the tool_call's " +
+		"ctx.signal, absent only in a harness. #2523 gives tool_call no budget " +
+		"of its own, so the look borrows the read-only tool_result budget " +
+		"(500 ms); that wall bound is always live.",
+	"call:clients/runtime-tool-result.ts#ensureToolResultClients:2b57f8b9~b4f8a98d":
+		"The tool_result signal is threaded into the fail-open bootstrap demand; " +
+		"the edit budget remains live when a caller has no signal.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:19412575~b4f8a98d":
+		"Observed tool analysis uses ToolResultDeps.signal and the edit budget; " +
+		"a missing signal is an explicit standalone-harness case.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:2b57f8b9~51bbeb13":
+		"The edit's complexity delta (#5087) uses the tool_result signal, " +
+		"threaded from ctx.signal and absent only in a harness; the edit " +
+		"budget (HOOK_WALL_BUDGET_MS.tool_result_edit) stays live without it, " +
+		"and a delta it abandons appends nothing to the result.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:2b57f8b9~b4f8a98d":
+		"The classified bootstrap demand uses ToolResultDeps.signal and the " +
+		"edit budget; a missing signal is an explicit harness case.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:464d2ad3~b4f8a98d":
+		"Observed duplicate-claim joins use the same ToolResultDeps.signal and " +
+		"edit budget; the local alias keeps this call site distinct for the sweep.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:861069ce~b4f8a98d":
+		"The HEAD-move look on a bash tool_result (#4493) uses " +
+		"ToolResultDeps.signal and the edit budget, as the bash-write primary " +
+		"phase does (#4528 r4: the read-only bound cut a slow primary " +
+		"mid-send); a missing signal is an explicit standalone-harness case.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:8f7626bd~b4f8a98d":
+		"Each observed changed-file analysis uses ToolResultDeps.signal and the " +
+		"edit budget; the local alias keeps this call site distinct for the sweep.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:b9faf573~b4f8a98d":
+		"Classified pipeline analysis uses ToolResultDeps.signal and the edit " +
+		"budget; a missing signal is an explicit standalone-harness case.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:d0c1590a~b4f8a98d":
+		"`deps.signal` — the `tool_result` hook's own ctx signal, the same one the " +
+		"head-move look beside it passes. Optional in the deps type: a host that " +
+		"offers no signal leaves the wall-clock half live on its own, which is " +
+		"weaker than #2523's contract and is the pre-existing shape of every " +
+		"`tool_result` bound in this handler. The look's publish is never " +
+		"cancelled by a cut, only this wait.",
+	"call:clients/runtime-tool-result.ts#handleToolResult:ef8fdef7~b4f8a98d":
+		"The primary phase of a bash tool_result's written files (#4507) uses " +
+		"ToolResultDeps.signal (aliased so this site keys apart from the HEAD " +
+		"look's) and the edit budget, which its dispatches already run under " +
+		"(#4528 r1 F1: a 500 ms cut let a dependent be checked before its " +
+		"dependency was sent); a missing signal is an explicit " +
+		"standalone-harness case.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:2b57f8b9~67c7ff0d":
+		"`deps.signal` — the live `turn_end` ctx.signal in the pi host, threaded " +
+		"through `TurnEndDeps`, and the SAME optionality as the secrets lane's " +
+		"registered call below (absent only in the standalone MCP adapter and " +
+		"unit harnesses, where the turn_end wall budget is still live). This is " +
+		"#3274's scanner-store read: `readScannerCache` memoizes the bounded " +
+		"promise per store, so the three turn-end stores spend one budget each " +
+		"per delivery however many lanes await them, and an abandoned read " +
+		"yields null — a cold cache to every lane — never a stale envelope.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:2b57f8b9~9c52f63e":
+		"`deps.signal` — the live `turn_end` ctx.signal in the pi host, optional " +
+		"only in the standalone MCP adapter and unit harnesses, where the turn_end " +
+		"wall budget is still live. #4117: this is the dead-code client's " +
+		"`analyze` (vulture), awaited under the budget LEFT after the phases " +
+		"before it, as knip's is above. It replaces the #2523 exemption for the " +
+		"same await; the scan is abandoned, not cancelled: it finishes off-hook " +
+		"under vulture's own 30 s spawn timeout and single-flight slot, writes " +
+		"its row where it settles and is delivered by a later turn (round 2). " +
+		"#4154: a failed scan's re-read of the row on disk " +
+		"(`withRowForFailureWrite`, `readCacheAsync`) runs inside this same bound.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:2b57f8b9~b310ae4e":
+		"`deps.signal` — the live `turn_end` ctx.signal in the pi host, optional " +
+		"only in the standalone MCP adapter and unit harnesses, where the turn_end " +
+		"wall budget is still live. #3872: this is `knipClient.analyze`, awaited " +
+		"under the budget LEFT after the phases before it (not a fresh 3000 ms), " +
+		"so a slow scan releases the handler instead of holding it past " +
+		"`hook-await-exceeded`; a root whose last scan outlasted that budget is " +
+		"awaited for one timer tick only (a memo hit still answers), so the " +
+		"handler does not sit out the full budget on every turn. It replaces the " +
+		"#2523 exemption for the same " +
+		"await; the scan itself is abandoned, not cancelled, and finishes off-hook " +
+		"under knip's own 30 s spawn timeout and single-flight slot.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:4da1e4ca~7e52ce49":
+		"`getAmbientAbortSignal(): AbortSignal | undefined` (clients/safe-spawn.ts) " +
+		"— the turn's registered abort signal, set from the host's `ctx.signal` " +
+		"when the turn_end hook fires (index.ts:3068). ABSENT when the host " +
+		"supplies no signal there, and in a bare unit harness; the bound is then " +
+		"wall-clock only. Either way the wall budget is live: the hook's " +
+		"HOOK_WALL_BUDGET_MS.turn_end caps the whole pass and composes with the " +
+		"pass's own internal deadline (3s) and the per-touch floor.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:9256e1fe~67c7ff0d":
+		"`cascadeSettleSignal` is the live turn_end abort signal from " +
+		"`TurnEndDeps.signal`; direct harnesses may omit it, leaving the " +
+		"explicit turn_end wall cap as the remaining bound for parked computes.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:c900b7a9~67c7ff0d":
+		"`runnerDrainSignal` is the live turn_end abort signal from " +
+		"`TurnEndDeps.signal`; it is optional only in direct unit harnesses, " +
+		"where the wall-clock half still bounds the drain. The drain is the " +
+		"session-partitioned runner delivery seam and must not wait indefinitely.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:e5344cbe~67c7ff0d":
+		"`madgeAvailabilitySignal` is the live turn_end abort signal from " +
+		"`TurnEndDeps.signal`; it may be absent only in direct harnesses, while " +
+		"the madge availability probe remains wall-bounded and best effort.",
+	"call:clients/runtime-turn.ts#handleTurnEnd:e953bca9~404f0b0f":
+		"The late auxiliary re-promotion observer receives the live `turn_end` " +
+		"ctx.signal from `deps.signal` when pi supplies one, but that signal is " +
+		"optional on the MCP adapter and unit harness. One shared turn-end deadline " +
+		"bounds the entire drained-pair loop, so missing abort provenance cannot " +
+		"multiply the wall budget by the 50-pair cap.",
+	"call:clients/session-event-guard.ts#guardSessionEvent:04249a13~4951798b":
+		"The registered pi handler receives its live ctx.signal through the " +
+		"shared session-event wrapper. The agent_settled handler installs its " +
+		"own ambient abort signal before the signal-less outer bound, so aborted " +
+		"work requeues before release (#2939 F6). Its budget is selected from the one hook " +
+		"registry, including the read-only versus edit tool_result split.",
+	"call:clients/turn-end/lanes/secrets.ts#blockingGitleaksFindings:c06d5cf4~67c7ff0d":
+		"#1892 moved this call, unchanged, from `runtime-turn.ts` into the secrets " +
+		"lane (the key it held there was " +
+		"`call:clients/runtime-turn.ts#2b57f8b9~67c7ff0d`). `ctx.signal` is " +
+		"`TurnEndLaneContext.signal`, which the composer fills from `deps.signal` " +
+		"— the live `turn_end` ctx.signal in the pi host, optional only for the " +
+		"standalone MCP adapter and unit harnesses. The turn_end wall budget is " +
+		"always live, and timeout falls back to raw findings so security findings " +
+		"remain blockers.",
+	"call:index.ts#activateExtension:8d9498e9~d5ee5018":
+		"`undefined` is intentional: pi provides no caller abort signal for " +
+		"session_shutdown. The handler returns this promise to pi, which awaits " +
+		"the extension shutdown event before closing stdin or exiting. The " +
+		"quit-only session_shutdown_quit wall bound is 500ms; replacement " +
+		"reasons use the zero session_shutdown budget to preserve successor " +
+		"ordering, and a wedged quit sink records one hook-await-exceeded row.",
+	"call:index.ts#activateExtension:c06d5cf4~a7f40027":
+		"The tool_result handler receives the live pi ctx.signal and the selected " +
+		"read-only or edit budget; the nested handler bound is deliberate. It " +
+		"ends on the registration bound's deadline (#5108 G2).",
+	"call:index.ts#activateExtension:c06d5cf4~b4f8a98d":
+		"The tool_result edit bootstrap receives the live pi ctx.signal and the " +
+		"edit budget; read-only calls use only resident clients.",
+	"call:index.ts#activateExtension:c06d5cf4~c78f4265":
+		"The session_start handler receives the live pi ctx.signal; the shared " +
+		"session_start budget bounds the handler await.",
+};
+
+/**
+ * A THIRD population: synchronous scanner-cache reads on a hook path (#3274).
+ *
+ * ## The recurrence this prevents
+ *
+ * `CacheManager.readCache` is synchronous — two `existsSync` plus two
+ * `readFileSync`+`JSON.parse` — and `turn_end` ran three of them per delivery.
+ * Nothing above could bound it: `bounded()` takes a PROMISE, and the read
+ * completes during ARGUMENT EVALUATION, so a wrapper registered a turn_end
+ * budget that could never be spent (#3274 probed it against the built seam
+ * with an already-aborted signal and `ms: 0`: `bounded()` returned `undefined`
+ * and the read had already parsed its JSON). The two populations above scan
+ * `await` and `Promise.race` — ASYNC constructs — so a bare synchronous
+ * blocking read on a hook path was invisible to the one mechanism built to
+ * enumerate turn-end stalls, and #3273's review (H3273-1) found it only by
+ * reading the code. That blindness is what this population closes.
+ *
+ * ## A RATCHET, not an admission table
+ *
+ * Unlike {@link EXEMPT_SITES} there is no per-site reason text and no way to
+ * register a new one: the pin is a COUNT per file, and {@link
+ * SYNC_HOOK_READ_CEILING} is the total those counts may never exceed. A new
+ * synchronous read on a hook path reds twice — its file's pin and the ceiling
+ * — and the only green fix is the async seam (`CacheManager.readCacheAsync`).
+ * Migrating one lowers a pin, which also reds, on purpose: the number is the
+ * worklist, and #3300 is the umbrella that walks it down to zero and then
+ * deletes the synchronous method. Slice 1 (#3274) moved the three turn-end
+ * SCANNER stores; every other caller is counted here and unchanged.
+ *
+ * ## What the detector matches, and what it deliberately does not
+ *
+ * The member ACCESS `.readCache`, on any receiver, over
+ * comment-and-string-blanked source. Three deliberate choices:
+ *
+ * - Not `cacheManager.readCache`: a guard that enumerates one receiver
+ *   spelling is AGENTS.md defect shape 34, and the shipped tree already holds
+ *   `args.cacheManager.readCache` beside `cacheManager.readCache`, so renaming
+ *   the local would have walked the count DOWN — the direction this ratchet
+ *   reads as progress.
+ * - Not the call PARENTHESES either. The first version required `(` or a
+ *   generic before it and measured 10 reads in `runtime-turn.ts` where there
+ *   are 12: `readCache<{ testRunGeneration?: number; }>(…)` puts a `;` inside
+ *   the type argument, and three of the four in `test-runner-delivery.ts` hid
+ *   the same way. A member access needs no balanced-generic parser to find,
+ *   and a bare reference that is not called (`const read = cm.readCache`) is a
+ *   use of the synchronous seam too.
+ * - `readCacheAsync` does not match: the lookahead refuses an identifier
+ *   character after `readCache`, so the remedy is never counted as the defect.
+ */
+const SYNC_HOOK_READ_FILES = [
+	...hookPathFiles(REPO_ROOT),
+	...hookHelperModules(REPO_ROOT),
+];
+
+/** `.readCache` on any receiver, never `.readCacheAsync`. */
+const SYNC_CACHE_READ = /\.readCache(?![A-Za-z0-9_$])/;
+
+/**
+ * `codeMatches` is what makes this a CODE scan: it blanks comments and string
+ * contents and drops every match that lands in them. The population
+ * measurement and the mutation cases below both go through this one function,
+ * so the fixtures prove the property the population actually has. An explicit
+ * `stripSource` here was measured to be redundant — deleting it left every
+ * case green, because `codeMatches` had already done it — and a guard nobody
+ * can red is one more thing to keep true for nothing.
+ */
+function countSyncCacheReads(source: string): number {
+	return codeMatches(source, SYNC_CACHE_READ).length;
+}
+
+/** rel -> synchronous `readCache` calls in it RIGHT NOW. */
+function measureSyncHookReads(): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const absolute of new Set(SYNC_HOOK_READ_FILES)) {
+		const rel = relativePosix(REPO_ROOT, absolute);
+		const count = countSyncCacheReads(fs.readFileSync(absolute, "utf8"));
+		if (count > 0) out[rel] = count;
+	}
+	return out;
+}
+
+/**
+ * file -> synchronous `readCache` uses, pinned exactly. Down only; see the
+ * header. `clients/runtime-turn.ts` is 11 rather than the 12 on
+ * `origin/master`: #3274 moved the scanner-store memo to `readCacheAsync`
+ * under `bounded()`. #4725 lowered it to 9 and `clients/git-guard.ts` from 2
+ * to 1 by FOLDING, not migrating: the turn end's two `turn-end-findings`
+ * reads and git-guard's two now share one synchronous read
+ * (`storedRecord`), so one site is left to move to `readCacheAsync`. #4738
+ * folded two more the same way, 9 to 7: the turn-end composer's dedupe and
+ * main writes read the record through `readTurnEndGuardRecord`, which is
+ * that same `storedRecord` read.
+ *
+ * One of `runtime-agent-end.ts`'s two is `typeof cacheManager.readCache ===
+ * "function"` — a capability probe, not a read. It is counted on purpose:
+ * #3300's last slice deletes the method, and deletion sweeps dependents
+ * first, so a use that would break is exactly what this table must show.
+ */
+const SYNC_HOOK_READS: Readonly<Record<string, number>> = {
+	"clients/actionable-warnings.ts": 1,
+	"clients/git-guard.ts": 1,
+	"clients/runtime-agent-end.ts": 2,
+	"clients/runtime-context.ts": 8,
+	"clients/runtime-session.ts": 8,
+	"clients/runtime-turn.ts": 7,
+	"clients/test-runner-delivery.ts": 4,
+	"tools/lens-diagnostics.ts": 2,
+};
+
+/**
+ * The total the pins above may never exceed — the ratchet's one number, 39 on
+ * `origin/master` before this slice. #3300 lowers it per migrated population;
+ * nothing raises it.
+ */
+const SYNC_HOOK_READ_CEILING = 33;
+
+/** `auditRegistry` takes flat strings; the structure is folded in here. */
+function exemptionReasons(): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [key, entry] of Object.entries(EXEMPT_SITES)) {
+		const budget = isHookBudgetKey(entry.site)
+			? `${HOOK_WALL_BUDGET_MS[entry.site]}ms budget`
+			: "no declared budget";
+		out[key] =
+			`[${entry.family}, ${entry.site}, ${budget}, owner ${entry.owner}] ${entry.reason}`;
+	}
+	return out;
+}
+
+// The detector, the key derivation and this file-listing/scan driver are all
+// imported from `tests/support/hook-await-scan.ts` — the ONE home shared
+// with `scripts/rekey-hook-await-exemptions.mjs` (see that file's header,
+// and the usage note above `EXEMPT_SITES`). A vitest test file cannot be
+// `import()`ed by a plain Node script, so a second, hand-copied detector in
+// the script would be the single-source-of-truth violation AGENTS.md flags.
+const awaits = scanFiles(
+	REPO_ROOT,
+	hookPathFiles(REPO_ROOT),
+	findUnboundedAwaitLines,
+	"",
+);
+const races = scanFiles(
+	REPO_ROOT,
+	shippedSourceFiles(REPO_ROOT),
+	findHandRolledRaceLines,
+	"race:",
+	(rel) => rel === DEFINITION_FILE,
+);
+const boundedCalls = scanFiles(
+	REPO_ROOT,
+	shippedSourceFiles(REPO_ROOT),
+	findBoundedCallLines,
+	"call:",
+	(rel) => rel === DEFINITION_FILE,
+);
+
+/** rel -> unbounded-await count for every one-hop helper that has any. */
+function measureHelperModules(): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const absolute of hookHelperModules(REPO_ROOT)) {
+		const rel = relativePosix(REPO_ROOT, absolute);
+		const count = findUnboundedAwaitLines(
+			stripSource(fs.readFileSync(absolute, "utf8")),
+		).length;
+		if (count > 0) out[rel] = count;
+	}
+	return out;
+}
+
+describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled race", () => {
+	it("keeps hook admission registries sorted", () => {
+		// #2671 recurrence: an unsorted admission is a merge-conflict magnet.
+		expect(() => assertSortedRegistry("fixture", ["b", "a"])).toThrow(
+			"entries must be sorted",
+		);
+		assertSortedRegistry("EXEMPT_SITES", Object.keys(EXEMPT_SITES));
+		assertSortedRegistry("BOUNDED_CALL_SITES", Object.keys(BOUNDED_CALL_SITES));
+		assertSortedRegistry("SYNC_HOOK_READS", Object.keys(SYNC_HOOK_READS));
+	});
+	it(
+		"scans both file groups and finds both families (a dead scan is not a clean one)",
+		() => {
+			// Two floors, two failure modes (#1755 review F4): a broken walk and a
+			// broken detector must not share a message.
+			expect(awaits.scanned).toBeGreaterThanOrEqual(8);
+			expect(races.scanned).toBeGreaterThanOrEqual(200);
+			expect(awaits.occurrences.length).toBeGreaterThanOrEqual(1);
+			expect(races.occurrences.length).toBeGreaterThanOrEqual(1);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	it("recognises a real bound and nothing else", () => {
+		// Mutation guard on the DETECTOR (defect shape 10): each fixture is a
+		// shape that appears in the scanned files today, or the shape slice 2
+		// will replace it with.
+		expect(findUnboundedAwaitLines("await loadBootstrapClients();")).toEqual([
+			1,
+		]);
+		expect(
+			findUnboundedAwaitLines(
+				'await bounded(loadBootstrapClients(), { ms: 500, signal, hook: "tool_result", label: "bootstrap" });',
+			),
+		).toEqual([]);
+		// A deadline with no signal is HALF a bound, which is the defect.
+		expect(findUnboundedAwaitLines("await withBudget(sweep(), 500);")).toEqual([
+			1,
+		]);
+		// #2530 round 3 F2: round 1 accepted this because the word `signal`
+		// appeared ANYWHERE in the call's own parentheses — even here, where it
+		// names an argument of the WRAPPED work (`sweep`), not anything reaching
+		// `withDeadline`'s own race. None of `withDeadline`/`withTimeout`/
+		// `withBudget`/`withinRemaining` takes a `signal` parameter at all
+		// (`DeadlineOptions` has none), so the match was pure substring — the
+		// exact deadline-only hole #2523 exists to close, reopened by text
+		// instead of semantics. `bounded()` is the only accepted shape now.
+		expect(
+			findUnboundedAwaitLines(
+				"await withDeadline(sweep(), { ms: 500, signal });",
+			),
+		).toEqual([1]);
+		expect(
+			findUnboundedAwaitLines(
+				"await withTimeout(sweep(cwd, { signal }), 500);",
+			),
+		).toEqual([1]);
+		expect(
+			findUnboundedAwaitLines(
+				"await withinRemaining(sweep(cwd, { signal }), deadlineAt);",
+			),
+		).toEqual([1]);
+		// Review round 2 (F3): a bare `Promise.race` is NEVER a bound here,
+		// even when the word `signal` appears in it. A signal-only race is the
+		// mirror image of the deadline-only defect — the shape
+		// `clients/project-diagnostics/fresh-fetch.ts:670` already has, and the
+		// one this file's own inventory names as "signal only, no deadline" —
+		// so accepting it let a half-bound pass BOTH families at once. Round 1
+		// pinned that hole as correct. A new race is forbidden by the
+		// `hand-rolled-race` family anyway, which leaves `bounded()` as the only
+		// accepted form.
+		expect(
+			findUnboundedAwaitLines(
+				"await Promise.race([sweep(), aborted(signal)]);",
+			),
+		).toEqual([1]);
+		// #2530 round 3 F3: `Promise.any` is the same first-settlement-wins
+		// shape as `Promise.race` with a timer arm.
+		expect(
+			findUnboundedAwaitLines("await Promise.any([sweep(), aborted(signal)]);"),
+		).toEqual([1]);
+		// Including the timer-bearing spelling: the race family forbids it, and
+		// the await family must not quietly call it bounded on the way past.
+		expect(
+			findUnboundedAwaitLines(
+				"await Promise.race([sweep(), timeout(AbortSignal.timeout(5), signal)]);",
+			),
+		).toEqual([1]);
+		// A line is bounded only if EVERY await on it is.
+		expect(
+			findUnboundedAwaitLines(
+				'await bounded(a(), { ms: 1, signal, hook: "h", label: "l" }) + await raw();',
+			),
+		).toEqual([1]);
+		// Not a keyword: a property named `await`, an identifier tail.
+		expect(findUnboundedAwaitLines("queue.await(job);")).toEqual([]);
+		expect(findUnboundedAwaitLines("const awaited = value;")).toEqual([]);
+		// Comments and strings are blanked before the scan reaches them.
+		expect(
+			findUnboundedAwaitLines(stripSource("// await loadBootstrapClients();")),
+		).toEqual([]);
+		expect(
+			findUnboundedAwaitLines(stripSource('const s = "await sweep();";')),
+		).toEqual([]);
+	});
+
+	it("recognises a hand-rolled timeout race and nothing else", () => {
+		expect(
+			findHandRolledRaceLines(
+				[
+					"const winner = await Promise.race([",
+					"\twork(),",
+					"\tnew Promise((resolve) => setTimeout(resolve, 5000)),",
+					"]);",
+				].join("\n"),
+			),
+		).toEqual([1]);
+		expect(
+			findHandRolledRaceLines(
+				"await Promise.race([work(), abortPromise(AbortSignal.timeout(500))]);",
+			),
+		).toEqual([1]);
+		// #2530 round 3 F3: `Promise.any` is the same first-settlement-wins
+		// shape as `Promise.race` with a timer arm, and round 1 matched only
+		// `race`.
+		expect(
+			findHandRolledRaceLines(
+				"await Promise.any([work(), new Promise((r) => setTimeout(r, 500))]);",
+			),
+		).toEqual([1]);
+		// The dominant spelling: the timer arm hoisted into a named local a few
+		// lines above the race. An inline-only detector called this clean.
+		expect(
+			findHandRolledRaceLines(
+				[
+					"const timeoutPromise = new Promise((resolve) => {",
+					"\ttimeoutHandle = setTimeout(() => resolve(TIMED_OUT), budgetMs);",
+					"});",
+					"const raced = await Promise.race([work(), timeoutPromise]);",
+				].join("\n"),
+			),
+		).toEqual([4]);
+		// A race with NO timer arm is not a hand-rolled bound — it is ordinary
+		// first-past-the-post, and forbidding it would be a different rule.
+		expect(
+			findHandRolledRaceLines("await Promise.race([primary(), secondary()]);"),
+		).toEqual([]);
+		// A bare setTimeout with no race is a delay, not a bound.
+		expect(
+			findHandRolledRaceLines("await new Promise((r) => setTimeout(r, 10));"),
+		).toEqual([]);
+		expect(
+			findHandRolledRaceLines(
+				stripSource("// Promise.race([work(), setTimeout(done, 5)])"),
+			),
+		).toEqual([]);
+	});
+
+	// Recurrence (AGENTS.md shape 69, spelling enumerator): the call head was
+	// `Promise.race(` and nothing else, so `clients/lsp/index.ts`'s
+	// `Promise.race<…>(` client-wait race read as no race at all. The scan
+	// admits one form, a direct call whose own arms show no timer, and refuses
+	// every other reference to `race`/`any`, because the arms of an aliased or
+	// extracted race are not in view. Each plant below was green (`[]`) before.
+	it("refuses a race reached through type arguments, an alias, a binding or a computed access", () => {
+		const filler = Array.from({ length: 30 }, (_, i) => `const f${i} = ${i};`);
+		// Type arguments: the timer arm is in the call's own parentheses.
+		expect(
+			findHandRolledRaceLines(
+				[
+					"const r = await Promise.race<string | undefined>([",
+					"\twork(),",
+					"\tnew Promise<undefined>((resolve) => setTimeout(resolve, 5)),",
+					"]);",
+				].join("\n"),
+			),
+		).toEqual([1]);
+		// An alias: the call site is far from the reference and names no timer.
+		expect(
+			findHandRolledRaceLines(
+				[
+					"const race = Promise.race.bind(Promise);",
+					...filler,
+					"const r = await race([work(), sleepArm()]);",
+				].join("\n"),
+			),
+		).toEqual([1]);
+		// A value reached through another binding.
+		expect(
+			findHandRolledRaceLines(
+				[
+					"const { race } = Promise;",
+					...filler,
+					"const r = await race([work(), sleepArm()]);",
+				].join("\n"),
+			),
+		).toEqual([1]);
+		// A computed access (string contents are blanked before the scan).
+		expect(
+			findHandRolledRaceLines(
+				stripSource('const r = await Promise["race"]([work(), sleepArm()]);'),
+			),
+		).toEqual([1]);
+		// The admitted form stays admitted: a direct call, generic or not, with
+		// no timer in its arms or in the 25 lines above it.
+		expect(
+			findHandRolledRaceLines(
+				"const r = await Promise.race<string>([primary(), secondary()]);",
+			),
+		).toEqual([]);
+	});
+
+	it("MUTATION: a bare await planted on a hook path goes red, and bounded() makes it green", () => {
+		// The end-to-end proof, through the REAL detector and the REAL audit —
+		// not a hand-typed key. Planting the await must fail the guard even
+		// though its file is full of already-exempted siblings.
+		const rel = "clients/runtime-probe-hook.ts";
+		const planted = [
+			"export async function onProbeTurnEnd(deps: ProbeDeps): Promise<void> {",
+			"\tawait sweepInlineBlockerFreshness(deps);",
+			"}",
+		].join("\n");
+		const plantedRawLines = planted.split("\n");
+		const plantedHits = findUnboundedAwaitLines(stripSource(planted));
+		expect(plantedHits).toEqual([2]);
+		const plantedAudit = auditRegistry({
+			sweepName: "hook-await-bounds sweep",
+			flagged: plantedHits.map((line) => ({
+				key: awaitOccurrenceKey(rel, plantedRawLines, line - 1),
+				detail: `${rel}:${line}`,
+			})),
+			registered: [],
+			exemptions: exemptionReasons(),
+			minFlagged: 1,
+		});
+		expect(plantedAudit.unaccounted).toHaveLength(1);
+		expect(plantedAudit.problems.join("\n")).toContain("neither");
+
+		// The same await wrapped in bounded() is not flagged at all, so there is
+		// nothing left for an exemption to excuse.
+		const wrapped = [
+			"export async function onProbeTurnEnd(deps: ProbeDeps): Promise<void> {",
+			"\tawait bounded(sweepInlineBlockerFreshness(deps), {",
+			"\t\tms: HOOK_WALL_BUDGET_MS.turn_end,",
+			"\t\tsignal: deps.signal,",
+			'\t\thook: "turn_end",',
+			'\t\tlabel: "sweepInlineBlockerFreshness",',
+			"\t});",
+			"}",
+		].join("\n");
+		expect(findUnboundedAwaitLines(stripSource(wrapped))).toEqual([]);
+	});
+
+	it("every exemption names a declared hook budget or a stated non-hook reason", () => {
+		const entries = Object.entries(EXEMPT_SITES);
+		for (const [key, entry] of entries) {
+			expect(
+				isHookBudgetKey(entry.site) ||
+					entry.site === "off-hook" ||
+					entry.site === "unbudgeted-hook",
+				`${key}: site "${entry.site}" is not a declared hook budget key`,
+			).toBe(true);
+			expect(entry.owner, `${key}: no owning issue`).toMatch(/#\d+/);
+			expect(
+				key.startsWith("race:") === (entry.family === "hand-rolled-race"),
+				`${key}: family "${entry.family}" does not match the key namespace`,
+			).toBe(true);
+		}
+		// The binding to clients/hook-budgets.ts must not be vacuous: if every
+		// entry were "off-hook" the table would assert nothing about any hook.
+		const hookOwned = entries.filter(([, entry]) =>
+			isHookBudgetKey(entry.site),
+		);
+		expect(hookOwned.length).toBeGreaterThanOrEqual(
+			Math.max(1, Math.floor(entries.length / 4)),
+		);
+	});
+
+	it(
+		"derives the helper set from the import graph, not from a list of names",
+		() => {
+			// #2557 review F4. The round-1 shape was six hand-written module names,
+			// which is defect shape 34: it could not see `clients/observed-mutation.ts`
+			// or `clients/lsp/index.ts` — modules this PR itself labels hook-reached.
+			const helpers = hookHelperModules(REPO_ROOT).map((absolute) =>
+				relativePosix(REPO_ROOT, absolute),
+			);
+			// A dead walk is not a clean one: the resolver returning [] (a stray
+			// `strings: "blank"` erases every specifier, which it did on the first
+			// cut) would make every count below vacuously correct.
+			expect(helpers.length).toBeGreaterThanOrEqual(100);
+			// The facade is now the one-hop LSP boundary; its implementation module
+			// remains behind that adapter and is covered by the LSP population.
+			expect(helpers).toContain("clients/observed-mutation.ts");
+			expect(helpers).toContain("clients/lsp/capabilities.ts");
+			expect(helpers).toContain("clients/formatters.ts");
+			// ...and one it WRONGLY included: `clients/dispatch/dispatcher.ts` is
+			// two hops out, through `clients/dispatch/integration.ts`.
+			expect(helpers).not.toContain("clients/dispatch/dispatcher.ts");
+			expect(
+				localImportTargets(
+					path.join(REPO_ROOT, "clients/dispatch/integration.ts"),
+				).map((absolute) => relativePosix(REPO_ROOT, absolute)),
+			).toContain("clients/dispatch/dispatcher.ts");
+			// ...and one the TYPE-ONLY exclusion above wrongly included before this
+			// PR: `clients/lsp/client.ts` is reached from a hook handler only for
+			// its exported TYPES (`LSPDiagnostic`/`LSPCodeAction` in signatures);
+			// the actual value-level LSP client is `clients/lsp/index.ts`'s
+			// `getLSPService()`.
+			expect(helpers).not.toContain("clients/lsp/client.ts");
+			// A hook handler is not its own helper.
+			for (const handler of hookPathFiles(REPO_ROOT)) {
+				expect(helpers).not.toContain(relativePosix(REPO_ROOT, handler));
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	// #2557 review friction: 9 modules / 128 awaits (`clients/lsp/client.ts`
+	// alone contributing 75) reached the one-hop set ONLY through an
+	// `import type` clause, never a value import — a hook handler that
+	// imports a TYPE from a helper never actually calls into it, so counting
+	// it as a hook-reached module is a false positive the reviewer measured
+	// tripping 22% of recently merged PRs. A type edge is not a call.
+	it("does not count a module reached only through import type / export type", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-hook-await-type-only-"),
+		);
+		try {
+			fs.writeFileSync(
+				path.join(dir, "type-only-target.ts"),
+				"export interface A {}\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "value-target.ts"),
+				"export const B = 1;\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "mixed-target.ts"),
+				"export interface C {}\nexport const D = 1;\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "importer.ts"),
+				[
+					'import type { A } from "./type-only-target.js";',
+					'import { B } from "./value-target.js";',
+					// A mixed clause: an inline `type` specifier alongside a real
+					// value one. The whole DECLARATION does not start with `type`,
+					// so this stays a real edge (the module IS called into).
+					'import { type C, D } from "./mixed-target.js";',
+					'export type { A as AReExport } from "./type-only-target.js";',
+					"",
+					"export function use(): void {",
+					"  void B;",
+					"  void D;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			const targets = localImportTargets(path.join(dir, "importer.ts")).map(
+				(absolute) => path.basename(absolute),
+			);
+			expect(targets).not.toContain("type-only-target.ts");
+			expect(targets).toContain("value-target.ts");
+			expect(targets).toContain("mixed-target.ts");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it(
+		"pins every one-hop helper module's unbounded-await count",
+		() => {
+			const measured = measureHelperModules();
+			// Vacuity floor: an empty measurement would make the audit below pass on
+			// nothing at all.
+			expect(Object.keys(measured).length).toBeGreaterThanOrEqual(50);
+			expect(
+				Object.values(measured).reduce((total, n) => total + n, 0),
+			).toBeGreaterThan(0);
+			const audit = auditSymbolCounts({
+				sweepName: "hook helper unbounded-await pin (#2523 slice 3 worklist)",
+				counts: measured,
+				pinned: HELPER_UNBOUNDED,
+				remediation:
+					"A module a registered hook handler imports DIRECTLY gained or lost " +
+					"an unbounded await. Wrap it in bounded() (clients/deadline-utils.ts) " +
+					"and lower the pinned number, or raise the number here and say why it " +
+					"had to grow. A module that appears with no pin at all is new to the " +
+					"one-hop set — add it. " +
+					HELPER_EXEMPTION_REASON,
+			});
+			expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+			expect(HELPER_EXEMPTION_REASON.length).toBeGreaterThan(120);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	it(
+		"pins every hook-path file's synchronous readCache count",
+		() => {
+			// Recurrence prevented (#3274): `turn_end` ran three synchronous
+			// `CacheManager.readCache` calls per delivery — 2 existsSync + 2
+			// readFileSync/JSON.parse each — that NO population here could see,
+			// because both scan async constructs. `bounded()` cannot bound one: the
+			// read finishes during argument evaluation, before bounded() receives a
+			// promise. A new one must red, and a migrated one must lower a number.
+			const measured = measureSyncHookReads();
+			// Vacuity floor: an empty measurement would make the audit pass on
+			// nothing at all, which is how #1718 read clean for months.
+			expect(Object.keys(measured).length).toBeGreaterThanOrEqual(5);
+			const audit = auditSymbolCounts({
+				sweepName: "sync-hook-read ratchet (#3274, umbrella #3300)",
+				counts: measured,
+				pinned: SYNC_HOOK_READS,
+				remediation:
+					"A hook-path file gained or lost a synchronous CacheManager.readCache " +
+					"call. A NEW one is refused: it cannot be bounded (bounded() takes a " +
+					"promise; the read completes during argument evaluation), so use " +
+					"`readCacheAsync` and await it under bounded() with the hook's budget " +
+					"and ctx.signal — the shape `readScannerCache` in clients/runtime-turn.ts " +
+					"uses. A MIGRATED one lowers its file's pin and SYNC_HOOK_READ_CEILING " +
+					"in the same PR; #3300 is the umbrella that walks this table to zero " +
+					"and then deletes the synchronous method.",
+			});
+			expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+			// The ratchet itself: the total only ever goes down.
+			const total = Object.values(measured).reduce((sum, n) => sum + n, 0);
+			expect(total).toBeLessThanOrEqual(SYNC_HOOK_READ_CEILING);
+			expect(
+				Object.values(SYNC_HOOK_READS).reduce((sum, n) => sum + n, 0),
+			).toBeLessThanOrEqual(SYNC_HOOK_READ_CEILING);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	it("MUTATION: the sync-read detector sees calls, not prose or spellings", () => {
+		// The self-excuse direction is the dangerous one for a ratchet that
+		// counts DOWN: a real call the detector stops seeing reads as progress.
+		// So the receiver is not part of the match, and a comment or a string
+		// mentioning the call cannot change the number either way.
+		expect(countSyncCacheReads("cacheManager.readCache(a, b);")).toBe(1);
+		expect(countSyncCacheReads("args.cacheManager.readCache<Foo>(a, b);")).toBe(
+			1,
+		);
+		expect(countSyncCacheReads("cm.readCache(a, b);")).toBe(1);
+		// A type argument holding a `;` is the shape the first version of this
+		// detector missed — three of four in `test-runner-delivery.ts` and two in
+		// `runtime-turn.ts` — reading 10 where there were 12.
+		expect(
+			countSyncCacheReads("cm.readCache<{\n  gen?: number;\n}>('x', cwd);"),
+		).toBe(1);
+		// The async seam is the remedy, never a member of the population.
+		expect(countSyncCacheReads("await cm.readCacheAsync(a, b);")).toBe(0);
+		// A comment and a string naming the call satisfy nothing (F7).
+		expect(countSyncCacheReads("// cacheManager.readCache(a, b);")).toBe(0);
+		expect(
+			countSyncCacheReads('const s = "cacheManager.readCache(a, b)";'),
+		).toBe(0);
+		expect(
+			countSyncCacheReads("/** cacheManager.readCache(a, b) */ noop();"),
+		).toBe(0);
+	});
+
+	it(
+		"registers every shipped bounded() call with the provenance of its signal",
+		() => {
+			// #2557 review F2. `bounded()` reads a missing signal as one that never
+			// aborts, so a seam with an optional signal runs on ONE live bound
+			// whenever its caller had none. Round 1 made that greppable with a
+			// `NEVER_ABORTED` sentinel — a second concept for behaviour bounded()
+			// already had. Registering the CALLS instead covers the same seams
+			// without one, and covers sites that would never have named a sentinel.
+			const audit = auditRegistry({
+				sweepName: "bounded() call-site registry (#2523)",
+				flagged: boundedCalls.occurrences,
+				registered: [],
+				exemptions: BOUNDED_CALL_SITES,
+				scannedCount: boundedCalls.scanned,
+				minScanned: 200,
+				minFlagged: 1,
+				remediation:
+					"A new bounded() call site. Add an entry here keyed by the printed " +
+					"occurrence key, saying WHERE its `signal` comes from and whether " +
+					"that source can be undefined — if it can, this call runs on the " +
+					"wall clock alone whenever it is, which is weaker than #2523's " +
+					"contract and has to be a written decision rather than a default.",
+			});
+			expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+			for (const [key, reason] of Object.entries(BOUNDED_CALL_SITES)) {
+				expect(reason.length, `${key}: provenance too thin`).toBeGreaterThan(
+					80,
+				);
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	it("MUTATION: the bounded() call detector sees calls and nothing that merely looks like one", () => {
+		expect(
+			findBoundedCallLines(
+				[
+					"const settled = await bounded(work(), {",
+					"\tms: 5,",
+					"\tsignal: deps.signal,",
+					'\thook: "turn_end",',
+					'\tlabel: "l",',
+					"});",
+				].join("\n"),
+			),
+		).toEqual([3]);
+		// Shorthand `signal` keys on the same line the value comes from.
+		expect(
+			findBoundedCallLines(
+				[
+					'await bounded(w(), { ms, signal, hook: "turn_end", label: "l" });',
+				].join("\n"),
+			),
+		).toEqual([1]);
+		// No `signal` property at all (a JS caller): keyed at the call head, so
+		// it is still registered rather than invisible.
+		expect(findBoundedCallLines("await bounded(w(), { ms: 5 });")).toEqual([1]);
+		// The neighbours that must NOT match.
+		expect(findBoundedCallLines("await boundedLspCall(call, deps);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines("const n = boundedNumber(v, 5);")).toEqual([]);
+		expect(findBoundedCallLines("await deps.bounded(work(), opts);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines("const c = new BoundedFifoMap(10);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines(stripSource("// bounded(w(), o);"))).toEqual(
+			[],
+		);
+	});
+
+	it("documents the heuristic's limits", () => {
+		expect(SWEEP_HEURISTIC_LIMITS.length).toBeGreaterThanOrEqual(4);
+		for (const limit of SWEEP_HEURISTIC_LIMITS) {
+			expect(limit.length).toBeGreaterThan(40);
+		}
+	});
+
+	it(
+		"every hook-path await and every hand-rolled race is bounded or exempted",
+		() => {
+			const audit = auditRegistry({
+				sweepName: "hook-await-bounds sweep (#2523 AC1)",
+				flagged: [...awaits.occurrences, ...races.occurrences],
+				registered: [],
+				exemptions: exemptionReasons(),
+				scannedCount: awaits.scanned + races.scanned,
+				// index.ts + mcp/server.ts + clients/mcp/session.ts + eight
+				// clients/runtime-*.ts, plus ~450 shipped files for the race scan.
+				minScanned: 208,
+				minFlagged: 1,
+				remediation:
+					"An await: wrap it in bounded() from clients/deadline-utils.ts — it " +
+					"takes the hook's budget from HOOK_WALL_BUDGET_MS " +
+					"(clients/hook-budgets.ts) AND the hook's ctx.signal, and its type " +
+					"refuses one without the other. A `race:` key: use bounded() (or " +
+					"withDeadline for a signal-less leaf) instead of hand-rolling the " +
+					"timer arm. Otherwise add an EXEMPT_SITES entry here keyed by the " +
+					"printed occurrence key, with its family, the hook whose budget it " +
+					"spends, a real reason, and the issue that owns closing it.",
+			});
+			expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	it("#3938 a harmless insertion inside a long hook handler does not re-key its await", () => {
+		// The REAL detector over the built seam: a compile-valid handler whose
+		// flagged await starts 397 lines below its declaration, then six
+		// harmless lines push it past the old 400-line window. Pre-#3938 the
+		// key lost its `#onProbeLongHook:` component; now it is stable.
+		const filler = Array.from(
+			{ length: 396 },
+			(_, i) => `\tconst filler${i} = ${i};`,
+		);
+		const flagged = "\tawait sweepInlineBlockerFreshness(deps);";
+		const before = [
+			"export async function onProbeLongHook(deps: ProbeDeps): Promise<void> {",
+			...filler,
+			flagged,
+			"}",
+		].join("\n");
+		const beforeHits = findUnboundedAwaitLines(stripSource(before));
+		expect(beforeHits).toEqual([filler.length + 2]);
+		const beforeLines = before.split("\n");
+		const beforeKey = awaitOccurrenceKey(
+			"clients/runtime-probe-long.ts",
+			beforeLines,
+			beforeHits[0] - 1,
+		);
+		expect(beforeKey).toMatch(
+			/^clients\/runtime-probe-long\.ts#onProbeLongHook:[0-9a-f]{8}~/,
+		);
+
+		const padding = Array.from(
+			{ length: 6 },
+			(_, i) => `\t// harmless padding line ${i}`,
+		).join("\n");
+		// Padding lands directly after the DECLARATION, far from the flagged
+		// await, so only the owner derivation is under test: the await's own
+		// neighbours (its `~context` suffix) are unchanged.
+		const after = [
+			"export async function onProbeLongHook(deps: ProbeDeps): Promise<void> {",
+			padding,
+			...filler,
+			flagged,
+			"}",
+		].join("\n");
+		const afterHits = findUnboundedAwaitLines(stripSource(after));
+		expect(afterHits).toEqual([filler.length + 6 + 2]);
+		const afterLines = after.split("\n");
+		const afterKey = awaitOccurrenceKey(
+			"clients/runtime-probe-long.ts",
+			afterLines,
+			afterHits[0] - 1,
+		);
+		expect(afterKey).toBe(beforeKey);
+	});
+
+	it(
+		"#3938 comment/template padding does not re-key the registered runtime-tool-result await",
+		() => {
+			// The REAL scan (module-level `awaits`) already keyed every hook-path
+			// await. Take the live registered occurrence from it, not a hand-typed
+			// hash, and prove below that it is a real exemption.
+			const rel = "clients/runtime-tool-result.ts";
+			const registeredKey = `${rel}#handleToolResult:a1bef279~57385903`;
+			const registered = awaits.occurrences.find(
+				(o) => o.key === registeredKey,
+			);
+			expect(
+				registered,
+				"the real scan no longer derives the registered #handleToolResult await",
+			).toBeDefined();
+			expect(Object.hasOwn(EXEMPT_SITES, registered!.key)).toBe(true);
+
+			const rawLines = fs
+				.readFileSync(path.join(REPO_ROOT, rel), "utf8")
+				.split("\n");
+			const flaggedIndex =
+				Number(registered!.detail.match(/:(\d+)\s/)?.[1]) - 1;
+			expect(awaitOccurrenceKey(rel, rawLines, flaggedIndex)).toBe(
+				registered!.key,
+			);
+
+			// Insert far from the await (right after handleToolResult's own
+			// `} = deps;`) so the flagged line's `~context` neighbours are untouched.
+			const declIndex = rawLines.findIndex((l) =>
+				/^(?:export\s+)?(?:async\s+)?function\s+handleToolResult\b/.test(l),
+			);
+			let insertAt = -1;
+			for (let i = declIndex; i < flaggedIndex; i++) {
+				if (rawLines[i].trim() === "} = deps;") {
+					insertAt = i + 1;
+					break;
+				}
+			}
+			expect(declIndex).toBeGreaterThanOrEqual(0);
+			expect(insertAt).toBeGreaterThan(declIndex);
+
+			// Both shapes were verified byte-identical under `oxfmt` (#3938 r2):
+			// the column-0 interior line is stable, so the formatter would not move
+			// the fixture that triggers the re-key.
+			const paddings: Record<string, string[]> = {
+				"template-literal interior": [
+					"\tconst noise = `",
+					"function fakeFromString() {",
+					"`;",
+				],
+				"block-comment interior": ["/*", "function fakeFromComment() {", "*/"],
+			};
+			for (const [label, padding] of Object.entries(paddings)) {
+				const padded = [
+					...rawLines.slice(0, insertAt),
+					...padding,
+					...rawLines.slice(insertAt),
+				];
+				const paddedIndex = flaggedIndex + padding.length;
+				// The flagged line's own hash and neighbourhood are byte-identical;
+				// only the owner derivation could re-key it.
+				expect(padded[paddedIndex]).toBe(rawLines[flaggedIndex]);
+				expect(
+					awaitOccurrenceKey(rel, padded, paddedIndex),
+					`${label} must not re-key the registered await`,
+				).toBe(registered!.key);
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+});

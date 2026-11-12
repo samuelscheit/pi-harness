@@ -1,0 +1,298 @@
+#!/usr/bin/env node
+/**
+ * Bundle the compiled extension entry (`dist/index.js`) into a single
+ * self-contained ESM file, inlining pure-JS runtime dependencies.
+ *
+ * WHY THIS EXISTS
+ * pi ships as a `bun build --compile` single-file executable and loads
+ * extensions inside that embedded runtime. That runtime's module resolver does
+ * not traverse an extension's on-disk `node_modules` for a BARE specifier (e.g.
+ * `import "minimatch"`), so analyzers that transitively import third-party deps
+ * (minimatch via `file-utils.js` -> jscpd/todo/complexity) fail to load
+ * ("Cannot find package 'minimatch' …") and drop to degraded mode. Bundling
+ * inlines those deps so the extension imports nothing by bare specifier at load
+ * time. Runs after `tsc` (build:dist) has produced `dist/`; bundles in place.
+ *
+ * KEPT EXTERNAL (not inlined)
+ *   The list lives in ./lib/host-provided-deps.mjs, which is also what
+ *   package.json's dependency shape and tests/packaging.test.ts are pinned to
+ *   (#1926). Two reasons a package is external:
+ *   - Host-provided: pi resolves it from its own embedded runtime, so the
+ *     extension must NOT declare it as a runtime dependency.
+ *   - Native addon / wasm loaded lazily by absolute path at call time.
+ *   node: builtins are external by default.
+ *
+ * esbuild is run through `npm exec` (resolved from npm's own CLI so there is no
+ * npx `.cmd` shim and no shell), the same resolve-your-own-toolchain approach
+ * build:dist uses for tsc (#437): esbuild installs into npm's cache, never the
+ * project tree, so this adds no dependency and works under a from-source
+ * `--omit=dev` install where project devDeps are absent. This relies on npm's
+ * `exec --package` syntax; pi always installs via npm so the shipping path is
+ * npm. A non-npm `npm_execpath` (pnpm/yarn/bun) is rejected with a clear error.
+ *
+ * WHY `--prefix` AND NOT A DIFFERENT `cwd` (#2590, #2594 review F1)
+ * The isolation mechanism (`npm exec --package` resolves against the WHOLE
+ * project dependency tree unless steered elsewhere) is shared with
+ * `scripts/build-dist-tsc.mjs`'s tsc spawn (#2593) — see
+ * scripts/lib/exec-isolation.mjs for the full mechanism writeup and both
+ * call sites' shared builder.
+ *
+ * A first attempt at this fix moved the spawn's `cwd` to a temp directory,
+ * which also moves npm's `runPath` (it defaults to `process.cwd()`) — but
+ * esbuild bakes its bundled-module-path banner COMMENTS relative to ITS OWN
+ * cwd, so that shipped a `dist/index.js` with hundreds of machine- and
+ * worktree-specific relative paths (`// ../../home/<user>/...`) baked into
+ * it, a different artifact than master's (see tests/packaging.test.ts's
+ * "bakes no user-profile absolute path into the bundle").
+ *
+ * The actual fix: keep the spawn's `cwd` (and therefore `runPath`) at
+ * `root`, and pass `--prefix <freshly created empty temp dir>` on the npm
+ * CLI invocation instead (see scripts/lib/exec-isolation.mjs). `distEntry`
+ * and the esbuild `--outfile` are both already absolute paths, so nothing
+ * about esbuild's OUTPUT changes; the fix touches only what npm's exec
+ * resolution can see, never what esbuild itself runs from.
+ *
+ * USAGE
+ *   node scripts/bundle-dist.mjs   # invoked by `npm run bundle:dist`
+ */
+import { execFileSync } from "node:child_process";
+import {
+	cpSync,
+	existsSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	buildIsolatedExecInvocation,
+	createIsolatedExecPrefix,
+	readLockedToolVersion,
+} from "./lib/exec-isolation.mjs";
+import { BUNDLE_EXTERNALS } from "./lib/host-provided-deps.mjs";
+import { isMainModule } from "./lib/is-main-module.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ESBUILD_VERSION = readLockedToolVersion({ root, packageName: "esbuild" });
+const distEntry = path.join(root, "dist", "index.js");
+const tmpOut = path.join(root, "dist", "index.bundled.mjs");
+const splitOutDir = path.join(root, "dist", ".bundle-split");
+
+/**
+ * #3219: every OTHER runtime entry the package ships, as esbuild
+ * `out=in` pairs (output path relative to dist/, input tsc emit). Before
+ * #3219 these ran from the unbundled tsc tree, so the tarball carried
+ * dist/clients/** and dist/tools/** (~8 MB, the same code as the bundle) just
+ * for them. The three bins, the MCP fresh-analysis worker that mcp/server.js
+ * spawns by path (`<server dir>/worker.js`), the two persist worker threads
+ * the extension starts with `new Worker(path)`, and the installer registry
+ * the shipped self-test probes.
+ *
+ * Chunk layout, measured on this build: these share esbuild chunks
+ * (4.13 MB, 126 files) and dist/index.js stays ONE self-contained file
+ * (4.97 MB) exactly as before. Splitting index.js into the same chunks would
+ * save another ~4 MB (4.93 MB for all seven) but would make pi load ~130
+ * files through its loader at session start, and scripts/warm-loader-cache.mjs
+ * warms only dist/index.js. Chunks are written at the dist/ ROOT
+ * (`chunk-<hash>.js`), beside index.js, so `import.meta.url` inside shared
+ * code resolves to the same directory it does in the single-file bundle.
+ */
+export const SPLIT_ENTRIES = [
+	["mcp/cli", "dist/mcp/cli.js"],
+	["mcp/server", "dist/mcp/server.js"],
+	["mcp/analyze-cli", "dist/mcp/analyze-cli.js"],
+	["mcp/worker", "dist/mcp/worker.js"],
+	[
+		"workers/project-snapshot-persist-worker",
+		"dist/clients/project-snapshot-persist-worker.js",
+	],
+	[
+		"workers/review-graph-persist-worker",
+		"dist/clients/review-graph/persist-worker.js",
+	],
+	// The installer registry (TOOLS, ensureTool, …) as a bundled module with
+	// its exports kept, for scripts/install-selftest.mjs and the release-QA
+	// install smoke (smoke-tools.mjs --installer-root), which read it from an
+	// INSTALLED package where dist/clients/ no longer exists.
+	["probes/installer", "dist/clients/installer/index.js"],
+];
+
+// Packages the bundle must NOT inline: host-provided ones resolve from pi's
+// embedded runtime; native/wasm ones are dynamic-imported by absolute path.
+// Single source of truth — see ./lib/host-provided-deps.mjs (#1926).
+const EXTERNAL = BUNDLE_EXTERNALS;
+
+// esbuild's ESM output wraps bundled CommonJS modules (e.g. vscode-jsonrpc) in a
+// shim that throws on any dynamic require(); a pure-ESM Node process has no
+// ambient require. Prepend a real one so those bundled CJS deps resolve at load.
+const REQUIRE_BANNER =
+	'import { createRequire as __pilensCreateRequire } from "node:module"; const require = __pilensCreateRequire(import.meta.url);';
+
+// npm's own CLI, set by npm when it runs this via `npm run bundle:dist`. Running
+// esbuild through `node <npm-cli> exec` (rather than the `npx`/`npx.cmd` shim)
+// keeps the spawn shell-free and cross-platform, so args are never re-parsed by
+// a shell. This uses npm's `exec --package` syntax specifically; pnpm/yarn/bun
+// expose a different exec/dlx surface, so the invocation is intentionally
+// npm-only (pi always installs via npm, so the shipping path is npm) and we
+// reject a non-npm `npm_execpath` with a clear message rather than passing
+// npm flags to another package manager's CLI.
+const npmCli = process.env.npm_execpath;
+const isNpmCli = npmCli
+	? /npm-cli\.js$|(^|[\\/])npm(\.js)?$/.test(npmCli)
+	: false;
+
+/**
+ * Build the argv + spawn options for the esbuild `npm exec` invocation.
+ * Pure and side-effect-free (takes the prefix directory as an input rather
+ * than creating one) so a test can pin the exact production shape without
+ * spawning anything — see tests/scripts/bundle-dist.test.ts (#2594 review
+ * F2: a test that only checked the prefix resolver in isolation would stay
+ * green even if the call site stopped using its result).
+ *
+ * `cwd: root` is load-bearing — see the header comment — and asserted
+ * directly, not inferred from the absence of a `cwd` override. The actual
+ * argv-building is the shared `buildIsolatedExecInvocation` (#2593; also
+ * used by scripts/build-dist-tsc.mjs) — see scripts/lib/exec-isolation.mjs.
+ *
+ * @param {{ npmCli: string, execPrefix: string }} args
+ * @returns {{ command: string, argv: string[], options: { cwd: string, stdio: "inherit" } }}
+ */
+export function buildEsbuildExecInvocation({ npmCli: npmCliPath, execPrefix }) {
+	return buildIsolatedExecInvocation({
+		npmCli: npmCliPath,
+		execPrefix,
+		cwd: root,
+		packageSpec: `esbuild@${ESBUILD_VERSION}`,
+		execArgv: [
+			"esbuild",
+			distEntry,
+			"--bundle",
+			"--platform=node",
+			"--format=esm",
+			...EXTERNAL.map((name) => `--external:${name}`),
+			`--outfile=${tmpOut}`,
+		],
+	});
+}
+
+/**
+ * #3219: the esbuild invocation for {@link SPLIT_ENTRIES}. Same isolation,
+ * externals and require banner as the index bundle; `--splitting` writes the
+ * shared code once as `chunk-<hash>.js`. Output goes to a staging directory
+ * because esbuild refuses to overwrite its own inputs (the bins are bundled
+ * over their tsc emit).
+ *
+ * @param {{ npmCli: string, execPrefix: string }} args
+ */
+export function buildSplitEsbuildExecInvocation({
+	npmCli: npmCliPath,
+	execPrefix,
+}) {
+	return buildIsolatedExecInvocation({
+		npmCli: npmCliPath,
+		execPrefix,
+		cwd: root,
+		packageSpec: `esbuild@${ESBUILD_VERSION}`,
+		execArgv: [
+			"esbuild",
+			...SPLIT_ENTRIES.map(
+				([out, input]) => `${out}=${path.join(root, input)}`,
+			),
+			"--bundle",
+			"--platform=node",
+			"--format=esm",
+			"--splitting",
+			"--chunk-names=chunk-[hash]",
+			...EXTERNAL.map((name) => `--external:${name}`),
+			`--banner:js=${REQUIRE_BANNER}`,
+			`--outdir=${splitOutDir}`,
+		],
+	});
+}
+
+/** Run one isolated esbuild invocation; returns false (after logging) on failure. */
+function runEsbuild(build) {
+	// mkdtempSync runs inside the try so a TMPDIR failure surfaces through the
+	// existing "[bundle] esbuild failed: …" message rather than an uncaught
+	// stack trace (#2594 review F3). No retry/fallback: there is no recorded
+	// recurrence of mkdtemp failing here, so none is built for it.
+	let execPrefix;
+	try {
+		execPrefix = createIsolatedExecPrefix();
+		const { command, argv, options } = build({ npmCli, execPrefix });
+		execFileSync(command, argv, options);
+		return true;
+	} catch (err) {
+		console.error(`[bundle] esbuild failed: ${err?.message ?? err}`);
+		return false;
+	} finally {
+		// Tidiness, not correctness: npm's own package cache lives under npm's
+		// cache dir, not this directory, so nothing load-bearing is left behind
+		// here either way — but don't leak temp directories on every build.
+		if (execPrefix) {
+			rmSync(execPrefix, { recursive: true, force: true });
+		}
+	}
+}
+
+export function main() {
+	if (!existsSync(distEntry)) {
+		console.error(
+			`[bundle] ${distEntry} not found — run build:dist (tsc) first.`,
+		);
+		process.exit(1);
+	}
+	// Idempotency guard: the bundle step rewrites dist/index.js IN PLACE, so a
+	// second standalone `npm run bundle:dist` (without build:dist's fresh tsc
+	// emit) would re-bundle the bundle and prepend the require banner a second
+	// time — a duplicate `const require` declaration that fails to load
+	// ("Identifier '__pilensCreateRequire' has already been declared"). Detect
+	// the banner and no-op instead.
+	if (readFileSync(distEntry, "utf8").startsWith(REQUIRE_BANNER)) {
+		console.error(
+			"[bundle] dist/index.js is already bundled — skipping (run build:dist for a fresh emit).",
+		);
+		process.exit(0);
+	}
+	if (!npmCli) {
+		console.error(
+			"[bundle] npm_execpath unset — run via `npm run bundle:dist`.",
+		);
+		process.exit(1);
+	}
+	if (!isNpmCli) {
+		console.error(
+			`[bundle] npm_execpath is not npm (${npmCli}) — this step uses npm's ` +
+				"`exec --package` syntax. Run `npm run bundle:dist` with npm.",
+		);
+		process.exit(1);
+	}
+
+	// #3219: the split entries first. They read the tsc emit of the bins and
+	// workers, so this must run before anything overwrites dist/mcp/*.js; a
+	// previous partial run is detected by dist/workers/ and not re-bundled.
+	if (!existsSync(path.join(root, "dist", "workers"))) {
+		rmSync(splitOutDir, { recursive: true, force: true });
+		if (!runEsbuild(buildSplitEsbuildExecInvocation)) process.exit(1);
+		cpSync(splitOutDir, path.join(root, "dist"), { recursive: true });
+		rmSync(splitOutDir, { recursive: true, force: true });
+		console.error(
+			`[bundle] wrote ${SPLIT_ENTRIES.length} split entries and their shared chunks`,
+		);
+	}
+
+	if (!runEsbuild(buildEsbuildExecInvocation)) process.exit(1);
+
+	// Prepend the require banner, then replace the tsc-emitted entry in place.
+	writeFileSync(tmpOut, `${REQUIRE_BANNER}\n${readFileSync(tmpOut, "utf8")}`);
+	renameSync(tmpOut, distEntry);
+	console.error(
+		`[bundle] wrote self-contained ${path.relative(root, distEntry)}`,
+	);
+}
+
+if (isMainModule(import.meta.url)) {
+	main();
+}

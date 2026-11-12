@@ -1,0 +1,179 @@
+import { toolAbsentSkip } from "./utils/runner-helpers.js";
+import { skipped } from "../types.js";
+import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
+import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
+import {
+	getLinterPolicyForCwd,
+	markdownlintConfigArgs,
+} from "../../tool-policy.js";
+import { PRIORITY } from "../priorities.js";
+import type {
+	Diagnostic,
+	DispatchContext,
+	RunnerDefinition,
+	RunnerResult,
+} from "../types.js";
+import { resolveToolCommandWithInstallFallback } from "./utils/runner-helpers.js";
+import type { ToolExitCodes } from "./utils/spawn-outcome.js";
+import { markdownlintNoFixInvocation } from "./utils/markdownlint-api.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
+
+// EXIT TABLE (markdownlint-cli2 0.17 README https://github.com/DavidAnson/markdownlint-cli2#exit-codes): 0 = no
+// findings, 1 = lint findings, 2 = unexpected error (unreadable config, bad
+// glob, crash). Only 2 is a rejected invocation.
+const MARKDOWNLINT_EXIT_CODES: ToolExitCodes = { ran: [1] };
+
+// markdownlint-cli2 text output does not include per-violation fixability,
+// so we keep a static allowlist of MD### rules whose --fix is deterministic.
+// Sourced from the rule pages in
+// https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md — every
+// entry below is documented as "Fixable: yes" (or equivalent). Update when
+// markdownlint adds or changes auto-fix support.
+const MARKDOWNLINT_FIXABLE_RULES = new Set<string>([
+	"MD001",
+	"MD004",
+	"MD005",
+	"MD007",
+	"MD009",
+	"MD010",
+	"MD011",
+	"MD012",
+	"MD014",
+	"MD018",
+	"MD019",
+	"MD020",
+	"MD021",
+	"MD022",
+	"MD023",
+	"MD026",
+	"MD027",
+	"MD030",
+	"MD031",
+	"MD032",
+	"MD034",
+	"MD037",
+	"MD038",
+	"MD039",
+	"MD044",
+	"MD047",
+	"MD049",
+	"MD050",
+	"MD053",
+	"MD058",
+]);
+
+// markdownlint-cli2 output: `path:line[:col] [error|warning] MD###/name[/name…] message`
+// Two things the original parser missed (→ silent 0 diagnostics, #212):
+//   1. cli2 emits a severity token (`error`/`warning`) between the col and the
+//      rule code — older markdownlint-cli did not.
+//   2. some rules carry MULTIPLE slash-separated names (e.g.
+//      `MD041/first-line-heading/first-line-h1`).
+// The severity token is optional so older/relative-path output still parses.
+function parseMarkdownlintOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
+	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
+	for (const line of raw.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		// Rule code is MD### followed by one or more slash-joined names. Use a
+		// single char class (`[\w/-]+`) rather than a nested quantifier
+		// (`(?:/[\w-]+)+`) so there's no super-linear backtracking (S5852).
+		const match = line.match(
+			/^(.*?):(\d+)(?::(\d+))?\s+(?:error|warning)?\s*(MD\d+\/[\w/-]+)\s+(.+)$/,
+		);
+		if (!match) continue;
+		const [, reported, lineNum, col, ruleCode, message] = match;
+		// #3295: the leading `.*?` this parser discarded IS markdownlint-cli2's
+		// reported path, and its config globs can widen the run past the argv.
+		if (reported && !pathsEqual(path.resolve(cwd, reported), absTarget))
+			continue;
+		const ruleName = ruleCode.split("/")[0];
+		const fixable = MARKDOWNLINT_FIXABLE_RULES.has(ruleName);
+		diagnostics.push({
+			id: `markdownlint-${lineNum}-${ruleName}`,
+			message: `[${ruleCode}] ${message}`,
+			filePath,
+			line: Number(lineNum),
+			column: col ? Number(col) : 1,
+			severity: "warning",
+			semantic: "warning",
+			tool: "markdownlint",
+			rule: ruleName,
+			fixable,
+			fixSuggestion: fixable
+				? "Run `markdownlint-cli2 --fix` to apply the deterministic auto-correction for this rule."
+				: undefined,
+		});
+	}
+	return diagnostics;
+}
+
+const markdownlintRunner: RunnerDefinition = {
+	id: "markdownlint",
+	appliesTo: ["markdown"],
+	priority: PRIORITY.DOC_QUALITY,
+	skipTestFiles: false,
+
+	async run(ctx: DispatchContext): Promise<RunnerResult> {
+		const cwd = resolveRunnerCwd(ctx, "markdownlint");
+		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
+		if (policy && !policy.preferredRunners.includes("markdownlint")) {
+			return skipped("not-preferred");
+		}
+		const cmd = await resolveToolCommandWithInstallFallback(
+			cwd,
+			"markdownlint",
+		);
+
+		if (!cmd) return toolAbsentSkip(cwd, { id: "markdownlint" });
+
+		// Shared config-args seam (#1247): the autofix path consumes the same
+		// builder, so the package-owned fallback config can never drift.
+		const configArgs = markdownlintConfigArgs(cwd);
+		const args = [...configArgs, ctx.filePath];
+		// #5119: cli2's own `fix` option cannot be turned off from the CLI, and a
+		// project `"fix": true` rewrote the file on a diagnostics pass. Lint
+		// through its exported `main` with `optionsOverride: { fix: false }` in a
+		// package-owned child, under the same spawn budget and kill; the bare
+		// command is spawned (never with --fix) only when no package is found.
+		const invocation = markdownlintNoFixInvocation({ command: cmd, cwd, args });
+		// #5413: a timeout arms the cooldown in `safeSpawnAsync`, keyed by this
+		// runner's id (the dispatcher's runner scope), and the dispatcher skips
+		// the runner before it runs again this session.
+		const result = await safeSpawnAsync(invocation.command, invocation.args, {
+			timeout: 15000,
+			cwd,
+		});
+
+		// #1816: this runner read `result.status` zero times, so an exit-2
+		// config error with an empty stdout parsed to zero diagnostics and was
+		// reported as a clean Markdown file. An empty result must distinguish
+		// clean from errored.
+		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		// #1948: one seam for both gates — the tool produced nothing, and the
+		// tool produced something the parser could not read.
+		const run = parseToolRun(
+			"markdownlint",
+			{ result, output: raw, exitCodes: MARKDOWNLINT_EXIT_CODES },
+			(out) => parseMarkdownlintOutput(out, ctx.filePath, cwd),
+		);
+		if (run.skipped) return run.skipped;
+
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "markdownlint",
+			ctx,
+			result,
+			diagnostics,
+			classify: () => ({ status: "succeeded", semantic: "warning" }),
+		});
+	},
+};
+
+export default markdownlintRunner;

@@ -1,0 +1,583 @@
+/**
+ * A dependency-free mock of the host `ExtensionAPI` for testing pi-lens's
+ * extension wiring (#171).
+ *
+ * pi-lens's entry (`index.ts` default export) registers flags, commands, tools,
+ * and lifecycle hooks through `pi.registerFlag/registerCommand/registerTool/on`.
+ * `createPiMock()` records every registration and lets a test drive a hook
+ * (`emit`) or command (`runCommand`) through the *real* handler, so the glue is
+ * verified end-to-end instead of each helper in isolation.
+ *
+ * Typed against the pinned `@earendil-works/pi-coding-agent` types only
+ * (type-only import — no runtime dependency, per AGENTS.md install constraints).
+ *
+ * LAZY-TOOLS POSTURE (#4687, #4723 F5). Both harnesses start the situational
+ * tools INACTIVE by default, because pi-lens's default `tools.lazy` is `true`
+ * on every model; the one decision table is `lazyToolsApply` in
+ * `clients/tool-set-policy.ts`. `makeCtx` names no model, which an opted-in
+ * `tools.lazy: "auto"` treats as lazy too (the configured default, never
+ * eager); a per-model case belongs on tier 2 (`pi-session.ts`, `modelCompat`).
+ */
+
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
+import { afterEach, expect } from "vitest";
+import { withTimeout } from "../../clients/deadline-utils.js";
+import { runHandlerExpectingNoThrow } from "./handler-verdict.js";
+import {
+	failOnOpenMockSessions,
+	trackSessionEvent,
+} from "./mock-session-teardown.js";
+import { piMockAdmission } from "./pi-mock-importers.js";
+
+/**
+ * Admit-list gate (#4632, recurrence #4631): this double is the wrong seam for
+ * host-semantics cases, and the list of test files still allowed to load it only
+ * shrinks. The check runs at module load, on the test file vitest is running, so
+ * it sees every importer however the specifier was spelled or reached.
+ */
+const admissionRefusal = piMockAdmission(expect.getState().testPath);
+if (admissionRefusal !== undefined) throw new Error(admissionRefusal);
+
+/**
+ * #3855: the session manager is pi's, not the ctx's. pi 1.0.4 hands a /reload
+ * or in-memory /fork (and /clone) successor its predecessor's manager OBJECT:
+ * `AgentSession.reload()` rebuilds the extension runner from
+ * `this.sessionManager` (`core/agent-session.js`, `_buildRuntime`), the
+ * runner's ctx returns `runner.sessionManager` (`core/extensions/runner.js`,
+ * `get sessionManager()`), and the in-memory `fork()` passes
+ * `this.session.sessionManager` (`core/agent-session-runtime.js`). `/new`,
+ * resume and a persisted fork build a new one (`SessionManager.create`,
+ * `inMemory`, `open`). pi-lens keys a file-less successor by that identity
+ * (`startKey`, `clients/session-scope.ts`), so the mock must not mint a new
+ * manager per ctx there: a replacement shutdown of those kinds hands its
+ * ctx's manager to the next `session_start` of the same reason, which keeps
+ * its own id and file on that one object. Consumed by that start, replaced by
+ * the next such shutdown, and cleared after every test.
+ *
+ * Limit (verify r3 V5): this is ONE slot for the whole process, keyed by
+ * reason, where pi keeps one manager per AgentSession. Any same-kind shutdown
+ * replaces it and any same-reason start consumes it, a gap subagent's
+ * included, so the mock cannot express a subagent replacing itself, or an
+ * SDK-style bind, inside a primary's gap: such a cell reads as a false
+ * demotion here. Those cells are judged only in pi's real runtime
+ * (`tests/index-3521-fork-tree-witness.test.ts`).
+ */
+const MANAGER_STATE = Symbol("pi-mock.session-manager-state");
+interface MockSessionManager {
+	getSessionId(): string | undefined;
+	getSessionFile(): string | undefined;
+	[MANAGER_STATE]: { id: string | undefined; file: string | undefined };
+}
+let managerHandOver:
+	| { reason: string; manager: MockSessionManager }
+	| undefined;
+afterEach(() => {
+	managerHandOver = undefined;
+});
+// #5146: registered first, so it runs last, after every `afterEach` the file
+// declared: a case that ends with a session still open reds here, however the
+// session was started (see `failOnOpenMockSessions`).
+afterEach(async () => {
+	await failOnOpenMockSessions();
+});
+
+function mockManagerOf(ctx: unknown): MockSessionManager | undefined {
+	try {
+		const manager = (ctx as { sessionManager?: unknown })?.sessionManager;
+		return manager &&
+			typeof manager === "object" &&
+			MANAGER_STATE in (manager as object)
+			? (manager as MockSessionManager)
+			: undefined;
+	} catch {
+		// An invalidated ctx throws on every accessor (`makeStaleCtx`).
+		return undefined;
+	}
+}
+
+function handOverManager(event: string, payload: unknown, ctx: unknown): void {
+	const { reason, targetSessionFile } = (payload ?? {}) as {
+		reason?: string;
+		targetSessionFile?: string;
+	};
+	if (event === "session_shutdown") {
+		const manager = mockManagerOf(ctx);
+		const keeps =
+			reason === "reload" ||
+			(reason === "fork" && targetSessionFile === undefined);
+		if (keeps && manager) managerHandOver = { reason, manager };
+		return;
+	}
+	if (
+		event !== "session_start" ||
+		managerHandOver === undefined ||
+		managerHandOver.reason !== reason
+	)
+		return;
+	const own = mockManagerOf(ctx);
+	if (!own) return;
+	const { manager } = managerHandOver;
+	managerHandOver = undefined;
+	manager[MANAGER_STATE] = { ...own[MANAGER_STATE] };
+	(ctx as { sessionManager: MockSessionManager }).sessionManager = manager;
+}
+
+interface RecordedFlag {
+	description?: string;
+	type: "boolean" | "string";
+	default?: boolean | string;
+}
+
+interface RecordedCommand {
+	description?: string;
+	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+	getArgumentCompletions?: unknown;
+}
+
+/** A handler registered via `pi.on(event, handler)`. */
+type Hook = (event: unknown, ctx: unknown) => unknown;
+
+/** A session_start test must fail if its awaited handler does not settle. */
+export const SESSION_START_TEST_BUDGET_MS = 5_000;
+
+async function runSessionStartWithBudget<T>(
+	hook: () => T | Promise<T>,
+): Promise<T> {
+	try {
+		return await withTimeout(
+			Promise.resolve().then(hook),
+			SESSION_START_TEST_BUDGET_MS,
+		);
+	} catch (error) {
+		if (error instanceof Error && /^Timeout after /.test(error.message)) {
+			throw new Error(
+				`session_start handler exceeded test budget (${SESSION_START_TEST_BUDGET_MS}ms)`,
+			);
+		}
+		throw error;
+	}
+}
+
+/** A `ui.notify(...)` call captured for assertions. */
+interface CapturedNotification {
+	message: string;
+	type: "info" | "warning" | "error";
+}
+
+/** A `ui.setStatus(...)` call captured for assertions. */
+interface CapturedStatus {
+	key: string;
+	text: string | undefined;
+}
+
+/** A `ui.setWidget(...)` call captured for assertions. */
+interface CapturedWidget {
+	key: string;
+	content: unknown;
+	options: unknown;
+}
+
+export interface MockCtx extends ExtensionCommandContext {
+	/** Every `ctx.ui.notify(...)` made through this context, in order. */
+	notifications: CapturedNotification[];
+	/** Every `ctx.ui.setStatus(...)` call, in order. */
+	statusCalls: CapturedStatus[];
+	/** Every `ctx.ui.setWidget(...)` call, in order. */
+	widgetCalls: CapturedWidget[];
+}
+
+/** A `pi.sendMessage(...)` call captured for assertions (#484). */
+interface CapturedMessage {
+	customType: string;
+	content: unknown;
+	display: boolean;
+	details: unknown;
+}
+
+export interface PiMock {
+	// ── recordings ───────────────────────────────────────────────────────────
+	readonly flags: Map<string, RecordedFlag>;
+	readonly commands: Map<string, RecordedCommand>;
+	readonly tools: Map<string, unknown>;
+	readonly handlers: Map<string, Hook[]>;
+	readonly flagValues: Map<string, boolean | string>;
+	readonly messageRenderers: Map<string, unknown>;
+	readonly sentMessages: CapturedMessage[];
+	/**
+	 * #dynamic-tooling: tools registered via `registerTool` are active by
+	 * default (mirrors the real host — see docs' `getActiveTools`/
+	 * `setActiveTools` example, which starts from "all registered tools" and
+	 * filters DOWN). Only meaningful when `supportsActiveTools` is true.
+	 */
+	readonly activeTools: Set<string>;
+	/** Number of host active-tool mutations, for lifecycle wiring assertions. */
+	readonly activeToolSetCalls: string[][];
+
+	// ── ExtensionAPI surface that index.ts uses ──────────────────────────────
+	registerFlag(name: string, options: RecordedFlag): void;
+	registerCommand(name: string, options: RecordedCommand): void;
+	registerTool(tool: { name: string } & Record<string, unknown>): void;
+	on(event: string, handler: Hook): void;
+	getFlag(name: string): boolean | string | undefined;
+	/** #484: registered message renderers, keyed by customType. */
+	registerMessageRenderer(customType: string, renderer: unknown): void;
+	/** #484: captures every `pi.sendMessage(...)` call into `sentMessages`. */
+	sendMessage(message: {
+		customType: string;
+		content: unknown;
+		display: boolean;
+		details?: unknown;
+	}): void;
+
+	// ── test helpers ─────────────────────────────────────────────────────────
+	/**
+	 * Set a flag value (read back via getFlag) once the factory has registered
+	 * the flag. A value set before registration is refused (#4913 part D): pi
+	 * applies command-line flag values after every factory, so no pre-set path
+	 * exists. A flag a test is ABOUT goes to tier 2 (`pi-session.ts`); a quiet
+	 * flag goes to the global config (`PI_LENS_CONFIG_PATH`, `useGlobalConfig`).
+	 */
+	setFlag(name: string, value: boolean | string): void;
+	getHandlers(event: string): Hook[];
+	/** First handler for an event, or throw if none registered. */
+	getHandlerOrThrow(event: string): Hook;
+	getTool(name: string): unknown | undefined;
+	getCommand(name: string): RecordedCommand | undefined;
+	/**
+	 * #1453: reproduce what the host does before EVERY `session_start`.
+	 * `AgentSession`'s constructor calls `_buildRuntime({ includeAllExtensionTools:
+	 * true })`, and fork / newSession / switchSession / importFromJsonl / reload
+	 * each construct a FRESH session that way before the event is emitted. The
+	 * active tool set is never persisted per session, so every registered tool
+	 * is active again by the time pi-lens's handler runs. The mock preserves the
+	 * extension closure for every rebuild and does not re-run the factory. Bound:
+	 * this mock does not re-run the extension factory and does not reproduce pi's
+	 * lifecycle ordering. Real pi re-runs the factory on reload, resume, fork,
+	 * and new; the real-pi
+	 * integration tests cover that boundary.
+	 * Call this to reproduce pi's `session_shutdown` then `session_start` order.
+	 */
+	simulateSessionShutdownAndRebuild(
+		reason: "reload" | "resume" | "fork" | "new" | "quit",
+		ctx?: unknown,
+	): Promise<void>;
+	/** Run every handler registered for `event`; return the last defined result. */
+	emit(event: string, payload?: unknown, ctx?: unknown): Promise<unknown>;
+	/** Invoke a registered command's handler. */
+	runCommand(
+		name: string,
+		args?: string,
+		ctx?: ExtensionCommandContext,
+	): Promise<void>;
+	/** Cast to the host type for `extension(pi.asExtensionAPI())`. */
+	asExtensionAPI(): ExtensionAPI;
+}
+
+export interface PiMockOptions {
+	/**
+	 * #dynamic-tooling: whether this mocked host exposes
+	 * `pi.getActiveTools`/`pi.setActiveTools`. Default true (current pi).
+	 * Set false to simulate an older host with no dynamic-tooling support —
+	 * `index.ts`'s feature-detection must fall back to leaving every tool
+	 * statically active rather than throwing.
+	 */
+	supportsActiveTools?: boolean;
+}
+
+export function createPiMock(options: PiMockOptions = {}): PiMock {
+	const supportsActiveTools = options.supportsActiveTools ?? true;
+	const flags = new Map<string, RecordedFlag>();
+	const commands = new Map<string, RecordedCommand>();
+	const tools = new Map<string, unknown>();
+	const handlers = new Map<string, Hook[]>();
+	// No flag value exists before the factory registers its flag (#4913 part D).
+	const flagValues = new Map<string, boolean | string>();
+	const messageRenderers = new Map<string, unknown>();
+	const sentMessages: CapturedMessage[] = [];
+	const activeTools = new Set<string>();
+	const activeToolSetCalls: string[][] = [];
+
+	const mock: PiMock = {
+		flags,
+		commands,
+		tools,
+		handlers,
+		flagValues,
+		messageRenderers,
+		sentMessages,
+		activeTools,
+		activeToolSetCalls,
+
+		registerFlag(name, options) {
+			flags.set(name, options);
+			// Seed a default so getFlag is meaningful even if not pre-set.
+			if (!flagValues.has(name) && options.default !== undefined) {
+				flagValues.set(name, options.default);
+			}
+		},
+		registerCommand(name, options) {
+			commands.set(name, options);
+		},
+		registerTool(tool) {
+			if (!tool?.name) throw new Error("registerTool: tool has no name");
+			if (tools.has(tool.name)) {
+				// Mirror the host: a duplicate name throws so callers can catch it.
+				throw new Error(`tool already registered: ${tool.name}`);
+			}
+			tools.set(tool.name, tool);
+			// Mirror the real host: newly registered tools are active by default.
+			activeTools.add(tool.name);
+		},
+		on(event, handler) {
+			// `tool_call` is the one hook whose handler swallows a throw into a
+			// verdict (`handleToolCall`'s total guard), so every route to it
+			// (`emit`, `getHandlers`, `getHandlerOrThrow`, `handlers`) runs
+			// through the checker: a swallowed throw fails the awaiting test
+			// instead of reading as "no opinion" (#3518, recurrence #4182).
+			//
+			// #5146: the session events are reported to `trackSessionEvent` here,
+			// not in `emit`, so a route that never calls `emit` (a handler picked
+			// out of `getHandlers`, a loop over `handlers`, a computed or aliased
+			// emit) is observed all the same.
+			const boundedHandler: Hook =
+				event === "session_start"
+					? (payload, ctx) => {
+							trackSessionEvent(mock, event, ctx);
+							return runSessionStartWithBudget(() => handler(payload, ctx));
+						}
+					: event === "session_shutdown"
+						? (payload, ctx) => {
+								trackSessionEvent(mock, event, ctx);
+								return handler(payload, ctx);
+							}
+						: event === "tool_call"
+							? (payload, ctx) =>
+									runHandlerExpectingNoThrow(() => handler(payload, ctx))
+							: handler;
+			const list = handlers.get(event) ?? [];
+			list.push(boundedHandler);
+			handlers.set(event, list);
+		},
+		getFlag(name) {
+			return flagValues.get(name);
+		},
+		registerMessageRenderer(customType, renderer) {
+			messageRenderers.set(customType, renderer);
+		},
+		sendMessage(message) {
+			sentMessages.push({
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+			});
+		},
+
+		setFlag(name, value) {
+			// Refuses the pre-set path (#4913 part D): a value set before the factory
+			// registers its flag is read by no factory-time reader in real pi.
+			if (!flags.has(name)) {
+				throw new Error(
+					`setFlag(${name}): the factory has not registered this flag yet; set it after the factory runs (pi applies flag values after every factory)`,
+				);
+			}
+			flagValues.set(name, value);
+		},
+		getHandlers(event) {
+			return handlers.get(event) ?? [];
+		},
+		getHandlerOrThrow(event) {
+			const list = handlers.get(event);
+			if (!list || list.length === 0) {
+				throw new Error(`no handler registered for event: ${event}`);
+			}
+			return list[0];
+		},
+		getTool(name) {
+			return tools.get(name);
+		},
+		getCommand(name) {
+			return commands.get(name);
+		},
+		async simulateSessionShutdownAndRebuild(reason, ctx) {
+			if (reason === "quit") {
+				await mock.emit(
+					"session_shutdown",
+					{ type: "session_shutdown", reason },
+					ctx,
+				);
+				return;
+			}
+			// The rebuilt session announces itself with `ctx`, so the replacement
+			// file pi names at shutdown IS that ctx's own file (#3612: the
+			// hand-off slot is keyed by it). A reload keeps its file and sends
+			// no target.
+			const replacementFile = (() => {
+				try {
+					return (
+						ctx as {
+							sessionManager?: { getSessionFile?: () => string | undefined };
+						}
+					)?.sessionManager?.getSessionFile?.();
+				} catch {
+					return undefined;
+				}
+			})();
+			await mock.emit(
+				"session_shutdown",
+				{
+					type: "session_shutdown",
+					reason,
+					targetSessionFile: reason === "reload" ? undefined : replacementFile,
+				},
+				ctx,
+			);
+			for (const name of tools.keys()) activeTools.add(name);
+			await mock.emit("session_start", { type: "session_start", reason }, ctx);
+		},
+		async emit(event, payload, ctx) {
+			handOverManager(event, payload, ctx);
+			let result: unknown;
+			for (const handler of mock.getHandlers(event)) {
+				const r = await handler(payload, ctx);
+				if (r !== undefined) result = r;
+			}
+			return result;
+		},
+		async runCommand(name, args = "", ctx = makeCtx()) {
+			const cmd = commands.get(name);
+			if (!cmd) throw new Error(`no command registered: ${name}`);
+			await cmd.handler(args, ctx);
+		},
+		asExtensionAPI() {
+			const api: Record<string, unknown> = { ...mock };
+			if (supportsActiveTools) {
+				api.getActiveTools = () => Array.from(activeTools);
+				api.setActiveTools = (names: string[]) => {
+					activeToolSetCalls.push([...names]);
+					activeTools.clear();
+					for (const name of names) activeTools.add(name);
+				};
+			}
+			return api as unknown as ExtensionAPI;
+		},
+	};
+
+	return mock;
+}
+
+/**
+ * A minimal command/handler context. Only the fields pi-lens handlers actually
+ * touch are real (`cwd`, `ui.notify`, `ui.setStatus`, `ui.setWidget`,
+ * `ui.theme`); the rest are inert stubs. `notifications` captures every
+ * `ui.notify(...)` for assertions.
+ */
+export function makeCtx(
+	overrides: Partial<{
+		cwd: string;
+		sessionId: string;
+		sessionFile?: string;
+		/**
+		 * #1334 S5: host project-trust decision. Omit entirely to simulate an
+		 * older host with no `isProjectTrusted` on the ctx — pi-lens must then
+		 * behave exactly as it did before the trust gate existed.
+		 */
+		isProjectTrusted: boolean;
+		/**
+		 * #1334 S2: the host run mode (`ExtensionContext.mode`). Defaults to
+		 * "tui". Pass `null` to simulate an older host with NO `mode` field —
+		 * pi-lens must then behave exactly as it did before mode awareness.
+		 */
+		mode: "tui" | "rpc" | "json" | "print" | null;
+		/**
+		 * #1655 item 2: the host's live `Model` behind `ctx.model`
+		 * (`ExtensionContext.model` → `AgentSession.model`). pi-lens reads its
+		 * telemetry identity from HERE, not from any event field — pi sets none
+		 * of `provider`/`model`/`sessionId` on a `session_start` or a
+		 * `tool_result` payload. Omit to simulate a host with no model selected.
+		 */
+		model: { id: string; provider: string } | undefined;
+	}> = {},
+): MockCtx {
+	const notifications: CapturedNotification[] = [];
+	const statusCalls: CapturedStatus[] = [];
+	const widgetCalls: CapturedWidget[] = [];
+	const ui = {
+		notify: (message: string, type: "info" | "warning" | "error" = "info") => {
+			notifications.push({ message, type });
+		},
+		setStatus: (key: string, text: string | undefined) => {
+			statusCalls.push({ key, text });
+		},
+		setWidget: (key: string, content?: unknown, options?: unknown) => {
+			widgetCalls.push({ key, content, options });
+		},
+		setWorkingMessage: () => {},
+		setWorkingVisible: () => {},
+		setTitle: () => {},
+		select: async () => undefined,
+		confirm: async () => false,
+		input: async () => undefined,
+		theme: {},
+	};
+
+	const ctx = {
+		ui,
+		notifications,
+		statusCalls,
+		widgetCalls,
+		mode: "tui",
+		hasUI: true,
+		cwd: overrides.cwd ?? process.cwd(),
+		// Read-only session manager (#190). Tests pass `sessionId` to drive
+		// resume rehydration via `ctx.sessionManager.getSessionId()`.
+		// One object per pi session: see `handOverManager` (#3855).
+		sessionManager: (() => {
+			const manager = {
+				[MANAGER_STATE]: {
+					id: overrides.sessionId,
+					file: overrides.sessionFile,
+				},
+				getSessionId: () => manager[MANAGER_STATE].id,
+				getSessionFile: () => manager[MANAGER_STATE].file,
+			} as MockSessionManager;
+			return manager;
+		})(),
+		model: overrides.model,
+		signal: undefined,
+		isIdle: () => true,
+		hasPendingMessages: () => false,
+		abort: () => {},
+		shutdown: () => {},
+		getContextUsage: () => undefined,
+		compact: () => {},
+		getSystemPrompt: () => "",
+		waitForIdle: async () => {},
+	};
+
+	// Only present when the test asked for it — an absent accessor is the
+	// "older host, no trust surface" case; repository-owned LSP executables
+	// must fail closed without an explicit host grant (#1334 S5).
+	if (overrides.isProjectTrusted !== undefined) {
+		(ctx as Record<string, unknown>).isProjectTrusted = () =>
+			overrides.isProjectTrusted;
+	}
+
+	// `mode: null` means "older host, no mode field at all" — delete it rather
+	// than leaving a null the feature detection would have to special-case.
+	if (overrides.mode === null) {
+		delete (ctx as Record<string, unknown>).mode;
+	} else if (overrides.mode !== undefined) {
+		(ctx as Record<string, unknown>).mode = overrides.mode;
+	}
+
+	return ctx as unknown as MockCtx;
+}
+
+// The stale-context stub lives in its own file, so a test that needs only the
+// stub does not load this double (#4913 L1). Re-exported for the files that
+// still import it from here.
+export { makeStaleCtx, STALE_CTX_MESSAGE } from "./stale-ctx.js";

@@ -1,0 +1,146 @@
+name: PR metadata
+
+# #3838: the PR-metadata checks (title, body, close-keyword syntax) in ONE
+# workflow. They read the live PR title and body, so they must re-run when the
+# PR is edited; the rest of the PR checks read the tree and must not. While
+# `edited` lived on lint.yml, every retitle re-ran that workflow's whole job
+# graph (62 of 167 Lint PR runs in the 2026-09-30 window, 446 jobs) to refresh
+# three of them. Consumers key on the job name, never on the workflow that
+# hosts it: `PR metadata` (title and close-keyword syntax, #5002) and `PR body
+# (advisory)`.
+#
+# Default pull_request types omit "edited". Without it, retitling a PR to fix
+# a title-lint failure replays the STALE payload from the original "opened"
+# event instead of re-running against the new title (#1917 review F3, #2640).
+# Merged-PR close verification is a different event (`pull_request_target:
+# closed`, with write access) and stays in close-keyword-verification.yml.
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, edited]
+
+# An edit must not cancel the run for the pushed head (#3716): the `-edited`
+# suffix keeps an edited event's group apart from opened / synchronize /
+# reopened, which share one group and so still cancel each other.
+concurrency:
+  group: pr-metadata-${{ github.event.pull_request.number }}-${{ github.event.action == 'edited' && '-edited' || '' }}
+  cancel-in-progress: true
+
+permissions: {}
+
+# #5420: one transient registry 5xx must not red npm ci or npx; npm's default
+# is 2 retries. The gate (workflow-level, literal, floored) is
+# tests/config/release-download-helper-workflow.test.ts.
+env:
+  npm_config_fetch_retries: 5
+  npm_config_fetch_retry_maxtimeout: 120000
+
+jobs:
+  # #5002: the title and close-keyword validations are two steps of one gating
+  # job. Each step runs even when the other fails, so one push still names both.
+  pr-metadata:
+    name: PR metadata
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. Both
+    # validations are one `node` call each; measured max of the former jobs:
+    # 14s (Close-keyword syntax); timeout = floor of 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: false
+          node-version: "22"
+
+      - name: Validate PR title (conventional prefix + issue ref)
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-pr-title.mjs
+
+      - name: Validate per-issue close keywords
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/check-close-keywords.mjs --lint-pr
+
+  pr-body-lint:
+    name: PR body (advisory)
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      # #4288: `resolveBugClosing` reads the closed issue's labels through
+      # `GET /repos/{owner}/{repo}/issues/{n}`, which needs issues:read. A fork
+      # pull_request gets a read-only token, but read permissions are still
+      # granted, so the base repository's labels stay readable; a 403 warns and
+      # skips the Detection requirement instead of blocking. #4968: the same
+      # read covers issues the body only references (`Refs #N`), where an
+      # unreadable label refuses instead.
+      issues: read
+    timeout-minutes: 5
+    # Runs on synchronize too (#3802): the TLA+ coverage rule reads the diff, so
+    # a push that adds a mapped-file change or the missing .cfg must re-evaluate
+    # (PR #3864 F2; #3030 had skipped synchronize for the body alone). The
+    # `-edited` concurrency suffix above keeps an edit run and a push run from
+    # cancelling each other.
+    # Advisory to start: this job is not in required-checks branch protection.
+    # A finding stays visible as a red check without blocking a merge.
+    # Promotion bound (#2904): it stays advisory until it has been green on ten
+    # consecutive merged PRs; only then is it a candidate for required checks.
+    # No tool tracks the streak: the orchestrator counts it from this job's row
+    # in `scripts/ci-verdict.mjs` for each merged PR. Demotion (#3875): the
+    # first refusal of a decision-branch Observability lint on a merged PR
+    # that its reviewer judges not a decision moves that refusal to a
+    # `::notice::` advisory until a fixture pins the shape
+    # (`docs/pi-lens-reviewer.md` "Record read-back").
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: false
+          node-version: "22"
+
+      # #4717: the body lint reads markdown through `marked`
+      # (scripts/lib/markdown-lexer.mjs). The lane keeps its "no install"
+      # cheapness: `npm install --no-save marked@<v>` would reify the whole
+      # lockfile (457 packages, measured), so the one zero-dependency tarball is
+      # fetched with `npm pack` and checked against the lockfile's sha512
+      # before it is unpacked. A mismatch, or a version the lockfile does not
+      # pin, fails the step: the lint never reads a body with an unpinned
+      # parser.
+      - name: Install marked (version and integrity pinned by the lockfile)
+        run: |
+          set -eu
+          version=$(node -p "require('./package.json').devDependencies.marked")
+          locked=$(node -p "require('./package-lock.json').packages['node_modules/marked'].version")
+          integrity=$(node -p "require('./package-lock.json').packages['node_modules/marked'].integrity")
+          test "$version" = "$locked"
+          tarball=$(npm pack --silent --ignore-scripts "marked@${version}" --pack-destination "$RUNNER_TEMP")
+          actual="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP/$tarball" | base64 -w0)"
+          test "$actual" = "$integrity"
+          mkdir -p node_modules/marked
+          tar -xzf "$RUNNER_TEMP/$tarball" -C node_modules/marked --strip-components=1
+
+      - name: Validate PR body structure
+        env:
+          # Existing bodies need a cleanup window before title-case headings
+          # block; the other prose rules only warn (#5110).
+          PI_LENS_PROSE_GRACE: "1"
+        run: node scripts/check-pr-body.mjs

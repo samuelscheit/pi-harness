@@ -1,0 +1,123 @@
+name: Parser smoke (real binaries, tier 1)
+
+# Holds runner PARSERS to real binary output (#1937).
+#
+# The nightly `tool-smoke` lane runs Step 1: each tool spawns and exits cleanly.
+# That bar is too low to catch a wrong parser. The taplo runner passed Step 1
+# for months while spawning `taplo check --output=json`, a flag taplo rejects,
+# and reporting every malformed TOML file as clean. The vale runner (#1933) did
+# the same with an envelope vale has never emitted.
+#
+# This lane runs Step 2 instead: install the real binary, run pi-lens's real
+# dispatch path over a planted violation, and FAIL when the runner produces no
+# findings. It is advisory — a scheduled workflow gates no pull request — but it
+# is allowed to go red, because a step that cannot fail is telemetry nobody
+# reads.
+#
+# Scope is tier 1: the fixtures whose tools install as a pip package, an npm
+# package, or a single GitHub-release binary. No JVM, Go, Rust, or .NET setup,
+# which is what keeps the run short. The selection lives on the fixture rows in
+# scripts/smoke-tools.mjs (`tier1: true`), not here — a language list in this
+# file would be a second copy that drifts.
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # daily 04:00 UTC, ahead of the 06:00 tool-smoke lane
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# #5420: one transient registry 5xx must not red npm ci or npx; npm's default
+# is 2 retries. The gate (workflow-level, literal, floored) is
+# tests/config/release-download-helper-workflow.test.ts.
+env:
+  npm_config_fetch_retries: 5
+  npm_config_fetch_retry_maxtimeout: 120000
+
+jobs:
+  parser-smoke:
+    name: Step 2 — planted violation must produce findings
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The installer resolves GitHub release assets through the REST API.
+    # Unauthenticated is 60 requests/hour per IP and shared runners exhaust it.
+    #
+    # PI_LENS_HOME/PILENS_DATA_DIR (#2670 review F1, for symmetry with
+    # tool-smoke.yml): this job only runs one `--install` step today, so there
+    # is no per-job cache to preserve here yet, but pinning keeps this
+    # workflow behaving identically to its sibling rather than depending on
+    # `withScratchHome`'s per-invocation default the moment a second
+    # `--install` step is ever added. A bare `/tmp` path, not
+    # `${{ runner.temp }}`: the `runner` context is unavailable at job-level
+    # `env:` (actionlint: "context \"runner\" is not allowed here"), and this
+    # runner's whole VM is destroyed after the job either way.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PI_LENS_HOME: /tmp/pi-lens-home
+      PILENS_DATA_DIR: /tmp/pi-lens-home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      # pip carries ruff, yamllint, and sqlfluff. Everything else in tier 1 is
+      # an npm package or a GitHub-release binary the harness fetches itself.
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      # `npm ci --ignore-scripts` rather than `npm install`: the lockfile pins
+      # every resolved version, and no dependency lifecycle script runs in a job
+      # that goes on to download and execute third-party binaries. Skipping
+      # scripts also skips `prepare`, so the two steps it would have run are
+      # spelled out below.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+
+      - name: Build dist
+        run: npm run build:dist
+
+      # #4358: restore the managed tool tree (npm tools and release binaries
+      # under PI_LENS_HOME) keyed on the installer registry's pins plus the ISO
+      # week. A prefix of its own: this job installs the tier-1 subset, and a
+      # shared key would let that subset shadow tool-smoke's full tree. pip
+      # tools (ruff, yamllint, sqlfluff) install outside PI_LENS_HOME and are
+      # not cached.
+      - name: Restore the managed tool tree
+        id: tool_tree
+        uses: ./.github/actions/tool-tree-cache
+        with:
+          mode: restore
+          prefix: parser-smoke-tools
+
+      - name: Tier-1 parsers against real binaries
+        id: tier1
+        # --min-pass is the floor that keeps a green verdict honest. An
+        # unavailable tool reports a warning, never a failure, so without it a
+        # run where every install failed would exit 0 having proved nothing.
+        # Raise it when tier 1 grows; the coverage test holds it to the fixture
+        # count so it cannot silently rot.
+        run: >-
+          node scripts/smoke-tools.mjs --step2 --tier1 --install --verbose
+          --min-pass=11
+
+      # Saved once the tier-1 step has run, red or green: it is the only
+      # install-bearing step, so a tree saved after it is complete. Skipped when
+      # an earlier step failed (nothing installed), on an exact hit, and on a
+      # cancel.
+      - name: Save the managed tool tree
+        if: ${{ !cancelled() && steps.tool_tree.outputs.cache-hit != 'true' && steps.tier1.outcome != 'skipped' }}
+        continue-on-error: true
+        uses: ./.github/actions/tool-tree-cache
+        with:
+          mode: save
+          prefix: parser-smoke-tools

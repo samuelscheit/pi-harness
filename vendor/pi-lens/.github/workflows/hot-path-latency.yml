@@ -1,0 +1,169 @@
+name: Hot-path latency
+
+# #4363: times session_start, dispatch and the diagnostics-cache replay, and
+# (#4905) three bash tool_calls at a non-git home over the opaque file cap
+# (row tool_call_bash_home_overcap), and (#5087) a first-read tool_call and an
+# edit's tool_result (rows tool_call_first_touch, tool_result_edit), on the
+# checked-out commit and on its first parent, and fails only on a regression
+# that is both statistically significant and above a stated threshold. A pull
+# request checks out GitHub's merge of its head into master's tip, so the first
+# parent is that tip and the comparison isolates what the PR changes. A master
+# push compares the pushed commit with the one before it. The rule, the
+# sampler and the fixtures are in scripts/lib/latency-stats.mjs,
+# scripts/check-hot-path-latency.mjs and scripts/hot-path-sample.mjs. Before
+# this lane only a reviewer re-running a probe caught #4344 round 1 (replay
+# 6 ms to 321 ms).
+#
+# REQUIRED despite the name. The maintainer flipped it to a required check after
+# the 2026-10-31 decision (#4363), and a required name gates whatever its suffix
+# says. The job does not use continue-on-error, so the run conclusion stays
+# truthful. The flip bar was 10 consecutive master push runs that conclude
+# success with no false red:
+#
+#   gh run list --workflow hot-path-latency.yml --branch master --event push \
+#     --limit 10 --json conclusion --jq 'all(.[]; .conclusion == "success")'
+#
+# Prints true when the last 10 master runs were all green. Only master pushes
+# that touch the push paths below run, so the streak counts those. A red master
+# run is read by hand: a real regression and a false red both reset the count,
+# and a false red is a threshold bug.
+#
+# ALWAYS REPORTS. A required check from a path-filtered workflow stays
+# "Expected" forever on a PR the filter skips, so the pull_request trigger has
+# no `paths:`. The job always starts, and its first step asks
+# scripts/ci-changed-files.mjs (the seam ci.yml's `changes` and install-smoke's
+# `scope` use) whether the diff touches HOT_PATH_PATHS. When it does not, every
+# timing step is skipped and the job passes in seconds with the line "no
+# hot-path files changed". The job is never skipped at job level: a skipped job
+# reports `skipped`, and ci-verdict demands a literal `success` on a required
+# row (#2618). The check name `Hot-path latency (advisory)` is the required
+# context; renaming the job renames the context. A master push keeps its
+# `paths:` filter (a required check applies to pull requests, and the streak
+# above counts runs that timed). GitHub's `on.push.paths` cannot read the
+# script's list, so it is repeated there and pinned equal by
+# tests/config/hot-path-latency-workflow.test.ts.
+#
+# COST. About 3 minutes of one ubuntu-latest runner (2m36s on the first run,
+# #4389): install, two tsc builds, 2 x 16 one-process samples of about 4 s on a
+# hosted runner; the #4905 row adds 0.35-1.1 s per sample. It times only when a
+# path the hot paths read changes (HOT_PATH_PATHS); any other pull request
+# costs a checkout and one script. It uses no Actions cache (setup-node
+# `cache:` is off on purpose): the repository sits at its 10 GB cache cap (#4358) and a cache
+# write here would evict a CI entry.
+#
+# LIMIT. Both trees run on the head's node_modules, so a dependency bump is not
+# compared. The sampler times pi-lens's own code; a language server's time is
+# not in it.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+    paths:
+      - "clients/**"
+      - "tools/**"
+      - "rules/**"
+      - "index.ts"
+      - "vendor/**"
+      - "tsconfig*.json"
+      - "scripts/hot-path-sample.mjs"
+      - "scripts/check-hot-path-latency.mjs"
+      - "scripts/lib/latency-stats.mjs"
+      - ".github/workflows/hot-path-latency.yml"
+  # #3754: a required check must also report on the merge queue's
+  # `gh-readonly-queue/...` commit (tests/config/merge-queue-workflows.test.ts),
+  # and #5066's bot-PR dispatch census derives its targets from this trigger.
+  # scripts/ci-changed-files.mjs reads a merge_group event as hotpath=true, so a
+  # queued PR is timed.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch: {}
+
+permissions: {}
+
+# A pull request shares one group per ref and cancels superseded runs. A push
+# or a manual run gets its own group per commit: GitHub cancels a PENDING run
+# when a newer one queues in the same group even without cancel-in-progress,
+# and a `cancelled` master run would break the 10-green flip command above.
+concurrency:
+  group: hot-path-latency-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# #5420: one transient registry 5xx must not red npm ci or npx; npm's default
+# is 2 retries. The gate (workflow-level, literal, floored) is
+# tests/config/release-download-helper-workflow.test.ts.
+env:
+  npm_config_fetch_retries: 5
+  npm_config_fetch_retry_maxtimeout: 120000
+
+jobs:
+  latency:
+    name: Hot-path latency (advisory)
+    runs-on: ubuntu-latest
+    # The first run took 2m36s. The script stops itself at 10 minutes
+    # (DEFAULT_BUDGET_MS), half of this cap, so a hung sample ends as a harness
+    # failure and not as a cancelled run.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: true
+          node-version: "22"
+
+      # hotpath is `true` for a push, a manual run and every doubt (an
+      # unreadable or empty file list, the API cap); only a pull request whose
+      # every changed path is off HOT_PATH_PATHS reads `false`. The steps below
+      # test `!= 'false'`, so an empty output times the lane, and a crashed
+      # classify step reds the job instead of passing it.
+      - name: Classify the changed files
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ci-changed-files.mjs --event "$EVENT_NAME" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
+
+      - name: No hot-path files changed
+        if: steps.scope.outputs.hotpath == 'false'
+        run: |
+          line="no hot-path files changed: nothing to time, passing"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        if: steps.scope.outputs.hotpath != 'false'
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Build head
+        if: steps.scope.outputs.hotpath != 'false'
+        run: npm run build
+
+      # HEAD^1 is master's tip for a pull request (the merge ref's first parent)
+      # and the previous commit for a push or a manual run.
+      - name: Build base
+        if: steps.scope.outputs.hotpath != 'false'
+        run: |
+          set -eu
+          base_sha=$(git rev-parse HEAD^1)
+          echo "base $base_sha, head $(git rev-parse HEAD)"
+          git worktree add --detach "$RUNNER_TEMP/base" "$base_sha"
+          ln -s "$PWD/node_modules" "$RUNNER_TEMP/base/node_modules"
+          cd "$RUNNER_TEMP/base"
+          npm run build
+
+      - name: Time the hot paths on base and head
+        if: steps.scope.outputs.hotpath != 'false'
+        run: |
+          node scripts/check-hot-path-latency.mjs \
+            --base "$RUNNER_TEMP/base" --head "$PWD" --runs 15 \
+            --scratch "$RUNNER_TEMP/hot-path-scratch" \
+            --json "$RUNNER_TEMP/hot-path-latency.json"
