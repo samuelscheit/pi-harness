@@ -6,7 +6,8 @@
 // same gateway settings Claude Code uses)
 //
 // Pi: vendor/pi (a git subtree of github.com/earendil-works/pi) is built and linked globally,
-// replacing an npm-installed @earendil-works/pi-coding-agent.
+// replacing an npm-installed @earendil-works/pi-coding-agent. The harness's node_modules links to
+// vendor/pi/node_modules, so its scripts, tests and type checks resolve the vendored packages.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
 // - settings.json: this repo as the only package, Opus 5.5 as the startup model
@@ -20,7 +21,7 @@
 //                  never written to a file.
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +59,8 @@ if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_P
 	npm(root, "uninstall", "-g", PI_PACKAGE);
 }
 npm(join(vendoredPi, "packages/coding-agent"), "link");
+const harnessModules = join(root, "node_modules");
+if (!existsSync(harnessModules)) symlinkSync("vendor/pi/node_modules", harnessModules);
 
 const readJson = (file) => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {});
 const writeJson = (file, value) => writeFileSync(file, `${JSON.stringify(value, null, "\t")}\n`);
