@@ -19,6 +19,7 @@ import {
 	type SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import { attribute, cacheEvent, type RequestState, requestState, type Usage } from "./attribution.ts";
+import { recordedArms } from "../lib/experiments.ts";
 import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
 import { deleteSession, transaction } from "./store.ts";
 import { delegatedTaskDigest, delegation, referenceIndex, toolEffect } from "./work.ts";
@@ -167,8 +168,8 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 	const insertRequest = db.prepare(
 		`INSERT INTO requests (session_id, entry_id, ts, kind, provider, model, thinking, stop_reason, version, input, output,
 		cache_read, cache_write, prompt_tokens, cost, cost_input, cost_output, cost_read, cost_write, message_count, trigger,
-		trigger_tokens, cache_event, cache_lost, cache_waste, input_rate, read_rate, write_rate, long_retention)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		trigger_tokens, cache_event, cache_lost, cache_waste, input_rate, read_rate, write_rate, long_retention, tool_calls)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const costSplit = (usage: Usage) => [usage.cost.total, usage.cost.input, usage.cost.output, usage.cost.cacheRead, usage.cost.cacheWrite];
 	const insertCost = db.prepare(
@@ -196,7 +197,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 	const sessionId = header.id;
 	const sideCall = (entryId: string, ts: number, kind: string, provider: string, model: string, usage: Usage) =>
 		insertRequest.run(sessionId, entryId, ts, kind, provider, model, null, null, null, usage.input, usage.output, usage.cacheRead,
-			usage.cacheWrite, usage.input + usage.cacheRead + usage.cacheWrite, ...costSplit(usage), 0, null, 0, null, 0, 0, null, null, null, 0);
+			usage.cacheWrite, usage.input + usage.cacheRead + usage.cacheWrite, ...costSplit(usage), 0, null, 0, null, 0, 0, null, null, null, 0, null);
 
 	transaction(db, () => {
 		deleteSession(db, sessionId);
@@ -259,7 +260,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 					message.stopReason, version, usage.input, usage.output, usage.cacheRead, usage.cacheWrite, attribution.promptTokens,
 					...costSplit(usage), prompt.messageCount, attribution.trigger ?? null, attribution.triggerTokens, event?.cause ?? null,
 					event?.lostTokens ?? 0, event?.waste ?? 0, attribution.rates.input, attribution.rates.read, attribution.rates.write,
-					(usage.cacheWrite1h ?? 0) > 0 ? 1 : 0);
+					(usage.cacheWrite1h ?? 0) > 0 ? 1 : 0, message.content.filter((part) => part.type === "toolCall").length);
 				for (const [category, c] of attribution.composition) {
 					insertCost.run(sessionId, entry.id, category, c.blocks, c.tokens, c.newTokens, c.read, c.write, c.uncached);
 				}
@@ -315,6 +316,12 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		for (const pause of idlePauses(turns, warms, coldCompactions, last ? time(last) : time(header))) {
 			insertPause.run(sessionId, pause.start, pause.end ?? null, pause.minutes, pause.warms, pause.warmCost, pause.outcome,
 				pause.promptTokens, pause.resumeCost);
+		}
+		const insertArm = db.prepare(
+			"INSERT INTO experiment_arms (session_id, experiment, arm, forced, assigned_at, ended_at) VALUES (?, ?, ?, ?, ?, ?)",
+		);
+		for (const [experiment, arm] of recordedArms(entries)) {
+			insertArm.run(sessionId, experiment, arm.arm, arm.forced ? 1 : 0, arm.assignedAt, arm.endedAt ?? null);
 		}
 		db.prepare(
 			`INSERT INTO sessions (id, file, cwd, parent_session, name, prompt_digest, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages)

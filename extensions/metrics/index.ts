@@ -2,20 +2,31 @@
 //
 // `/harness stats` reports on the current project, `/harness stats all` on every session.
 // `/harness dashboard` starts the usage dashboard (dashboard/) detached, unless it runs, and
-// gives its URL scoped to the current project.
+// gives its URL scoped to the current project. `/harness experiment` runs the A/B experiments
+// (see experiment.ts).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { launch } from "../../dashboard/server/launch.ts";
 import { DEFAULT_PORT, lanUrls } from "../../dashboard/server/server.ts";
+import { ARM_ENTRY, listExperiments, recordedArms } from "../lib/experiments.ts";
+import { EXPERIMENT_USAGE, experimentCommand } from "./experiment.ts";
 import { stats } from "./stats.ts";
 
-const USAGE = "Usage: /harness stats [all] | /harness dashboard";
+const USAGE = `Usage: /harness stats [all] | /harness dashboard | ${EXPERIMENT_USAGE.replace("Usage: ", "")}`;
 
 export default function metrics(pi: ExtensionAPI) {
 	pi.registerCommand("harness", {
-		description: "Harness metrics: /harness stats [all], /harness dashboard",
+		description: "Harness metrics: /harness stats [all], /harness dashboard, /harness experiment [<name> on|off|stop]",
 		getArgumentCompletions: (prefix) =>
-			["stats", "stats all", "dashboard"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value })),
+			[
+				"stats",
+				"stats all",
+				"dashboard",
+				"experiment",
+				...listExperiments().flatMap((e) => ["on", "off", "stop"].map((action) => `experiment ${e.name} ${action}`)),
+			]
+				.filter((value) => value.startsWith(prefix))
+				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => {
 			const [command, ...rest] = args.trim().split(/\s+/);
 			if (command === "stats" && rest.every((arg) => arg === "all")) {
@@ -30,6 +41,13 @@ export default function metrics(pi: ExtensionAPI) {
 				} catch (error) {
 					ctx.ui.notify(`Could not start the usage dashboard: ${error instanceof Error ? error.message : String(error)}`, "error");
 				}
+			} else if (command === "experiment") {
+				const { text, level } = experimentCommand(rest, {
+					sessionId: ctx.sessionManager.getSessionId(),
+					recorded: recordedArms(ctx.sessionManager.getEntries()),
+					appendEntry: (data) => pi.appendEntry(ARM_ENTRY, data),
+				});
+				ctx.ui.notify(text, level);
 			} else {
 				ctx.ui.notify(USAGE, "warning");
 			}
