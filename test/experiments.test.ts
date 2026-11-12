@@ -22,6 +22,7 @@ import { crossedGroups, experimentCommand, renderComparison } from "../extension
 import { indexSessions } from "../extensions/metrics/indexer.ts";
 import { type ArmSession, bootstrapContrast, cellsOf, compareCells, contrastWeight, experiments, Scope } from "../extensions/metrics/queries/index.ts";
 import { openStore } from "../extensions/metrics/store.ts";
+import { applyRules, listRules, promoteExperiment } from "../extensions/lib/rules.ts";
 import prompt from "../extensions/prompt/index.ts";
 
 let dir: string;
@@ -206,8 +207,9 @@ describe("prompt extension", () => {
 	 * Run the extension's before_agent_start against an in-memory session; returns the custom
 	 * sections. The tool selection carries over between runs, as Pi's active tools do.
 	 */
-	function harness(sessionId: string, experimentsDir: string, initialTools = ["read", "bash", "edit", "write"]) {
+	function harness(sessionId: string, experimentsDir: string, initialTools = ["read", "bash", "edit", "write"], rulesDir = join(dir, "rules")) {
 		const entries: ReturnType<typeof armEntry>[] = [];
+		const notices: string[] = [];
 		let handler: ((event: unknown, ctx: unknown) => void) | undefined;
 		const pi = {
 			on: (name: string, h: typeof handler) => {
@@ -215,17 +217,66 @@ describe("prompt extension", () => {
 			},
 			appendEntry: (customType: string, data: ArmEntryData) => entries.push({ ...armEntry(data), customType }),
 		};
-		prompt(pi as never, experimentsDir);
-		const ctx = { sessionManager: { getSessionId: () => sessionId, getEntries: () => entries } };
+		prompt(pi as never, experimentsDir, rulesDir);
+		const ctx = { hasUI: true, ui: { notify: (text: string) => notices.push(text) }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries } };
 		let tools = initialTools;
 		const run = () => {
-			const options = { customPrompt: undefined, contextFiles: [], sections: {} as Record<string, string>, selectedTools: [...tools] };
+			const options = { customPrompt: undefined, contextFiles: [], sections: { cwd: "Current working directory: /x" } as Record<string, string>, selectedTools: [...tools] };
 			handler!({ systemPromptOptions: options }, ctx);
 			tools = options.selectedTools;
-			return options.sections;
+			const { cwd: _, ...added } = options.sections;
+			return added;
 		};
-		return { entries, run, tools: () => tools };
+		return { entries, notices, run, tools: () => tools };
 	}
+
+	test("rules are sections and tools for every session, before the experiments", () => {
+		const rules = experimentFile("batch", "---\npromoted: 2026-11-12\n---\nBatch calls.\n", join(dir, "rules"));
+		experimentFile("loop", "---\ntools: [workflow, fix_loop]\n---\n", rules);
+		const at = experimentFile("x", "---\ntools: fix_loop\n---\nVariant.");
+		for (const arm of ["A", "B"] as const) {
+			const session = harness(sessionIn(arm, "x"), at);
+			const sections = session.run();
+			assert.deepEqual(Object.keys(sections), arm === "B" ? ["batch", "experiment-x"] : ["batch"], `arm ${arm}: the rule's section first`);
+			assert.equal(sections.batch, "Batch calls.");
+			assert.deepEqual(session.tools(), ["read", "bash", "edit", "write", "fix_loop", "workflow"], `arm ${arm}: a rule's tool stays on although the experiment switches it off in arm A`);
+			assert.deepEqual(session.notices, []);
+		}
+		rmSync(join(rules, "loop.md"));
+		const later = harness("later", join(dir, "none"), ["read", "workflow"]);
+		later.run();
+		assert.deepEqual(later.tools(), ["read", "workflow"], "a removed rule no longer switches anything; the tool's own registration decides");
+	});
+
+	test("rules with a problem or a taken section name are left out and reported once", () => {
+		const rules = experimentFile("cwd", "Shadows Pi's section.", join(dir, "rules"));
+		experimentFile("empty", "---\npromoted: 2026-11-12\n---\n", rules);
+		experimentFile("Bad", "text", rules);
+		experimentFile("tools", "---\ntools: [\"no spaces\"]\n---\nX", rules);
+		experimentFile("ok", "Fine.", rules);
+		const session = harness("s", join(dir, "none"));
+		assert.deepEqual(session.run(), { ok: "Fine." });
+		assert.equal(session.notices.length, 1);
+		const lines = session.notices[0]!.split("\n");
+		assert.equal(lines[0], "Ignored prompt rules:");
+		assert.deepEqual(
+			lines.slice(1).map((line) => line.slice(rules.length + 1)),
+			["Bad.md: invalid name (use ^[a-z0-9][a-z0-9_-]*$)", "cwd.md: the prompt has a section cwd already", "empty.md: empty rule", 'tools.md: tools must name tools, got ["no spaces"]'],
+		);
+		session.run();
+		assert.equal(session.notices.length, 1, "the same problems are not reported again");
+	});
+
+	test("applyRules adds sections in file order and collects tools, a tools-only rule adds no section", () => {
+		const rules = experimentFile("b", "---\ntools: [codemode, workflow]\n---\n", join(dir, "rules"));
+		experimentFile("a", "---\ntools: workflow\n---\nA.", rules);
+		const sections: Record<string, string> = {};
+		const { tools, problems } = applyRules(listRules(rules), sections);
+		assert.deepEqual(sections, { a: "A." });
+		assert.deepEqual([...tools], ["workflow", "codemode"]);
+		assert.equal(problems, "");
+		assert.deepEqual(listRules(join(dir, "none")), []);
+	});
 
 	test("only arm B gets the variant as its own section, and the arm is recorded once", () => {
 		const at = experimentFile("parallel-tools", "---\nstatus: running\n---\n- Batch calls.\n");
@@ -643,6 +694,30 @@ describe("/harness experiment", () => {
 		assert.deepEqual(crossedGroups(listExperiments(at)), [["x", "y"]]);
 	});
 
+	test("promote moves the experiment to a rule with its tools and logs the result", () => {
+		const at = experimentFile("x", "---\nstatus: running\nstarted: 2026-11-13\ninteracts: y\ntools: [x_tool, y_tool]\n---\nVariant.\n");
+		experimentFile("y", "---\ntools: y_tool\n---\n", at);
+		const rules = join(dir, "rules");
+		const { ctx, changelog } = context(at);
+		const published: [string[], string][] = [];
+		const promoted = experimentCommand(["x", "promote"], { ...ctx, rulesDir: rules, publish: (paths, message) => (published.push([paths, message]), "Committed abc.") });
+		assert.match(promoted.text, /^Promoted x to a rule for every session; result logged in the changelog\.\nCommitted abc\./);
+		assert.deepEqual(published, [[[join(rules, "x.md"), join(at, "x.md"), changelog], "chore(experiments): promote x"]]);
+		assert.deepEqual(listExperiments(at).map((e) => e.name), ["y"], "the experiment file is gone");
+		assert.equal(readFileSync(join(rules, "x.md"), "utf8"), "---\ntools:\n  - x_tool\n  - y_tool\npromoted: 2026-11-20\n---\n\nVariant.\n");
+		assert.deepEqual(listRules(rules), [{ name: "x", file: join(rules, "x.md"), body: "Variant.", tools: ["x_tool", "y_tool"] }]);
+		const log = readFileSync(changelog, "utf8");
+		assert.match(log, /^## 2026-11-20 — experiment promoted: x$/m);
+		assert.match(log, /became the rule `prompt\/rules\/x\.md`/);
+		assert.match(log, /\*\*Result at promote/);
+
+		experimentCommand(["y", "promote"], { ...ctx, rulesDir: rules });
+		assert.equal(readFileSync(join(rules, "y.md"), "utf8"), "---\ntools: y_tool\npromoted: 2026-11-20\n---\n\n\n", "a tools-only experiment keeps its single tool");
+		experimentFile("y", "Again.", at);
+		assert.throws(() => promoteExperiment(listExperiments(at)[0]!, rules), /y\.md exists already/);
+		assert.equal(readFileSync(join(at, "y.md"), "utf8"), "Again.", "a refused promotion keeps the experiment");
+	});
+
 	test("rejects unknown experiments, ignored ones and bad arguments", () => {
 		const at = experimentFile("x", "Variant.");
 		experimentFile("empty", "", at);
@@ -650,7 +725,7 @@ describe("/harness experiment", () => {
 		assert.match(experimentCommand(["nope", "on"], ctx).text, /No experiment nope/);
 		assert.match(experimentCommand(["empty", "on"], ctx).text, /ignored: empty variant/);
 		for (const args of [["x"], ["x", "maybe"], ["x", "on", "now"]]) {
-			assert.deepEqual(experimentCommand(args, ctx), { text: "Usage: /harness experiment [<name> on|off|stop]", level: "warning" });
+			assert.deepEqual(experimentCommand(args, ctx), { text: "Usage: /harness experiment [<name> on|off|stop|promote]", level: "warning" });
 		}
 		assert.equal(appended.length, 0);
 	});

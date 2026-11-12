@@ -44,9 +44,9 @@ export type Arm = "A" | "B";
 export const ARMS: readonly Arm[] = ["A", "B"];
 
 // Pi's section names are `[a-z][a-z0-9_-]*`; the section is `experiment-<name>`.
-const NAME = /^[a-z0-9][a-z0-9_-]*$/;
+export const NAME = /^[a-z0-9][a-z0-9_-]*$/;
 // Tool names as providers accept them.
-const TOOL = /^[a-zA-Z0-9_-]{1,64}$/;
+export const TOOL = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export const sectionName = (experiment: string) => `experiment-${experiment}`;
 
@@ -86,7 +86,7 @@ export function readExperiment(file: string, name: string): Experiment {
 }
 
 /** A frontmatter value naming one thing or a list of them (absent: none); undefined when invalid. */
-function nameList(raw: unknown, valid: (name: string) => boolean): string[] | undefined {
+export function nameList(raw: unknown, valid: (name: string) => boolean): string[] | undefined {
 	const list = raw === undefined || raw === null ? [] : typeof raw === "string" ? [raw] : raw;
 	if (!Array.isArray(list) || !list.every((item) => typeof item === "string" && valid(item))) return undefined;
 	return [...new Set(list as string[])];

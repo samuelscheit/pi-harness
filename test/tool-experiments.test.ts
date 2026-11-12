@@ -33,6 +33,7 @@ let runtime: ModelRuntime;
 let dir: string;
 let repo: string;
 let experimentsDir: string;
+let rulesDir: string;
 const open: AgentSession[] = [];
 
 before(async () => {
@@ -58,6 +59,7 @@ beforeEach(() => {
 	writeFileSync(join(experimentsDir, "codemode.md"), "---\ntools: codemode\n---\nUse codemode for batches.");
 	writeFileSync(join(experimentsDir, "fix-loop.md"), "---\ntools: fix_loop\n---\n");
 	writeFileSync(join(experimentsDir, "workflow.md"), "---\ntools: workflow\n---\n");
+	rulesDir = join(dir, "rules");
 });
 afterEach(() => {
 	for (const session of open.splice(0)) session.dispose();
@@ -84,7 +86,7 @@ async function session(sessionManager: SessionManager): Promise<AgentSession> {
 		noContextFiles: true,
 		extensionFactories: [
 			createCodemodeExtension({ mode: "on" }),
-			(pi: ExtensionAPI) => prompt(pi, experimentsDir),
+			(pi: ExtensionAPI) => prompt(pi, experimentsDir, rulesDir),
 			(pi: ExtensionAPI) => workflow(pi, { experimentsDir, workflowDirs: () => [HARNESS_WORKFLOWS, join(repo, ".pi", "workflows")], modelRuntime: async () => runtime }),
 		],
 	});
@@ -109,6 +111,32 @@ const respond = (...steps: FauxResponseStep[]) => faux.setResponses(steps);
 /** The text of the tool results in the session, in order. */
 const results = (s: AgentSession) =>
 	s.messages.flatMap((m) => (m.role === "toolResult" ? [{ tool: m.toolName, error: m.isError, text: m.content.map((c) => (c.type === "text" ? c.text : "")).join("") }] : []));
+
+describe("rules", () => {
+	test("promoted tools are on in every session, and a saved workflow follows the workflow rule", async () => {
+		rmSync(experimentsDir, { recursive: true });
+		mkdirSync(rulesDir);
+		writeFileSync(join(rulesDir, "codemode.md"), "---\ntools: codemode\n---\nUse codemode for batches.");
+		writeFileSync(join(rulesDir, "workflow.md"), "---\ntools: workflow\n---\nWrite procedures as workflows.");
+		for (const arm of ["A", "B"] as const) {
+			const s = await newSession(idIn(arm, "codemode"));
+			let system = "";
+			respond((context) => {
+				system = JSON.stringify(context.messages.filter((m) => m.role === "system"));
+				return fauxAssistantMessage("ok");
+			});
+			await s.prompt("go");
+			for (const tool of ["codemode", "workflow", "fix_loop"]) assert.equal(s.getActiveToolNames().includes(tool), true, `${tool} for a session the old experiments put in ${arm}`);
+			assert.match(system, /Use codemode for batches\./);
+			assert.match(system, /Write procedures as workflows\./);
+		}
+		rmSync(join(rulesDir, "workflow.md"));
+		const without = await newSession(idIn("B", "codemode", "0190d000-0000-7000-8000-"));
+		respond(fauxAssistantMessage("ok"));
+		await without.prompt("go");
+		assert.deepEqual(["codemode", "workflow", "fix_loop"].map((tool) => without.getActiveToolNames().includes(tool)), [true, false, false], "without the rule the workflows stay off");
+	});
+});
 
 describe("tools per arm", () => {
 	test("codemode, workflow and fix_loop are declared in arm B only", async () => {
