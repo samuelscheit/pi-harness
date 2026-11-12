@@ -12,7 +12,8 @@
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
 // - settings.json: this repo and the vendored pi-lens as packages, Opus 5.5 as the startup model, and context
 //                  cost control: a one-hour cache, refreshed once while idle (cacheWarmingIdleMinutes), and
-//                  compaction with Haiku before a run whenever carrying (or rewriting) the context costs more.
+//                  compaction with Haiku before a run whose cache expired, when that costs less than writing the
+//                  context again (`warm` compaction stays off until its effect on quality is measured).
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
 //                  Messages API), and a `gateway` provider for every other gateway model
 //                  (Responses API), with context windows from the gateway's /v1/models and
