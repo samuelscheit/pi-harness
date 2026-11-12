@@ -9,7 +9,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /** Meta key set once Claude Code transcripts were imported; it survives schema rebuilds. */
 const CLAUDE_IMPORTED = "claude_imported";
@@ -47,6 +47,9 @@ CREATE TABLE requests (
 	input_rate REAL, read_rate REAL, write_rate REAL, long_retention INTEGER NOT NULL DEFAULT 0,
 	-- Tool calls the assistant message made (Pi turns; NULL for imported Claude Code turns).
 	tool_calls INTEGER,
+	-- Replayed thinking blocks the provider dropped from this request without billing them (Anthropic
+	-- drop_block on a prefix binding mismatch, see payload.ts); request_costs counts them at 0 tokens.
+	thinking_dropped INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (session_id, entry_id)
 );
 -- What each request's cost paid for, by content category and billing rate.

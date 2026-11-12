@@ -7,6 +7,7 @@ import { after, before, describe, test } from "node:test";
 import {
 	breakdown,
 	coldResumes,
+	droppedThinking,
 	compactionOpportunities,
 	compactions,
 	contentCosts,
@@ -187,6 +188,9 @@ describe("cache, tools and context", () => {
 	test("rebuilds, pauses and compactions follow the window", () => {
 		assert.deepEqual(rebuilds(scope()).map((r) => [r.cause, r.requests, r.lostTokens]), [["model switched", 1, 10_000]]);
 		assert.equal(largestRebuilds(scope())[0]!.title, "Parent work");
+		assert.deepEqual(droppedThinking(scope()), { blocks: 7, requests: 1, sessions: 1 });
+		assert.deepEqual(droppedThinking(scope({ start: T0 + 3 * MIN })), { blocks: 0, requests: 0, sessions: 0 }, "the window applies");
+		assert.deepEqual(droppedThinking(scope({ project: "/p2" })), { blocks: 0, requests: 0, sessions: 0 }, "the project applies");
 		assert.deepEqual(pauses(scope()).map((p) => [p.outcome, p.pauses, p.resumeCost]), [["cold", 1, 0.2]]);
 		assert.equal(coldResumes(scope())[0]!.session, "A");
 		assert.deepEqual(compactions(scope()).map((c) => [c.reason, c.count, c.cost]), [["threshold", 1, 0.04]]);

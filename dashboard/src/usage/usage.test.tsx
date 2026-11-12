@@ -203,6 +203,7 @@ describe("waste, subagents and versions", () => {
 		open("/waste");
 		const advice = (await screen.findByRole("heading", { name: "What to change" })).closest("section") as HTMLElement;
 		expect(within(advice).getByText(/Switching models starts a new cache/)).toBeInTheDocument();
+		expect(screen.getByText(`blocks in ${fixtures.waste.thinkingDropped.requests} requests, reasoning the model lost`)).toBeInTheDocument();
 		expect(screen.getByRole("heading", { name: "Best single compaction per session" })).toBeInTheDocument();
 		const cold = screen.getByRole("heading", { name: "Cold resumes" }).closest("section") as HTMLElement;
 		expect(within(cold).getByRole("link", { name: "Parent work" })).toBeInTheDocument();

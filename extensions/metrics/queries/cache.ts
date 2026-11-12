@@ -22,6 +22,22 @@ export function rebuilds(scope: Scope): RebuildCause[] {
 		.map((row) => ({ cause: String(row.cause), requests: Number(row.n), sessions: Number(row.sessions), lostTokens: Number(row.lost), waste: Number(row.waste) }));
 }
 
+export interface DroppedThinking {
+	/** Replayed thinking blocks the provider dropped without billing them (prefix binding mismatch). */
+	blocks: number;
+	requests: number;
+	sessions: number;
+}
+
+/** Thinking the model silently lost: blocks Anthropic dropped from requests (see payload.ts). A quality signal, not a cost. */
+export function droppedThinking(scope: Scope): DroppedThinking {
+	const row = scope.get(
+		`SELECT COALESCE(SUM(r.thinking_dropped), 0) blocks, COUNT(*) n, COUNT(DISTINCT r.session_id) sessions
+		FROM requests r WHERE r.thinking_dropped > 0 AND ${scope.where("r", "ts", true)}`,
+	);
+	return { blocks: Number(row.blocks), requests: Number(row.n), sessions: Number(row.sessions) };
+}
+
 export interface RebuildExample {
 	session: string;
 	title: string;

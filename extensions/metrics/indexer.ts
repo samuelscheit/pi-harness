@@ -26,6 +26,7 @@ import {
 import { attribute, cacheEvent, type RequestState, requestState, type Usage } from "./attribution.ts";
 import { recordedArms } from "../lib/experiments.ts";
 import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
+import { droppedThinking } from "./payload.ts";
 import { deleteSession, transaction } from "./store.ts";
 import { delegatedTaskDigest, delegation, mergeEffects, type ReportedWork, referenceIndex, reportedWork, toolEffect } from "./work.ts";
 
@@ -198,8 +199,8 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 	const insertRequest = db.prepare(
 		`INSERT INTO requests (session_id, entry_id, ts, kind, provider, model, thinking, stop_reason, version, input, output,
 		cache_read, cache_write, prompt_tokens, cost, cost_input, cost_output, cost_read, cost_write, message_count, trigger,
-		trigger_tokens, cache_event, cache_lost, cache_waste, input_rate, read_rate, write_rate, long_retention, tool_calls)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		trigger_tokens, cache_event, cache_lost, cache_waste, input_rate, read_rate, write_rate, long_retention, tool_calls, thinking_dropped)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const costSplit = (usage: Usage) => [usage.cost.total, usage.cost.input, usage.cost.output, usage.cost.cacheRead, usage.cost.cacheWrite];
 	const insertCost = db.prepare(
@@ -231,7 +232,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 	const sessionId = header.id;
 	const sideCall = (entryId: string, ts: number, kind: string, provider: string, model: string, usage: Usage) =>
 		insertRequest.run(sessionId, entryId, ts, kind, provider, model, null, null, null, usage.input, usage.output, usage.cacheRead,
-			usage.cacheWrite, usage.input + usage.cacheRead + usage.cacheWrite, ...costSplit(usage), 0, null, 0, null, 0, 0, null, null, null, 0, null);
+			usage.cacheWrite, usage.input + usage.cacheRead + usage.cacheWrite, ...costSplit(usage), 0, null, 0, null, 0, 0, null, null, null, 0, null, 0);
 
 	transaction(db, () => {
 		deleteSession(db, sessionId);
@@ -253,10 +254,13 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		const turns: TurnPoint[] = [];
 		const warms: { ts: number; cost: number }[] = [];
 		const coldCompactions: number[] = [];
+		// Pi process starts so far: Pi records the model with a `model_change` entry whenever it opens or resumes the session.
+		let starts = 0;
 
 		for (const entry of entries) {
 			const ts = time(entry);
-			if (entry.type === "session_info") name = entry.name ?? name;
+			if (entry.type === "model_change") starts += 1;
+			else if (entry.type === "session_info") name = entry.name ?? name;
 			else if (entry.type === "compaction") {
 				compactions += 1;
 				insertCompaction.run(sessionId, entry.id, ts, entry.reason ?? null, entry.tokensBefore, entry.usage?.cost.total ?? 0);
@@ -292,9 +296,11 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 			} else if (entry.type === "message" && entry.message.role === "assistant") {
 				const message = entry.message;
 				const usage = message.usage as Usage;
-				const prompt = parsePrompt(buildSessionContext(entries, entry.parentId, byId).messages);
+				const context = buildSessionContext(entries, entry.parentId, byId).messages;
+				const dropped = droppedThinking(context, message);
+				const prompt = parsePrompt(context, dropped.digests);
 				const attribution = attribute(prompt, usage, previous?.rates);
-				const state = requestState(prompt, attribution, usage, ts, message.model, message.thinkingLevel);
+				const state = requestState(prompt, attribution, usage, ts, message.model, message.thinkingLevel, starts);
 				// A request that failed before the provider answered has no usage: it neither read nor
 				// wrote the cache, so it is no predecessor for rebuilds and no resume after a pause.
 				const answered = attribution.promptTokens > 0;
@@ -307,7 +313,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 					message.stopReason, version, usage.input, usage.output, usage.cacheRead, usage.cacheWrite, attribution.promptTokens,
 					...costSplit(usage), prompt.messageCount, attribution.trigger ?? null, attribution.triggerTokens, event?.cause ?? null,
 					event?.lostTokens ?? 0, event?.waste ?? 0, attribution.rates.input, attribution.rates.read, attribution.rates.write,
-					(usage.cacheWrite1h ?? 0) > 0 ? 1 : 0, message.content.filter((part) => part.type === "toolCall").length);
+					(usage.cacheWrite1h ?? 0) > 0 ? 1 : 0, message.content.filter((part) => part.type === "toolCall").length, dropped.count);
 				for (const [category, c] of attribution.composition) {
 					insertCost.run(sessionId, entry.id, category, c.blocks, c.tokens, c.newTokens, c.read, c.write, c.uncached);
 				}

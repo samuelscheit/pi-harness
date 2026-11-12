@@ -27,6 +27,8 @@ import {
 	compactionOpportunities,
 	compactions,
 	contextSizes,
+	type DroppedThinking,
+	droppedThinking,
 	type Filters,
 	GROUPS,
 	type Group,
@@ -101,6 +103,7 @@ export interface ContextView {
 export interface WasteView {
 	kpis: Totals;
 	rebuilds: RebuildCause[];
+	thinkingDropped: DroppedThinking;
 	examples: RebuildExample[];
 	pauses: PauseOutcome[];
 	coldResumes: ColdResume[];
@@ -149,6 +152,7 @@ export function route(db: DatabaseSync, path: string, params: URLSearchParams, n
 			return {
 				kpis: totals(scope),
 				rebuilds: rebuilds(scope),
+				thinkingDropped: droppedThinking(scope),
 				examples: largestRebuilds(scope),
 				pauses: pauses(scope),
 				coldResumes: coldResumes(scope),
