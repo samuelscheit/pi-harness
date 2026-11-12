@@ -87,7 +87,7 @@ Verified: Pi runs in t3 (this handoff's second session ran in it); t3's MCP tool
 
 - T3 Code Nightly ships a Pi provider (`packages/provider-pi`): `pi --mode rpc`, plus a generated extension `pi-t3-mcp-extension.ts` (env `T3_MCP_URL`, `T3_MCP_BEARER_TOKEN`, `T3_PI_RUNTIME_MODE`) that registers t3's MCP tools as Pi tools. Pi's UI requests (select, confirm, input, editor) show as t3 dialogs. The plan-mode toggle is off for Pi.
 - An extracted bundle for reading is in `/tmp/t3asar/apps/server/dist/runtimeLayer-D81jNfD9.mjs` (temporary; re-extract `app.asar` with `npx @electron/asar extract` if it's gone).
-- t3 shows a Pi `notify` as a system notice only while a turn is active; other extension UI updates (status, widgets) are ignored. Dialogs (select/confirm/input/editor) are not yet tested: they need `ask_user`.
+- t3 shows a Pi `notify` as a system notice only while a turn is active; other extension UI updates (status, widgets) are ignored. Dialogs (select/confirm/input/editor) show as question cards. Unpatched t3 cancels every open dialog when a turn ends, so an `ask_user` card vanished seconds after it appeared and the agent got "dismissed"; `scripts/patch-t3.ts` (patch `dialogs`, t3code branch `pi-dialogs-outlive-turns`) keeps dialogs open until answered, dismissed by Pi (vendor/pi sends `extension_ui_request` `method: "dismiss"` when an abort signal or timeout closes one) or the process exits, and counts an open dialog as background work so the idle unload keeps the session.
 
 ### Gateway (`~/Developer/Developer/ai/Open-WebUI-Adapter`, branch `samuel_test`; pushing redeploys prod)
 
@@ -102,7 +102,7 @@ Verified: Pi runs in t3 (this handoff's second session ran in it); t3's MCP tool
 1. **Tools.** Done: `ask_user`, web search/fetch. Open, waiting on the user's choice:
     - LSP: chosen: pi-lens, vendored and on trial (see `vendor/pi-lens`, `extensions/lens`). Open: judge it from the metrics after real sessions; trim what costs more than it helps per project or globally.
     - `t3-adapt`: which `mcp__t3-code__*` tools to hide, re-describe or wrap. Measured: t3's tool definitions and its `t3_code_orchestration` section cost ~1–2% per request; `orchestrator_capabilities` results are 1.6k tokens and stay in context ~75 requests.
-    - Check `ask_user` cards in a real t3 thread (verified over RPC only).
+    - Check `ask_user` cards in a real t3 thread after restarting t3 with the `dialogs` patch: the card stays after the turn ends, and answering it starts a new turn.
 2. **Self-improvement.**
     - Done: `note_improvement` (`extensions/improvements`) appends an entry (time, session, cwd, observation, proposal) to `<repo root>/.agents/improvements.md` (scope `project`) or this repo's `.agents/improvements.md` (scope `harness`). Consumers: dreaming and `/improve`.
     - Dreaming as a t3 scheduled task: reads the backlog, sessions and `metrics.db`; classifies `user_messages` (follow-up, steer, after interrupt) into corrections with a cheap model; makes small playbook edits (ACE style); commits each change with its hypothesis and target metric; switches a share of new sessions to it; promotes or reverts on the target metric plus guardrails (corrections, tool errors). Compare by randomized arms (`/harness experiment`), not by harness version: before/after is confounded by task mix and project AGENTS.md edits.

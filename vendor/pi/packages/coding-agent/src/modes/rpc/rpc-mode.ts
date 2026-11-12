@@ -110,17 +110,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				pendingExtensionRequests.delete(id);
 			};
 
-			const onAbort = () => {
+			// Closed here, not by the client: tell the client so it can take the dialog down.
+			const dismiss = () => {
 				cleanup();
+				output({ type: "extension_ui_request", id, method: "dismiss" });
 				resolve(defaultValue);
 			};
+			const onAbort = dismiss;
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
 			if (opts?.timeout) {
-				timeoutId = setTimeout(() => {
-					cleanup();
-					resolve(defaultValue);
-				}, opts.timeout);
+				timeoutId = setTimeout(dismiss, opts.timeout);
 			}
 
 			pendingExtensionRequests.set(id, {

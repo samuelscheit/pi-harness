@@ -106,3 +106,13 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Judged by:** turns per package, cost and cache-read cost per session, `codemode` usage; guardrail: tool error rate. File effects of calls made from scripts count through Pi's nested-call records.
 
 **Revert:** `/harness experiment codemode stop`, or delete the file.
+
+## 2026-11-13 — t3 patch: Pi dialogs outlive the turn that showed them
+
+**Change:** `scripts/patch-t3.ts` now holds a list of patches, each skipped once its marker is in the bundle. The new `dialogs` patch (t3code branch `pi-dialogs-outlive-turns`) stops t3's Pi adapter from cancelling open dialogs when a turn ends, cancels a card when Pi reports `dismiss` for it, and counts open dialogs as background work. vendor/pi's RPC mode sends `{"type":"extension_ui_request","id":…,"method":"dismiss"}` when it closes a dialog itself (abort signal or timeout).
+
+**Evidence:** the user saw every `ask_user` card appear briefly and disappear, and the agent received "(dismissed without an answer)". `finalizeTurn` in t3's Pi adapter called `cancelPendingPrompts`; `ask_user` returns at once, so the turn ended seconds after asking and the cancel reached Pi as the answer. Stop had the same effect and woke the agent again with "dismissed".
+
+**Judged by:** `ask_user` answers that are not "dismissed" (user_messages of custom type `ask_user`); no dialog cards left that Pi no longer waits for.
+
+**Revert:** restore `app.asar.pre-pi-harness` and run `node scripts/patch-t3.ts` without the `dialogs` entry; revert the `dismiss` lines in `vendor/pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts`.

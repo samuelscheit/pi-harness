@@ -94,6 +94,20 @@ Open a multi-line text editor with optional prefilled content.
 
 Expected response: `extension_ui_response` with `value` (the edited text) or `cancelled: true`.
 
+### dismiss
+
+Pi closed an open `select`, `confirm` or `input` dialog itself, because the extension's abort signal fired or its `timeout` passed. The `id` is the dialog's. Take the dialog down; it expects no response, and a late one is ignored.
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-1",
+  "method": "dismiss"
+}
+```
+
+A dialog lives until it is answered, cancelled or dismissed, independent of agent runs: an extension can ask without waiting for the answer, and the dialog stays open after the run ends.
+
 ### notify
 
 Display a notification. Fire-and-forget, no response expected.
