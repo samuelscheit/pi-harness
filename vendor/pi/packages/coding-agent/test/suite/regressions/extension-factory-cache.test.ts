@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import { DefaultResourceLoader } from "../../../src/core/resource-loader.ts";
 interface TestState {
 	moduleLoads?: number;
 	factoryRuns?: number;
+	version?: string;
 }
 
 function state(): TestState {
@@ -110,6 +111,40 @@ describe("extension factory cache", () => {
 
 		expect(state().moduleLoads).toBe(2);
 		expect(state().factoryRuns).toBe(2);
+	});
+
+	it("reloads a changed JavaScript extension, which Node caches natively, and keeps an unchanged one", async () => {
+		const { root, cwd } = fixture("native-js");
+		const extensionPath = join(root, "native.mjs");
+		const write = (version: string, mtime: Date) => {
+			writeFileSync(
+				extensionPath,
+				`const state = (globalThis.__extensionFactoryCacheTest ??= {});\nstate.moduleLoads = (state.moduleLoads ?? 0) + 1;\nexport default function () { state.version = "${version}"; }\n`,
+				"utf-8",
+			);
+			utimesSync(extensionPath, mtime, mtime);
+		};
+		const load = async () => {
+			clearExtensionCache();
+			const result = await loadExtensions([extensionPath], cwd);
+			expect(result.errors).toEqual([]);
+			return state().version;
+		};
+
+		write("v1", new Date("2026-01-01T00:00:00Z"));
+		expect(await load()).toBe("v1");
+		expect(await load()).toBe("v1");
+		expect(state().moduleLoads).toBe(1);
+
+		write("v2", new Date("2026-01-01T00:00:10Z"));
+		expect(await load()).toBe("v2");
+		expect(state().moduleLoads).toBe(2);
+		expect(await load()).toBe("v2");
+		expect(state().moduleLoads).toBe(2);
+
+		write("v3", new Date("2026-01-01T00:00:20Z"));
+		expect(await load()).toBe("v3");
+		expect(state().moduleLoads).toBe(3);
 	});
 
 	it("keeps the cache scoped to one cwd", async () => {

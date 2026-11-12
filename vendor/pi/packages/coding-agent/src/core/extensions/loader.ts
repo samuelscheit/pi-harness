@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Provider } from "@earendil-works/pi-ai";
 import { mcpNamespace } from "@earendil-works/pi-mcp";
 import type { KeyId } from "@earendil-works/pi-tui";
@@ -574,6 +574,33 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
+/**
+ * The URL each native JavaScript extension (.js, .mjs) was last imported from, by the file's
+ * modification time. jiti imports such a file natively, and Node caches a native module for the life
+ * of the process whatever jiti's `moduleCache` says, so `/reload` kept running the old code of a
+ * changed JavaScript extension (a built package such as pi-lens's `dist/index.js`) until Pi restarted.
+ * A file changed since its last import is imported under a new URL (`?pi-reload=<mtime>`), which
+ * Node evaluates anew; an unchanged one keeps its module, so reloads do not pile up copies. Only the
+ * entry gets a new URL: a bundled package reloads whole, an unbundled one keeps its other files.
+ */
+const nativeModuleUrls = new Map<string, { mtimeMs: number; url: string | undefined }>();
+
+/** The URL to import a native JavaScript extension from now, or undefined for the plain path. */
+function nativeReloadUrl(extensionPath: string): string | undefined {
+	if (usesEmbeddedModules || !/\.m?js$/i.test(extensionPath)) return undefined;
+	let mtimeMs: number;
+	try {
+		mtimeMs = fs.statSync(extensionPath).mtimeMs;
+	} catch {
+		return undefined;
+	}
+	const loaded = nativeModuleUrls.get(extensionPath);
+	if (loaded?.mtimeMs === mtimeMs) return loaded.url;
+	const url = loaded ? `${pathToFileURL(extensionPath).href}?pi-reload=${mtimeMs}` : undefined;
+	nativeModuleUrls.set(extensionPath, { mtimeMs, url });
+	return url;
+}
+
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
@@ -596,7 +623,11 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		...resolutionOptions,
 	});
 
-	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
+	const canonicalPath = canonicalizePath(extensionPath);
+	const reloadUrl = nativeReloadUrl(canonicalPath);
+	const module = reloadUrl
+		? ((await import(reloadUrl)) as { default?: unknown }).default
+		: await jiti.import(canonicalPath, { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
