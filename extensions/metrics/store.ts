@@ -9,7 +9,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** Meta key set once Claude Code transcripts were imported; it survives schema rebuilds. */
 const CLAUDE_IMPORTED = "claude_imported";
@@ -80,7 +80,8 @@ CREATE TABLE tool_files (
 );
 -- Subagents a session started (delegate_task, linked to the child by sessions.prompt_digest) or
 -- messaged again (t3_thread_send, linked by thread_id), and child sessions a tool ran in this
--- process (kind 'tool', thread_id = the child's session id from details.childSession, title = tool).
+-- process (kind 'tool', one row per child: call_id = '<tool call id>/<n>', thread_id = the child's
+-- session id from details.childSessions, title = tool).
 CREATE TABLE delegations (
 	session_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL,
 	thread_id TEXT, task_digest TEXT, title TEXT,

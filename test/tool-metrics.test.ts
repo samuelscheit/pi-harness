@@ -60,19 +60,20 @@ const result = (minute: number, id: string, name: string, extra: object = {}) =>
 const arm = (minute: number, experiment: string, armName: "A" | "B") => ({ type: "custom", timestamp: at(minute), customType: ARM_ENTRY, data: { experiment, arm: armName, forced: false } });
 
 describe("reported work", () => {
-	test("nested calls, changed files, goal and child session from a tool result", () => {
+	test("nested calls, changed files, goal and child sessions from a tool result", () => {
 		const work = reportedWork(
 			[{ name: "edit", arguments: { path: "src/a.ts" } }, { name: "bash", arguments: { command: "sed -i 's/x/y/' src/b.ts" } }, { name: "read", arguments: { path: "c.ts" } }, { name: "write" }],
-			{ changedFiles: ["src/d.ts", "/abs/e.ts", 3, ""], ok: false, childSession: "child-1" },
+			{ changedFiles: ["src/d.ts", "/abs/e.ts", 3, ""], ok: false, childSessions: ["child-1", 7, "", "child-2"] },
 			"/repo",
 		);
 		assert.deepEqual(work.effect.writes.sort(), ["/abs/e.ts", "/repo/src/a.ts", "/repo/src/b.ts", "/repo/src/d.ts"]);
 		assert.ok(work.effect.files.includes("/repo/c.ts"), "a nested read names its file");
 		assert.equal(work.effect.mutates, true);
 		assert.equal(work.ok, false);
-		assert.equal(work.childSession, "child-1");
-		assert.deepEqual(reportedWork(undefined, "text details", "/repo"), { effect: { files: [], writes: [], mutates: false } });
-		assert.deepEqual(reportedWork([], { ok: "yes", childSession: 5 }, "/repo"), { effect: { files: [], writes: [], mutates: false } });
+		assert.deepEqual(work.childSessions, ["child-1", "child-2"]);
+		const none = { effect: { files: [], writes: [], mutates: false }, childSessions: [] };
+		assert.deepEqual(reportedWork(undefined, "text details", "/repo"), none);
+		assert.deepEqual(reportedWork([], { ok: "yes", childSessions: "child-1" }, "/repo"), none);
 	});
 
 	test("a parent named by path resolves to its id: from its header, else its file name; an id stays", () => {
@@ -91,12 +92,12 @@ describe("fix_loop sessions in the index and the comparison", () => {
 	const sessions = () => join(dir, "sessions");
 
 	/** A parent in `armName` of fix-loop with one fix_loop call that ran `child` and changed a.ts, then read it again (or not). */
-	function parent(id: string, armName: "A" | "B", options: { child?: string; ok?: boolean; reread?: boolean; cost?: number } = {}): string {
+	function parent(id: string, armName: "A" | "B", options: { child?: string; children?: string[]; ok?: boolean; reread?: boolean; cost?: number } = {}): string {
 		const body: object[] = [user(0, "go"), arm(0, "fix-loop", armName), assistant(1, options.cost ?? 1, [{ id: `${id}-c1`, name: "bash", arguments: { command: "npm test" } }]), result(1, `${id}-c1`, "bash")];
 		if (options.child) {
 			body.push(
 				assistant(2, 0.5, [{ id: `${id}-fl`, name: "fix_loop", arguments: { goal: "g", files: ["a.ts"], check: "npm test" } }]),
-				result(3, `${id}-fl`, "fix_loop", { details: { ok: options.ok ?? true, changedFiles: ["/repo/a.ts"], childSession: options.child } }),
+				result(3, `${id}-fl`, "fix_loop", { details: { ok: options.ok ?? true, changedFiles: ["/repo/a.ts"], childSessions: options.children ?? [options.child] } }),
 			);
 			if (options.reread) body.push(assistant(4, 0.25, [{ id: `${id}-r`, name: "read", arguments: { path: "a.ts" } }]), result(4, `${id}-r`, "read"));
 		}
@@ -116,6 +117,19 @@ describe("fix_loop sessions in the index and the comparison", () => {
 		assert.deepEqual({ ...db.prepare("SELECT ok, mutates FROM tool_results WHERE call_id = 'P1-fl'").get() }, { ok: 1, mutates: 1 });
 		assert.deepEqual(db.prepare("SELECT file, write FROM tool_files WHERE call_id = 'P1-fl'").all().map((r) => ({ ...r })), [{ file: "/repo/a.ts", write: 1 }]);
 		assert.equal((db.prepare("SELECT ok FROM tool_results WHERE call_id = 'P1-c1'").get() as { ok: null }).ok, null, "tools without a goal report none");
+		db.close();
+	});
+
+	test("a tool that ran several children links each of them", () => {
+		const p = parent("P2", "B", { child: "K2", children: ["K2", "K3"] });
+		child("K2", p, 0.1, 0);
+		child("K3", p, 0.2, 0);
+		const db = openStore(join(dir, "metrics.db"));
+		assert.deepEqual(indexSessions(db, sessions()).failed, []);
+		assert.deepEqual(
+			db.prepare("SELECT call_id, kind, thread_id FROM delegations WHERE session_id = 'P2' ORDER BY call_id").all().map((r) => ({ ...r })),
+			[{ call_id: "P2-fl/1", kind: "tool", thread_id: "K2" }, { call_id: "P2-fl/2", kind: "tool", thread_id: "K3" }],
+		);
 		db.close();
 	});
 
