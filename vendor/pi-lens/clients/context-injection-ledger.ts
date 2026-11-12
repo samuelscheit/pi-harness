@@ -28,6 +28,14 @@
  *   breaks at the newest point, the cheapest one.
  * - Each decline records one `context-injection-retain-declined` degradation
  *   per session and reason.
+ * - Persistence (pi-harness): pi re-runs the factory for /reload (a harness
+ *   hot reload is one) and a restarted pi starts empty, so an in-memory ledger
+ *   stopped re-sending exactly the injections earlier requests carried and the
+ *   provider wrote the whole conversation to its cache again. Given a
+ *   {@link LedgerStore}, every retain and clear is appended to the session as
+ *   a record, and the first rebuild of a session in an activation replays the
+ *   records since the last clear. Restored entries pass the same digest check
+ *   as any other, so a transcript they no longer match prunes them.
  */
 import { BoundedLruCache } from "./bounded-cache.js";
 import {
@@ -57,7 +65,7 @@ type DeclineReason =
 	| "no-session-id"
 	| "transcript-not-hashable";
 
-type RetainedEntry =
+export type RetainedEntry =
 	| {
 			kind: "user-text";
 			anchor: number;
@@ -100,18 +108,45 @@ export interface LedgerRebuild {
 	): DeclineReason | undefined;
 }
 
+/** What the ledger appends to a session: one retained entry, or the end of all before it. */
+export type LedgerRecord =
+	| { op: "retain"; entry: RetainedEntry }
+	| { op: "clear" };
+
+/** A session's persisted records (the session file, see index.ts). */
+export interface LedgerStore {
+	/** The session's records, oldest first. */
+	load(): readonly LedgerRecord[];
+	save(record: LedgerRecord): void;
+}
+
+/** The entries the records leave: those after the last clear, in order. */
+export function replayRecords(
+	records: readonly LedgerRecord[],
+): RetainedEntry[] {
+	const entries: RetainedEntry[] = [];
+	for (const record of records) {
+		if (record.op === "clear") entries.length = 0;
+		else entries.push(record.entry);
+	}
+	return entries;
+}
+
 export interface InjectionLedger {
 	/**
 	 * Re-apply `sessionId`'s entries to pi's own transcript `raw` (never
-	 * mutated). A missing id returns `raw` with a retain that declines.
+	 * mutated). A missing id returns `raw` with a retain that declines. With a
+	 * `store`, the session's entries are restored from it on its first rebuild
+	 * in this ledger, and a retain is saved to it.
 	 */
 	rebuild(
 		sessionId: string | undefined,
 		raw: ReadonlyArray<LedgerMessage>,
 		appendToUserContent: AppendToUserContent,
+		store?: LedgerStore,
 	): LedgerRebuild;
-	/** Forget a session's entries (context injection switched off). */
-	clearSession(sessionId: string | undefined): void;
+	/** Forget a session's entries (context injection switched off), also in `store`. */
+	clearSession(sessionId: string | undefined, store?: LedgerStore): void;
 	/** Entries held for a session (test and record seam). */
 	size(sessionId: string): number;
 }
@@ -155,6 +190,8 @@ export function createInjectionLedger(): InjectionLedger {
 	const sessions = new BoundedLruCache<string, RetainedEntry[]>(
 		MAX_RETAINED_SESSIONS,
 	);
+	/** Sessions whose store this ledger has read already. */
+	const restored = new Set<string>();
 
 	const noSession = (raw: ReadonlyArray<LedgerMessage>): LedgerRebuild => ({
 		messages: raw as LedgerMessage[],
@@ -173,8 +210,15 @@ export function createInjectionLedger(): InjectionLedger {
 		sessionId: string | undefined,
 		raw: ReadonlyArray<LedgerMessage>,
 		appendToUserContent: AppendToUserContent,
+		store?: LedgerStore,
 	): LedgerRebuild => {
 		if (!sessionId) return noSession(raw);
+		if (store && !restored.has(sessionId)) {
+			restored.add(sessionId);
+			const entries = replayRecords(store.load()).slice(-MAX_RETAINED_ENTRIES);
+			if (entries.length > 0 && !sessions.get(sessionId))
+				sessions.set(sessionId, entries);
+		}
 		const held = sessions.get(sessionId) ?? [];
 		let digests: RollingDigests | undefined;
 		const rawDigests = (): RollingDigests => {
@@ -200,7 +244,11 @@ export function createInjectionLedger(): InjectionLedger {
 		const pruned = held.length - valid.length;
 		if (pruned > 0) {
 			if (valid.length > 0) sessions.set(sessionId, valid);
-			else sessions.delete(sessionId);
+			else {
+				sessions.delete(sessionId);
+				// Nothing left can line up again: a restart need not replay any of it.
+				store?.save({ op: "clear" });
+			}
 		}
 
 		const byAnchor = new Map<number, RetainedEntry[]>();
@@ -285,6 +333,7 @@ export function createInjectionLedger(): InjectionLedger {
 							bytes,
 						};
 			sessions.set(sessionId, [...current, entry]);
+			store?.save({ op: "retain", entry });
 			return undefined;
 		};
 
@@ -313,8 +362,16 @@ export function createInjectionLedger(): InjectionLedger {
 
 	return {
 		rebuild,
-		clearSession: (sessionId) => {
-			if (sessionId) sessions.delete(sessionId);
+		clearSession: (sessionId, store) => {
+			if (!sessionId) return;
+			const held = sessions.get(sessionId)?.length ?? 0;
+			sessions.delete(sessionId);
+			if (!store) return;
+			// A store this ledger has not read yet may still hold entries.
+			const stored =
+				!restored.has(sessionId) && replayRecords(store.load()).length > 0;
+			restored.add(sessionId);
+			if (held > 0 || stored) store.save({ op: "clear" });
 		},
 		size: (sessionId) => sessions.get(sessionId)?.length ?? 0,
 	};
