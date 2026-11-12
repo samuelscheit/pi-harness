@@ -461,3 +461,30 @@ When a run is about to settle (`agent_before_settle`), the extension runs one `p
 **Judged by:** no running session loses its harness sections after a deploy.
 
 **Revert:** revert the commit.
+
+## 2026-11-12 — metrics: thinking at its billed size, dropped thinking recorded, honest cache-loss labels
+
+**Change:**
+
+- **Thinking sizing:** `extensions/metrics/blocks.ts` sizes a replayed thinking block at its message's reported `usage.reasoning`, split across the message's blocks by the old estimate. These sizes are exact, so `attribution.ts` does not scale them; estimated blocks fill the rest of the prompt. The text + signature estimate remains only for messages without reported reasoning.
+- **Dropped blocks:** the new `extensions/metrics/payload.ts` reads the `thinking_dropped` input transformations Pi records on a reply and maps their request-body paths back to the session's thinking blocks by replaying Pi's Anthropic layout. Those blocks cost 0. `requests.thinking_dropped` (schema 12) counts them per request, and `/harness stats` and the dashboard's Waste view show the total.
+- **Cache-loss labels:** `rebuildCause` no longer guesses. A rebuild whose prefix the session file shows unchanged is "request changed outside the session file (extension injection or provider)". It gets ", after a Pi restart" when a `model_change` entry lies between the two requests, and ", alongside a prompt or tools update" when an appended update is new. The old "prompt or tools updated mid-conversation" and "cache missed without a prompt change" are gone. Idle expiry, compaction and visible prefix changes are unchanged.
+
+**Evidence:** `docs/research/context-engineering/08-thinking-and-cache-loss.md`.
+
+- Across 2,723 tool-loop request pairs, prompt growth matches the reported thinking tokens at 1.00×; the old estimate was 1.44×.
+- Pi sends `drop_block`, and the API does not bill the blocks it drops.
+- 17 of 19 "prompt updated" or "missed without change" rebuilds had a byte-identical prefix in Pi's own payloads; pi-lens's lost in-memory ledger caused them.
+- The layout replay places all 2,417 recorded `thinking_dropped` paths (54 requests) on a thinking block.
+
+Re-indexing the same session files (cutoff 2026-11-12 23:44 UTC, $445.91 of Pi spend):
+
+- **Thinking:** $96.40 (21.6%) → $44.52 (10.0%), 319.5M → 152.8M tokens. Tool results rose $155.69 → $186.99 and tool calls $53.95 → $65.79.
+- **Rebuilds:**
+  - 23 "prompt or tools updated" + 5 "missed without change" ($42.54) became 14 "…after a Pi restart" ($24.74), 13 "…alongside a prompt or tools update" ($17.77) and 1 bare ($0.03, a 4k partial miss).
+  - Idle expiry (8) and compaction (2) are unchanged.
+- **Dropped:** 2,443 thinking blocks in 55 requests of 14 sessions.
+
+**Judged by:** the thinking share stays near the measured billing (8–11% of Pi spend). The "outside the session file" rows and `thinking_dropped` should fall toward 0 now that the pi-lens ledger persists.
+
+**Revert:** revert the commit, then delete `~/.pi/agent/metrics.db` (older code refuses an index of a newer schema). It rebuilds from the session files.

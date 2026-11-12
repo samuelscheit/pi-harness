@@ -11,6 +11,7 @@ import {
 	compactions,
 	contentCosts,
 	contextSizes,
+	droppedThinking,
 	type Filters,
 	KEEP_TOKENS,
 	PAUSE_OUTCOMES,
@@ -69,6 +70,12 @@ export function report(db: DatabaseSync, filters: Filters = {}): string {
 	const causes = rebuilds(scope);
 	if (causes.length) {
 		out.push(`Cache rebuilds\n${table(["cause", "times", "tokens lost", "extra cost"], causes.map((r) => [r.cause, String(r.requests), count(r.lostTokens), money(r.waste)]))}`);
+	}
+	const dropped = droppedThinking(scope);
+	if (dropped.blocks) {
+		out.push(
+			`Thinking dropped by the API (an earlier message, prompt or tool changed under it; not billed, the model lost that reasoning): ${dropped.blocks} blocks in ${dropped.requests} requests of ${dropped.sessions} sessions`,
+		);
 	}
 
 	const pauseRows = pauses(scope);

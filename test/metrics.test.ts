@@ -5,52 +5,13 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { attribute, cacheEvent, ratesOf, type RequestState, requestState, type Usage } from "../extensions/metrics/attribution.ts";
+import { attribute, CHANGED_OUTSIDE_SESSION, cacheEvent, ratesOf, type RequestState, requestState } from "../extensions/metrics/attribution.ts";
 import { imageTokens, parsePrompt, versionId } from "../extensions/metrics/blocks.ts";
 import { idlePauses, indexSessions } from "../extensions/metrics/indexer.ts";
 import { changeSummary, changes } from "../extensions/metrics/queries/versions.ts";
 import { report } from "../extensions/metrics/report.ts";
 import { openStore, SCHEMA_VERSION } from "../extensions/metrics/store.ts";
-
-// Opus-like prices per token.
-const PRICE = { input: 5e-6, read: 0.5e-6, write: 6.25e-6, output: 25e-6 };
-
-function usage(input: number, cacheRead: number, cacheWrite: number, output: number): Usage {
-	const cost = {
-		input: input * PRICE.input,
-		cacheRead: cacheRead * PRICE.read,
-		cacheWrite: cacheWrite * PRICE.write,
-		output: output * PRICE.output,
-		total: 0,
-	};
-	cost.total = cost.input + cost.cacheRead + cost.cacheWrite + cost.output;
-	return { input, output, cacheRead, cacheWrite, cacheWrite1h: 0, cost };
-}
-
-const tool = (name: string, description = `${name} tool`) => ({ name, description, parameters: { type: "object", properties: {} } });
-
-const system = (sections: Record<string, string | null>, toolsAdded = [tool("bash"), tool("read")]): AgentMessage =>
-	({ role: "system", content: "", sections, toolsAdded, timestamp: 0 }) as AgentMessage;
-
-const user = (text: string): AgentMessage => ({ role: "user", content: text, timestamp: 0 });
-
-function assistant(content: unknown[], stopReason = "toolUse", u = usage(1, 0, 0, 10), extra: Record<string, unknown> = {}): AgentMessage {
-	return {
-		role: "assistant",
-		content,
-		api: "anthropic-messages",
-		provider: "anthropic",
-		model: "claude-opus-5-5",
-		thinkingLevel: "medium",
-		usage: u,
-		stopReason,
-		timestamp: 0,
-		...extra,
-	} as AgentMessage;
-}
-
-const toolResult = (id: string, name: string, text: string, extra: Record<string, unknown> = {}): AgentMessage =>
-	({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError: false, timestamp: 0, ...extra }) as AgentMessage;
+import { assistant, PRICE, system, tool, toolResult, usage, user } from "./metrics-fixtures.ts";
 
 function png(width: number, height: number): string {
 	const header = Buffer.alloc(24);
@@ -173,6 +134,7 @@ describe("attribution", () => {
 		thinking: "medium",
 		longRetention: false,
 		rates: { input: PRICE.input, read: PRICE.read, write: PRICE.write },
+		starts: 1,
 		...overrides,
 	});
 	const rebuilt = usage(1, 1_000, 21_000, 10);
@@ -191,8 +153,17 @@ describe("attribution", () => {
 		["a tool change", { ts: 1000, digests: ["T", "s", "m1", "m2"] }, "tool definitions changed", true],
 		["a prompt change", { ts: 1000, digests: ["t", "S", "m1", "m2"] }, "system prompt changed", true],
 		["an edited message", { ts: 1000, digests: ["t", "s", "m1", "M2"] }, "earlier tool result: bash changed", true],
-		["a mid-conversation update", { ts: 1000, digests: ["t", "s", "m1", "m2", "u"], newCategories: ["system update"] }, "prompt or tools updated mid-conversation", true],
-		["nothing visible", { ts: 1000, digests: ["t", "s", "m1", "m2", "r"] }, "cache missed without a prompt change", true],
+		// An appended update leaves the prefix unchanged, so it is reported next to the cause, not as it.
+		["a mid-conversation update", { ts: 1000, digests: ["t", "s", "m1", "m2", "u"], newCategories: ["system update"] }, `${CHANGED_OUTSIDE_SESSION}, alongside a prompt or tools update`, true],
+		["nothing visible", { ts: 1000, digests: ["t", "s", "m1", "m2", "r"] }, CHANGED_OUTSIDE_SESSION, true],
+		["a Pi restart", { ts: 1000, digests: ["t", "s", "m1", "m2", "r"], starts: 2 }, `${CHANGED_OUTSIDE_SESSION}, after a Pi restart`, true],
+		["a Pi restart that also updated the prompt", { ts: 1000, digests: ["t", "s", "m1", "m2", "u"], newCategories: ["system update"], starts: 2 }, `${CHANGED_OUTSIDE_SESSION}, after a Pi restart`, true],
+		// What the session file shows changing is claimed before a restart or an update next to it.
+		["a Pi restart with a visible prompt change", { ts: 1000, digests: ["t", "S", "m1", "m2"], starts: 2 }, "system prompt changed", true],
+		["an update whose prefix changed", { ts: 1000, digests: ["t", "s", "M1", "m2", "u"], newCategories: ["system update"] }, "earlier user prompt changed", true],
+		// Idle expiry and compaction come first, also after a restart.
+		["idle past the TTL across a restart", { ts: 301_000, starts: 2 }, "cache expired after idle (5 min TTL)", true],
+		["a compaction across a restart", { ts: 1000, messageCount: 3, digests: ["t", "s", "c"], starts: 2 }, "compaction", false],
 	];
 	for (const [name, overrides, cause, avoidable] of cases) {
 		test(`explains a rebuild after ${name}`, () => {
@@ -206,14 +177,15 @@ describe("attribution", () => {
 	}
 
 	test("a 1 h cache write extends the idle window", () => {
-		assert.equal(cacheEvent(state({ longRetention: true }), state({ ts: 301_000, digests: ["t", "s", "m1", "m2", "x"] }), rebuilt)!.cause, "cache missed without a prompt change");
+		assert.equal(cacheEvent(state({ longRetention: true }), state({ ts: 301_000, digests: ["t", "s", "m1", "m2", "x"] }), rebuilt)!.cause, CHANGED_OUTSIDE_SESSION);
 		assert.equal(cacheEvent(state({ longRetention: true }), state({ ts: 3_601_000 }), rebuilt)!.cause, "cache expired after idle (1 h TTL)");
 	});
 
 	test("records the predecessor state of a request", () => {
 		const u = usage(1, 0, 600, 1);
-		const s = requestState(prompt, attribute(prompt, u), { ...u, cacheWrite1h: 600 }, 5, "m", "low");
+		const s = requestState(prompt, attribute(prompt, u), { ...u, cacheWrite1h: 600 }, 5, "m", "low", 3);
 		assert.equal(s.promptTokens, 601);
+		assert.equal(s.starts, 3);
 		assert.equal(s.longRetention, true);
 		assert.deepEqual(s.newCategories, ["user prompt"]);
 	});

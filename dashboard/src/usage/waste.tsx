@@ -14,12 +14,16 @@ const ADVICE: Record<string, string> = {
 	"thinking level changed": "Changing the thinking level mid-session invalidates the cached history.",
 	"tool definitions changed": "The initial tool set changed mid-session (an MCP server reconnected, an extension changed). Tools loaded through tool search append instead of rewriting.",
 	"system prompt changed": "A prompt section changed and was folded into the leading prompt, which happens for models without mid-conversation system messages.",
-	"prompt or tools updated mid-conversation": "The cache read stopped at an appended prompt or tool update. Check that the provider keeps mid-conversation system messages in place.",
-	"cache missed without a prompt change": "The prompt was a prefix of the previous one, yet not read from cache: a provider-side eviction or a turn adding more than 20 blocks (cache lookback).",
 };
+
+/** attribution.ts CHANGED_OUTSIDE_SESSION, optionally followed by what the session shows next to it. */
+const CHANGED_OUTSIDE_SESSION = "request changed outside the session file";
+const OUTSIDE_ADVICE =
+	"The session file shows the prompt unchanged, so something rewrote the request on the way out: usually an extension's per-request injection (pi-lens retained injections are lost on a Pi restart or harness reload), else the provider or a turn adding more than 20 blocks (cache lookback).";
 
 function advice(cause: string): string {
 	if (ADVICE[cause]) return ADVICE[cause];
+	if (cause.startsWith(CHANGED_OUTSIDE_SESSION)) return OUTSIDE_ADVICE;
 	if (cause.startsWith("earlier ")) return `Content already in the conversation (${cause.slice(8, -8)}) was rewritten, so everything after it had to be cached again.`;
 	return "";
 }
@@ -48,6 +52,7 @@ export function WasteView() {
 					{ label: "Compaction opportunity", value: usd(data.opportunities.total), detail: `best single compaction, ${count(data.opportunities.sessions.length)} sessions` },
 					{ label: "Side calls", value: usd(sideCost), detail: `${share(sideCost, total)} of spend` },
 					{ label: "Compactions", value: count(data.compactions.reduce((s, c) => s + c.count, 0)), detail: `${usd(data.compactions.reduce((s, c) => s + c.cost, 0))}, not counted as waste` },
+					{ label: "Thinking dropped", value: count(data.thinkingDropped.blocks), detail: `blocks in ${count(data.thinkingDropped.requests)} requests, reasoning the model lost`, tone: data.thinkingDropped.blocks > 0 ? "bad" : "default" },
 				]}
 			/>
 			<div className="grid gap-4 xl:grid-cols-2">

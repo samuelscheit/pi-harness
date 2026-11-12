@@ -5,8 +5,9 @@
 // Ported from the gateway's usage_insights/blocks.py, but reading Pi's own messages instead of a
 // provider payload, so one parser covers every API and every past session can be re-analysed.
 // Prompt caching is a prefix, so this order decides which block was billed as a cache read, a
-// cache write or plain input. Token counts are estimates; attribution scales them to the
-// provider's real count.
+// cache write or plain input. Most token counts are estimates; attribution scales them to the
+// provider's real count. Replayed thinking is the exception: its size is what the provider reported
+// generating (`exact`), see `thinkingBlocks`.
 
 import { createHash } from "node:crypto";
 import { renderSystemMessageUpdate } from "@earendil-works/pi-ai";
@@ -29,6 +30,8 @@ export interface Block {
 	toolCallId?: string;
 	/** After the conversation's last assistant message: what triggered this request. */
 	isNew: boolean;
+	/** Sized from a count the provider reported, not estimated: attribution does not scale it. */
+	exact?: boolean;
 }
 
 export interface ToolCallInfo {
@@ -54,6 +57,14 @@ export interface Prompt {
 }
 
 export const digest = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
+
+type ThinkingPart = { type: "thinking"; thinking: string; thinkingSignature?: string; redacted?: boolean };
+
+/** Identifies one thinking block across the requests that replay it. */
+export const thinkingDigest = (part: ThinkingPart): string => digest(`t\0${part.thinking}\0${part.thinkingSignature ?? ""}`);
+
+/** Whether Pi replays the block as thinking (signed or redacted); an unsigned one goes back as plain text. */
+export const replayedAsThinking = (part: ThinkingPart): boolean => part.redacted === true || (part.thinkingSignature ?? "").trim().length > 0;
 
 const textTokens = (text: string): number => text.length / CHARS_PER_TOKEN;
 
@@ -153,6 +164,34 @@ function contentBlocks(content: unknown, category: string, toolCallId?: string):
 	return blocks;
 }
 
+/**
+ * The thinking blocks of one assistant message.
+ *
+ * Anthropic bills a replayed thinking block at the thinking tokens the model reported generating
+ * (`usage.reasoning`), not at its stored text: with display "summarized" the text is a summary and the
+ * full reasoning travels encrypted in the signature. Measured on 2,723 tool-loop request pairs, the
+ * prompt grows by 1.00x the reported tokens (docs/research/context-engineering/08-thinking-and-cache-loss.md).
+ * A message's reported tokens are split across its replayed blocks in proportion to the estimate below.
+ *
+ * Fallback, only when the message reports no thinking tokens (errored or aborted replies, which Pi
+ * does not replay anyway, and providers that do not report them): summary text plus decoded signature
+ * bytes at 4 per token, the gateway's estimate, which attribution then scales like any other block.
+ * An unsigned block goes back as plain text, so it is sized as text.
+ */
+function thinkingBlocks(message: Extract<AgentMessage, { role: "assistant" }>): Map<ThinkingPart, RawBlock> {
+	const parts = message.content.filter((part): part is ThinkingPart => part.type === "thinking");
+	const estimate = (part: ThinkingPart) => textTokens(part.thinking) + ((part.thinkingSignature ?? "").length * 0.75) / CHARS_PER_TOKEN;
+	const reasoning = message.usage?.reasoning;
+	const replayedWeight = parts.filter(replayedAsThinking).reduce((sum, part) => sum + estimate(part), 0);
+	return new Map(
+		parts.map((part) => {
+			const reported = reasoning !== undefined && replayedAsThinking(part) && replayedWeight > 0;
+			const tokens = reported ? (reasoning * estimate(part)) / replayedWeight : estimate(part);
+			return [part, { category: "thinking", tokens, digest: thinkingDigest(part), ...(reported ? { exact: true } : {}) }];
+		}),
+	);
+}
+
 function blocksOf(message: AgentMessage): RawBlock[] {
 	const cached = messageBlocks.get(message);
 	if (cached) return cached;
@@ -172,23 +211,19 @@ function blocksOf(message: AgentMessage): RawBlock[] {
 		case "user":
 			blocks = contentBlocks(message.content, "user prompt");
 			break;
-		case "assistant":
+		case "assistant": {
 			blocks = [];
+			const thinking = thinkingBlocks(message);
 			for (const part of message.content) {
 				if (part.type === "text") blocks.push({ category: "assistant text", tokens: textTokens(part.text), digest: digest(`a\0${part.text}`) });
-				else if (part.type === "thinking") {
-					const signature = part.thinkingSignature ?? "";
-					blocks.push({
-						category: "thinking",
-						tokens: textTokens(part.thinking) + (signature.length * 0.75) / CHARS_PER_TOKEN,
-						digest: digest(`t\0${part.thinking}\0${signature}`),
-					});
-				} else if (part.type === "toolCall") {
+				else if (part.type === "thinking") blocks.push(thinking.get(part)!);
+				else if (part.type === "toolCall") {
 					const args = JSON.stringify(part.arguments ?? {});
 					blocks.push({ category: `tool call: ${part.name}`, tokens: textTokens(args), digest: digest(`${part.id}\0${args}`) });
 				}
 			}
 			break;
+		}
 		case "toolResult":
 			blocks = contentBlocks(message.content, `tool result: ${message.toolName}`, message.toolCallId);
 			break;
@@ -215,8 +250,12 @@ function blocksOf(message: AgentMessage): RawBlock[] {
 	return blocks;
 }
 
-/** Split the context of one request (Pi's messages, leading system message first). */
-export function parsePrompt(messages: readonly AgentMessage[]): Prompt {
+/**
+ * Split the context of one request (Pi's messages, leading system message first). `droppedThinking`:
+ * digests of thinking blocks the provider dropped from this request (see payload.ts); they were not
+ * billed, so they count with 0 tokens.
+ */
+export function parsePrompt(messages: readonly AgentMessage[], droppedThinking: ReadonlySet<string> = new Set()): Prompt {
 	const prompt: Prompt = {
 		blocks: [],
 		messageCount: 0,
@@ -278,7 +317,10 @@ export function parsePrompt(messages: readonly AgentMessage[]): Prompt {
 		}
 	}
 	prompt.messageCount = rest.length;
-	prompt.blocks = raw.map((block, index) => ({ ...block, isNew: index >= lastAssistant }));
+	prompt.blocks = raw.map((block, index) => {
+		const dropped = block.category === "thinking" && droppedThinking.has(block.digest);
+		return { ...block, ...(dropped ? { tokens: 0, exact: true } : {}), isNew: index >= lastAssistant };
+	});
 	return prompt;
 }
 

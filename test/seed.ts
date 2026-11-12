@@ -38,6 +38,8 @@ interface Turn {
 	cacheRead?: number;
 	event?: [string, number, number];
 	stop?: string;
+	/** Thinking blocks the API dropped from the request. */
+	dropped?: number;
 }
 
 export const TURN_SPLIT = { read: 0.1, write: 0.2, uncached: 0.01, output: 0.05 };
@@ -76,6 +78,7 @@ function request(db: DatabaseSync, t: Turn) {
 		read_rate: (t.kind ?? "turn") === "turn" ? RATES.read : null,
 		write_rate: (t.kind ?? "turn") === "turn" ? RATES.write : null,
 		long_retention: 0,
+		thinking_dropped: t.dropped ?? 0,
 	});
 }
 
@@ -129,7 +132,7 @@ export function seed(db: DatabaseSync) {
 
 	session(db, { id: "A", cwd: "/p1", at: at(-0.1), end: at(31), name: "Parent work" });
 	for (const [i, minute] of [0, 1, 2, 3].entries()) {
-		request(db, { session: "A", entry: `a${i + 1}`, at: at(minute), version: i < 2 ? "v1" : "v2", event: i === 1 ? ["model switched", 10_000, 0.05] : undefined, prompt: 100_000 + i * 50_000 });
+		request(db, { session: "A", entry: `a${i + 1}`, at: at(minute), version: i < 2 ? "v1" : "v2", event: i === 1 ? ["model switched", 10_000, 0.05] : undefined, dropped: i === 2 ? 7 : 0, prompt: 100_000 + i * 50_000 });
 		content(db, "A", `a${i + 1}`);
 	}
 	request(db, { session: "A", entry: "warm", kind: "cache_warm", at: at(10), split: { read: 0.02, write: 0, uncached: 0, output: 0 } });

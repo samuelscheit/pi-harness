@@ -3,8 +3,9 @@
 // Ported from the gateway's usage_insights/attribution.py. Prompt caching is a prefix: the first
 // `cacheRead` tokens are billed at the read rate, the next `cacheWrite` tokens at the write rate
 // and the rest as plain input. Walking the prompt's blocks in the order the provider reads them
-// tells which content was paid at which rate. Estimated block sizes are scaled to the provider's
-// real count, and the rates come from the cost Pi recorded for the request.
+// tells which content was paid at which rate. Estimated block sizes are scaled to the part of the
+// provider's real count that blocks of a reported size (replayed thinking) leave, and the rates come
+// from the cost Pi recorded for the request.
 
 import type { Prompt } from "./blocks.ts";
 
@@ -64,8 +65,12 @@ export function ratesOf(usage: Usage, fallback?: Rates): Rates {
 
 export function attribute(prompt: Prompt, usage: Usage, fallback?: Rates): Attribution {
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-	const estimated = prompt.blocks.reduce((sum, b) => sum + b.tokens, 0) || 1;
-	const scale = promptTokens / estimated;
+	const exact = prompt.blocks.reduce((sum, b) => sum + (b.exact ? b.tokens : 0), 0);
+	const estimated = prompt.blocks.reduce((sum, b) => sum + (b.exact ? 0 : b.tokens), 0);
+	// Reported sizes stand; estimates fill the rest of the prompt. Should the reported sizes not fit
+	// (or nothing is left to estimate), they are scaled too, so the blocks always sum to the prompt.
+	const exactScale = exact > 0 && (exact > promptTokens || estimated === 0) ? promptTokens / exact : 1;
+	const scale = estimated > 0 ? (promptTokens - exact * exactScale) / estimated : 0;
 	const rates = ratesOf(usage, fallback);
 	const readEnd = usage.cacheRead;
 	const writeEnd = readEnd + usage.cacheWrite;
@@ -74,7 +79,7 @@ export function attribute(prompt: Prompt, usage: Usage, fallback?: Rates): Attri
 	let position = 0;
 	let newTokens = 0;
 	for (const block of prompt.blocks) {
-		const tokens = block.tokens * scale;
+		const tokens = block.tokens * (block.exact ? exactScale : scale);
 		const start = position;
 		const end = start + tokens;
 		position = end;
@@ -117,9 +122,11 @@ export interface RequestState {
 	/** Whether this request wrote its cache with one-hour retention. */
 	longRetention: boolean;
 	rates: Rates;
+	/** Pi process starts recorded in the session so far (`model_change` entries: Pi writes one when it opens or resumes the session). */
+	starts: number;
 }
 
-export function requestState(prompt: Prompt, attribution: Attribution, usage: Usage, ts: number, model: string, thinking?: string): RequestState {
+export function requestState(prompt: Prompt, attribution: Attribution, usage: Usage, ts: number, model: string, thinking: string | undefined, starts: number): RequestState {
 	return {
 		ts,
 		promptTokens: attribution.promptTokens,
@@ -132,6 +139,7 @@ export function requestState(prompt: Prompt, attribution: Attribution, usage: Us
 		thinking,
 		longRetention: (usage.cacheWrite1h ?? 0) > 0,
 		rates: attribution.rates,
+		starts,
 	};
 }
 
@@ -144,6 +152,22 @@ export interface CacheEvent {
 	waste: number;
 }
 
+/** A rebuild nothing in the session file explains: the request Pi sent was the previous one plus new content. */
+export const CHANGED_OUTSIDE_SESSION = "request changed outside the session file (extension injection or provider)";
+
+/**
+ * Why the cache was rebuilt, and whether it was avoidable. Causes are claimed only from what the
+ * session file shows; a prefix the session file shows unchanged was changed outside it.
+ *
+ * In practice that is an extension rewriting the request (pi-lens's retained context injections
+ * are kept in memory, so a Pi restart or a harness reload drops them from the middle of the
+ * transcript; report 08 traced 17 of 19 such rebuilds to it), else the provider. Two facts the
+ * session does show are kept in the label without being claimed as the cause:
+ * - a process start in between (Pi restarted or resumed the session, losing extension state);
+ * - a prompt or tool update new in this request. Pi appends it after the cached history on every
+ *   model the harness runs (`supportsMidConvoSystemMessages`, required by test/prompt-cache.test.ts),
+ *   so it does not break the prefix itself; it coincides with harness reloads, which do.
+ */
 function rebuildCause(previous: RequestState, current: RequestState): [string, boolean] {
 	const ttl = previous.longRetention ? 3600 : 300;
 	if ((current.ts - previous.ts) / 1000 > ttl) return [`cache expired after idle (${ttl === 3600 ? "1 h" : "5 min"} TTL)`, true];
@@ -152,9 +176,9 @@ function rebuildCause(previous: RequestState, current: RequestState): [string, b
 	if (previous.messageCount && current.messageCount < previous.messageCount * 0.6) return ["compaction", false];
 	const diverged = previous.digests.findIndex((digest, i) => i < current.digests.length && digest !== current.digests[i]);
 	if (diverged < 0) {
-		return current.newCategories.includes("system update")
-			? ["prompt or tools updated mid-conversation", true]
-			: ["cache missed without a prompt change", true];
+		if (current.starts !== previous.starts) return [`${CHANGED_OUTSIDE_SESSION}, after a Pi restart`, true];
+		if (current.newCategories.includes("system update")) return [`${CHANGED_OUTSIDE_SESSION}, alongside a prompt or tools update`, true];
+		return [CHANGED_OUTSIDE_SESSION, true];
 	}
 	if (diverged < previous.sectionEnds[0]) return ["tool definitions changed", true];
 	if (diverged < previous.sectionEnds[1]) return ["system prompt changed", true];
