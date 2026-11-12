@@ -9,13 +9,17 @@
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
 //                  Messages API), and a `gateway` provider for every other gateway model
 //                  (Responses API), with context windows from the gateway's /v1/models.
-// The gateway key is never written: both providers read $ANTHROPIC_AUTH_TOKEN at request time.
+// - auth.json:     both providers' key, read from the macOS Keychain item KEYCHAIN_SERVICE, so Pi
+//                  works however it is started (t3 does not load shell variables) and the token is
+//                  never written to a file.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const KEYCHAIN_SERVICE = "pi-harness-gateway";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent");
 const base = process.env.ANTHROPIC_BASE_URL?.replace(/\/+$/, "");
@@ -46,10 +50,17 @@ const modelsFile = join(agentDir, "models.json");
 const models = readJson(modelsFile);
 models.providers = {
 	...models.providers,
-	anthropic: { baseUrl: origin, apiKey: "$ANTHROPIC_AUTH_TOKEN" },
-	gateway: { baseUrl: v1, api: "openai-responses", apiKey: "$ANTHROPIC_AUTH_TOKEN", models: gatewayModels },
+	anthropic: { baseUrl: origin },
+	gateway: { baseUrl: v1, api: "openai-responses", models: gatewayModels },
 };
 writeJson(modelsFile, models);
+
+// -U replaces an existing item; the token travels as an argument only to the local `security` tool.
+execFileSync("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", "gateway", "-w", token]);
+const authFile = join(agentDir, "auth.json");
+const keyFromKeychain = { type: "api_key", key: `!security find-generic-password -ws '${KEYCHAIN_SERVICE}'` };
+writeJson(authFile, { ...readJson(authFile), anthropic: keyFromKeychain, gateway: keyFromKeychain });
+chmodSync(authFile, 0o600);
 
 const settingsFile = join(agentDir, "settings.json");
 const settings = readJson(settingsFile);
