@@ -10,7 +10,7 @@
 // vendor/pi/node_modules, so its scripts, tests and type checks resolve the vendored packages.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
-// - settings.json: this repo as the only package, Opus 5.5 as the startup model, and prompt caching
+// - settings.json: this repo and the vendored pi-lens as packages, Opus 5.5 as the startup model, and prompt caching
 //                  tuned for pauses: a one-hour cache, refreshed once while idle (cacheWarmingIdleMinutes),
 //                  and a cold cache compacted with Haiku before a large context is written again.
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
@@ -35,6 +35,7 @@ const COLD_COMPACTION_MIN_TOKENS = 50_000;
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const vendoredPi = join(root, "vendor/pi");
+const vendoredLens = join(root, "vendor/pi-lens");
 const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent");
 const base = process.env.ANTHROPIC_BASE_URL?.replace(/\/+$/, "");
 const token = process.env.ANTHROPIC_AUTH_TOKEN;
@@ -65,6 +66,10 @@ if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_P
 	npm(root, "uninstall", "-g", PI_PACKAGE);
 }
 npm(join(vendoredPi, "packages/coding-agent"), "link");
+// pi-lens: install scripts skipped (its `prepare` also rewires git hooks); build and fetch the core grammars explicitly.
+npm(vendoredLens, "ci", "--ignore-scripts", "--no-audit", "--no-fund");
+npm(vendoredLens, "run", "build:dist");
+execFileSync("node", ["scripts/download-grammars.js", "--core", "--dest", "grammars"], { cwd: vendoredLens, stdio: "inherit" });
 const harnessModules = join(root, "node_modules");
 if (!existsSync(harnessModules)) symlinkSync("vendor/pi/node_modules", harnessModules);
 
@@ -95,7 +100,8 @@ const settingsFile = join(agentDir, "settings.json");
 const settings = readJson(settingsFile);
 writeJson(settingsFile, {
 	...settings,
-	packages: [root],
+	// The harness first: its lens extension points pi-lens at the layered config before pi-lens loads.
+	packages: [root, vendoredLens],
 	defaultProvider: "anthropic",
 	defaultModel: "claude-opus-5-5",
 	cacheRetention: "long",
