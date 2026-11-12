@@ -37,6 +37,7 @@ import {
 	getCurrentSystemMessage,
 	getCurrentTools,
 	getPromptCacheTtlMs,
+	resolvePromptCacheRetention,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
 import type {
@@ -78,6 +79,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactionSaving,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
@@ -844,24 +846,38 @@ export class AgentSession {
 	}
 
 	/**
-	 * Compact with a cheap model when the prompt cache has expired and the context is large.
+	 * Compact before a run when that is cheaper over the expected rest of the session.
 	 *
-	 * Once the cache entry is gone, the next request writes the whole context to the cache again
-	 * at the session model's write price. Summarizing first with `compaction.coldCache.model`
-	 * costs a fraction of that and leaves a much smaller context to write.
+	 * The next requests would carry the whole context at the read price, or write it again when
+	 * the cache expired. Compacting with `compaction.economic.model` costs one uncached read and a
+	 * summary, then the much smaller kept context is carried instead (see `compactionSaving`).
 	 */
-	private async _compactColdCache(): Promise<void> {
-		const cold = this.settingsManager.getColdCacheCompaction();
+	private async _compactIfCheaper(): Promise<void> {
+		const economic = this.settingsManager.getEconomicCompaction();
 		const model = this.model;
-		if (!cold || !model || isVirtualModel(model)) return;
-		const branch = this.sessionManager.getBranch();
-		const ttlMs = getPromptCacheTtlMs(model, { cacheRetention: this.settingsManager.getCacheRetention() });
-		if (!isPromptCacheCold(branch, ttlMs, Date.now())) return;
-		const tokens = estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens;
-		if (tokens < cold.minTokens) return;
-		const summaryModel = this._modelRuntime.getModel(cold.model.provider, cold.model.id);
+		if (!economic || !model || isVirtualModel(model)) return;
+		const summaryModel = this._modelRuntime.getModel(economic.model.provider, economic.model.id);
 		if (!summaryModel) return;
-		await this._runAutoCompaction("cold", false, summaryModel);
+		const branch = this.sessionManager.getBranch();
+		const streamOptions = { cacheRetention: this.settingsManager.getCacheRetention() };
+		const ttlMs = getPromptCacheTtlMs(model, streamOptions);
+		const cold = isPromptCacheCold(branch, ttlMs, Date.now());
+		// Anthropic bills a one-hour cache write at twice the input price (see calculateCost).
+		const writePerMillion = resolvePromptCacheRetention(streamOptions) === "long" ? model.cost.input * 2 : model.cost.cacheWrite;
+		const saving = compactionSaving({
+			contextTokens: estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens,
+			keepTokens: this.settingsManager.getCompactionKeepRecentTokens(model),
+			cold,
+			pastRequests: branch.filter((entry) => entry.type === "message" && entry.message.role === "assistant").length,
+			prices: {
+				read: model.cost.cacheRead / 1e6,
+				write: writePerMillion / 1e6,
+				summaryInput: summaryModel.cost.input / 1e6,
+				summaryOutput: summaryModel.cost.output / 1e6,
+			},
+		});
+		if (saving < economic.minSaving) return;
+		await this._runAutoCompaction(cold ? "cold" : "economic", false, summaryModel);
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -2040,7 +2056,7 @@ export class AgentSession {
 		const lastAssistant = this._findLastAssistantMessage();
 		if (lastAssistant) {
 			await this._checkCompaction(lastAssistant, false);
-			await this._compactColdCache();
+			await this._compactIfCheaper();
 		}
 
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;

@@ -52,15 +52,17 @@ describe("bestCompaction", () => {
 	test("a big context with many requests left is worth compacting", () => {
 		const turns = Array.from({ length: 100 }, (_, i) => turn(30_000 + i * 2_000));
 		const best = bestCompaction(turns)!;
-		// Compacting at request i saves (p_i - 23k) on each of the 99 - i later requests, minus its own cost.
-		const saving = (i: number) => (turns[i]!.promptTokens - 23_000) * READ * (99 - i) - (turns[i]!.promptTokens * READ + 3_000 * INPUT * 5 + 23_000 * WRITE);
+		// Compacting at request i keeps 20k + a 3k summary, saving (p_i - 23k) on each of the 99 - i later
+		// requests, minus Haiku reading p_i, writing the summary, and writing the kept 23k.
+		const haiku = INPUT * 0.2;
+		const saving = (i: number) => (turns[i]!.promptTokens - 23_000) * READ * (99 - i) - (turns[i]!.promptTokens * haiku + 3_000 * haiku * 5 + 23_000 * WRITE);
 		const expected = turns.map((_, i) => saving(i)).reduce((a, b) => Math.max(a, b));
 		assert.ok(Math.abs(best.saving - expected) < 1e-9);
 		assert.ok(best.index > 0 && best.index < 99);
 	});
 
 	test("compacting right before the end does not pay for itself", () => {
-		// Reading 200k, writing a summary and rewriting what is kept (~$0.32) beats one cheaper read ($0.09).
+		// Haiku reading 200k, a summary and writing the kept 23k (~$0.36) beats one cheaper read ($0.09).
 		assert.equal(bestCompaction([turn(200_000), turn(201_000)]), undefined);
 		assert.equal(bestCompaction([turn(200_000)]), undefined);
 		// With enough requests left the same compaction pays.

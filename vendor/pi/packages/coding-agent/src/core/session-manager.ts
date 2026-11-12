@@ -89,7 +89,7 @@ export interface UsageEntry extends SessionEntryBase {
 }
 
 /** What started a compaction: the user, the context threshold, a context overflow, or an expired prompt cache. */
-export type CompactionReason = "manual" | "threshold" | "overflow" | "cold";
+export type CompactionReason = "manual" | "threshold" | "overflow" | "cold" | "economic";
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";

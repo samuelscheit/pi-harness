@@ -10,9 +10,9 @@
 // vendor/pi/node_modules, so its scripts, tests and type checks resolve the vendored packages.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
-// - settings.json: this repo and the vendored pi-lens as packages, Opus 5.5 as the startup model, and prompt caching
-//                  tuned for pauses: a one-hour cache, refreshed once while idle (cacheWarmingIdleMinutes),
-//                  and a cold cache compacted with Haiku before a large context is written again.
+// - settings.json: this repo and the vendored pi-lens as packages, Opus 5.5 as the startup model, and context
+//                  cost control: a one-hour cache, refreshed once while idle (cacheWarmingIdleMinutes), and
+//                  compaction with Haiku before a run whenever carrying (or rewriting) the context costs more.
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
 //                  Messages API), and a `gateway` provider for every other gateway model
 //                  (Responses API), with context windows from the gateway's /v1/models and
@@ -30,8 +30,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
-// Below this, a compaction (summary + ~20k kept tokens) saves little over writing the context again.
-const COLD_COMPACTION_MIN_TOKENS = 50_000;
+// Compact only when that is expected to save at least this many dollars (it also loses detail).
+const COMPACTION_MIN_SAVING = 0.25;
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const vendoredPi = join(root, "vendor/pi");
@@ -108,7 +108,7 @@ writeJson(settingsFile, {
 	cacheWarmingIdleMinutes: 60,
 	compaction: {
 		...settings.compaction,
-		coldCache: { minTokens: COLD_COMPACTION_MIN_TOKENS, model: "anthropic/claude-haiku-5-5" },
+		economic: { model: "anthropic/claude-haiku-5-5", minSaving: COMPACTION_MIN_SAVING },
 	},
 });
 
