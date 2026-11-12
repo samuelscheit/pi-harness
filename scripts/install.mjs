@@ -1,26 +1,34 @@
 #!/usr/bin/env node
-// Point a Pi agent directory at this harness and the model gateway.
+// Install the vendored Pi as the global `pi` and point its agent directory at this harness and
+// the model gateway.
 //
 // Usage: node scripts/install.mjs   (needs ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN, the
 // same gateway settings Claude Code uses)
+//
+// Pi: vendor/pi (a git subtree of github.com/earendil-works/pi) is built and linked globally,
+// replacing an npm-installed @earendil-works/pi-coding-agent.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
 // - settings.json: this repo as the only package, Opus 5.5 as the startup model
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
 //                  Messages API), and a `gateway` provider for every other gateway model
 //                  (Responses API), with context windows from the gateway's /v1/models.
+//                  The gateway forwards Anthropic message threads, so Claude requests send only
+//                  what is new since the previous reply.
 // - auth.json:     both providers' key, read from the macOS Keychain item KEYCHAIN_SERVICE, so Pi
 //                  works however it is started (t3 does not load shell variables) and the token is
 //                  never written to a file.
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
+const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const vendoredPi = join(root, "vendor/pi");
 const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent");
 const base = process.env.ANTHROPIC_BASE_URL?.replace(/\/+$/, "");
 const token = process.env.ANTHROPIC_AUTH_TOKEN;
@@ -42,6 +50,15 @@ const gatewayModels = data
 		...(m.max_tokens ? { maxTokens: m.max_tokens } : {}),
 	}));
 
+const npm = (cwd, ...args) => execFileSync("npm", args, { cwd, stdio: "inherit" });
+npm(vendoredPi, "ci");
+npm(vendoredPi, "run", "build");
+const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_PACKAGE)).isSymbolicLink()) {
+	npm(root, "uninstall", "-g", PI_PACKAGE);
+}
+npm(join(vendoredPi, "packages/coding-agent"), "link");
+
 const readJson = (file) => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {});
 const writeJson = (file, value) => writeFileSync(file, `${JSON.stringify(value, null, "\t")}\n`);
 mkdirSync(agentDir, { recursive: true });
@@ -50,7 +67,7 @@ const modelsFile = join(agentDir, "models.json");
 const models = readJson(modelsFile);
 models.providers = {
 	...models.providers,
-	anthropic: { baseUrl: origin },
+	anthropic: { baseUrl: origin, compat: { supportsMessageThreads: true } },
 	gateway: { baseUrl: v1, api: "openai-responses", models: gatewayModels },
 };
 writeJson(modelsFile, models);
