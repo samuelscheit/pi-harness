@@ -1,12 +1,15 @@
-// A/B experiments (see extensions/lib/experiments.ts): per experiment, the randomly assigned
-// sessions of each arm compared over the same time and the same projects.
+// A/B experiments (see extensions/lib/experiments.ts): the randomly assigned sessions of each
+// arm compared over the same time and the same projects, for one experiment or for a combination
+// of experiments whose arms cross (a factorial comparison: cells AA, AB, BA, BB for two).
 //
-// A session counts with what happened while it was in the experiment ([assigned_at, ended_at))
-// and inside the scope's window. Sessions whose arm was ever set by hand are reported but left
-// out, and so are projects that have sessions in only one arm, so a project's task mix weighs on
-// both arms. Every metric is a ratio of sums over sessions (tool calls / turns, cost / sessions,
-// …); its uncertainty is a 95% bootstrap interval of the difference B − A, resampling sessions
-// within each arm.
+// A session counts with what happened while it was in every experiment of the comparison (from
+// its latest assignment to its earliest end) and inside the scope's window. Sessions whose arm was
+// ever set by hand are reported but left out, and so are projects without sessions in every cell,
+// so a project's task mix weighs on all cells. Every metric is a ratio of sums over sessions (tool
+// calls / turns, cost / sessions, …). The effect is the factorial contrast of the cells: B − A for
+// one experiment, the interaction (BB − BA) − (AB − AA) for two, that is how much the second
+// experiment's effect changes with the first one's arm. Its uncertainty is a 95% bootstrap
+// interval, resampling sessions within each cell.
 
 import { type Arm, ARMS } from "../../lib/experiments.ts";
 import type { Scope } from "./scope.ts";
@@ -14,7 +17,8 @@ import type { Scope } from "./scope.ts";
 export interface ArmSession {
 	session: string;
 	project: string;
-	arm: Arm;
+	/** The session's arms, one letter per experiment of the comparison (in its order). */
+	cell: string;
 	forced: boolean;
 	turns: number;
 	toolCalls: number;
@@ -26,6 +30,12 @@ export interface ArmSession {
 	readCost: number;
 	toolResults: number;
 	toolErrors: number;
+	/** Calls that changed files (see tool_results.mutates), and those made with the edit/write tools. */
+	mutatingCalls: number;
+	toolMutatingCalls: number;
+	/** Edit tool calls, and the distinct files they wrote. */
+	editCalls: number;
+	editedFiles: number;
 }
 
 interface MetricDef {
@@ -38,10 +48,12 @@ interface MetricDef {
 
 const perSession = () => 1;
 
-/** The metrics of a comparison, the primary one first. */
+/** The metrics of a comparison. */
 export const EXPERIMENT_METRICS: readonly MetricDef[] = [
 	{ key: "toolCallsPerTurn", label: "tool calls per turn", unit: "count", numerator: (s) => s.toolCalls, denominator: (s) => s.turns },
 	{ key: "batchedTurns", label: "turns with 2+ tool calls", unit: "share", numerator: (s) => s.batchedTurns, denominator: (s) => s.turns },
+	{ key: "toolMutationShare", label: "file changes via edit/write", unit: "share", numerator: (s) => s.toolMutatingCalls, denominator: (s) => s.mutatingCalls },
+	{ key: "editCallsPerFile", label: "edit calls per edited file", unit: "count", numerator: (s) => s.editCalls, denominator: (s) => s.editedFiles },
 	{ key: "turnsPerPackage", label: "turns per package", unit: "count", numerator: (s) => s.turns, denominator: (s) => s.packages },
 	{ key: "turnsPerSession", label: "turns per session", unit: "count", numerator: (s) => s.turns, denominator: perSession },
 	{ key: "costPerSession", label: "cost per session", unit: "usd", numerator: (s) => s.cost, denominator: perSession },
@@ -51,31 +63,40 @@ export const EXPERIMENT_METRICS: readonly MetricDef[] = [
 	{ key: "toolErrorRate", label: "tool error rate", unit: "share", numerator: (s) => s.toolErrors, denominator: (s) => s.toolResults },
 ];
 
-export interface ArmMetric {
+export interface CellMetric {
 	key: string;
 	label: string;
 	unit: MetricDef["unit"];
-	a: number | null;
-	b: number | null;
-	/** b − a, and its 95% bootstrap interval (null with fewer than two sessions in an arm). */
-	diff: number | null;
+	/** The metric per cell (null without sessions or with a zero denominator). */
+	values: Record<string, number | null>;
+	/** The factorial contrast of the cells (B − A, or the interaction), and its 95% bootstrap interval (null with fewer than two sessions in a cell). */
+	effect: number | null;
 	ci: [number, number] | null;
 }
 
 export interface ExperimentComparison {
-	experiment: string;
-	/** Sessions compared, per arm. */
-	sessions: Record<Arm, number>;
-	/** Turns compared, per arm. */
-	turns: Record<Arm, number>;
-	/** Sessions left out because their arm was set by hand. */
+	/** The experiments compared; one, or several whose arms cross. */
+	experiments: string[];
+	/** The cells, one arm letter per experiment: A, B, or AA, AB, BA, BB. */
+	cells: string[];
+	/** Sessions compared, per cell. */
+	sessions: Record<string, number>;
+	/** Turns compared, per cell. */
+	turns: Record<string, number>;
+	/** Sessions left out because an arm was set by hand. */
 	forced: number;
-	/** Random sessions left out because their project has sessions in one arm only. */
+	/** Random sessions left out because their project has no sessions in some cell. */
 	unmatched: number;
-	/** Projects with sessions in both arms. */
+	/** Projects with sessions in every cell. */
 	projects: string[];
-	metrics: ArmMetric[];
+	metrics: CellMetric[];
 }
+
+/** Every combination of arms for `n` experiments, in order (A, B; AA, AB, BA, BB; …). */
+export const cellsOf = (n: number): string[] => (n === 0 ? [""] : cellsOf(n - 1).flatMap((cell) => ARMS.map((arm: Arm) => cell + arm)));
+
+/** A cell's weight in the factorial contrast: the product of −1 for A and +1 for B. */
+export const contrastWeight = (cell: string): number => [...cell].reduce((w, arm) => (arm === "B" ? w : -w), 1);
 
 /** Experiments with recorded arms in scope. */
 export function experimentNames(scope: Scope): string[] {
@@ -84,15 +105,35 @@ export function experimentNames(scope: Scope): string[] {
 		.map((r) => r.experiment);
 }
 
-/** Every session of an experiment with turns in scope, with its numbers while in the experiment. */
-export function armSessions(scope: Scope, experiment: string): ArmSession[] {
-	// Rows of table `alias` (timestamp `ts`) inside the session's time in the experiment and the window.
+/**
+ * The sessions in every one of `experiments` (as table `a`: session_id, cell, forced and the time
+ * they were in all of them, [assigned_at, ended_at)), with the parameters naming the experiments.
+ */
+function armsTable(experiments: string[]): { sql: string; params: Record<string, string> } {
+	const aliases = experiments.map((_, i) => `a${i}`);
+	const latest = (column: string) => (aliases.length === 1 ? `a0.${column}` : `MAX(${aliases.map((x) => `${x}.${column}`).join(", ")})`);
+	// The earliest end; NULL (still running) only when no experiment ended.
+	const open = "9223372036854775807";
+	const ended = aliases.length === 1 ? "a0.ended_at" : `NULLIF(MIN(${aliases.map((x) => `COALESCE(${x}.ended_at, ${open})`).join(", ")}), ${open})`;
+	const joins = aliases.slice(1).map((x, i) => `JOIN experiment_arms ${x} ON ${x}.session_id = a0.session_id AND ${x}.experiment = $experiment${i + 1}`);
+	return {
+		sql: `(SELECT a0.session_id, ${aliases.map((x) => `${x}.arm`).join(" || ")} cell, ${latest("forced")} forced,
+			${latest("assigned_at")} assigned_at, ${ended} ended_at
+			FROM experiment_arms a0 ${joins.join(" ")} WHERE a0.experiment = $experiment0)`,
+		params: Object.fromEntries(experiments.map((name, i) => [`$experiment${i}`, name])),
+	};
+}
+
+/** Every session in all of `experiments` with turns in scope, with its numbers while in all of them. */
+export function armSessions(scope: Scope, experiments: string[]): ArmSession[] {
+	// Rows of table `alias` (timestamp `ts`) inside the session's time in the experiments and the window.
 	const during = (alias: string) =>
 		`${alias}.session_id = a.session_id AND ${alias}.ts >= a.assigned_at AND (a.ended_at IS NULL OR ${alias}.ts < a.ended_at) AND ${scope.window(`${alias}.ts`)}`;
 	const model = scope.filters.model === undefined ? "" : "AND r.model = $model";
+	const arms = armsTable(experiments);
 	return scope
 		.all(
-			`SELECT a.session_id, s.cwd, a.arm, a.forced,
+			`SELECT a.session_id, s.cwd, a.cell, a.forced,
 				(SELECT COUNT(*) FROM requests r WHERE ${during("r")} AND r.kind = 'turn' ${model}) turns,
 				(SELECT COALESCE(SUM(r.tool_calls), 0) FROM requests r WHERE ${during("r")} AND r.kind = 'turn' ${model}) tool_calls,
 				(SELECT COUNT(*) FROM requests r WHERE ${during("r")} AND r.kind = 'turn' AND r.tool_calls >= 2 ${model}) batched,
@@ -100,16 +141,21 @@ export function armSessions(scope: Scope, experiment: string): ArmSession[] {
 				(SELECT COALESCE(SUM(r.cost_read), 0) FROM requests r WHERE ${during("r")} ${model}) read_cost,
 				(SELECT COUNT(*) FROM user_messages u WHERE ${during("u")} AND u.kind != 'steer') packages,
 				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")}) results,
-				(SELECT COALESCE(SUM(t.is_error), 0) FROM tool_results t WHERE ${during("t")}) errors
-			FROM experiment_arms a JOIN sessions s ON s.id = a.session_id
-			WHERE a.experiment = $experiment AND ${scope.where("a", undefined)}
+				(SELECT COALESCE(SUM(t.is_error), 0) FROM tool_results t WHERE ${during("t")}) errors,
+				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")} AND t.mutates = 1) mutating,
+				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")} AND t.mutates = 1 AND t.tool IN ('edit', 'write')) tool_mutating,
+				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")} AND t.tool = 'edit') edits,
+				(SELECT COUNT(DISTINCT f.file) FROM tool_results t JOIN tool_files f ON f.session_id = t.session_id AND f.call_id = t.call_id
+					WHERE ${during("t")} AND t.tool = 'edit' AND f.write = 1) edited_files
+			FROM ${arms.sql} a JOIN sessions s ON s.id = a.session_id
+			WHERE ${scope.where("a", undefined)}
 			ORDER BY a.session_id`,
-			{ $experiment: experiment },
+			arms.params,
 		)
 		.map((r) => ({
 			session: String(r.session_id),
 			project: String(r.cwd),
-			arm: r.arm as Arm,
+			cell: String(r.cell),
 			forced: Number(r.forced) === 1,
 			turns: Number(r.turns),
 			toolCalls: Number(r.tool_calls),
@@ -119,6 +165,10 @@ export function armSessions(scope: Scope, experiment: string): ArmSession[] {
 			readCost: Number(r.read_cost),
 			toolResults: Number(r.results),
 			toolErrors: Number(r.errors),
+			mutatingCalls: Number(r.mutating),
+			toolMutatingCalls: Number(r.tool_mutating),
+			editCalls: Number(r.edits),
+			editedFiles: Number(r.edited_files),
 		}))
 		.filter((s) => s.turns > 0);
 }
@@ -137,15 +187,17 @@ function prng(seed: number): () => number {
 
 const ratio = (num: number, den: number) => (den > 0 ? num / den : null);
 
+export type Pairs = [number, number][];
+
 /**
- * 95% percentile interval of ratio(B) − ratio(A), resampling each arm's [numerator, denominator]
- * pairs with replacement. Null when an arm has fewer than two sessions. Resamples where a ratio
- * is undefined (all denominators zero) are skipped.
+ * 95% percentile interval of Σ weight × ratio(group), resampling each group's [numerator,
+ * denominator] pairs with replacement. Null when a group has fewer than two sessions. Resamples
+ * where a ratio is undefined (all denominators zero) are skipped.
  */
-export function bootstrapDiff(a: [number, number][], b: [number, number][], resamples = 2000, seed = 1): [number, number] | null {
-	if (a.length < 2 || b.length < 2) return null;
+export function bootstrapContrast(groups: { pairs: Pairs; weight: number }[], resamples = 2000, seed = 1): [number, number] | null {
+	if (groups.some((g) => g.pairs.length < 2)) return null;
 	const next = prng(seed);
-	const resample = (pairs: [number, number][]) => {
+	const resample = (pairs: Pairs) => {
 		let num = 0;
 		let den = 0;
 		for (let i = 0; i < pairs.length; i++) {
@@ -155,54 +207,59 @@ export function bootstrapDiff(a: [number, number][], b: [number, number][], resa
 		}
 		return ratio(num, den);
 	};
-	const diffs: number[] = [];
+	const contrasts: number[] = [];
 	for (let i = 0; i < resamples; i++) {
-		const ra = resample(a);
-		const rb = resample(b);
-		if (ra !== null && rb !== null) diffs.push(rb - ra);
+		let total = 0;
+		let defined = true;
+		for (const g of groups) {
+			const r = resample(g.pairs);
+			if (r === null) defined = false;
+			else total += g.weight * r;
+		}
+		if (defined) contrasts.push(total);
 	}
-	if (diffs.length === 0) return null;
-	diffs.sort((x, y) => x - y);
-	const at = (p: number) => diffs[Math.min(diffs.length - 1, Math.max(0, Math.round(p * (diffs.length - 1))))]!;
+	if (contrasts.length === 0) return null;
+	contrasts.sort((x, y) => x - y);
+	const at = (p: number) => contrasts[Math.min(contrasts.length - 1, Math.max(0, Math.round(p * (contrasts.length - 1))))]!;
 	return [at(0.025), at(0.975)];
 }
 
-/** Compare the arms of one experiment from its sessions (see the module comment for what counts). */
-export function compareArms(experiment: string, sessions: ArmSession[]): ExperimentComparison {
+/** Compare the cells of one or more experiments from their sessions (see the module comment for what counts). */
+export function compareCells(experiments: string[], sessions: ArmSession[]): ExperimentComparison {
+	const cells = cellsOf(experiments.length);
 	const random = sessions.filter((s) => !s.forced);
-	const armsOf = new Map<string, Set<Arm>>();
-	for (const s of random) armsOf.set(s.project, (armsOf.get(s.project) ?? new Set()).add(s.arm));
-	const projects = [...armsOf].filter(([, arms]) => arms.size === ARMS.length).map(([project]) => project).sort();
+	const cellsIn = new Map<string, Set<string>>();
+	for (const s of random) cellsIn.set(s.project, (cellsIn.get(s.project) ?? new Set()).add(s.cell));
+	const projects = [...cellsIn].filter(([, seen]) => seen.size === cells.length).map(([project]) => project).sort();
 	const compared = random.filter((s) => projects.includes(s.project));
-	const byArm = (arm: Arm) => compared.filter((s) => s.arm === arm);
-	const [a, b] = [byArm("A"), byArm("B")];
+	const byCell = new Map(cells.map((cell) => [cell, compared.filter((s) => s.cell === cell)]));
 	const sum = (list: ArmSession[], f: (s: ArmSession) => number) => list.reduce((total, s) => total + f(s), 0);
+	const perCell = <T>(f: (list: ArmSession[]) => T) => Object.fromEntries(cells.map((cell) => [cell, f(byCell.get(cell)!)]));
 	return {
-		experiment,
-		sessions: { A: a.length, B: b.length },
-		turns: { A: sum(a, (s) => s.turns), B: sum(b, (s) => s.turns) },
+		experiments,
+		cells,
+		sessions: perCell((list) => list.length),
+		turns: perCell((list) => sum(list, (s) => s.turns)),
 		forced: sessions.length - random.length,
 		unmatched: random.length - compared.length,
 		projects,
 		metrics: EXPERIMENT_METRICS.map((m) => {
-			const pairs = (list: ArmSession[]) => list.map((s): [number, number] => [m.numerator(s), m.denominator(s)]);
-			const va = ratio(sum(a, m.numerator), sum(a, m.denominator));
-			const vb = ratio(sum(b, m.numerator), sum(b, m.denominator));
-			return {
-				key: m.key,
-				label: m.label,
-				unit: m.unit,
-				a: va,
-				b: vb,
-				diff: va === null || vb === null ? null : vb - va,
-				ci: bootstrapDiff(pairs(a), pairs(b)),
-			};
+			const values = perCell((list) => ratio(sum(list, m.numerator), sum(list, m.denominator)));
+			const effect = cells.some((cell) => values[cell] === null) ? null : cells.reduce((total, cell) => total + contrastWeight(cell) * values[cell]!, 0);
+			const groups = cells.map((cell) => ({
+				pairs: byCell.get(cell)!.map((s): [number, number] => [m.numerator(s), m.denominator(s)]),
+				weight: contrastWeight(cell),
+			}));
+			return { key: m.key, label: m.label, unit: m.unit, values, effect, ci: bootstrapContrast(groups) };
 		}),
 	};
 }
 
-/** Every experiment in scope (or the one named), compared. Pi sessions only: only Pi assigns arms. */
-export function experiments(input: Scope, name?: string): ExperimentComparison[] {
+/**
+ * Comparisons of the given groups of experiments (each one experiment, or several whose arms
+ * cross), or of every recorded experiment alone. Pi sessions only: only Pi assigns arms.
+ */
+export function experiments(input: Scope, groups?: string[][]): ExperimentComparison[] {
 	const scope = input.with({ source: "pi" });
-	return (name === undefined ? experimentNames(scope) : [name]).map((experiment) => compareArms(experiment, armSessions(scope, experiment)));
+	return (groups ?? experimentNames(scope).map((name) => [name])).map((group) => compareCells(group, armSessions(scope, group)));
 }

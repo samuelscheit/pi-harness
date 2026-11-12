@@ -1,6 +1,7 @@
 // `/harness experiment`: the A/B experiments (extensions/lib/experiments.ts) from the command line.
 //
 //   /harness experiment              running experiments, this session's arms, interim results
+//                                    (with the crossed cells of experiments that declare `interacts`)
 //   /harness experiment <name> on    force this session into arm B (off: arm A), from its next run
 //   /harness experiment <name> stop  mark the experiment stopped and log its result in the changelog
 
@@ -20,13 +21,13 @@ import {
 } from "../lib/experiments.ts";
 import { HARNESS_ROOT } from "../lib/repository.ts";
 import { money, percent, table } from "./format.ts";
-import { type ArmMetric, type ExperimentComparison, experiments, Scope } from "./queries/index.ts";
+import { type CellMetric, type ExperimentComparison, experiments, Scope } from "./queries/index.ts";
 import { indexAll, metricsPath } from "./stats.ts";
 import { openStore } from "./store.ts";
 
 export const CHANGELOG = join(HARNESS_ROOT, ".agents/changelog.md");
 
-const value = (unit: ArmMetric["unit"], v: number | null, signed = false): string => {
+const value = (unit: CellMetric["unit"], v: number | null, signed = false): string => {
 	if (v === null) return "–";
 	const sign = signed && v > 0 ? "+" : "";
 	if (unit === "share") return `${sign}${percent(v)}`;
@@ -34,22 +35,39 @@ const value = (unit: ArmMetric["unit"], v: number | null, signed = false): strin
 	return `${sign}${v.toFixed(2)}`;
 };
 
-/** One experiment's comparison as text: sessions per arm, then each metric with B − A and its interval. */
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/** A comparison as text: sessions and turns per cell, then each metric per cell with the effect and its interval. */
 export function renderComparison(c: ExperimentComparison): string {
+	const crossed = c.experiments.length > 1;
+	const cells = c.cells.map((cell, i) => (i === 0 ? `${cell} ${plural(c.sessions[cell]!, "session")} / ${plural(c.turns[cell]!, "turn")}` : `${cell} ${c.sessions[cell]} / ${c.turns[cell]}`));
 	const head = [
-		`${c.experiment}: ${c.sessions.A} sessions / ${c.turns.A} turns in A, ${c.sessions.B} / ${c.turns.B} in B` +
-			` (${c.projects.length} ${c.projects.length === 1 ? "project" : "projects"} with both arms)`,
-		...(c.forced || c.unmatched ? [`left out: ${c.forced} forced, ${c.unmatched} in projects with one arm only`] : []),
+		`${c.experiments.join(" × ")}: ${cells.join(", ")} (${plural(c.projects.length, "project")} with every ${crossed ? "cell" : "arm"})`,
+		...(crossed ? [`cells: arm in ${c.experiments.join(", then ")}; interaction = how much ${c.experiments.at(-1)}'s B − A differs between the arms of ${c.experiments.slice(0, -1).join(", ")}`] : []),
+		...(c.forced || c.unmatched ? [`left out: ${c.forced} forced, ${c.unmatched} in projects missing ${crossed ? "a cell" : "an arm"}`] : []),
 	];
-	if (c.sessions.A + c.sessions.B === 0) return [...head, "no comparable sessions yet"].join("\n");
+	if (c.cells.every((cell) => c.sessions[cell] === 0)) return [...head, "no comparable sessions yet"].join("\n");
 	const rows = c.metrics.map((m) => [
 		m.label,
-		value(m.unit, m.a),
-		value(m.unit, m.b),
-		value(m.unit, m.diff, true),
+		...c.cells.map((cell) => value(m.unit, m.values[cell] ?? null)),
+		value(m.unit, m.effect, true),
 		m.ci ? `${value(m.unit, m.ci[0], true)} … ${value(m.unit, m.ci[1], true)}` : "–",
 	]);
-	return [...head, table(["metric", "A", "B", "B − A", "95% CI"], rows)].join("\n");
+	return [...head, table(["metric", ...c.cells, crossed ? "interaction" : "B − A", "95% CI"], rows)].join("\n");
+}
+
+/** The pairs of experiments to cross: each declared `interacts`, once per pair, the declaring experiment first. */
+export function crossedGroups(files: Experiment[]): string[][] {
+	const seen = new Set<string>();
+	const groups: string[][] = [];
+	for (const e of files.filter((f) => !f.problem)) {
+		for (const other of e.interacts) {
+			const key = [e.name, other].sort((x, y) => x.localeCompare(y)).join("\0");
+			if (!seen.has(key)) groups.push([e.name, other]);
+			seen.add(key);
+		}
+	}
+	return groups;
 }
 
 const armLabel = (arm: Arm) => (arm === "B" ? "B (variant)" : "A (control)");
@@ -61,36 +79,38 @@ function sessionLine(experiment: Experiment, sessionId: string, recorded: Map<st
 	return `this session: ${armLabel(state.arm)}${state.forced ? ", forced" : ""}${state.endedAt !== undefined ? ", ended" : ""}`;
 }
 
-/** The status report: experiment files, this session's arms and the interim results from the index. */
+/** The status report: experiment files, this session's arms and the interim results (single and crossed) from the index. */
 export function experimentStatus(files: Experiment[], sessionId: string, recorded: Map<string, ArmState>, results: ExperimentComparison[]): string {
-	const byName = new Map(results.map((r) => [r.experiment, r]));
+	const singles = new Map(results.filter((r) => r.experiments.length === 1).map((r) => [r.experiments[0]!, r]));
+	const crossed = results.filter((r) => r.experiments.length > 1);
 	const blocks = files.map((e) => {
 		const state = e.problem ? `ignored: ${e.problem}` : e.status;
 		const lines = [`## ${e.name} (${state}${e.frontmatter.started ? `, started ${String(e.frontmatter.started)}` : ""})`];
 		if (!e.problem && e.status === "running") lines.push(sessionLine(e, sessionId, recorded));
-		const result = byName.get(e.name);
+		const result = singles.get(e.name);
 		lines.push(result ? renderComparison(result) : "no sessions recorded yet");
+		for (const pair of crossed.filter((r) => r.experiments[0] === e.name)) lines.push("", renderComparison(pair));
 		return lines.join("\n");
 	});
 	// Experiments whose file is gone still have their sessions in the index.
-	for (const result of results) {
-		if (!files.some((f) => f.name === result.experiment)) blocks.push(`## ${result.experiment} (file removed)\n${renderComparison(result)}`);
+	for (const [name, result] of singles) {
+		if (!files.some((f) => f.name === name)) blocks.push(`## ${name} (file removed)\n${renderComparison(result)}`);
 	}
 	return blocks.length ? blocks.join("\n\n") : `No experiments. Add one as ${EXPERIMENTS_DIR}/<name>.md.`;
 }
 
-/** The changelog entry for a stopped experiment, with its result at that point. */
-export function stopEntry(result: ExperimentComparison | undefined, name: string, at: Date): string {
+/** The changelog entry for a stopped experiment, with its results at that point (alone and crossed). */
+export function stopEntry(results: ExperimentComparison[], name: string, at: Date): string {
 	return [
 		"",
 		`## ${at.toISOString().slice(0, 10)} — experiment stopped: ${name}`,
 		"",
 		`**Change:** \`prompt/experiments/${name}.md\` marked \`status: stopped\`; no session gets its section any more. Promote the variant into \`prompt/base.md\` or delete the file.`,
 		"",
-		"**Result at stop (random sessions, projects with both arms):**",
+		"**Result at stop (random sessions, projects with every arm or cell):**",
 		"",
 		"```",
-		result ? renderComparison(result) : `${name}: no sessions recorded`,
+		results.length ? results.map(renderComparison).join("\n\n") : `${name}: no sessions recorded`,
 		"```",
 		"",
 		"**Revert:** set `status: running` in the file (arms stay as recorded).",
@@ -114,18 +134,22 @@ export interface ExperimentContext {
 	appendEntry: (data: ArmEntryData) => void;
 	dir?: string;
 	changelog?: string;
-	/** The comparisons from the index, by experiment name (all when undefined). */
-	compare?: (name?: string) => ExperimentComparison[];
+	/** The comparisons from the index of the given groups of experiments (every recorded experiment alone when undefined). */
+	compare?: (groups?: string[][]) => ExperimentComparison[];
 	now?: Date;
 }
 
-const compareFromIndex = (name?: string) => withIndex((db) => experiments(new Scope(db, {}), name));
+const compareFromIndex = (groups?: string[][]) => withIndex((db) => experiments(new Scope(db, {}), groups));
 
 /** Run `/harness experiment <args>`; returns the text to show and its level. */
 export function experimentCommand(args: string[], context: ExperimentContext): { text: string; level: "info" | "warning" } {
 	const { dir = EXPERIMENTS_DIR, compare = compareFromIndex } = context;
 	const files = listExperiments(dir);
-	if (args.length === 0) return { text: experimentStatus(files, context.sessionId, context.recorded, compare()), level: "info" };
+	const crossed = crossedGroups(files);
+	if (args.length === 0) {
+		const results = [...compare(), ...(crossed.length ? compare(crossed) : [])];
+		return { text: experimentStatus(files, context.sessionId, context.recorded, results), level: "info" };
+	}
 	const [name = "", action = ""] = args;
 	if (args.length !== 2 || !["on", "off", "stop"].includes(action)) return { text: EXPERIMENT_USAGE, level: "warning" };
 	const experiment = files.find((f) => f.name === name);
@@ -134,10 +158,10 @@ export function experimentCommand(args: string[], context: ExperimentContext): {
 	if (experiment.status !== "running") return { text: `Experiment ${name} is already stopped.`, level: "warning" };
 	if (action === "stop") {
 		const at = context.now ?? new Date();
-		const [result] = compare(name);
+		const results = compare([[name], ...crossed.filter((group) => group.includes(name))]);
 		stopExperiment(experiment, at);
-		appendFileSync(context.changelog ?? CHANGELOG, stopEntry(result, name, at));
-		return { text: `Stopped ${name}; result logged in the changelog.\n${result ? renderComparison(result) : ""}`.trim(), level: "info" };
+		appendFileSync(context.changelog ?? CHANGELOG, stopEntry(results, name, at));
+		return { text: `Stopped ${name}; result logged in the changelog.\n${results.map(renderComparison).join("\n\n")}`.trim(), level: "info" };
 	}
 	const arm: Arm = action === "on" ? "B" : "A";
 	context.appendEntry({ experiment: name, arm, forced: true });
