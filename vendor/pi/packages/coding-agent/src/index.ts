@@ -39,7 +39,7 @@ export {
 	compactionCost,
 	compactionSaving,
 	DEFAULT_COMPACTION_SETTINGS,
-	expectedRequests,
+	EXPECTED_REQUESTS,
 	estimateTokens,
 	type FileOperations,
 	findCutPoint,

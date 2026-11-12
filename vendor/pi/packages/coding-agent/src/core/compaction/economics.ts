@@ -8,10 +8,13 @@
  * not compacting also costs writing the whole context again.
  */
 
-/** Requests a session is expected to make after this one, as a share of the requests it made so far. */
-const EXPECTED_REQUESTS_PER_PAST_REQUEST = 0.5;
-const MIN_EXPECTED_REQUESTS = 10;
-const MAX_EXPECTED_REQUESTS = 60;
+/**
+ * Requests a run is expected to be followed by before the session ends or compacts. Measured over
+ * 6,320 prompts in Claude Code and Pi sessions (Oct–Nov 2026): the remainder does not depend on
+ * how long the session already ran (25th percentile ~30, median ~100, at every length). The 25th
+ * percentile keeps the saving an underestimate while the quality a summary loses is not priced.
+ */
+export const EXPECTED_REQUESTS = 30;
 /** A summary is at most this long, and at most this share of what it summarizes. */
 const SUMMARY_MAX_TOKENS = 3_000;
 const SUMMARY_SHARE = 0.25;
@@ -34,14 +37,7 @@ export interface CompactionCase {
 	keepTokens: number;
 	/** Whether the prompt cache has expired, so the context would be written again. */
 	cold: boolean;
-	/** Assistant requests the session made so far. */
-	pastRequests: number;
 	prices: CompactionPrices;
-}
-
-/** How many more requests to expect: half the past ones, within bounds (see the metrics for the measured spread). */
-export function expectedRequests(pastRequests: number): number {
-	return Math.min(MAX_EXPECTED_REQUESTS, Math.max(MIN_EXPECTED_REQUESTS, Math.round(pastRequests * EXPECTED_REQUESTS_PER_PAST_REQUEST)));
 }
 
 /**
@@ -61,10 +57,9 @@ export function compactionCost(
 }
 
 /** Dollars compacting now saves over the expected rest of the session; negative when it costs more. */
-export function compactionSaving({ contextTokens, keepTokens, cold, pastRequests, prices }: CompactionCase): number {
+export function compactionSaving({ contextTokens, keepTokens, cold, prices }: CompactionCase): number {
 	const compaction = compactionCost(contextTokens, keepTokens, prices);
 	if (!compaction) return -Infinity;
-	const requests = expectedRequests(pastRequests);
-	const without = (cold ? contextTokens * prices.write : 0) + requests * contextTokens * prices.read;
-	return without - (compaction.cost + requests * compaction.keptTokens * prices.read);
+	const without = (cold ? contextTokens * prices.write : 0) + EXPECTED_REQUESTS * contextTokens * prices.read;
+	return without - (compaction.cost + EXPECTED_REQUESTS * compaction.keptTokens * prices.read);
 }

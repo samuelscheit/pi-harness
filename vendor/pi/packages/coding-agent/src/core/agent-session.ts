@@ -868,7 +868,6 @@ export class AgentSession {
 			contextTokens: estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens,
 			keepTokens: this.settingsManager.getCompactionKeepRecentTokens(model),
 			cold,
-			pastRequests: branch.filter((entry) => entry.type === "message" && entry.message.role === "assistant").length,
 			prices: {
 				read: model.cost.cacheRead / 1e6,
 				write: writePerMillion / 1e6,

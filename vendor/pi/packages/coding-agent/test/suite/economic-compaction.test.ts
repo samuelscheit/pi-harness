@@ -66,14 +66,14 @@ describe("economic compaction", () => {
 	});
 
 	it("an expired cache adds the rewrite to the saving: compacts cold where warm would not pay enough", async () => {
-		// Two prompts carry ~80k tokens. Warm, ten more requests save ~$0.26; cold adds the avoided ~$0.50 rewrite.
-		const warm = await economicHarness(0.5);
+		// Two prompts carry ~80k tokens. Warm, 30 more requests save ~$0.95; cold adds the avoided ~$0.50 rewrite.
+		const warm = await economicHarness(1.2);
 		harnesses.push(warm);
 		await run(warm, FIVE_MINUTES - 10_000);
 		vi.restoreAllMocks();
 		expect(compactions(warm)).toHaveLength(0);
 
-		const cold = await economicHarness(0.5);
+		const cold = await economicHarness(1.2);
 		harnesses.push(cold);
 		await run(cold, FIVE_MINUTES + 1000);
 		expect(compactions(cold).map((entry) => entry.reason)).toEqual(["cold"]);
@@ -99,7 +99,7 @@ describe("economic compaction", () => {
 	});
 
 	it("counts a warm refresh as keeping the cache alive", async () => {
-		const harness = await economicHarness(0.5);
+		const harness = await economicHarness(1.2);
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
 		await harness.session.prompt(`first ${BIG}`);

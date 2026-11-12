@@ -30,8 +30,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
-// Compact only when that is expected to save at least this many dollars (it also loses detail).
-const COMPACTION_MIN_SAVING = 0.25;
+// Compact only when the expected saving covers what the agent re-reads afterwards (measured over
+// 242 Claude Code compactions: $0.50–0.70 on average) with margin; detail lost beyond that is not priced.
+const COMPACTION_MIN_SAVING = 1;
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const vendoredPi = join(root, "vendor/pi");
