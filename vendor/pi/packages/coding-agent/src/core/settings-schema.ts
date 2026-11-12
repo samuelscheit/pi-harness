@@ -24,15 +24,17 @@ const CompactionSettingsSchema = Type.Object({
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
 		}),
 	),
-	coldCache: Type.Optional(
+	economic: Type.Optional(
 		Type.Object(
 			{
-				minTokens: nonNegativeSafeInteger({ description: "Compact only contexts of at least this many tokens." }),
-				model: Type.String({ description: 'The model that writes the summary, as "provider/modelId".' }),
+				model: Type.String({ description: 'The model that writes the summary, as "provider/modelId" (a cheap one).' }),
+				minSaving: Type.Optional(
+					Type.Number({ minimum: 0, description: "Compact only when the expected saving is at least this many dollars." }),
+				),
 			},
 			{
 				description:
-					"Before a run whose prompt cache has expired, compact a large context with a cheaper model instead of writing it to the cache again. Off when unset.",
+					"Before each run, compact when carrying a smaller context over the expected rest of the session (or not writing an expired cache again) saves more than compacting costs. Off when unset.",
 			},
 		),
 	),

@@ -12,12 +12,11 @@
 //   bound for what one well-timed compaction would have saved (quality loss not included).
 
 import type { DatabaseSync } from "node:sqlite";
+import { compactionCost, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import { count, minutes, money, percent, percentile, type Row, table } from "./format.ts";
 
-// Pi's compaction keeps about this many recent tokens and adds a summary of the rest.
-const COMPACTION_KEEP_TOKENS = 20_000;
-const COMPACTION_SUMMARY_TOKENS = 3_000;
-// Output costs five times input on current Claude models; the summary is the compaction's output.
+// The harness summarizes with Haiku, a fifth of Opus's price; output costs five times input.
+const SUMMARY_PRICE_SHARE = 0.2;
 const OUTPUT_TO_INPUT = 5;
 const SHORT_CACHE_MS = 5 * 60_000;
 const LONG_CACHE_MS = 60 * 60_000;
@@ -66,21 +65,25 @@ export interface Turn {
 }
 
 /**
- * The one compaction that would have saved the most: after request `index`, the context shrinks to
- * the kept tokens plus a summary, so every later request reads that much less; the compaction
- * itself reads the context, writes a summary and the next request writes the smaller context.
+ * The one compaction that would have saved the most, knowing how many requests followed: after
+ * request `index` the context shrinks to what Pi's compaction keeps, so every later request reads
+ * that much less, against the compaction's own cost (priced like Pi's economic compaction).
  */
-export function bestCompaction(turns: Turn[]): { index: number; saving: number } | undefined {
-	const kept = COMPACTION_KEEP_TOKENS + COMPACTION_SUMMARY_TOKENS;
+export function bestCompaction(turns: Turn[], keepTokens = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens): { index: number; saving: number } | undefined {
 	// Read-rate sums of all later requests, so each candidate costs O(1).
 	const laterRead = new Array<number>(turns.length + 1).fill(0);
 	for (let i = turns.length - 1; i >= 0; i--) laterRead[i] = laterRead[i + 1]! + turns[i]!.readRate;
 	let best: { index: number; saving: number } | undefined;
 	turns.forEach((turn, index) => {
-		const dropped = turn.promptTokens - kept;
-		if (dropped <= 0) return;
-		const cost = turn.promptTokens * turn.readRate + COMPACTION_SUMMARY_TOKENS * turn.inputRate * OUTPUT_TO_INPUT + kept * turn.writeRate;
-		const saving = dropped * laterRead[index + 1]! - cost;
+		const summaryInput = turn.inputRate * SUMMARY_PRICE_SHARE;
+		const compaction = compactionCost(turn.promptTokens, keepTokens, {
+			read: turn.readRate,
+			write: turn.writeRate,
+			summaryInput,
+			summaryOutput: summaryInput * OUTPUT_TO_INPUT,
+		});
+		if (!compaction) return;
+		const saving = (turn.promptTokens - compaction.keptTokens) * laterRead[index + 1]! - compaction.cost;
 		if (saving > 0 && (!best || saving > best.saving)) best = { index, saving };
 	});
 	return best;
@@ -219,7 +222,7 @@ export function contextReport(db: DatabaseSync, all: All, scoped: string): strin
 		savings.sort((a, b) => b.saving - a.saving);
 		const total = savings.reduce((sum, s) => sum + s.saving, 0);
 		out.push(
-			`Best single compaction per session (upper bound: keeps ${count(COMPACTION_KEEP_TOKENS)} + summary, quality loss not priced): ${money(total)} over ${savings.length} sessions\n${table(
+			`Best single compaction per session (knowing the later requests; keeps ${count(DEFAULT_COMPACTION_SETTINGS.keepRecentTokens)} + summary, quality loss not priced): ${money(total)} over ${savings.length} sessions\n${table(
 				["session", "requests", "cost", "peak context", "compact after", "at context", "saving"],
 				savings.slice(0, 8).map((s) => [s.label, String(s.requests), money(s.cost), count(s.peak), `#${s.at}`, count(s.tokens), money(s.saving)]),
 			)}`,

@@ -892,15 +892,15 @@ export class SettingsManager {
 		};
 	}
 
-	/** Cold-cache compaction (see `compaction.coldCache`), or undefined when it is off or invalid. */
-	getColdCacheCompaction(): { minTokens: number; model: { provider: string; id: string } } | undefined {
-		const cold = this.settings.compaction?.coldCache;
-		if (!this.getCompactionEnabled() || !cold || typeof cold.model !== "string") return undefined;
-		const slash = cold.model.indexOf("/");
-		if (slash <= 0 || slash === cold.model.length - 1) return undefined;
-		const minTokens = Number.isSafeInteger(cold.minTokens) && cold.minTokens >= 0 ? cold.minTokens : undefined;
-		if (minTokens === undefined) return undefined;
-		return { minTokens, model: { provider: cold.model.slice(0, slash), id: cold.model.slice(slash + 1) } };
+	/** Economic compaction (see `compaction.economic`), or undefined when it is off or invalid. */
+	getEconomicCompaction(): { minSaving: number; model: { provider: string; id: string } } | undefined {
+		const economic = this.settings.compaction?.economic;
+		if (!this.getCompactionEnabled() || !economic || typeof economic.model !== "string") return undefined;
+		const slash = economic.model.indexOf("/");
+		if (slash <= 0 || slash === economic.model.length - 1) return undefined;
+		const minSaving = economic.minSaving ?? 0;
+		if (!Number.isFinite(minSaving) || minSaving < 0) return undefined;
+		return { minSaving, model: { provider: economic.model.slice(0, slash), id: economic.model.slice(slash + 1) } };
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {

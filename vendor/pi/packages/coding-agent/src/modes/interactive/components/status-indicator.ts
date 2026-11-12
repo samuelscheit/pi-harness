@@ -89,7 +89,7 @@ export class CompactionStatusIndicator extends StatusIndicator {
 		const label =
 			reason === "manual"
 				? `Compacting context... ${cancelHint}`
-				: `${reason === "overflow" ? "Context overflow detected, " : reason === "cold" ? "Prompt cache expired, " : ""}Auto-compacting... ${cancelHint}`;
+				: `${reason === "overflow" ? "Context overflow detected, " : reason === "cold" ? "Prompt cache expired, " : reason === "economic" ? "Context cheaper compacted, " : ""}Auto-compacting... ${cancelHint}`;
 		super(
 			"compaction",
 			ui,
