@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -20,7 +20,8 @@ CREATE TABLE sessions (
 	compactions INTEGER NOT NULL, user_messages INTEGER NOT NULL
 );
 -- One row per model call: kind 'turn' for an assistant message (with a cost split and harness
--- version), else Pi's side calls such as 'compaction' and 'cache_warm'.
+-- version), else Pi's side calls such as 'compaction' and 'cache_warm', and 'tool: <name>' for
+-- model work a tool reported in its result (web_search's own request).
 CREATE TABLE requests (
 	session_id TEXT NOT NULL, entry_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL,
 	provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT, stop_reason TEXT, version TEXT,
