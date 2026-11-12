@@ -9,7 +9,8 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { askJson, LABELS_FILE, type Labels, openIndex } from "./shared.ts";
+import { askJson } from "../lib/labels.ts";
+import { LABELS_FILE, type Labels, openIndex } from "./shared.ts";
 
 const model = process.argv.includes("--model") ? process.argv[process.argv.indexOf("--model") + 1] : "claude-opus-5-5";
 const CLUSTERS_FILE = LABELS_FILE.replace("user-message-labels", "rule-clusters");

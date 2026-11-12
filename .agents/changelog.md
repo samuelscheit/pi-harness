@@ -488,3 +488,27 @@ Re-indexing the same session files (cutoff 2026-11-12 23:44 UTC, $445.91 of Pi s
 **Judged by:** the thinking share stays near the measured billing (8–11% of Pi spend). The "outside the session file" rows and `thinking_dropped` should fall toward 0 now that the pi-lens ledger persists.
 
 **Revert:** revert the commit, then delete `~/.pi/agent/metrics.db` (older code refuses an index of a newer schema). It rebuilds from the session files.
+
+## 2026-11-12 — harness: dreaming
+
+**Change:** `scripts/dream` (run nightly by a t3 scheduled task) learns working rules from the corrections the user typed since the last run:
+
+- collect the user's own messages in Pi sessions they drove, with the agent's message before each;
+- label them with Sonnet 5.5: kind, the reusable rule implied, scope;
+- curate the corrections that carry a rule with Opus 5.5 into small deltas: recur, add, update, skip;
+- apply each delta as its own commit, live at once.
+
+Global rules become `prompt/rules/<name>.md` (`source: dream`). Project rules go under `## Learned rules` in that repository's instruction file. Ledger, read position and report go to `.agents/dreams/`. Labelling moved to `scripts/lib/labels.ts`, shared with the evidence scripts.
+
+**Evidence:** `docs/research/context-engineering/07` §10: 517 messages restated 108 recurring rules, and 331 of them concerned rules missing from the instructions. Report 05 informs the design:
+
+- ACE deltas, never whole-file rewrites (a rewrite collapsed 18,282 tokens to 122);
+- strongest model for curation;
+- background, not hot path;
+- only user-typed input (memory poisoning).
+
+The user chose: global rules in `prompt/rules`, project rules in the project's AGENTS.md; one commit per change, live at once; nightly on Opus 5.5.
+
+**Judged by:** recurrence per rule in the dream reports (corrections the curator matches to a rule that already existed); the recurrence rate by run should fall. Rules recurring in 2+ sessions after being written are candidates for a mechanical guard.
+
+**Revert:** `git revert` a rule's commit; pause the scheduled task to stop dreaming.
