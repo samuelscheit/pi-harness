@@ -160,3 +160,15 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Judged by:** the `workflow` experiment (saved workflows created and called, tool error rate). The `define-tool` experiment ends without a logged comparison (it started the same day); the sessions' recorded arms stay in their files and the index.
 
 **Revert:** revert the commit.
+
+## 2026-11-13 — releases reload sessions mid-run
+
+**Change:** vendored Pi gets `pi.requestReload()`: at once when idle, at the next turn boundary of a running agent run (after the turn's tool results, before the next model request), else when the run settles; repeated requests are one. After a turn-boundary reload, `before_agent_start` runs again with `reloaded: true`, so the reloaded handlers rebuild the run's prompt sections and tool selection, and the run's remaining turns use the new tools and prompt (sent as an appended prompt update, so the cache stays). A tool call executing at the time finishes on the old code. `extensions/release` now calls it instead of sending itself `/harness-reload` when idle and again on `agent_settled`; the command is removed.
+
+**Why:** a session picked up a new release only after its run, and a long autonomous run (or an agent improving the harness during its own run) never did.
+
+**Verified:** Pi tests (`agent-session-request-reload.test.ts`): idle reload; mid-run reload where the requesting tool call finishes on v1, the next turn's call runs v2 and the next request carries v2's prompt section; a request in the last turn reloads after settling, once; a request from an `agent_settled` handler waits for the handlers; a reloaded handler's tool selection applies; `reload()` itself still refuses during a run. The other Pi tests are unchanged (27 failures in cache warming, config schemas, package commands and `find` fail the same without this patch). Harness: 287 tests pass.
+
+**Needs:** a Pi restart once (Pi itself changed). Until then the new release extension's reload request fails in old processes and the session reports it.
+
+**Revert:** revert the commit and restart Pi.
