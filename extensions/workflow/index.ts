@@ -99,6 +99,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		promptGuidelines: [
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
+			"When you are about to run the same kind of long shell command again with different arguments, save it as a workflow with the arguments as parameters (built with sh`…`) and call that tool from then on.",
 		],
 		parameters: Type.Object({
 			code: Type.String({ description: "TypeScript: the body of an async function using the globals above." }),
@@ -154,7 +155,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	pi.on("before_agent_start", (event, ctx) => {
 		event.systemPromptOptions.selectedTools = switched(ctx, event.systemPromptOptions.selectedTools);
 	});
-	// A workflow saved during a turn is callable from the next one, like a tool define_tool defines.
+	// A workflow saved during a turn is callable from the next turn.
 	pi.on("turn_end", (_event, ctx) => {
 		const active = pi.getActiveTools();
 		const next = switched(ctx, active);

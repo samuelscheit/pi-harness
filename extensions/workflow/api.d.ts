@@ -10,8 +10,15 @@
  */
 declare const tools: Record<string, (args: Record<string, unknown>) => Promise<any>>;
 
-/** Run a bash command in `cwd`; resolves also for non-zero exits. Output is stdout and stderr interleaved. */
+/** Run a bash command in `cwd`; resolves also for non-zero exits. Output is stdout and stderr interleaved. Build commands from values with `sh`. */
 declare function shell(command: string, options?: { cwd?: string; timeoutSeconds?: number }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
+
+/**
+ * Template tag: the command with each `${value}` (string, number, or an array of them) inserted as
+ * one quoted shell word, so values never become shell syntax. Write values unquoted and put `--`
+ * before values that could start with `-`: shell(sh`grep -rn -- ${pattern} ${dirs}`).
+ */
+declare function sh(strings: TemplateStringsArray, ...values: unknown[]): string;
 
 /**
  * One model request without tools. Resolves to the answer's text, or with `schema` (JSON Schema of an
@@ -56,10 +63,15 @@ declare const workflows: Record<string, (input: Record<string, unknown>) => Prom
 declare const cwd: string;
 
 /**
- * A saved workflow is a file `<repo>/.pi/workflows/<name>.ts` that becomes the tool `<name>`:
- *   export const meta: WorkflowMeta = { description, parameters, budget };
- *   export default async function (input) { ...; return result; }
- * Its top level only declares; imports are not available.
+ * A saved workflow is a file `<repo>/.pi/workflows/<name>.ts` that becomes the tool `<name>` from the
+ * next turn, also in later sessions. Its top level only declares; imports are not available. E.g. a
+ * command you keep running with different arguments:
+ *   export const meta: WorkflowMeta = { description: "Run one test file; failures only.", budget: 0.01,
+ *     parameters: { type: "object", properties: { file: { type: "string" } }, required: ["file"] } };
+ *   export default async function ({ file }: { file: string }) {
+ *     const r = await shell(sh`npm test -- ${file}`);
+ *     return r.exitCode === 0 ? "passed" : r.output.split("\n").filter((l) => /FAIL|Error/.test(l)).join("\n");
+ *   }
  */
 interface WorkflowMeta {
 	/** What it does and when to call it: the tool's description. */

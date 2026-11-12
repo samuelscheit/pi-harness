@@ -19,6 +19,7 @@ import { createAgent } from "./agent.ts";
 import { compile, evaluate, inlineModule, scriptStack } from "./compile.ts";
 import type { SavedWorkflow } from "./library.ts";
 import { llm } from "./llm.ts";
+import { sh } from "./sh.ts";
 
 const DEFAULT_CONCURRENCY = 4;
 const MAX_LLM_IN_FLIGHT = 8;
@@ -276,6 +277,7 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 				onDispose: (dispose) => disposers.push(dispose),
 			}),
 		map: mapItems,
+		sh,
 		log: (...values: unknown[]) => progress(values.map((v) => (typeof v === "string" ? v : show(v))).join(" ")),
 		changes: async () => {
 			if (!root || !start) throw new Error(`changes() needs a git repository; ${env.cwd} is not in one`);
