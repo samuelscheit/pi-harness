@@ -115,6 +115,11 @@ export class CacheWarmer {
 	private readonly getIdleMaxAgeMs: () => number;
 	/** Called with the persisted usage entry after each successful refresh. */
 	onWarmed?: (entry: UsageEntry) => void;
+	/**
+	 * Called whenever warming is scheduled, starts a refresh or stops, so a host that unloads idle
+	 * sessions (t3) can keep this one while a refresh is pending.
+	 */
+	onStatusChanged?: () => void;
 
 	constructor(
 		models: Pick<ModelRuntime, "streamSimple">,
@@ -227,6 +232,7 @@ export class CacheWarmer {
 	private stop(reason: string, stopped?: Pick<CacheWarmingStatus, "decision" | "extensionOverride">): void {
 		this.clearRun();
 		this.inactive = { state: "inactive", reason, ...stopped };
+		this.onStatusChanged?.();
 	}
 
 	private schedule(run: ActiveRun): void {
@@ -243,10 +249,12 @@ export class CacheWarmer {
 		}
 		run.timer = setTimeout(() => void this.refresh(run), Math.max(0, run.nextWarmAt - Date.now()));
 		run.timer.unref?.();
+		this.onStatusChanged?.();
 	}
 
 	private async refresh(run: ActiveRun): Promise<void> {
 		run.timer = undefined;
+		this.onStatusChanged?.();
 		if (!this.validateRun(run)) return;
 		if (this.refreshDeadlineMissed(run)) return;
 		const decision = this.evaluate(run);

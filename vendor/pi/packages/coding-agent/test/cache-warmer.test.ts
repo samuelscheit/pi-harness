@@ -372,6 +372,24 @@ describe("idle warming limit", () => {
 		await vi.advanceTimersByTimeAsync(3_600_000);
 		expect(calls).toHaveLength(1);
 	});
+
+	it("reports every status change: scheduled, refreshing, scheduled again or stopped", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { warmer } = fakeRuntime({ idleMaxAgeMs: 2 * 60 * 60_000 });
+		const states: string[] = [];
+		warmer.onStatusChanged = () => states.push(warmer.status.state);
+		warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		warmer.onAgentSettled();
+		expect(states).toEqual(["scheduled"]);
+		await vi.advanceTimersByTimeAsync(3_240_000);
+		expect(states).toEqual(["scheduled", "refreshing", "scheduled"]);
+		// The next refresh (at 108 min) is within the two-hour limit; the one after is not.
+		await vi.advanceTimersByTimeAsync(3_240_000);
+		expect(states).toEqual(["scheduled", "refreshing", "scheduled", "refreshing", "inactive"]);
+		warmer.cancel();
+		expect(states.at(-1)).toBe("inactive");
+	});
 });
 
 describe("one-hour cache economics", () => {
