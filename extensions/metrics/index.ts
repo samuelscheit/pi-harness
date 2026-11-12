@@ -60,14 +60,14 @@ export default function metrics(pi: ExtensionAPI, options: MetricsOptions = {}) 
 	}
 
 	pi.registerCommand("harness", {
-		description: "Harness metrics: /harness stats [all], /harness dashboard, /harness experiment [<name> on|off|stop]",
+		description: "Harness metrics: /harness stats [all], /harness dashboard, /harness experiment [<name> on|off|stop|promote]",
 		getArgumentCompletions: (prefix) =>
 			[
 				"stats",
 				"stats all",
 				"dashboard",
 				"experiment",
-				...listExperiments().flatMap((e) => ["on", "off", "stop"].map((action) => `experiment ${e.name} ${action}`)),
+				...listExperiments().flatMap((e) => ["on", "off", "stop", "promote"].map((action) => `experiment ${e.name} ${action}`)),
 			]
 				.filter((value) => value.startsWith(prefix))
 				.map((value) => ({ value, label: value })),

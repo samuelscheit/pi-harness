@@ -7,8 +7,9 @@
 // `<repository>/.pi/workflows/*.ts`. They are read on every run, so a workflow the agent saves is
 // callable from its next turn.
 //
-// All are registered inactive. The experiments switch them per arm (lib/experiments.ts): a saved
-// workflow an experiment names (fix_loop) follows that experiment, the others follow `workflow`.
+// All are registered inactive. A rule (lib/rules.ts) switches them on for every session, an
+// experiment per arm (lib/experiments.ts): a saved workflow an experiment names follows that
+// experiment, the others follow `workflow` as the prompt extension selected it (it runs first).
 
 import { readFileSync } from "node:fs";
 import { relative } from "node:path";

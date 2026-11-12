@@ -1,7 +1,8 @@
 // Harness prompt: prompt/base.md as the base system prompt, prompt/AGENTS.md, the user's
-// global working rules, as the first context file, and the variants of the A/B experiments
-// (prompt/experiments, see extensions/lib/experiments.ts): in arm B their prompt sections and
-// tools; every tool an experiment names is off otherwise.
+// global working rules, as the first context file, the stable rules (prompt/rules, see
+// extensions/lib/rules.ts: each its own section, its tools on in every session), and the variants
+// of the A/B experiments (prompt/experiments, see extensions/lib/experiments.ts): in arm B their
+// prompt sections and tools; every tool an experiment names is off otherwise, unless a rule names it.
 //
 // The base replaces Pi's default preamble only; Pi still appends context files (AGENTS.md of the
 // project and its parents), the skills list and the working directory as their own sections.
@@ -22,12 +23,14 @@ import {
 	toolSwitches,
 } from "../lib/experiments.ts";
 import { HARNESS_ROOT } from "../lib/repository.ts";
+import { applyRules, listRules, RULES_DIR } from "../lib/rules.ts";
 
 const PROMPT_DIR = join(HARNESS_ROOT, "prompt");
 const BASE_PROMPT = join(PROMPT_DIR, "base.md");
 const GLOBAL_RULES = join(PROMPT_DIR, "AGENTS.md");
 
-export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DIR) {
+export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DIR, rulesDir = RULES_DIR) {
+	let reported = "";
 	pi.on("before_agent_start", (event, ctx) => {
 		const options = event.systemPromptOptions;
 		options.customPrompt = readFileSync(BASE_PROMPT, "utf8").trim();
@@ -35,6 +38,11 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 			{ path: GLOBAL_RULES, content: readFileSync(GLOBAL_RULES, "utf8").trim() },
 			...options.contextFiles.filter((file) => file.path !== GLOBAL_RULES),
 		];
+
+		// Rules before experiments, so an experiment section can never take a rule's name.
+		const { tools: ruleTools, problems } = applyRules(listRules(rulesDir), options.sections);
+		if (problems && problems !== reported && ctx.hasUI) ctx.ui.notify(`Ignored prompt rules:\n${problems}`, "warning");
+		reported = problems;
 
 		// Record missing assignments and ended experiments first (appendEntry writes synchronously),
 		// then read the arms back: a forced arm from `/harness experiment` wins over the hash.
@@ -47,6 +55,8 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		for (const experiment of running) {
 			if (experiment.body && arms.get(experiment.name)?.arm === "B") options.sections[sectionName(experiment.name)] = experiment.body;
 		}
-		options.selectedTools = applyToolSwitches(options.selectedTools, toolSwitches(experiments, sessionId, arms));
+		const switches = toolSwitches(experiments, sessionId, arms);
+		for (const tool of ruleTools) switches.set(tool, true);
+		options.selectedTools = applyToolSwitches(options.selectedTools, switches);
 	});
 }

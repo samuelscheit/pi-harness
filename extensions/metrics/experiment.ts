@@ -4,6 +4,8 @@
 //                                    (with the crossed cells of experiments that declare `interacts`)
 //   /harness experiment <name> on    force this session into arm B (off: arm A), from its next run
 //   /harness experiment <name> stop  mark the experiment stopped and log its result in the changelog
+//   /harness experiment <name> promote  make it a stable rule (lib/rules.ts) for every session and log
+//                                    its result in the changelog
 
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,6 +21,7 @@ import {
 	listExperiments,
 	stopExperiment,
 } from "../lib/experiments.ts";
+import { promoteExperiment, RULES_DIR } from "../lib/rules.ts";
 import { SOURCE_ROOT } from "../lib/repository.ts";
 import { money, percent, table } from "./format.ts";
 import { type CellMetric, type ExperimentComparison, experiments, Scope } from "./queries/index.ts";
@@ -100,21 +103,37 @@ export function experimentStatus(files: Experiment[], sessionId: string, recorde
 	return blocks.length ? blocks.join("\n\n") : `No experiments. Add one as ${EXPERIMENTS_DIR}/<name>.md.`;
 }
 
-/** The changelog entry for a stopped experiment, with its results at that point (alone and crossed). */
-export function stopEntry(results: ExperimentComparison[], name: string, at: Date): string {
+/** How an experiment ended, for its changelog entry. */
+const ENDINGS = {
+	stop: {
+		title: "experiment stopped",
+		change: (name: string) =>
+			`\`prompt/experiments/${name}.md\` marked \`status: stopped\`; no session gets its section or tools any more. Promote it with \`/harness experiment ${name} promote\` after restarting it, or delete the file.`,
+		revert: "set `status: running` in the file (arms stay as recorded).",
+	},
+	promote: {
+		title: "experiment promoted",
+		change: (name: string) => `\`prompt/experiments/${name}.md\` became the rule \`prompt/rules/${name}.md\`: every session gets its section \`${name}\` and its tools.`,
+		revert: "delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.",
+	},
+} as const;
+
+/** The changelog entry for an experiment that ended, with its results at that point (alone and crossed). */
+export function endEntry(results: ExperimentComparison[], name: string, at: Date, ending: keyof typeof ENDINGS): string {
+	const { title, change, revert } = ENDINGS[ending];
 	return [
 		"",
-		`## ${at.toISOString().slice(0, 10)} — experiment stopped: ${name}`,
+		`## ${at.toISOString().slice(0, 10)} — ${title}: ${name}`,
 		"",
-		`**Change:** \`prompt/experiments/${name}.md\` marked \`status: stopped\`; no session gets its section any more. Promote the variant into \`prompt/base.md\` or delete the file.`,
+		`**Change:** ${change(name)}`,
 		"",
-		"**Result at stop (random sessions, projects with every arm or cell):**",
+		`**Result at ${ending} (random sessions, projects with every arm or cell):**`,
 		"",
 		"```",
 		results.length ? results.map(renderComparison).join("\n\n") : `${name}: no sessions recorded`,
 		"```",
 		"",
-		"**Revert:** set `status: running` in the file (arms stay as recorded).",
+		`**Revert:** ${revert}`,
 		"",
 	].join("\n");
 }
@@ -134,6 +153,7 @@ export interface ExperimentContext {
 	recorded: Map<string, ArmState>;
 	appendEntry: (data: ArmEntryData) => void;
 	dir?: string;
+	rulesDir?: string;
 	changelog?: string;
 	/** The comparisons from the index of the given groups of experiments (every recorded experiment alone when undefined). */
 	compare?: (groups?: string[][]) => ExperimentComparison[];
@@ -160,23 +180,24 @@ export function experimentCommand(args: string[], context: ExperimentContext): {
 		return { text: experimentStatus(files, context.sessionId, context.recorded, results), level: "info" };
 	}
 	const [name = "", action = ""] = args;
-	if (args.length !== 2 || !["on", "off", "stop"].includes(action)) return { text: EXPERIMENT_USAGE, level: "warning" };
+	if (args.length !== 2 || !["on", "off", "stop", "promote"].includes(action)) return { text: EXPERIMENT_USAGE, level: "warning" };
 	const experiment = files.find((f) => f.name === name);
 	if (!experiment) return { text: `No experiment ${name} in ${dir}.`, level: "warning" };
 	if (experiment.problem) return { text: `Experiment ${name} is ignored: ${experiment.problem}.`, level: "warning" };
 	if (experiment.status !== "running") return { text: `Experiment ${name} is already stopped.`, level: "warning" };
-	if (action === "stop") {
+	if (action === "stop" || action === "promote") {
 		const at = context.now ?? new Date();
 		const results = compare([[name], ...crossed.filter((group) => group.includes(name))]);
-		const file = stopExperiment(experiment, at);
+		const files = action === "stop" ? [stopExperiment(experiment, at)] : promoteExperiment(experiment, context.rulesDir ?? RULES_DIR, at);
 		const changelog = context.changelog ?? CHANGELOG;
-		appendFileSync(changelog, stopEntry(results, name, at));
-		const published = context.publish ? `\n${context.publish([file, changelog], `chore(experiments): stop ${name}`)}` : "";
-		return { text: `Stopped ${name}; result logged in the changelog.${published}\n${results.map(renderComparison).join("\n\n")}`.trim(), level: "info" };
+		appendFileSync(changelog, endEntry(results, name, at, action));
+		const published = context.publish ? `\n${context.publish([...files, changelog], `chore(experiments): ${action} ${name}`)}` : "";
+		const done = action === "stop" ? `Stopped ${name}` : `Promoted ${name} to a rule for every session`;
+		return { text: `${done}; result logged in the changelog.${published}\n${results.map(renderComparison).join("\n\n")}`.trim(), level: "info" };
 	}
 	const arm: Arm = action === "on" ? "B" : "A";
 	context.appendEntry({ experiment: name, arm, forced: true });
 	return { text: `This session is in ${armLabel(arm)} of ${name} from its next run; it no longer counts in the random comparison.`, level: "info" };
 }
 
-export const EXPERIMENT_USAGE = "Usage: /harness experiment [<name> on|off|stop]";
+export const EXPERIMENT_USAGE = "Usage: /harness experiment [<name> on|off|stop|promote]";

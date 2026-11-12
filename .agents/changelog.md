@@ -182,3 +182,234 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Verified:** `test/dashboard-keeper.test.ts` with real servers on a free port: start, reuse, restart after SIGKILL, replacement of a server on another release, a held lock, three concurrent checks start one server; the extension checks at start and periodically, stops on shutdown, never overlaps checks and reports each failure once. Harness: 295 tests pass.
 
 **Revert:** revert the commit.
+
+## 2026-11-12 — experiment promoted: codemode
+
+**Change:** `prompt/experiments/codemode.md` became the rule `prompt/rules/codemode.md`: every session gets its section `codemode` and its tools.
+
+**Result at promote (random sessions, projects with every arm or cell):**
+
+```
+codemode: A 8 sessions / 809 turns, B 3 / 47 (2 projects with every arm)
+left out: 0 forced, 1 in projects missing an arm
+metric                               A       B  B − A    95% CI
+------------------------------  ------  ------  -------  -----------------
+tool calls per turn               1.08    0.87  -0.21    -0.57 … -0.00
+turns with 2+ tool calls          9.9%    6.4%  -4%      -10% … +3.0%
+file changes via edit/write        47%     57%  +10%     -11% … +26%
+edit calls per edited file        1.80    2.00  +0.20    -0.19 … +0.48
+turns per package                33.71    5.22  -28.49   -108.79 … -9.09
+turns per session               101.13   15.67  -85.46   -126.00 … -48.71
+cost per session                $11.07   $2.26  -$8.80   -$14.42 … -$4.56
+cache-read cost per session      $5.18  $0.433  -$4.74   -$6.80 … -$2.82
+cost per turn                   $0.109  $0.144  +$0.035  -$0.052 … +$0.201
+cache-read cost per turn        $0.051  $0.028  -$0.024  -$0.042 … +$0.003
+tool error rate                   2.5%    4.9%  +2.4%    -3% … +4.5%
+child-session cost per session  $0.000  $0.000  $0.000   $0.000 … $0.000
+sessions calling codemode           0%      0%  0%       0% … 0%
+turns calling codemode              0%      0%  0%       0% … 0%
+
+codemode × parallel-tools: AA 3 sessions / 361 turns, AB 1 / 172, BA 1 / 12, BB 1 / 27 (1 project with every cell)
+cells: arm in codemode, then parallel-tools; interaction = how much parallel-tools's B − A differs between the arms of codemode
+left out: 0 forced, 6 in projects missing a cell
+metric                              AA      AB  BA          BB  interaction  95% CI
+------------------------------  ------  ------  ------  ------  -----------  ------
+tool calls per turn               1.03    1.16  0.50      1.07  +0.45        –
+turns with 2+ tool calls          7.2%     17%  0%        7.4%  -2%          –
+file changes via edit/write        36%     80%  –          60%  –            –
+edit calls per edited file        1.55    1.65  –         2.00  –            –
+turns per package                25.79   21.50  2.40     27.00  +28.89       –
+turns per session               120.33  172.00  12.00    27.00  -36.67       –
+cost per session                $13.43  $13.44  $2.72    $1.54  -$1.19       –
+cache-read cost per session      $6.12   $6.93  $0.587  $0.366  -$1.02       –
+cost per turn                   $0.112  $0.078  $0.227  $0.057  -$0.137      –
+cache-read cost per turn        $0.051  $0.040  $0.049  $0.014  -$0.025      –
+tool error rate                   2.7%    1.0%  0%        6.9%  +8.6%        –
+child-session cost per session  $0.000  $0.000  $0.000  $0.000  $0.000       –
+sessions calling codemode           0%      0%  0%          0%  0%           –
+turns calling codemode              0%      0%  0%          0%  0%           –
+
+workflow × codemode: AA 0 sessions / 0 turns, AB 0 / 0, BA 0 / 0, BB 0 / 0 (0 projects with every cell)
+cells: arm in workflow, then codemode; interaction = how much codemode's B − A differs between the arms of workflow
+left out: 0 forced, 9 in projects missing a cell
+no comparable sessions yet
+```
+
+**Revert:** delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.
+
+## 2026-11-12 — experiment promoted: edit-tool
+
+**Change:** `prompt/experiments/edit-tool.md` became the rule `prompt/rules/edit-tool.md`: every session gets its section `edit-tool` and its tools.
+
+**Result at promote (random sessions, projects with every arm or cell):**
+
+```
+edit-tool: A 8 sessions / 476 turns, B 11 / 1100 (2 projects with every arm)
+left out: 0 forced, 1 in projects missing an arm
+metric                               A       B  B − A    95% CI
+------------------------------  ------  ------  -------  -----------------
+tool calls per turn               1.15    1.22  +0.07    -0.35 … +0.38
+turns with 2+ tool calls           13%     15%  +1.5%    -17% … +15%
+file changes via edit/write        28%     49%  +20%     +2.7% … +43%
+edit calls per edited file        1.91    1.80  -0.11    -0.97 … +0.85
+turns per package                15.87   50.00  +34.13   +7.88 … +88.08
+turns per session                59.50  100.00  +40.50   -18.51 … +93.81
+cost per session                 $7.24   $8.83  +$1.60   -$5.55 … +$7.55
+cache-read cost per session      $2.35   $4.20  +$1.85   -$1.40 … +$4.91
+cost per turn                   $0.122  $0.088  -$0.033  -$0.068 … +$0.004
+cache-read cost per turn        $0.039  $0.042  +$0.003  -$0.012 … +$0.022
+tool error rate                   2.9%    1.7%  -1%      -3% … +0.8%
+child-session cost per session  $0.000  $0.000  $0.000   $0.000 … $0.000
+
+edit-tool × single-edit: AA 5 sessions / 217 turns, AB 3 / 259, BA 5 / 271, BB 6 / 829 (2 projects with every cell)
+cells: arm in edit-tool, then single-edit; interaction = how much single-edit's B − A differs between the arms of edit-tool
+left out: 0 forced, 1 in projects missing a cell
+metric                              AA      AB      BA      BB  interaction  95% CI
+------------------------------  ------  ------  ------  ------  -----------  -----------------
+tool calls per turn               1.35    0.99    1.45    1.14  +0.05        -1.10 … +0.78
+turns with 2+ tool calls           22%    5.8%     21%     12%  +6.8%        -33% … +33%
+file changes via edit/write        22%     33%     55%     46%  -20%         -53% … +14%
+edit calls per edited file        2.00    1.83    2.16    1.67  -0.32        -1.90 … +0.92
+turns per package                18.08   14.39   45.17   51.81  +10.34       -31.66 … +149.83
+turns per session                43.40   86.33   54.20  138.17  +41.03       -82.50 … +142.83
+cost per session                 $4.15  $12.38   $4.87  $12.13  -$0.969      -$16.16 … +$11.15
+cache-read cost per session      $1.17   $4.31   $1.60   $6.37  +$1.63       -$5.15 … +$7.30
+cost per turn                   $0.096  $0.143  $0.090  $0.088  -$0.050      -$0.127 … +$0.015
+cache-read cost per turn        $0.027  $0.050  $0.029  $0.046  -$0.006      -$0.025 … +$0.025
+tool error rate                   2.4%    3.5%    1.8%    1.7%  -1%          -4% … +4.5%
+child-session cost per session  $0.000  $0.000  $0.000  $0.000  $0.000       $0.000 … $0.000
+```
+
+**Revert:** delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.
+
+## 2026-11-12 — experiment promoted: fix-loop
+
+**Change:** `prompt/experiments/fix-loop.md` became the rule `prompt/rules/fix-loop.md`: every session gets its section `fix-loop` and its tools.
+
+**Result at promote (random sessions, projects with every arm or cell):**
+
+```
+fix-loop: A 6 sessions / 528 turns, B 5 / 328 (2 projects with every arm)
+left out: 0 forced, 1 in projects missing an arm
+metric                               A       B  B − A    95% CI
+------------------------------  ------  ------  -------  -----------------
+tool calls per turn               1.11    1.00  -0.11    -0.17 … -0.03
+turns with 2+ tool calls           13%    4.6%  -8%      -12% … -3%
+file changes via edit/write        57%     29%  -29%     -52% … +2.6%
+edit calls per edited file        1.81    1.75  -0.06    -0.90 … +0.37
+turns per package                31.06   20.50  -10.56   -87.49 … +41.70
+turns per session                88.00   65.60  -22.40   -89.43 … +59.00
+cost per session                 $8.48   $8.89  +$0.417  -$7.28 … +$11.04
+cache-read cost per session      $4.31   $3.37  -$0.933  -$4.59 … +$3.66
+cost per turn                   $0.096  $0.136  +$0.039  -$0.005 … +$0.075
+cache-read cost per turn        $0.049  $0.051  +$0.002  -$0.029 … +$0.021
+tool error rate                   1.7%    4.3%  +2.6%    +1.3% … +4.1%
+child-session cost per session  $0.000  $0.000  $0.000   $0.000 … $0.000
+sessions calling fix_loop           0%      0%  0%       0% … 0%
+turns calling fix_loop              0%      0%  0%       0% … 0%
+```
+
+**Revert:** delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.
+
+## 2026-11-12 — experiment promoted: parallel-tools
+
+**Change:** `prompt/experiments/parallel-tools.md` became the rule `prompt/rules/parallel-tools.md`: every session gets its section `parallel-tools` and its tools.
+
+**Result at promote (random sessions, projects with every arm or cell):**
+
+```
+parallel-tools: A 9 sessions / 843 turns, B 10 / 756 (2 projects with every arm)
+left out: 0 forced, 1 in projects missing an arm
+metric                               A       B  B − A    95% CI
+------------------------------  ------  ------  -------  -----------------
+tool calls per turn               1.14    1.26  +0.13    -0.17 … +0.48
+turns with 2+ tool calls           11%     17%  +5.8%    -8% … +20%
+file changes via edit/write        33%     52%  +18%     -1% … +41%
+edit calls per edited file        1.66    1.92  +0.26    -0.19 … +0.97
+turns per package                27.19   32.87  +5.68    -29.15 … +63.77
+turns per session                93.67   75.60  -18.07   -75.83 … +40.22
+cost per session                 $8.73   $7.80  -$0.938  -$7.46 … +$5.10
+cache-read cost per session      $3.67   $3.29  -$0.382  -$3.69 … +$2.80
+cost per turn                   $0.093  $0.103  +$0.010  -$0.021 … +$0.046
+cache-read cost per turn        $0.039  $0.044  +$0.004  -$0.011 … +$0.021
+tool error rate                   2.2%    1.9%  -0%      -2% … +1.4%
+child-session cost per session  $0.000  $0.000  $0.000   $0.000 … $0.000
+```
+
+**Revert:** delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.
+
+## 2026-11-12 — experiment promoted: single-edit
+
+**Change:** `prompt/experiments/single-edit.md` became the rule `prompt/rules/single-edit.md`: every session gets its section `single-edit` and its tools.
+
+**Result at promote (random sessions, projects with every arm or cell):**
+
+```
+single-edit: A 10 sessions / 491 turns, B 9 / 1088 (2 projects with every arm)
+left out: 0 forced, 1 in projects missing an arm
+metric                               A       B  B − A    95% CI
+------------------------------  ------  ------  -------  -----------------
+tool calls per turn               1.40    1.11  -0.29    -0.82 … +0.01
+turns with 2+ tool calls           21%     11%  -11%     -29% … +2.1%
+file changes via edit/write        41%     43%  +1.6%    -17% … +30%
+edit calls per edited file        2.13    1.68  -0.44    -1.06 … +0.27
+turns per package                27.28   32.00  +4.72    -26.75 … +53.69
+turns per session                49.10  120.89  +71.79   +20.24 … +121.43
+cost per session                 $4.53  $12.22  +$7.68   +$2.22 … +$13.39
+cache-read cost per session      $1.40   $5.68  +$4.28   +$1.45 … +$7.08
+cost per turn                   $0.092  $0.101  +$0.009  -$0.028 … +$0.042
+cache-read cost per turn        $0.028  $0.047  +$0.019  +$0.005 … +$0.032
+tool error rate                   2.0%    2.1%  +0.0%    -2% … +1.7%
+child-session cost per session  $0.000  $0.000  $0.000   $0.000 … $0.000
+```
+
+**Revert:** delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.
+
+## 2026-11-12 — experiment promoted: workflow
+
+**Change:** `prompt/experiments/workflow.md` became the rule `prompt/rules/workflow.md`: every session gets its section `workflow` and its tools.
+
+**Result at promote (random sessions, projects with every arm or cell):**
+
+```
+workflow: A 3 sessions / 318 turns, B 1 / 2 (1 project with every arm)
+left out: 0 forced, 5 in projects missing an arm
+metric                               A  B       B − A    95% CI
+------------------------------  ------  ------  -------  ------
+tool calls per turn               1.08  0.50    -0.58    –
+turns with 2+ tool calls           11%  0%      -11%     –
+file changes via edit/write        45%  –       –        –
+edit calls per edited file        1.60  –       –        –
+turns per package                22.71  2.00    -20.71   –
+turns per session               106.00  2.00    -104.00  –
+cost per session                $11.91  $0.153  -$11.76  –
+cache-read cost per session      $5.21  $0.108  -$5.10   –
+cost per turn                   $0.112  $0.077  -$0.036  –
+cache-read cost per turn        $0.049  $0.054  +$0.005  –
+tool error rate                   2.6%  0%      -3%      –
+child-session cost per session  $0.000  $0.000  $0.000   –
+sessions calling workflow           0%  0%      0%       –
+turns calling workflow              0%  0%      0%       –
+
+workflow × codemode: AA 0 sessions / 0 turns, AB 0 / 0, BA 0 / 0, BB 0 / 0 (0 projects with every cell)
+cells: arm in workflow, then codemode; interaction = how much codemode's B − A differs between the arms of workflow
+left out: 0 forced, 9 in projects missing a cell
+no comparable sessions yet
+```
+
+**Revert:** delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.
+
+## 2026-11-12 — harness: stable rules, one file each; all experiments promoted
+
+**Change:** new `extensions/lib/rules.ts` and `prompt/rules/<name>.md`. Each rule is its own prompt section `<name>` in every session. A rule's frontmatter `tools` are switched on for everyone, also over an experiment that would switch them off. Rules come before the experiments, and a rule whose name Pi's prompt already has is refused and reported.
+
+`/harness experiment <name> promote` moves an experiment to a rule and logs its result here, as `stop` does. The user asked to promote every running experiment while keeping one file per rule; the six entries above hold their results at promotion.
+
+**Evidence:** user decision. The results were mostly inconclusive at 5–11 sessions per arm. Two were adverse:
+
+- `fix-loop`: tool error rate +2.6 pp; `fix_loop` was never called.
+- `single-edit`: +$7.68 per session, from longer sessions; cost per turn was not significant.
+
+**Judged by:** the same metrics as before promotion, compared by harness version (`requests.version`). Watch tool error rate and cost per turn especially.
+
+**Revert:** delete a rule file (its section and tools go), or move it back to `prompt/experiments/` with `status: running` to randomize it again.
