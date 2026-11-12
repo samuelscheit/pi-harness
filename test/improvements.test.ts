@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { appendNote, backlogPath, formatNote, repositoryRoot } from "../extensions/improvements/index.ts";
+import { appendNote, backlogPath, formatNote } from "../extensions/improvements/index.ts";
+import { repositoryRoot } from "../extensions/lib/repository.ts";
 
 let dir: string;
 beforeEach(() => {

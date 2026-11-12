@@ -9,12 +9,10 @@
 //   extensions, tools and models.
 
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-
-const HARNESS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+import { HARNESS_ROOT, repositoryRoot } from "../lib/repository.ts";
 const BACKLOG = join(".agents", "improvements.md");
 const HEADER = "# Improvement backlog\n\nNoted by agents with note_improvement; consumed by dreaming and /improve.\n";
 
@@ -37,14 +35,6 @@ export interface Note {
 	scope: "project" | "harness";
 	observation: string;
 	proposal: string;
-}
-
-/** The closest directory at or above `dir` holding `.git`, else `dir`. */
-export function repositoryRoot(dir: string): string {
-	for (let current = resolve(dir); ; current = dirname(current)) {
-		if (existsSync(join(current, ".git"))) return current;
-		if (dirname(current) === current) return resolve(dir);
-	}
 }
 
 export function backlogPath(scope: Note["scope"], cwd: string, harnessRoot = HARNESS_ROOT): string {
