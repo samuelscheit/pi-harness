@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, test } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { attribute, cacheEvent, ratesOf, type RequestState, requestState, type Usage } from "../extensions/metrics/attribution.ts";
 import { imageTokens, parsePrompt, versionId } from "../extensions/metrics/blocks.ts";
-import { indexSessions } from "../extensions/metrics/indexer.ts";
+import { idlePauses, indexSessions } from "../extensions/metrics/indexer.ts";
 import { diffState, report } from "../extensions/metrics/report.ts";
 import { openStore, SCHEMA_VERSION } from "../extensions/metrics/store.ts";
 
@@ -330,6 +330,10 @@ describe("indexer", () => {
 			{ kind: "tool", name: "bash" },
 			{ kind: "tool", name: "read" },
 		]);
+		assert.deepEqual(
+			db.prepare("SELECT entry_id, reason, tokens_before, cost > 0 paid FROM compactions").all().map((r) => ({ ...r })),
+			[{ entry_id: "cmp", reason: null, tokens_before: 2300, paid: 1 }],
+		);
 		const afterCompaction = db.prepare("SELECT message_count FROM requests WHERE entry_id = 'a6'").get() as { message_count: number };
 		assert.equal(afterCompaction.message_count, 4, "the summary, the kept u4 and a5, then u5");
 		db.close();
@@ -397,6 +401,37 @@ describe("indexer", () => {
 		assert.match(all, /version\s+project/);
 		assert.equal(report(db, { cwd: "/nowhere" }), "No Pi sessions recorded for this scope yet.");
 		db.close();
+	});
+});
+
+describe("idle pauses", () => {
+	const min = 60_000;
+	const turn = (ts: number, cacheRead = 0, promptTokens = 100_000, writeCost = 0) => ({ ts, promptTokens, cacheRead, writeCost });
+
+	test("classifies how a session resumed after a pause, and ignores short gaps", () => {
+		const turns = [
+			turn(0),
+			turn(4 * min, 99_000), // 4 min: no pause
+			turn(54 * min, 99_000), // warm after 50 min, kept by two refreshes
+			turn(120 * min, 0, 100_000, 0.8), // cold: rebuilt
+			turn(200 * min, 0, 40_000, 0.2), // compacted first
+		];
+		const warms = [{ ts: 20 * min, cost: 0.02 }, { ts: 45 * min, cost: 0.02 }, { ts: 300 * min, cost: 0.03 }];
+		const pauses = idlePauses(turns, warms, [199 * min], 310 * min);
+		assert.deepEqual(
+			pauses.map((p) => [p.outcome, Math.round(p.minutes), p.warms, Math.round(p.warmCost * 100) / 100, p.resumeWriteCost]),
+			[
+				["warm", 50, 2, 0.04, 0],
+				["cold", 66, 0, 0, 0.8],
+				["compacted", 80, 0, 0, 0.2],
+				["open", 110, 1, 0.03, 0],
+			],
+		);
+		assert.equal(pauses.at(-1)!.end, undefined);
+	});
+
+	test("has no open pause when the session just ended", () => {
+		assert.deepEqual(idlePauses([turn(0), turn(min, 99_000)], [], [], 2 * min), []);
 	});
 });
 

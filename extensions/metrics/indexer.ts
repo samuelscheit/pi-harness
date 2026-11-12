@@ -23,6 +23,65 @@ import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
 import { deleteSession, transaction } from "./store.ts";
 
 const USER_TEXT_LIMIT = 2000;
+// A pause longer than the short (5 min) cache lifetime: the cache survives it only if kept warm or long-lived.
+export const PAUSE_MS = 5 * 60_000;
+// A resumed request that read at least this share of the previous prompt from cache found it warm.
+const WARM_RESUME_FRACTION = 0.5;
+
+interface TurnPoint {
+	ts: number;
+	promptTokens: number;
+	cacheRead: number;
+	writeCost: number;
+}
+
+export interface IdlePause {
+	start: number;
+	end?: number;
+	minutes: number;
+	warms: number;
+	warmCost: number;
+	outcome: "warm" | "compacted" | "cold" | "open";
+	promptTokens: number;
+	resumeWriteCost: number;
+}
+
+/**
+ * Pauses longer than {@link PAUSE_MS} between turns, or after the last turn until `lastTs`, with
+ * the warm refreshes inside them and how the session resumed.
+ */
+export function idlePauses(
+	turns: TurnPoint[],
+	warms: { ts: number; cost: number }[],
+	coldCompactions: number[],
+	lastTs: number,
+): IdlePause[] {
+	const pauses: IdlePause[] = [];
+	turns.forEach((turn, index) => {
+		const next = turns[index + 1];
+		const end = next?.ts ?? lastTs;
+		if (end - turn.ts <= PAUSE_MS) return;
+		const inside = warms.filter((w) => w.ts > turn.ts && w.ts < end);
+		const outcome = !next
+			? "open"
+			: coldCompactions.some((ts) => ts > turn.ts && ts < next.ts)
+				? "compacted"
+				: next.cacheRead >= turn.promptTokens * WARM_RESUME_FRACTION
+					? "warm"
+					: "cold";
+		pauses.push({
+			start: turn.ts,
+			end: next?.ts,
+			minutes: (end - turn.ts) / 60_000,
+			warms: inside.length,
+			warmCost: inside.reduce((sum, w) => sum + w.cost, 0),
+			outcome,
+			promptTokens: turn.promptTokens,
+			resumeWriteCost: next?.writeCost ?? 0,
+		});
+	});
+	return pauses;
+}
 
 export interface IndexResult {
 	files: number;
@@ -117,6 +176,13 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const insertUser = db.prepare("INSERT INTO user_messages (session_id, entry_id, ts, kind, text) VALUES (?, ?, ?, ?, ?)");
+	const insertCompaction = db.prepare(
+		"INSERT INTO compactions (session_id, entry_id, ts, reason, tokens_before, cost) VALUES (?, ?, ?, ?, ?, ?)",
+	);
+	const insertPause = db.prepare(
+		`INSERT INTO idle_pauses (session_id, start_ts, end_ts, minutes, warms, warm_cost, outcome, prompt_tokens, resume_write_cost)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	);
 	const sessionId = header.id;
 	const sideCall = (entryId: string, ts: number, kind: string, provider: string, model: string, usage: Usage) =>
 		insertRequest.run(sessionId, entryId, ts, kind, provider, model, null, null, null, usage.input, usage.output, usage.cacheRead,
@@ -135,17 +201,23 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		// Per tool call: the requests that carried its result, the cost they paid for it, and the version that made the call.
 		const lifetime = new Map<string, { requests: number; tokens: number; cost: number; version?: string }>();
 		const toolCalls = new Map<string, string>();
+		const turns: TurnPoint[] = [];
+		const warms: { ts: number; cost: number }[] = [];
+		const coldCompactions: number[] = [];
 
 		for (const entry of entries) {
 			const ts = time(entry);
 			if (entry.type === "session_info") name = entry.name ?? name;
 			else if (entry.type === "compaction") {
 				compactions += 1;
+				insertCompaction.run(sessionId, entry.id, ts, entry.reason ?? null, entry.tokensBefore, entry.usage?.cost.total ?? 0);
+				if (entry.reason === "cold") coldCompactions.push(ts);
 				if (entry.usage) {
 					sideCall(entry.id, ts, "compaction", "", "", entry.usage);
 					cost += entry.usage.cost.total;
 				}
 			} else if (entry.type === "usage") {
+				if (entry.kind === "cache_warm") warms.push({ ts, cost: entry.usage.cost.total });
 				sideCall(entry.id, ts, entry.kind, entry.provider, entry.model, entry.usage);
 				cost += entry.usage.cost.total;
 			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
@@ -185,6 +257,12 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 					toolCalls.set(part.id, summarizeToolInput(part.arguments));
 					lifetime.set(part.id, { ...(lifetime.get(part.id) ?? { requests: 0, tokens: 0, cost: 0 }), version });
 				}
+				turns.push({
+					ts,
+					promptTokens: attribution.promptTokens,
+					cacheRead: usage.cacheRead,
+					writeCost: [...attribution.composition.values()].reduce((sum, c) => sum + c.write, 0),
+				});
 				requests += 1;
 				cost += usage.cost.total;
 				if (message.stopReason === "aborted") aborted += 1;
@@ -202,6 +280,11 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		}
 
 		const last = entries.at(-1);
+		turns.sort((a, b) => a.ts - b.ts);
+		for (const pause of idlePauses(turns, warms, coldCompactions, last ? time(last) : time(header))) {
+			insertPause.run(sessionId, pause.start, pause.end ?? null, pause.minutes, pause.warms, pause.warmCost, pause.outcome,
+				pause.promptTokens, pause.resumeWriteCost);
+		}
 		db.prepare(
 			`INSERT INTO sessions (id, file, cwd, parent_session, name, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
