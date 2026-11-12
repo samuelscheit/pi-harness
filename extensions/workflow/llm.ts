@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import { type AssistantMessage, type Message, type Tool, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { resolveModel, type Thinking, thinkingOption } from "./models.ts";
+import { CACHE_RETENTION, resolveModel, type Thinking, thinkingOption } from "./models.ts";
 
 export const DEFAULT_LLM_MODEL = "anthropic/claude-haiku-5-5";
 const MAX_ATTEMPTS = 3;
@@ -93,7 +93,7 @@ export async function llm(promptArg: unknown, optionsArg: unknown, env: LlmEnv):
 		const message = await env.runtime.completeSimple(
 			model,
 			{ systemPrompt, messages, tools: tool ? [tool] : undefined },
-			{ signal: env.signal, ...(thinking && thinking !== "off" ? { reasoning: thinking } : {}) },
+			{ signal: env.signal, cacheRetention: CACHE_RETENTION, ...(thinking && thinking !== "off" ? { reasoning: thinking } : {}) },
 		);
 		env.spend(message.usage);
 		if (message.stopReason === "aborted" || env.signal.aborted) throw env.signal.reason ?? new Error("llm(): aborted");

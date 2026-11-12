@@ -19,7 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { absolutePaths, canonical, changedPaths, isAllowed, restore, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { type Lease, type LeaseMode, workspaceLock } from "./lock.ts";
-import { resolveModel, type Thinking, thinkingOption } from "./models.ts";
+import { CACHE_RETENTION, resolveModel, type Thinking, thinkingOption } from "./models.ts";
 
 export const DEFAULT_AGENT_MODEL = "anthropic/claude-sonnet-5-5";
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
@@ -110,7 +110,11 @@ function callLine(tool: string, args: unknown): string {
 }
 
 async function createChild(options: AgentOptions, allowed: string[] | undefined, env: AgentEnv): Promise<AgentSession> {
-	const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true, maxRetries: 3 } });
+	const settingsManager = SettingsManager.inMemory({
+		compaction: { enabled: true },
+		retry: { enabled: true, maxRetries: 3 },
+		cacheRetention: CACHE_RETENTION,
+	});
 	const guard = (pi: ExtensionAPI) => {
 		if (!allowed) return;
 		pi.on("tool_call", (event) => {

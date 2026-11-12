@@ -391,6 +391,31 @@ describe("agent()", () => {
 	});
 });
 
+describe("prompt cache retention", () => {
+	const previous = process.env.PI_CACHE_RETENTION;
+	beforeEach(() => {
+		process.env.PI_CACHE_RETENTION = "long";
+	});
+	afterEach(() => {
+		if (previous === undefined) delete process.env.PI_CACHE_RETENTION;
+		else process.env.PI_CACHE_RETENTION = previous;
+	});
+
+	test("llm() and agent() requests use the 5-minute cache even when Pi was started with PI_CACHE_RETENTION=long", async () => {
+		const retention: unknown[] = [];
+		const record = (text: string): FauxResponseStep => (_context, options) => {
+			retention.push(options?.cacheRetention);
+			return say(text);
+		};
+		respond(record("plain"), record("first"), record("second"));
+		const { details } = await run(
+			"await llm('hi', { model: 'faux/faux-1', cache: false });\nconst a = agent({ model: 'faux/faux-1', tools: ['read'] });\nawait a.run('one');\nawait a.run('two');\nreturn 'ok';",
+		);
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(retention, ["short", "short", "short"], "one llm() request and both agent() runs");
+	});
+});
+
 describe("workspace lock", () => {
 	test("shared leases overlap and see each other's files; exclusive waits for all and blocks later shared ones", async () => {
 		const lock = new WorkspaceLock();
