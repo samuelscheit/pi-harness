@@ -1,0 +1,13 @@
+{
+	"name": "pi-harness",
+	"private": true,
+	"type": "module",
+	"description": "Self-improving Pi harness: Codex base prompt, gateway models, in-harness metrics.",
+	"scripts": {
+		"install-harness": "node scripts/install.mjs",
+		"import-prompt": "node scripts/import-codex-prompt.mjs"
+	},
+	"pi": {
+		"extensions": ["extensions/*/index.ts"]
+	}
+}
