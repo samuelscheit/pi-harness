@@ -172,3 +172,13 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Needs:** a Pi restart once (Pi itself changed). Until then the new release extension's reload request fails in old processes and the session reports it.
 
 **Revert:** revert the commit and restart Pi.
+
+## 2026-11-13 — the dashboard runs whenever Pi runs, and follows releases
+
+**Change:** `ensureDashboard` (`dashboard/server/launch.ts`) replaces `launch` and `restartOutdated`: it starts the dashboard detached when none answers and replaces one on another release than the deployed one, under a lock shared by all Pi processes (`~/.pi/agent/dashboard.lock`); the new release's frontend is built before the old server is stopped. Every Pi process running the installed harness calls it at session start and every 30 s (`extensions/metrics`), and the release extension right after deploying. A failure is shown once per distinct message. The deploy lock's code moved to `extensions/lib/lock.ts` (pid + heartbeat, takeover of abandoned locks) and is shared.
+
+**Why:** the dashboard ran only after `/harness dashboard`, and a deploy only restarted a server that still answered. A server that crashed, or was stopped by a deploy whose Pi process then died (seen 2026-11-12, pid 60330), stayed down until someone asked for it.
+
+**Verified:** `test/dashboard-keeper.test.ts` with real servers on a free port: start, reuse, restart after SIGKILL, replacement of a server on another release, a held lock, three concurrent checks start one server; the extension checks at start and periodically, stops on shutdown, never overlaps checks and reports each failure once. Harness: 295 tests pass.
+
+**Revert:** revert the commit.

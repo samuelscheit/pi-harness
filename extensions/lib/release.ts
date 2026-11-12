@@ -17,19 +17,15 @@
 // running.
 
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { acquireLock, pidAlive } from "./lock.ts";
 import { RELEASE_MARKER, type ReleaseMarker } from "./repository.ts";
 
 const exec = promisify(execFile);
 /** Releases kept besides the current one, for sessions that have not reloaded yet and for going back. */
 const KEEP = 5;
-/** The holder of the deploy lock touches it this often while deploying. */
-const LOCK_HEARTBEAT_MS = 2_000;
-/** A lock not touched for this long is abandoned (its holder hung, or its pid was reused). */
-const STALE_LOCK_MS = 15_000;
-const LOCK_OWNER = "pid";
 const VALIDATE_TIMEOUT_MS = 120_000;
 
 /** Paths in a release that link to the source repository instead of being copied. */
@@ -73,77 +69,6 @@ export async function importCheck(root: string): Promise<void> {
 		const e = error as { stderr?: string; message: string };
 		throw new Error((e.stderr || e.message).trim().split("\n").slice(0, 20).join("\n"));
 	}
-}
-
-/** Whether a process runs (a process of another user counts as running). */
-function pidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-/** Whether a lock was left by a holder that is gone: its process ended, or it stopped touching the lock. */
-function abandoned(path: string): boolean {
-	let touched: number;
-	try {
-		touched = statSync(path).mtimeMs;
-	} catch {
-		return false;
-	}
-	if (Date.now() - touched > STALE_LOCK_MS) return true;
-	try {
-		const pid = Number(readFileSync(join(path, LOCK_OWNER), "utf8"));
-		return Number.isInteger(pid) && pid > 0 && !pidAlive(pid);
-	} catch {
-		// Just created, the pid not written yet.
-		return false;
-	}
-}
-
-/**
- * Take the deploy lock, or undefined while another live process holds it. An abandoned lock is
- * moved aside (rename: only one waiter wins it) and taken over at once. While held, the lock is
- * touched every LOCK_HEARTBEAT_MS, so a waiter can tell a hung holder from a slow one.
- */
-function lock(agentDir: string): (() => void) | undefined {
-	const path = join(harnessDir(agentDir), ".lock");
-	mkdirSync(harnessDir(agentDir), { recursive: true });
-	const take = () => {
-		try {
-			mkdirSync(path);
-			return true;
-		} catch {
-			return false;
-		}
-	};
-	if (!take()) {
-		if (!abandoned(path)) return undefined;
-		const aside = `${path}.abandoned.${process.pid}`;
-		try {
-			renameSync(path, aside);
-		} catch {
-			return undefined;
-		}
-		rmSync(aside, { recursive: true, force: true });
-		if (!take()) return undefined;
-	}
-	writeFileSync(join(path, LOCK_OWNER), String(process.pid));
-	const heartbeat = setInterval(() => {
-		try {
-			const now = new Date();
-			utimesSync(path, now, now);
-		} catch {
-			// Taken over meanwhile; the deploy finishes either way (deploys of one commit agree).
-		}
-	}, LOCK_HEARTBEAT_MS);
-	heartbeat.unref();
-	return () => {
-		clearInterval(heartbeat);
-		rmSync(path, { recursive: true, force: true });
-	};
 }
 
 /** Remove builds that processes left behind when they died while deploying (`.<commit>.<pid>`). */
@@ -194,7 +119,7 @@ export async function deploy({ source, branch, agentDir, validate = importCheck 
 	const previous = currentRelease(agentDir)?.commit;
 	if (previous === commit) return { status: "current", commit };
 	if (existsSync(failedFile(agentDir, commit))) return { status: "failed", commit, error: readFileSync(failedFile(agentDir, commit), "utf8"), fresh: false };
-	const unlock = lock(agentDir);
+	const unlock = acquireLock(join(harnessDir(agentDir), ".lock"));
 	if (!unlock) return { status: "busy", commit };
 	try {
 		// Another process may have deployed it while this one waited.
