@@ -8,6 +8,7 @@ import {
 	type Arm,
 	ARM_ENTRY,
 	type ArmEntryData,
+	applyToolSwitches,
 	armUpdates,
 	hashArm,
 	listExperiments,
@@ -15,6 +16,7 @@ import {
 	runningExperiments,
 	sectionName,
 	stopExperiment,
+	toolSwitches,
 } from "../extensions/lib/experiments.ts";
 import { crossedGroups, experimentCommand, renderComparison } from "../extensions/metrics/experiment.ts";
 import { indexSessions } from "../extensions/metrics/indexer.ts";
@@ -153,6 +155,36 @@ describe("experiment files", () => {
 		assert.deepEqual(crossedGroups(listExperiments(at)), [["many", "one"], ["many", "two"], ["one", "two"]]);
 	});
 
+	test("tools name the tools of arm B; a tools-only experiment is valid", () => {
+		const at = experimentFile("one", "---\ntools: fix_loop\n---\n");
+		experimentFile("list", "---\ntools: [define_tool, codemode, codemode]\n---\nText.", at);
+		experimentFile("bad", "---\ntools: [\"no spaces\"]\n---\nText.", at);
+		experimentFile("number", "---\ntools: 3\n---\nText.", at);
+		experimentFile("empty", "---\ntools: []\n---\n", at);
+		const byName = new Map(listExperiments(at).map((e) => [e.name, e]));
+		assert.deepEqual(byName.get("one")!.tools, ["fix_loop"]);
+		assert.equal(byName.get("one")!.problem, undefined);
+		assert.deepEqual(byName.get("list")!.tools, ["define_tool", "codemode"], "duplicates once");
+		assert.match(byName.get("bad")!.problem!, /tools must name tools/);
+		assert.match(byName.get("number")!.problem!, /tools must name tools/);
+		assert.equal(byName.get("empty")!.problem, "empty variant");
+	});
+
+	test("tool switches: on in arm B of a running experiment, off otherwise; problems switch nothing", () => {
+		const at = experimentFile("a", "---\ntools: [shared, only_a]\n---\n");
+		experimentFile("b", "---\ntools: shared\n---\n", at);
+		experimentFile("off", "---\nstatus: stopped\ntools: stopped_tool\n---\n", at);
+		experimentFile("broken", "---\nstatus: paused\ntools: broken_tool\n---\n", at);
+		const all = listExperiments(at);
+		let id = "";
+		for (let i = 0; ; i++) if (hashArm(`u${i}`, "a") === "A" && hashArm(`u${i}`, "b") === "B") { id = `u${i}`; break; }
+		assert.deepEqual(Object.fromEntries(toolSwitches(all, id, new Map())), { shared: true, only_a: false, stopped_tool: false }, "on in any B wins");
+		const forced = recordedArms([armEntry({ experiment: "a", arm: "B", forced: true }), armEntry({ experiment: "b", arm: "A", forced: true })]);
+		assert.deepEqual(Object.fromEntries(toolSwitches(all, id, forced)), { shared: true, only_a: true, stopped_tool: false });
+		assert.deepEqual(applyToolSwitches(["x", "only_a", "y"], new Map([["only_a", false], ["shared", true], ["z", false]])), ["x", "y", "shared"]);
+		assert.deepEqual(applyToolSwitches([], new Map()), []);
+	});
+
 	test("a missing directory has no experiments", () => {
 		assert.deepEqual(listExperiments(join(dir, "nope")), []);
 	});
@@ -170,8 +202,11 @@ describe("experiment files", () => {
 });
 
 describe("prompt extension", () => {
-	/** Run the extension's before_agent_start against an in-memory session; returns the custom sections. */
-	function harness(sessionId: string, experimentsDir: string) {
+	/**
+	 * Run the extension's before_agent_start against an in-memory session; returns the custom
+	 * sections. The tool selection carries over between runs, as Pi's active tools do.
+	 */
+	function harness(sessionId: string, experimentsDir: string, initialTools = ["read", "bash", "edit", "write"]) {
 		const entries: ReturnType<typeof armEntry>[] = [];
 		let handler: ((event: unknown, ctx: unknown) => void) | undefined;
 		const pi = {
@@ -182,12 +217,14 @@ describe("prompt extension", () => {
 		};
 		prompt(pi as never, experimentsDir);
 		const ctx = { sessionManager: { getSessionId: () => sessionId, getEntries: () => entries } };
+		let tools = initialTools;
 		const run = () => {
-			const options = { customPrompt: undefined, contextFiles: [], sections: {} as Record<string, string> };
+			const options = { customPrompt: undefined, contextFiles: [], sections: {} as Record<string, string>, selectedTools: [...tools] };
 			handler!({ systemPromptOptions: options }, ctx);
+			tools = options.selectedTools;
 			return options.sections;
 		};
-		return { entries, run };
+		return { entries, run, tools: () => tools };
 	}
 
 	test("only arm B gets the variant as its own section, and the arm is recorded once", () => {
@@ -214,6 +251,50 @@ describe("prompt extension", () => {
 		rmSync(join(at, "x.md"));
 		assert.deepEqual(session.run(), {});
 		assert.equal(session.entries.length, 3, "ended once");
+	});
+
+	test("arm B gets the experiment's tools, arm A not; other tools keep their order", () => {
+		const at = experimentFile("fix-loop", "---\ntools: fix_loop\n---\n");
+		experimentFile("both", "---\ntools: [define_tool, codemode]\n---\nUse them.", at);
+		const id = (arms: string) => {
+			for (let i = 0; ; i++) if (hashArm(`t${i}`, "fix-loop") + hashArm(`t${i}`, "both") === arms) return `t${i}`;
+		};
+		const bb = harness(id("BB"), at);
+		assert.deepEqual(bb.run(), { "experiment-both": "Use them." }, "a tools-only experiment adds no section");
+		assert.deepEqual(bb.tools(), ["read", "bash", "edit", "write", "define_tool", "codemode", "fix_loop"]);
+		assert.deepEqual(bb.run(), { "experiment-both": "Use them." });
+		assert.deepEqual(bb.tools(), ["read", "bash", "edit", "write", "define_tool", "codemode", "fix_loop"], "resumed: same tools, no duplicates");
+
+		const ab = harness(id("AB"), at, ["read", "fix_loop", "bash"]);
+		ab.run();
+		assert.deepEqual(ab.tools(), ["read", "bash", "define_tool", "codemode"], "arm A removes a tool even if something activated it");
+		const aa = harness(id("AA"), at);
+		aa.run();
+		assert.deepEqual(aa.tools(), ["read", "bash", "edit", "write"]);
+	});
+
+	test("forcing an arm switches the tools from the next run; stopping turns them off for everyone", () => {
+		const at = experimentFile("x", "---\ntools: [x_tool]\n---\nVariant.");
+		const session = harness(sessionIn("A", "x"), at);
+		session.run();
+		assert.deepEqual(session.tools(), ["read", "bash", "edit", "write"]);
+		session.entries.push(armEntry({ experiment: "x", arm: "B", forced: true }));
+		session.run();
+		assert.deepEqual(session.tools(), ["read", "bash", "edit", "write", "x_tool"]);
+		session.entries.push(armEntry({ experiment: "x", arm: "A", forced: true }));
+		session.run();
+		assert.deepEqual(session.tools(), ["read", "bash", "edit", "write"]);
+
+		const b = harness(sessionIn("B", "x"), at);
+		b.run();
+		assert.deepEqual(b.tools().at(-1), "x_tool");
+		stopExperiment(listExperiments(at)[0]!);
+		b.run();
+		assert.deepEqual(b.tools(), ["read", "bash", "edit", "write"], "stopped: off");
+		rmSync(join(at, "x.md"));
+		const later = harness(sessionIn("B", "x"), at, ["read", "x_tool"]);
+		later.run();
+		assert.deepEqual(later.tools(), ["read", "x_tool"], "no file: the experiments no longer switch the tool");
 	});
 
 	test("empty or invalid experiments assign nothing", () => {
@@ -451,7 +532,7 @@ describe("comparison", () => {
 
 	const armSession = (id: string, cell: string, turns: number, toolCalls: number): ArmSession => ({
 		session: id, project: "/p", cell, forced: false, turns, toolCalls, batchedTurns: 0, packages: 1, cost: 0, readCost: 0, toolResults: 0, toolErrors: 0,
-		mutatingCalls: 0, toolMutatingCalls: 0, editCalls: 0, editedFiles: 0,
+		mutatingCalls: 0, toolMutatingCalls: 0, editCalls: 0, editedFiles: 0, childCost: 0, tools: {},
 	});
 
 	test("compareCells weighs sessions by their turns (ratio of sums)", () => {

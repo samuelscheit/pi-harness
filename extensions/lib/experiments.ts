@@ -4,9 +4,9 @@
 // variant's prompt text. Every session is assigned an arm per experiment, 50/50 from a hash of
 // the session id and the experiment name, so arms are stable when a session resumes and
 // independent across experiments. Arm B gets the text as its own prompt section
-// `experiment-<name>` (see extensions/prompt); arm A gets nothing. The arm is recorded in the
-// session file as a custom entry, so the metrics index (extensions/metrics) can compare the arms
-// even after the file is gone.
+// `experiment-<name>` and the experiment's tools (see extensions/prompt); arm A gets neither. The
+// arm is recorded in the session file as a custom entry, so the metrics index (extensions/metrics)
+// can compare the arms even after the file is gone.
 //
 // Frontmatter keys:
 //   status:  running (default) | stopped. A stopped experiment assigns no arms and adds no section.
@@ -15,15 +15,18 @@
 //   interacts: an experiment name, or a list of them, whose arms this one's effect may depend on
 //              (one changes how much the other can act). `/harness experiment` then also compares
 //              the crossed cells (AA, AB, BA, BB) and their interaction.
-// Other keys are kept as they are. An experiment with an empty body has nothing to test and is
-// ignored (listed with a problem), like one whose name is not a valid section name.
+//   tools:   a tool name, or a list of them, that arm B gets active and arm A does not. The tools
+//            are registered inactive (`defaultActive: false`, or built-in like `codemode`); every
+//            run switches them per arm (`toolSwitches`), so a forced arm or a stopped experiment
+//            switches them from the next run. A stopped experiment turns its tools off for
+//            everyone; promoting one means activating the tool by default and deleting the file.
+//            The comparison adds each tool's usage per arm.
+// Other keys are kept as they are. An experiment with neither a body nor tools has nothing to test
+// and is ignored (listed with a problem), like one whose name is not a valid section name.
 //
-// Non-prompt variants (a setting such as the compaction threshold) would use the same files and
-// entries: the file names the variant in its frontmatter (for example `setting:
-// compaction.reserveTokens` and `value: 300000`) with an optional empty body, and the extension
-// owning the setting applies the value in arm B after calling `sessionArm` for the experiment.
-// The prompt extension would then skip such experiments instead of treating an empty body as a
-// problem. Not built yet.
+// Setting variants (such as the compaction threshold) would use the same files and entries: the
+// file names the setting and value in its frontmatter, and the extension owning the setting
+// applies the value in arm B after calling `sessionArm`. Not built yet.
 
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -42,6 +45,8 @@ export const ARMS: readonly Arm[] = ["A", "B"];
 
 // Pi's section names are `[a-z][a-z0-9_-]*`; the section is `experiment-<name>`.
 const NAME = /^[a-z0-9][a-z0-9_-]*$/;
+// Tool names as providers accept them.
+const TOOL = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export const sectionName = (experiment: string) => `experiment-${experiment}`;
 
@@ -54,12 +59,14 @@ export interface Experiment {
 	body: string;
 	/** Experiments whose arms to cross with this one's in the comparison (frontmatter `interacts`). */
 	interacts: string[];
-	/** Why the experiment cannot run (invalid name, empty body, unreadable frontmatter). */
+	/** Tools active in arm B only (frontmatter `tools`). */
+	tools: string[];
+	/** Why the experiment cannot run (invalid name, nothing to test, unreadable frontmatter). */
 	problem?: string;
 }
 
 export function readExperiment(file: string, name: string): Experiment {
-	const base = { name, file, status: "running" as const, frontmatter: {}, body: "", interacts: [] };
+	const base = { name, file, status: "running" as const, frontmatter: {}, body: "", interacts: [], tools: [] };
 	if (!NAME.test(name)) return { ...base, problem: `invalid name (use ${NAME.source})` };
 	let parsed: { frontmatter: Record<string, unknown>; body: string };
 	try {
@@ -69,13 +76,20 @@ export function readExperiment(file: string, name: string): Experiment {
 	}
 	const status = parsed.frontmatter.status ?? "running";
 	if (status !== "running" && status !== "stopped") return { ...base, problem: `unknown status ${JSON.stringify(status)}` };
-	const raw = parsed.frontmatter.interacts ?? [];
-	const interacts = typeof raw === "string" ? [raw] : raw;
-	if (!Array.isArray(interacts) || !interacts.every((other) => typeof other === "string" && NAME.test(other) && other !== name)) {
-		return { ...base, problem: `interacts must name other experiments, got ${JSON.stringify(raw)}` };
-	}
+	const interacts = nameList(parsed.frontmatter.interacts, (other) => NAME.test(other) && other !== name);
+	if (!interacts) return { ...base, problem: `interacts must name other experiments, got ${JSON.stringify(parsed.frontmatter.interacts)}` };
+	const tools = nameList(parsed.frontmatter.tools, (tool) => TOOL.test(tool));
+	if (!tools) return { ...base, problem: `tools must name tools, got ${JSON.stringify(parsed.frontmatter.tools)}` };
 	const body = parsed.body.trim();
-	return { name, file, status, frontmatter: parsed.frontmatter, body, interacts, ...(body ? {} : { problem: "empty variant" }) };
+	const problem = body || tools.length ? {} : { problem: "empty variant" };
+	return { name, file, status, frontmatter: parsed.frontmatter, body, interacts, tools, ...problem };
+}
+
+/** A frontmatter value naming one thing or a list of them (absent: none); undefined when invalid. */
+function nameList(raw: unknown, valid: (name: string) => boolean): string[] | undefined {
+	const list = raw === undefined || raw === null ? [] : typeof raw === "string" ? [raw] : raw;
+	if (!Array.isArray(list) || !list.every((item) => typeof item === "string" && valid(item))) return undefined;
+	return [...new Set(list as string[])];
 }
 
 /** Every experiment file, by name. */
@@ -94,6 +108,31 @@ export const runningExperiments = (dir = EXPERIMENTS_DIR) => listExperiments(dir
 export function hashArm(sessionId: string, experiment: string): Arm {
 	const digest = createHash("sha256").update(`${experiment}\0${sessionId}`).digest();
 	return digest.readUInt32BE(0) < 0x8000_0000 ? "A" : "B";
+}
+
+/** The arm a session is in for a running experiment: the recorded one, else the one its next run records. */
+export const sessionArm = (experiment: string, sessionId: string, recorded: Map<string, ArmState>): Arm =>
+	recorded.get(experiment)?.arm ?? hashArm(sessionId, experiment);
+
+/**
+ * Which tools the experiments switch for a session, and how: every tool an experiment file names
+ * (running or stopped) is off, unless a running experiment naming it has the session in arm B.
+ * Tools no experiment names are not in the map. Experiments with a problem switch nothing.
+ */
+export function toolSwitches(experiments: readonly Experiment[], sessionId: string, recorded: Map<string, ArmState>): Map<string, boolean> {
+	const switches = new Map<string, boolean>();
+	for (const e of experiments) {
+		if (e.problem) continue;
+		const on = e.status === "running" && sessionArm(e.name, sessionId, recorded) === "B";
+		for (const tool of e.tools) switches.set(tool, (switches.get(tool) ?? false) || on);
+	}
+	return switches;
+}
+
+/** A tool selection with the switches applied: switched-off tools removed, switched-on ones appended, the rest in order. */
+export function applyToolSwitches(selected: readonly string[], switches: Map<string, boolean>): string[] {
+	const kept = selected.filter((tool) => switches.get(tool) !== false);
+	return [...kept, ...[...switches].filter(([tool, on]) => on && !kept.includes(tool)).map(([tool]) => tool)];
 }
 
 /** What an arm entry records: an assignment (random or forced), or that the experiment ended for the session. */

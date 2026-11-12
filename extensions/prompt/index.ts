@@ -1,16 +1,26 @@
 // Harness prompt: prompt/base.md as the base system prompt, prompt/AGENTS.md, the user's
-// global working rules, as the first context file, and the variants of the running A/B
-// experiments (prompt/experiments, see extensions/lib/experiments.ts) in arm B.
+// global working rules, as the first context file, and the variants of the A/B experiments
+// (prompt/experiments, see extensions/lib/experiments.ts): in arm B their prompt sections and
+// tools; every tool an experiment names is off otherwise.
 //
 // The base replaces Pi's default preamble only; Pi still appends context files (AGENTS.md of the
 // project and its parents), the skills list and the working directory as their own sections.
 // Everything is read on every run, so an edit (by the user or the improvement loop), a forced arm
-// or a stopped experiment reaches running sessions as a section update.
+// or a stopped experiment reaches running sessions as a section and tool update.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { ARM_ENTRY, armUpdates, EXPERIMENTS_DIR, recordedArms, runningExperiments, sectionName } from "../lib/experiments.ts";
+import {
+	applyToolSwitches,
+	ARM_ENTRY,
+	armUpdates,
+	EXPERIMENTS_DIR,
+	listExperiments,
+	recordedArms,
+	sectionName,
+	toolSwitches,
+} from "../lib/experiments.ts";
 import { HARNESS_ROOT } from "../lib/repository.ts";
 
 const PROMPT_DIR = join(HARNESS_ROOT, "prompt");
@@ -29,11 +39,14 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		// Record missing assignments and ended experiments first (appendEntry writes synchronously),
 		// then read the arms back: a forced arm from `/harness experiment` wins over the hash.
 		const session = ctx.sessionManager;
-		const running = runningExperiments(experimentsDir);
-		for (const update of armUpdates(session.getSessionId(), recordedArms(session.getEntries()), running)) pi.appendEntry(ARM_ENTRY, update);
+		const sessionId = session.getSessionId();
+		const experiments = listExperiments(experimentsDir);
+		const running = experiments.filter((e) => e.status === "running" && !e.problem);
+		for (const update of armUpdates(sessionId, recordedArms(session.getEntries()), running)) pi.appendEntry(ARM_ENTRY, update);
 		const arms = recordedArms(session.getEntries());
 		for (const experiment of running) {
-			if (arms.get(experiment.name)?.arm === "B") options.sections[sectionName(experiment.name)] = experiment.body;
+			if (experiment.body && arms.get(experiment.name)?.arm === "B") options.sections[sectionName(experiment.name)] = experiment.body;
 		}
+		options.selectedTools = applyToolSwitches(options.selectedTools, toolSwitches(experiments, sessionId, arms));
 	});
 }

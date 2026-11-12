@@ -5,9 +5,14 @@
 // assistant message's usage and cost. `buildSessionContext` rebuilds the exact context of a
 // request (compactions, branches and context edits included), which is then split and priced.
 // A session file is re-indexed as a whole whenever it changed.
+//
+// A tool result adds to what its call's arguments tell (see work.ts `reportedWork`): the effects of
+// the tools it called itself (codemode scripts, defined tools) and, from its details, the files it
+// changed, whether it reached its goal and the child session it ran (fix_loop). A child session's
+// header names its parent by file path, as Pi's forks do; the index keeps the parent's id.
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
 	buildSessionContext,
@@ -22,7 +27,7 @@ import { attribute, cacheEvent, type RequestState, requestState, type Usage } fr
 import { recordedArms } from "../lib/experiments.ts";
 import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
 import { deleteSession, transaction } from "./store.ts";
-import { delegatedTaskDigest, delegation, referenceIndex, toolEffect } from "./work.ts";
+import { delegatedTaskDigest, delegation, mergeEffects, type ReportedWork, referenceIndex, reportedWork, toolEffect } from "./work.ts";
 
 const USER_TEXT_LIMIT = 2000;
 // A pause longer than the short (5 min) cache lifetime: the cache survives it only if kept warm or long-lived.
@@ -132,6 +137,31 @@ export function indexSessions(db: DatabaseSync, sessionsDir: string): IndexResul
 
 const time = (entry: { timestamp: string }) => Date.parse(entry.timestamp);
 
+/**
+ * The session id behind a header's `parentSession`: Pi records the parent's file path (forks,
+ * child sessions), so the id comes from that file's header, else from Pi's file name
+ * `<timestamp>_<id>.jsonl`. A value that is no path is an id already.
+ */
+export function parentSessionId(parent: string | undefined): string | undefined {
+	if (!parent) return undefined;
+	if (!parent.endsWith(".jsonl")) return parent;
+	try {
+		const fd = openSync(parent, "r");
+		try {
+			const buffer = Buffer.alloc(4096);
+			const line = buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString("utf8").split("\n")[0]!;
+			const id = (JSON.parse(line) as { type?: string; id?: unknown }).id;
+			if (typeof id === "string" && id) return id;
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		// Gone or unreadable: fall back to the file name.
+	}
+	const name = basename(parent, ".jsonl");
+	return name.includes("_") ? name.slice(name.indexOf("_") + 1) : name;
+}
+
 function messageText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
@@ -179,10 +209,14 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 	const insertVersion = db.prepare("INSERT OR IGNORE INTO versions (id, sections, tools, first_seen) VALUES (?, ?, ?, ?)");
 	const insertBlob = db.prepare("INSERT OR IGNORE INTO blobs (hash, kind, name, text) VALUES (?, ?, ?, ?)");
 	const insertTool = db.prepare(
-		`INSERT INTO tool_results (session_id, call_id, ts, tool, summary, is_error, duration_ms, tokens, requests_in_context, lifetime_cost, version, referenced_later, mutates)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tool_results (session_id, call_id, ts, tool, summary, is_error, duration_ms, tokens, requests_in_context, lifetime_cost, version, referenced_later, mutates, ok)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
-	const insertFile = db.prepare("INSERT OR IGNORE INTO tool_files (session_id, call_id, ts, file, write) VALUES (?, ?, ?, ?, ?)");
+	// A file a call's result reports as written may already be in as named by its arguments.
+	const insertFile = db.prepare(
+		`INSERT INTO tool_files (session_id, call_id, ts, file, write) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (session_id, call_id, file) DO UPDATE SET write = MAX(write, excluded.write)`,
+	);
 	const insertDelegation = db.prepare(
 		"INSERT INTO delegations (session_id, call_id, ts, kind, thread_id, task_digest, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
 	);
@@ -212,6 +246,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		// Per tool call: the requests that carried its result, the cost they paid for it, and the version that made the call.
 		const lifetime = new Map<string, { requests: number; tokens: number; cost: number; version?: string }>();
 		const toolCalls = new Map<string, { name: string; args: unknown; summary: string; ts: number; files: string[]; mutates: boolean }>();
+		const reported = new Map<string, ReportedWork>();
 		// What the agent wrote after each point (text, thinking, tool arguments), to tell whether a result was used again.
 		const agentTexts: { ts: number; text: string }[] = [];
 		let promptDigest: string | undefined;
@@ -234,10 +269,22 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 				if (entry.kind === "cache_warm") warms.push({ ts, cost: entry.usage.cost.total });
 				sideCall(entry.id, ts, entry.kind, entry.provider, entry.model, entry.usage);
 				cost += entry.usage.cost.total;
-			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
-				// Model work a tool did itself, such as web_search's own request.
-				sideCall(entry.id, ts, `tool: ${entry.message.toolName}`, "", "", entry.message.usage as Usage);
-				cost += entry.message.usage.cost.total;
+			} else if (entry.type === "message" && entry.message.role === "toolResult") {
+				const result = entry.message;
+				if (result.usage) {
+					// Model work a tool did itself, such as web_search's own request.
+					sideCall(entry.id, ts, `tool: ${result.toolName}`, "", "", result.usage as Usage);
+					cost += result.usage.cost.total;
+				}
+				const work = reportedWork(result.nestedCalls?.calls, result.details, header.cwd);
+				reported.set(result.toolCallId, work);
+				const call = toolCalls.get(result.toolCallId);
+				if (call) {
+					const merged = mergeEffects({ files: call.files, writes: [], mutates: call.mutates }, work.effect);
+					call.files = merged.files;
+					call.mutates = merged.mutates;
+					for (const file of work.effect.files) insertFile.run(sessionId, result.toolCallId, call.ts, file, work.effect.writes.includes(file) ? 1 : 0);
+				}
 			} else if (entry.type === "message" && entry.message.role === "user") {
 				if (userMessages === 0) promptDigest = delegatedTaskDigest(messageText(entry.message.content));
 				userMessages += 1;
@@ -300,10 +347,13 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 			const life = lifetime.get(result.toolCallId);
 			const call = toolCalls.get(result.toolCallId);
 			const resultTs = time(entry);
+			const work = reported.get(result.toolCallId);
 			const used = referenced(resultTs, call?.files ?? []);
 			insertTool.run(sessionId, result.toolCallId, resultTs, result.toolName, call?.summary ?? "",
 				result.isError ? 1 : 0, result.durationMs ?? null, life?.tokens ?? 0,
-				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, used === undefined ? null : used ? 1 : 0, call?.mutates ? 1 : 0);
+				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, used === undefined ? null : used ? 1 : 0, call?.mutates ? 1 : 0,
+				work?.ok === undefined ? null : work.ok ? 1 : 0);
+			if (work?.childSession) insertDelegation.run(sessionId, result.toolCallId, call?.ts ?? resultTs, "tool", work.childSession, null, result.toolName);
 			const started = call && !result.isError ? delegation(call.name, call.args, messageText(result.content)) : undefined;
 			if (started) {
 				insertDelegation.run(sessionId, result.toolCallId, call!.ts, started.kind, started.threadId ?? null,
@@ -326,7 +376,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		db.prepare(
 			`INSERT INTO sessions (id, file, cwd, parent_session, name, prompt_digest, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(sessionId, path, header.cwd, header.parentSession ?? null, name ?? null, promptDigest ?? null, time(header), last ? time(last) : time(header),
+		).run(sessionId, path, header.cwd, parentSessionId(header.parentSession) ?? null, name ?? null, promptDigest ?? null, time(header), last ? time(last) : time(header),
 			requests, cost, aborted, errors, compactions, userMessages);
 		db.prepare("INSERT OR REPLACE INTO files (path, session_id, size, mtime_ms) VALUES (?, ?, ?, ?)").run(path, sessionId, size, mtimeMs);
 	});

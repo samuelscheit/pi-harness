@@ -10,6 +10,12 @@
 // one experiment, the interaction (BB − BA) − (AB − AA) for two, that is how much the second
 // experiment's effect changes with the first one's arm. Its uncertainty is a 95% bootstrap
 // interval, resampling sessions within each cell.
+//
+// A session's cost includes the child sessions its tools ran (fix_loop, see delegations kind
+// 'tool'), so an arm that moves work into cheaper children is not counted as saving all of it.
+// Experiments that switch tools (frontmatter `tools`) add each tool's usage: the share of sessions
+// and of turns calling it, for tools that report a goal the share of calls reaching it, and for
+// tools that change files the share of calls after which the agent read a changed file again.
 
 import { type Arm, ARMS } from "../../lib/experiments.ts";
 import type { Scope } from "./scope.ts";
@@ -26,8 +32,11 @@ export interface ArmSession {
 	batchedTurns: number;
 	/** Runs the user started: user messages other than steers. */
 	packages: number;
+	/** Cost and cache-read cost, the child sessions its tools ran included. */
 	cost: number;
 	readCost: number;
+	/** The part of cost that child sessions paid. */
+	childCost: number;
 	toolResults: number;
 	toolErrors: number;
 	/** Calls that changed files (see tool_results.mutates), and those made with the edit/write tools. */
@@ -36,7 +45,24 @@ export interface ArmSession {
 	/** Edit tool calls, and the distinct files they wrote. */
 	editCalls: number;
 	editedFiles: number;
+	/** Usage of the tools the comparison follows, by tool (absent: never called). */
+	tools: Record<string, ToolUse>;
 }
+
+export interface ToolUse {
+	calls: number;
+	/** Turns that called the tool. */
+	turns: number;
+	/** Calls that reported whether they reached their goal, and those that did. */
+	judged: number;
+	ok: number;
+	/** Calls that changed files, and those after which the agent read one of these files again. */
+	changing: number;
+	reread: number;
+}
+
+const NO_USE: ToolUse = { calls: 0, turns: 0, judged: 0, ok: 0, changing: 0, reread: 0 };
+const use = (s: ArmSession, tool: string) => s.tools[tool] ?? NO_USE;
 
 interface MetricDef {
 	key: string;
@@ -48,7 +74,7 @@ interface MetricDef {
 
 const perSession = () => 1;
 
-/** The metrics of a comparison. */
+/** The metrics of every comparison. */
 export const EXPERIMENT_METRICS: readonly MetricDef[] = [
 	{ key: "toolCallsPerTurn", label: "tool calls per turn", unit: "count", numerator: (s) => s.toolCalls, denominator: (s) => s.turns },
 	{ key: "batchedTurns", label: "turns with 2+ tool calls", unit: "share", numerator: (s) => s.batchedTurns, denominator: (s) => s.turns },
@@ -61,6 +87,15 @@ export const EXPERIMENT_METRICS: readonly MetricDef[] = [
 	{ key: "costPerTurn", label: "cost per turn", unit: "usd", numerator: (s) => s.cost, denominator: (s) => s.turns },
 	{ key: "readCostPerTurn", label: "cache-read cost per turn", unit: "usd", numerator: (s) => s.readCost, denominator: (s) => s.turns },
 	{ key: "toolErrorRate", label: "tool error rate", unit: "share", numerator: (s) => s.toolErrors, denominator: (s) => s.toolResults },
+	{ key: "childCostPerSession", label: "child-session cost per session", unit: "usd", numerator: (s) => s.childCost, denominator: perSession },
+];
+
+/** The usage metrics of a tool an experiment switches. */
+export const toolMetrics = (tool: string): MetricDef[] => [
+	{ key: `${tool}:sessions`, label: `sessions calling ${tool}`, unit: "share", numerator: (s) => (use(s, tool).calls > 0 ? 1 : 0), denominator: perSession },
+	{ key: `${tool}:turns`, label: `turns calling ${tool}`, unit: "share", numerator: (s) => use(s, tool).turns, denominator: (s) => s.turns },
+	{ key: `${tool}:ok`, label: `${tool} calls reaching their goal`, unit: "share", numerator: (s) => use(s, tool).ok, denominator: (s) => use(s, tool).judged },
+	{ key: `${tool}:reread`, label: `${tool} calls whose changed files were read again`, unit: "share", numerator: (s) => use(s, tool).reread, denominator: (s) => use(s, tool).changing },
 ];
 
 export interface CellMetric {
@@ -124,13 +159,37 @@ function armsTable(experiments: string[]): { sql: string; params: Record<string,
 	};
 }
 
-/** Every session in all of `experiments` with turns in scope, with its numbers while in all of them. */
-export function armSessions(scope: Scope, experiments: string[]): ArmSession[] {
+/** Every session in all of `experiments` with turns in scope, with its numbers while in all of them and the usage of `tools`. */
+export function armSessions(scope: Scope, experiments: string[], tools: readonly string[] = []): ArmSession[] {
 	// Rows of table `alias` (timestamp `ts`) inside the session's time in the experiments and the window.
 	const during = (alias: string) =>
 		`${alias}.session_id = a.session_id AND ${alias}.ts >= a.assigned_at AND (a.ended_at IS NULL OR ${alias}.ts < a.ended_at) AND ${scope.window(`${alias}.ts`)}`;
 	const model = scope.filters.model === undefined ? "" : "AND r.model = $model";
 	const arms = armsTable(experiments);
+	// Child sessions a tool call in the window ran.
+	const children = (column: string) =>
+		`(SELECT COALESCE(SUM(c.${column}), 0) FROM delegations d JOIN sessions c ON c.id = d.thread_id WHERE d.kind = 'tool' AND ${during("d")})`;
+	const usage = new Map<string, Record<string, ToolUse>>();
+	if (tools.length) {
+		const names = Object.fromEntries(tools.map((tool, i) => [`$tool${i}`, tool]));
+		const rows = scope.all(
+			`SELECT t.session_id, t.tool, COUNT(*) calls,
+				COUNT(DISTINCT (SELECT MAX(r.ts) FROM requests r WHERE r.session_id = t.session_id AND r.kind = 'turn' AND r.ts <= t.ts)) turns,
+				COUNT(t.ok) judged, COALESCE(SUM(t.ok), 0) ok,
+				COALESCE(SUM(EXISTS (SELECT 1 FROM tool_files f WHERE f.session_id = t.session_id AND f.call_id = t.call_id AND f.write = 1)), 0) changing,
+				COALESCE(SUM(EXISTS (SELECT 1 FROM tool_files f JOIN tool_files g ON g.session_id = f.session_id AND g.file = f.file AND g.write = 0 AND g.ts > t.ts
+					WHERE f.session_id = t.session_id AND f.call_id = t.call_id AND f.write = 1)), 0) reread
+			FROM ${arms.sql} a JOIN tool_results t ON ${during("t")}
+			WHERE t.tool IN (${Object.keys(names).join(", ")})
+			GROUP BY t.session_id, t.tool`,
+			{ ...arms.params, ...names },
+		);
+		for (const r of rows) {
+			const session = usage.get(String(r.session_id)) ?? {};
+			session[String(r.tool)] = { calls: Number(r.calls), turns: Number(r.turns), judged: Number(r.judged), ok: Number(r.ok), changing: Number(r.changing), reread: Number(r.reread) };
+			usage.set(String(r.session_id), session);
+		}
+	}
 	return scope
 		.all(
 			`SELECT a.session_id, s.cwd, a.cell, a.forced,
@@ -139,6 +198,8 @@ export function armSessions(scope: Scope, experiments: string[]): ArmSession[] {
 				(SELECT COUNT(*) FROM requests r WHERE ${during("r")} AND r.kind = 'turn' AND r.tool_calls >= 2 ${model}) batched,
 				(SELECT COALESCE(SUM(r.cost), 0) FROM requests r WHERE ${during("r")} ${model}) cost,
 				(SELECT COALESCE(SUM(r.cost_read), 0) FROM requests r WHERE ${during("r")} ${model}) read_cost,
+				${children("cost")} child_cost,
+				(SELECT COALESCE(SUM(cr.cost_read), 0) FROM delegations d JOIN requests cr ON cr.session_id = d.thread_id WHERE d.kind = 'tool' AND ${during("d")}) child_read_cost,
 				(SELECT COUNT(*) FROM user_messages u WHERE ${during("u")} AND u.kind != 'steer') packages,
 				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")}) results,
 				(SELECT COALESCE(SUM(t.is_error), 0) FROM tool_results t WHERE ${during("t")}) errors,
@@ -161,14 +222,16 @@ export function armSessions(scope: Scope, experiments: string[]): ArmSession[] {
 			toolCalls: Number(r.tool_calls),
 			batchedTurns: Number(r.batched),
 			packages: Number(r.packages),
-			cost: Number(r.cost),
-			readCost: Number(r.read_cost),
+			cost: Number(r.cost) + Number(r.child_cost),
+			readCost: Number(r.read_cost) + Number(r.child_read_cost),
+			childCost: Number(r.child_cost),
 			toolResults: Number(r.results),
 			toolErrors: Number(r.errors),
 			mutatingCalls: Number(r.mutating),
 			toolMutatingCalls: Number(r.tool_mutating),
 			editCalls: Number(r.edits),
 			editedFiles: Number(r.edited_files),
+			tools: usage.get(String(r.session_id)) ?? {},
 		}))
 		.filter((s) => s.turns > 0);
 }
@@ -224,8 +287,11 @@ export function bootstrapContrast(groups: { pairs: Pairs; weight: number }[], re
 	return [at(0.025), at(0.975)];
 }
 
-/** Compare the cells of one or more experiments from their sessions (see the module comment for what counts). */
-export function compareCells(experiments: string[], sessions: ArmSession[]): ExperimentComparison {
+/**
+ * Compare the cells of one or more experiments from their sessions (see the module comment for
+ * what counts), with the usage metrics of `tools`; a metric undefined in every cell is left out.
+ */
+export function compareCells(experiments: string[], sessions: ArmSession[], tools: readonly string[] = []): ExperimentComparison {
 	const cells = cellsOf(experiments.length);
 	const random = sessions.filter((s) => !s.forced);
 	const cellsIn = new Map<string, Set<string>>();
@@ -243,23 +309,28 @@ export function compareCells(experiments: string[], sessions: ArmSession[]): Exp
 		forced: sessions.length - random.length,
 		unmatched: random.length - compared.length,
 		projects,
-		metrics: EXPERIMENT_METRICS.map((m) => {
+		metrics: [...EXPERIMENT_METRICS, ...tools.flatMap(toolMetrics)].flatMap((m) => {
 			const values = perCell((list) => ratio(sum(list, m.numerator), sum(list, m.denominator)));
+			if (!EXPERIMENT_METRICS.includes(m) && cells.every((cell) => values[cell] === null)) return [];
 			const effect = cells.some((cell) => values[cell] === null) ? null : cells.reduce((total, cell) => total + contrastWeight(cell) * values[cell]!, 0);
 			const groups = cells.map((cell) => ({
 				pairs: byCell.get(cell)!.map((s): [number, number] => [m.numerator(s), m.denominator(s)]),
 				weight: contrastWeight(cell),
 			}));
-			return { key: m.key, label: m.label, unit: m.unit, values, effect, ci: bootstrapContrast(groups) };
+			return [{ key: m.key, label: m.label, unit: m.unit, values, effect, ci: bootstrapContrast(groups) }];
 		}),
 	};
 }
 
 /**
  * Comparisons of the given groups of experiments (each one experiment, or several whose arms
- * cross), or of every recorded experiment alone. Pi sessions only: only Pi assigns arms.
+ * cross), or of every recorded experiment alone, with the usage of the tools each experiment
+ * switches (`toolsOf`, from the experiment files). Pi sessions only: only Pi assigns arms.
  */
-export function experiments(input: Scope, groups?: string[][]): ExperimentComparison[] {
+export function experiments(input: Scope, groups?: string[][], toolsOf: (experiment: string) => readonly string[] = () => []): ExperimentComparison[] {
 	const scope = input.with({ source: "pi" });
-	return (groups ?? experimentNames(scope).map((name) => [name])).map((group) => compareCells(group, armSessions(scope, group)));
+	return (groups ?? experimentNames(scope).map((name) => [name])).map((group) => {
+		const tools = [...new Set(group.flatMap(toolsOf))];
+		return compareCells(group, armSessions(scope, group, tools), tools);
+	});
 }
