@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -15,6 +15,8 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE files (path TEXT PRIMARY KEY, session_id TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms REAL NOT NULL);
 CREATE TABLE sessions (
 	id TEXT PRIMARY KEY, file TEXT NOT NULL, cwd TEXT NOT NULL, parent_session TEXT, name TEXT,
+	-- Digest of the delegated task when a parent's delegate_task started this session (see delegations).
+	prompt_digest TEXT,
 	started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL,
 	requests INTEGER NOT NULL, cost REAL NOT NULL, aborted INTEGER NOT NULL, errors INTEGER NOT NULL,
 	compactions INTEGER NOT NULL, user_messages INTEGER NOT NULL
@@ -28,6 +30,8 @@ CREATE TABLE requests (
 	input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL,
 	prompt_tokens INTEGER NOT NULL, cost REAL NOT NULL, message_count INTEGER NOT NULL,
 	trigger TEXT, trigger_tokens INTEGER NOT NULL, cache_event TEXT, cache_lost INTEGER NOT NULL, cache_waste REAL NOT NULL,
+	-- Dollars per token this request paid (turns only), and whether it wrote its cache for one hour.
+	input_rate REAL, read_rate REAL, write_rate REAL, long_retention INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (session_id, entry_id)
 );
 -- What each request's cost paid for, by content category and billing rate.
@@ -42,6 +46,20 @@ CREATE TABLE tool_results (
 	session_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL, tool TEXT NOT NULL, summary TEXT NOT NULL,
 	is_error INTEGER NOT NULL, duration_ms INTEGER, tokens REAL NOT NULL,
 	requests_in_context INTEGER NOT NULL, lifetime_cost REAL NOT NULL, version TEXT,
+	-- Whether a later call touched one of its files or the agent later named one (NULL: no files).
+	referenced_later INTEGER,
+	PRIMARY KEY (session_id, call_id)
+);
+-- The files and directories each tool call touched (see work.ts), for rediscovery and stale context.
+CREATE TABLE tool_files (
+	session_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL, file TEXT NOT NULL,
+	PRIMARY KEY (session_id, call_id, file)
+);
+-- Subagents a session started (delegate_task, linked to the child by sessions.prompt_digest) or
+-- messaged again (t3_thread_send, linked by thread_id).
+CREATE TABLE delegations (
+	session_id TEXT NOT NULL, call_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL,
+	thread_id TEXT, task_digest TEXT, title TEXT,
 	PRIMARY KEY (session_id, call_id)
 );
 -- User messages with where they fell in the run: raw signals for corrections and interruptions.
@@ -69,9 +87,11 @@ CREATE TABLE versions (id TEXT PRIMARY KEY, sections TEXT NOT NULL, tools TEXT N
 CREATE TABLE blobs (hash TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL);
 CREATE INDEX requests_version ON requests (version);
 CREATE INDEX tool_results_tool ON tool_results (tool);
+CREATE INDEX tool_files_file ON tool_files (file);
+CREATE INDEX sessions_prompt ON sessions (prompt_digest);
 `;
 
-const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "user_messages", "compactions", "idle_pauses"];
+const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "tool_files", "delegations", "user_messages", "compactions", "idle_pauses"];
 
 export function openStore(path: string): DatabaseSync {
 	mkdirSync(dirname(path), { recursive: true });
