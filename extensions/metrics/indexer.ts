@@ -33,7 +33,8 @@ interface TurnPoint {
 	ts: number;
 	promptTokens: number;
 	cacheRead: number;
-	writeCost: number;
+	/** What it paid for prompt it did not read from cache: cache writes and uncached input. */
+	uncachedCost: number;
 }
 
 export interface IdlePause {
@@ -44,7 +45,7 @@ export interface IdlePause {
 	warmCost: number;
 	outcome: "warm" | "compacted" | "cold" | "open";
 	promptTokens: number;
-	resumeWriteCost: number;
+	resumeCost: number;
 }
 
 /**
@@ -78,7 +79,7 @@ export function idlePauses(
 			warmCost: inside.reduce((sum, w) => sum + w.cost, 0),
 			outcome,
 			promptTokens: turn.promptTokens,
-			resumeWriteCost: next?.writeCost ?? 0,
+			resumeCost: next?.uncachedCost ?? 0,
 		});
 	});
 	return pauses;
@@ -165,10 +166,11 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 
 	const insertRequest = db.prepare(
 		`INSERT INTO requests (session_id, entry_id, ts, kind, provider, model, thinking, stop_reason, version, input, output,
-		cache_read, cache_write, prompt_tokens, cost, message_count, trigger, trigger_tokens, cache_event, cache_lost, cache_waste,
-		input_rate, read_rate, write_rate, long_retention)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		cache_read, cache_write, prompt_tokens, cost, cost_input, cost_output, cost_read, cost_write, message_count, trigger,
+		trigger_tokens, cache_event, cache_lost, cache_waste, input_rate, read_rate, write_rate, long_retention)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
+	const costSplit = (usage: Usage) => [usage.cost.total, usage.cost.input, usage.cost.output, usage.cost.cacheRead, usage.cost.cacheWrite];
 	const insertCost = db.prepare(
 		`INSERT INTO request_costs (session_id, entry_id, category, blocks, tokens, new_tokens, read_cost, write_cost, uncached_cost)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -188,13 +190,13 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		"INSERT INTO compactions (session_id, entry_id, ts, reason, tokens_before, cost) VALUES (?, ?, ?, ?, ?, ?)",
 	);
 	const insertPause = db.prepare(
-		`INSERT INTO idle_pauses (session_id, start_ts, end_ts, minutes, warms, warm_cost, outcome, prompt_tokens, resume_write_cost)
+		`INSERT INTO idle_pauses (session_id, start_ts, end_ts, minutes, warms, warm_cost, outcome, prompt_tokens, resume_cost)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const sessionId = header.id;
 	const sideCall = (entryId: string, ts: number, kind: string, provider: string, model: string, usage: Usage) =>
 		insertRequest.run(sessionId, entryId, ts, kind, provider, model, null, null, null, usage.input, usage.output, usage.cacheRead,
-			usage.cacheWrite, usage.input + usage.cacheRead + usage.cacheWrite, usage.cost.total, 0, null, 0, null, 0, 0, null, null, null, 0);
+			usage.cacheWrite, usage.input + usage.cacheRead + usage.cacheWrite, ...costSplit(usage), 0, null, 0, null, 0, 0, null, null, null, 0);
 
 	transaction(db, () => {
 		deleteSession(db, sessionId);
@@ -245,14 +247,17 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 				const prompt = parsePrompt(buildSessionContext(entries, entry.parentId, byId).messages);
 				const attribution = attribute(prompt, usage, previous?.rates);
 				const state = requestState(prompt, attribution, usage, ts, message.model, message.thinkingLevel);
-				const event = cacheEvent(previous, state, usage);
-				previous = state;
+				// A request that failed before the provider answered has no usage: it neither read nor
+				// wrote the cache, so it is no predecessor for rebuilds and no resume after a pause.
+				const answered = attribution.promptTokens > 0;
+				const event = answered ? cacheEvent(previous, state, usage) : undefined;
+				if (answered) previous = state;
 				const version = versionId(prompt.state);
 				insertVersion.run(version, JSON.stringify(prompt.state.sections), JSON.stringify(prompt.state.tools), ts);
 				for (const [hash, blob] of prompt.texts) insertBlob.run(hash, blob.kind, blob.name, blob.text);
 				insertRequest.run(sessionId, entry.id, ts, "turn", message.provider, message.model, message.thinkingLevel ?? null,
 					message.stopReason, version, usage.input, usage.output, usage.cacheRead, usage.cacheWrite, attribution.promptTokens,
-					usage.cost.total, prompt.messageCount, attribution.trigger ?? null, attribution.triggerTokens, event?.cause ?? null,
+					...costSplit(usage), prompt.messageCount, attribution.trigger ?? null, attribution.triggerTokens, event?.cause ?? null,
 					event?.lostTokens ?? 0, event?.waste ?? 0, attribution.rates.input, attribution.rates.read, attribution.rates.write,
 					(usage.cacheWrite1h ?? 0) > 0 ? 1 : 0);
 				for (const [category, c] of attribution.composition) {
@@ -279,12 +284,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 					for (const file of files) insertFile.run(sessionId, part.id, ts, file);
 					lifetime.set(part.id, { ...(lifetime.get(part.id) ?? { requests: 0, tokens: 0, cost: 0 }), version });
 				}
-				turns.push({
-					ts,
-					promptTokens: attribution.promptTokens,
-					cacheRead: usage.cacheRead,
-					writeCost: [...attribution.composition.values()].reduce((sum, c) => sum + c.write, 0),
-				});
+				if (answered) turns.push({ ts, promptTokens: attribution.promptTokens, cacheRead: usage.cacheRead, uncachedCost: usage.cost.cacheWrite + usage.cost.input });
 				requests += 1;
 				cost += usage.cost.total;
 				if (message.stopReason === "aborted") aborted += 1;
@@ -314,7 +314,7 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		turns.sort((a, b) => a.ts - b.ts);
 		for (const pause of idlePauses(turns, warms, coldCompactions, last ? time(last) : time(header))) {
 			insertPause.run(sessionId, pause.start, pause.end ?? null, pause.minutes, pause.warms, pause.warmCost, pause.outcome,
-				pause.promptTokens, pause.resumeWriteCost);
+				pause.promptTokens, pause.resumeCost);
 		}
 		db.prepare(
 			`INSERT INTO sessions (id, file, cwd, parent_session, name, prompt_digest, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages)

@@ -81,6 +81,9 @@ if (existsSync(T3_APP)) console.log(patchApp(T3_APP));
 npm(vendoredLens, "ci", "--ignore-scripts", "--no-audit", "--no-fund");
 npm(vendoredLens, "run", "build:dist");
 execFileSync("node", ["scripts/download-grammars.js", "--core", "--dest", "grammars"], { cwd: vendoredLens, stdio: "inherit" });
+// The usage dashboard (`/harness dashboard`, `npm run dashboard`): its own dependencies and build.
+npm(join(root, "dashboard"), "ci", "--no-audit", "--no-fund");
+npm(join(root, "dashboard"), "run", "build");
 const harnessModules = join(root, "node_modules");
 if (!existsSync(harnessModules)) symlinkSync("vendor/pi/node_modules", harnessModules);
 

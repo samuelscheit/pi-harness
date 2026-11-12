@@ -23,10 +23,20 @@ describe("prices", () => {
 	test("one-hour cache writes cost twice the input price, five-minute ones the write price", () => {
 		const prices = modelPrices("claude-opus-5-5")!;
 		assert.ok(prices.input > 0 && prices.write > prices.input);
-		const short = requestCost(usage(0, 1_000_000, 0), prices) - requestCost(usage(0, 0), prices);
-		const long = requestCost(usage(0, 1_000_000, 1_000_000), prices) - requestCost(usage(0, 0), prices);
+		const short = requestCost(usage(0, 1_000_000, 0), prices).total - requestCost(usage(0, 0), prices).total;
+		const long = requestCost(usage(0, 1_000_000, 1_000_000), prices).total - requestCost(usage(0, 0), prices).total;
 		assert.ok(Math.abs(short - 1_000_000 * prices.write) < 1e-9);
 		assert.ok(Math.abs(long - 2_000_000 * prices.input) < 1e-9);
+	});
+
+	test("splits the cost by billing rate, summing to the total", () => {
+		const prices = modelPrices("claude-opus-5-5")!;
+		const split = requestCost({ input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 30, cache_creation_input_tokens: 40, cache_creation: { ephemeral_1h_input_tokens: 15 } }, prices);
+		assert.ok(Math.abs(split.input - 10 * prices.input) < 1e-12);
+		assert.ok(Math.abs(split.output - 20 * prices.output) < 1e-12);
+		assert.ok(Math.abs(split.read - 30 * prices.read) < 1e-12);
+		assert.ok(Math.abs(split.write - (25 * prices.write + 15 * prices.input * 2)) < 1e-12);
+		assert.ok(Math.abs(split.total - (split.input + split.output + split.read + split.write)) < 1e-12);
 	});
 });
 
