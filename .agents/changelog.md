@@ -47,3 +47,13 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Judged by:** turns and cost per package, edit calls per edited file; guardrail: edit error rate (`oldText` not found), tool error rate. Note: in law-formalization Pi agents edit almost only through `bash` (python heredocs, `cat >`, `sed -i`), which this rule does not reach.
 
 **Revert:** `/harness experiment single-edit stop`, or delete the file.
+
+## 2026-11-13 — experiment: edit-tool
+
+**Change:** new experiment `prompt/experiments/edit-tool.md` (arm B only): change files with `edit`/`write` instead of shell commands (heredocs, `cat >`, `sed -i`, inline scripts); the shell only for bulk mechanical replacements, generated output, moves and deletes.
+
+**Evidence:** Pi sessions so far route almost every file change through `bash`: law-formalization 15 of 216 mutating calls through `edit`/`write` (7%), other projects 101 of 557 (18%). rot-main-7 changed files with 34 Python heredocs, 27× `cat >`, 6× `sed -i` and no `edit` call. pi-lens checks files after `edit`/`write` and sees shell writes only for files it already tracks, so its diagnostics never reached those agents; `single-edit` cannot act either.
+
+**Judged by:** share of mutating calls through `edit`/`write` (from 7–18%); then first check run after edits failing (law-formalization Claude Code baseline 34%), cost of repair chains, turns and cost per package; guardrails: edit error rate, tool error rate. Interacts with `single-edit` (independent arms; the 2×2 cells can be compared).
+
+**Revert:** `/harness experiment edit-tool stop`, or delete the file.
