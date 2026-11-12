@@ -17,7 +17,7 @@ A Pi-based coding harness that runs inside t3 and improves itself over time:
 |---|---|
 | Base | Pi (Earendil), not oh-my-pi. oh-pi was deleted; the user doesn't use it. |
 | Models | Through the user's gateway (`ANTHROPIC_BASE_URL`, the same one Claude Code uses). Default `claude-opus-5-5`. The improvement loop may change models later. |
-| System prompt | Codex CLI's prompt, because the user prefers it (not as a workaround of any kind). |
+| System prompt | A minimal hand-written base (`prompt/base.md`), built up from the ground when a clarification proves necessary. Started from Codex CLI's prompt, then cut down. |
 | Not needed | Agent/subagent, plan mode, task list: t3 provides delegation. Background monitoring: t3. |
 | Needed | `ask_user` (Pi UI requests appear as t3 dialogs), LSP via a per-project setup scaffold, web search and fetch passed through by the gateway (no gateway endpoints), adapting t3's MCP tools (hide, re-describe, wrap), mid-session tool and prompt changes. |
 | Self-improvement | No `improve_harness` tool. Instead: a cheap `note_improvement` capture, recurring **dreaming** as a **t3 scheduled task** (visible in t3), and on-demand improvement through t3's `delegate_task` subagent, plus `/improve`. Keep it harness-neutral where possible (AGENTS.md, `.agents/skills`, `.agents/improvements.md`, `.agents/changelog.md`), e.g. for project task-management conventions. |
@@ -35,10 +35,7 @@ A Pi-based coding harness that runs inside t3 and improves itself over time:
 ### This repo (`~/Developer/Developer/ai/pi-harness`)
 
 - `vendor/pi`: Pi as a squashed git subtree of github.com/earendil-works/pi (9b88b94, after v1.5.2). Update with `git subtree pull --prefix vendor/pi https://github.com/earendil-works/pi.git main --squash`, then re-run the installer. The harness's `node_modules` is a symlink to `vendor/pi/node_modules` (npm can't install the vendored package's dependencies past the user's `before` cutoff).
-- `scripts/import-codex-prompt.mjs` imports `model_messages.instructions_template` for `gpt-6.1-sol` from `~/Developer/Developer/test/harness/codex` (`codex-rs/models-manager/models.json` at `origin/HEAD`) into `prompt/base.md`.
-  - It applies a fixed list of adaptations (identity, `ask_user`, `bash`/`command`, no orchestrator skills, no Apps/Plugins sections).
-  - It fails if a rule no longer matches or a Codex term is left over.
-  - `prompt/SOURCE.json` records the upstream commit; `NOTICE` holds the Apache-2.0 attribution.
+- `prompt/base.md`: the harness's own minimal base prompt (autonomy, `ask_user`, updates during a turn, final answer and file links, skills). It replaced the imported Codex CLI prompt; grow it from evidence when a gap shows up.
 - `prompt/AGENTS.md`: the user's global working rules (moved from `~/.claude/CLAUDE.md`).
 - `extensions/prompt/index.ts` sets `systemPromptOptions.customPrompt` from `prompt/base.md` and puts `prompt/AGENTS.md` first in `contextFiles`, on every run. Pi still appends the `project_context`, `skills` and `cwd` sections, and sends changed sections mid-session as appended updates.
 - `extensions/metrics`: metrics derived from Pi's session files.

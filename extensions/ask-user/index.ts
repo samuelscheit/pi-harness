@@ -1,6 +1,6 @@
 // ask_user: Codex's asynchronous user-input tool (request_user_input_async), on Pi's dialogs.
 //
-// The base prompt (prompt/base.md, from Codex) tells the model how to use it: ask early, keep
+// The base prompt (prompt/base.md) tells the model how to use it: ask early, keep
 // working on what does not depend on the answer, wait for required answers. So the tool keeps
 // Codex's contract: it shows the questions and returns `{"accepted":true}` at once; the answers
 // arrive later as a message that steers the running turn or starts a new one.
