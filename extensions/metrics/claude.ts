@@ -18,7 +18,7 @@ import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/pro
 import type { IndexResult } from "./indexer.ts";
 import { idlePauses } from "./indexer.ts";
 import { deleteSession, transaction } from "./store.ts";
-import { delegatedTaskDigest, delegation, referenceIndex, taskDigest, toolFiles } from "./work.ts";
+import { delegatedTaskDigest, delegation, type Effect, referenceIndex, taskDigest, toolEffect } from "./work.ts";
 
 type Entry = Record<string, any>;
 
@@ -156,7 +156,7 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 		deleteSession(db, id);
 		// Requests: assistant entries grouped by message id; the last entry carries the final usage.
 		const requests = new Map<string, { ts: number; entry: Entry }>();
-		const calls = new Map<string, { name: string; input: unknown; ts: number; files: string[] }>();
+		const calls = new Map<string, { name: string; input: unknown; ts: number } & Effect>();
 		const texts: { ts: number; text: string }[] = [];
 		const cwd = (entries.find((e) => typeof e.cwd === "string")?.cwd as string | undefined) ?? "";
 		for (const e of timed) {
@@ -170,7 +170,7 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 				else if (part.type === "thinking") written.push(part.thinking ?? "");
 				else if (part.type === "tool_use") {
 					written.push(JSON.stringify(part.input ?? {}));
-					calls.set(part.id, { name: part.name, input: part.input, ts: ts(e), files: toolFiles(part.name, part.input, cwd) });
+					calls.set(part.id, { name: part.name, input: part.input, ts: ts(e), ...toolEffect(part.name, part.input, cwd) });
 				}
 			}
 			texts.push({ ts: ts(e), text: written.join("\n") });
@@ -211,10 +211,10 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 
 		const referenced = referenceIndex([...calls.values()], texts);
 		const insertTool = db.prepare(
-			`INSERT OR IGNORE INTO tool_results (session_id, call_id, ts, tool, summary, is_error, duration_ms, tokens, requests_in_context, lifetime_cost, version, referenced_later)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+			`INSERT OR IGNORE INTO tool_results (session_id, call_id, ts, tool, summary, is_error, duration_ms, tokens, requests_in_context, lifetime_cost, version, referenced_later, mutates)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
 		);
-		const insertFile = db.prepare("INSERT OR IGNORE INTO tool_files (session_id, call_id, ts, file) VALUES (?, ?, ?, ?)");
+		const insertFile = db.prepare("INSERT OR IGNORE INTO tool_files (session_id, call_id, ts, file, write) VALUES (?, ?, ?, ?, ?)");
 		const insertDelegation = db.prepare(
 			"INSERT OR IGNORE INTO delegations (session_id, call_id, ts, kind, thread_id, task_digest, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		);
@@ -248,8 +248,8 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 				const used = referenced(resultTs, call?.files ?? []);
 				insertTool.run(id, result.tool_use_id, resultTs, call?.name ?? "unknown", JSON.stringify(call?.input ?? "").slice(0, 200),
 					result.is_error ? 1 : 0, null, tokens, carriedBy.length, carriedBy.reduce((sum, t) => sum + tokens * t.readRate, 0),
-					used === undefined ? null : used ? 1 : 0);
-				for (const file of call?.files ?? []) insertFile.run(id, result.tool_use_id, call!.ts, file);
+					used === undefined ? null : used ? 1 : 0, call?.mutates ? 1 : 0);
+				for (const file of call?.files ?? []) insertFile.run(id, result.tool_use_id, call!.ts, file, call!.writes.includes(file) ? 1 : 0);
 				if (!call) continue;
 				const toolResult: Entry = e.toolUseResult && typeof e.toolUseResult === "object" ? e.toolUseResult : {};
 				const input = (call.input ?? {}) as Entry;

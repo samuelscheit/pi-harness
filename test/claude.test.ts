@@ -90,6 +90,24 @@ describe("indexTranscript", () => {
 		assert.deepEqual({ ...row }, { tokens: 1000, requests_in_context: 2, referenced_later: 1 });
 	});
 
+	test("a shell edit marks its call as mutating and its file as written; a search does neither", () => {
+		const db = openStore(":memory:") as DatabaseSync;
+		const transcript = [
+			user(0, "fix it"),
+			assistant(1, "e1", [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "cd /repo && sed -i '' 's/a/b/' src/plan.ts" } }]),
+			user(2, [{ type: "tool_result", tool_use_id: "b1", content: "" }]),
+			assistant(3, "e2", [{ type: "tool_use", id: "b2", name: "Bash", input: { command: "rg -n plan /repo/src" } }]),
+			user(4, [{ type: "tool_result", tool_use_id: "b2", content: "src/plan.ts:1" }]),
+			assistant(5, "e3", [{ type: "tool_use", id: "b3", name: "Bash", input: { command: "git stash" } }]),
+			user(6, [{ type: "tool_result", tool_use_id: "b3", content: "" }]),
+		].join("\n");
+		indexTranscript(db, "/p/proj/s2.jsonl", transcript, 1, 1);
+		const calls = db.prepare("SELECT call_id, mutates FROM tool_results ORDER BY ts").all().map((r) => ({ ...r }));
+		assert.deepEqual(calls, [{ call_id: "b1", mutates: 1 }, { call_id: "b2", mutates: 0 }, { call_id: "b3", mutates: 1 }]);
+		const files = db.prepare("SELECT call_id, file, write FROM tool_files ORDER BY call_id, file").all().map((r) => ({ ...r }));
+		assert.deepEqual(files, [{ call_id: "b1", file: "/repo/src/plan.ts", write: 1 }, { call_id: "b2", file: "/repo/src", write: 0 }]);
+	});
+
 	test("an Agent call links to its subagent, a SendMessage by name is a resume of it", () => {
 		const db = indexed();
 		const rows = db.prepare("SELECT kind, thread_id, task_digest, title FROM delegations ORDER BY ts").all().map((r) => ({ ...r }));

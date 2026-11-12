@@ -136,10 +136,10 @@ export function seed(db: DatabaseSync) {
 	request(db, { session: "A", entry: "cmp", kind: "compaction", model: "", at: at(5), split: { read: 0, write: 0, uncached: 0.03, output: 0.01 } });
 	insert(db, "compactions", { session_id: "A", entry_id: "cmp", ts: at(5), reason: "threshold", tokens_before: 250_000, cost: 0.04 });
 	insert(db, "idle_pauses", { session_id: "A", start_ts: at(3), end_ts: at(20), minutes: 17, warms: 1, warm_cost: 0.02, outcome: "cold", prompt_tokens: 250_000, resume_cost: 0.2 });
-	insert(db, "tool_results", { session_id: "A", call_id: "c1", ts: at(0.5), tool: "bash", summary: "cat a.ts", is_error: 0, duration_ms: 100, tokens: 5000, requests_in_context: 3, lifetime_cost: 0.3, version: "v1", referenced_later: 0 });
-	insert(db, "tool_results", { session_id: "A", call_id: "c2", ts: at(2.5), tool: "read", summary: "b.ts", is_error: 1, duration_ms: 3, tokens: 100, requests_in_context: 1, lifetime_cost: 0.01, version: "v2", referenced_later: 1 });
-	insert(db, "tool_files", { session_id: "A", call_id: "c1", ts: at(0.5), file: "/p1/a.ts" });
-	insert(db, "tool_files", { session_id: "A", call_id: "c2", ts: at(2.5), file: "/p1/b.ts" });
+	insert(db, "tool_results", { session_id: "A", call_id: "c1", ts: at(0.5), tool: "bash", summary: "cat a.ts", is_error: 0, duration_ms: 100, tokens: 5000, requests_in_context: 3, lifetime_cost: 0.3, version: "v1", referenced_later: 0, mutates: 0 });
+	insert(db, "tool_results", { session_id: "A", call_id: "c2", ts: at(2.5), tool: "read", summary: "b.ts", is_error: 1, duration_ms: 3, tokens: 100, requests_in_context: 1, lifetime_cost: 0.01, version: "v2", referenced_later: 1, mutates: 0 });
+	insert(db, "tool_files", { session_id: "A", call_id: "c1", ts: at(0.5), file: "/p1/a.ts", write: 0 });
+	insert(db, "tool_files", { session_id: "A", call_id: "c2", ts: at(2.5), file: "/p1/b.ts", write: 0 });
 	insert(db, "user_messages", { session_id: "A", entry_id: "u1", ts: at(-0.05), kind: "first", text: "Do the parent work" });
 	insert(db, "user_messages", { session_id: "A", entry_id: "u2", ts: at(1.5), kind: "steer", text: "not that file" });
 	insert(db, "user_messages", { session_id: "A", entry_id: "u3", ts: at(2.5), kind: "after interrupt", text: "stop" });
@@ -150,8 +150,8 @@ export function seed(db: DatabaseSync) {
 	request(db, { session: "C", entry: "c-1", at: at(2), model: "claude-sonnet", version: "v1", prompt: 20_000, cacheRead: 0 });
 	request(db, { session: "C", entry: "c-2", at: at(4), model: "claude-sonnet", version: "v1", prompt: 30_000 });
 	// C read a.ts, which its parent had read already: rediscovery.
-	insert(db, "tool_results", { session_id: "C", call_id: "cc1", ts: at(3), tool: "read", summary: "a.ts", is_error: 0, duration_ms: 5, tokens: 2000, requests_in_context: 1, lifetime_cost: 0.02, version: "v1", referenced_later: 1 });
-	insert(db, "tool_files", { session_id: "C", call_id: "cc1", ts: at(3), file: "/p1/a.ts" });
+	insert(db, "tool_results", { session_id: "C", call_id: "cc1", ts: at(3), tool: "read", summary: "a.ts", is_error: 0, duration_ms: 5, tokens: 2000, requests_in_context: 1, lifetime_cost: 0.02, version: "v1", referenced_later: 1, mutates: 0 });
+	insert(db, "tool_files", { session_id: "C", call_id: "cc1", ts: at(3), file: "/p1/a.ts", write: 0 });
 
 	session(db, { id: "D", cwd: "/p1", at: at(30.2), end: at(31), digest: "dig-second" });
 	request(db, { session: "D", entry: "d-1", at: at(30.5), model: "claude-sonnet", version: "v1", prompt: 20_000, cacheRead: 0 });

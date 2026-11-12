@@ -280,6 +280,25 @@ describe("indexer", () => {
 		return openStore(join(dir, "metrics.db"));
 	}
 
+	test("records which calls changed files and which files they wrote", () => {
+		const db = store();
+		writeSession("writes", "/work/project", [
+			message("a7", "info", assistant([{ type: "toolCall", id: "c3", name: "edit", arguments: { path: "src/a.ts", edits: [] } }], "toolUse", usage(1, 1080, 10, 5))),
+			message("t3", "a7", toolResult("c3", "edit", "ok")),
+			message("a8", "t3", assistant([{ type: "toolCall", id: "c4", name: "bash", arguments: { command: "cat > notes.md <<'EOF'\nhi\nEOF" } }], "toolUse", usage(1, 1090, 10, 5))),
+			message("t4", "a8", toolResult("c4", "bash", "")),
+		]);
+		indexSessions(db, join(dir, "sessions"));
+		const calls = db.prepare("SELECT call_id, mutates FROM tool_results ORDER BY call_id").all().map((r) => ({ ...r }));
+		assert.deepEqual(calls, [{ call_id: "c1", mutates: 0 }, { call_id: "c2", mutates: 0 }, { call_id: "c3", mutates: 1 }, { call_id: "c4", mutates: 1 }]);
+		const files = db.prepare("SELECT call_id, file, write FROM tool_files ORDER BY call_id").all().map((r) => ({ ...r }));
+		assert.deepEqual(files, [
+			{ call_id: "c2", file: "/work/project/a.ts", write: 0 },
+			{ call_id: "c3", file: "/work/project/src/a.ts", write: 1 },
+			{ call_id: "c4", file: "/work/project/notes.md", write: 1 },
+		]);
+	});
+
 	test("indexes requests, costs, tools, user messages and side calls of a session", () => {
 		const db = store();
 		writeSession("one");
