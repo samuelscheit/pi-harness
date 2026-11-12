@@ -1,7 +1,0 @@
-{
-	"upstream": "https://github.com/openai/codex",
-	"license": "Apache-2.0",
-	"commit": "c0cc9fc820f62e4dbdde68214dd6d792d6c8a7ee",
-	"model": "gpt-6.1-sol",
-	"file": "codex-rs/models-manager/models.json#model_messages.instructions_template"
-}

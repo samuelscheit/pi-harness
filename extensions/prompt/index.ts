@@ -1,6 +1,5 @@
-// Harness prompt: prompt/base.md as the base system prompt (imported from Codex CLI, see
-// prompt/SOURCE.json) and prompt/AGENTS.md, the user's global working rules, as the first
-// context file.
+// Harness prompt: prompt/base.md as the base system prompt and prompt/AGENTS.md, the user's
+// global working rules, as the first context file.
 //
 // The base replaces Pi's default preamble only; Pi still appends context files (AGENTS.md of the
 // project and its parents), the skills list and the working directory as their own sections.
