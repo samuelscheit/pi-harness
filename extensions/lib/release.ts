@@ -11,6 +11,9 @@
 //   failed/<commit>.txt  why a commit was not deployed, so it is tried once
 //   .lock/               held while deploying (several Pi processes watch the same repository); holds
 //                        the holder's pid, and the holder touches it every few seconds
+//   in-use/<pid>         the release a running Pi process loaded (extensions/release writes it on
+//                        every load): pruning never removes a release a live process holds, so a
+//                        process that has not reloaded (or cannot: an older Pi) keeps its files
 //
 // A release is deployed only if every extension entry point imports in a fresh Node process: a
 // commit with a broken import or a syntax error stays undeployed and the previous release keeps
@@ -35,6 +38,26 @@ export const harnessDir = (agentDir: string) => join(agentDir, "harness");
 export const currentLink = (agentDir: string) => join(harnessDir(agentDir), "current");
 const releasesDir = (agentDir: string) => join(harnessDir(agentDir), "releases");
 const failedFile = (agentDir: string, commit: string) => join(harnessDir(agentDir), "failed", `${commit}.txt`);
+const inUseDir = (agentDir: string) => join(harnessDir(agentDir), "in-use");
+
+/** Record that process `pid` runs release `commit`, so pruning keeps that release while the process lives. */
+export function holdRelease(agentDir: string, commit: string, pid = process.pid): void {
+	mkdirSync(inUseDir(agentDir), { recursive: true });
+	writeFileSync(join(inUseDir(agentDir), String(pid)), commit);
+}
+
+/** The releases live processes hold; the holds of processes that exited are removed. */
+export function heldReleases(agentDir: string): Set<string> {
+	const held = new Set<string>();
+	if (!existsSync(inUseDir(agentDir))) return held;
+	for (const name of readdirSync(inUseDir(agentDir))) {
+		const pid = Number(name);
+		const file = join(inUseDir(agentDir), name);
+		if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) held.add(readFileSync(file, "utf8").trim());
+		else rmSync(file, { force: true });
+	}
+	return held;
+}
 
 /** The deployed release, or undefined before the first deploy. */
 export function currentRelease(agentDir: string): (ReleaseMarker & { root: string }) | undefined {
@@ -87,11 +110,13 @@ export function switchTo(agentDir: string, commit: string): void {
 	renameSync(temporary, currentLink(agentDir));
 }
 
-/** Remove all but the current and the KEEP newest other releases. */
+/** Remove all but the current release, the KEEP newest others and those a live process holds. */
 function prune(agentDir: string): void {
+	const keep = heldReleases(agentDir);
 	const current = currentRelease(agentDir)?.commit;
+	if (current) keep.add(current);
 	const old = readdirSync(releasesDir(agentDir))
-		.filter((name) => !name.startsWith(".") && name !== current)
+		.filter((name) => !name.startsWith(".") && !keep.has(name))
 		.map((name) => ({ name, mtime: statSync(join(releasesDir(agentDir), name)).mtimeMs }))
 		.sort((a, b) => b.mtime - a.mtime)
 		.slice(KEEP);

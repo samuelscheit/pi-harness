@@ -7,7 +7,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { changedBetween, commitToSource, currentLink, currentRelease, type DeployResult, deploy, harnessDir, switchTo } from "../extensions/lib/release.ts";
+import { changedBetween, commitToSource, currentLink, currentRelease, type DeployResult, deploy, harnessDir, heldReleases, holdRelease, switchTo } from "../extensions/lib/release.ts";
 import { inSource, type ReleaseMarker } from "../extensions/lib/repository.ts";
 import release from "../extensions/release/index.ts";
 
@@ -193,6 +193,33 @@ describe("deploy", () => {
 		switchTo(agentDir, commits.at(-2)!);
 		assert.equal(currentRelease(agentDir)!.commit, commits.at(-2));
 	});
+
+	test("a release a live process holds is never pruned; holds of exited processes are dropped", async () => {
+		const validate = async () => {};
+		const first = (await deployMain(validate)).commit;
+		holdRelease(agentDir, first, process.ppid);
+		writeFileSync(join(source, "lib", "value.ts"), "export const value = 'second';\n");
+		const second = commit("second");
+		await deployMain(validate);
+		holdRelease(agentDir, second, deadPid());
+		for (let i = 0; i < 7; i++) {
+			writeFileSync(join(source, "lib", "value.ts"), `export const value = ${i};\n`);
+			commit(`c${i}`);
+			await deployMain(validate);
+		}
+		const kept = readdirSync(join(harnessDir(agentDir), "releases"));
+		assert.ok(kept.includes(first), "held by a live process: kept although older than the five newest");
+		assert.ok(!kept.includes(second), "its holder exited: pruned like any other");
+		assert.equal(kept.length, 7, "current, five newest, and the held one");
+		assert.deepEqual([...heldReleases(agentDir)], [first]);
+		assert.deepEqual(readdirSync(join(harnessDir(agentDir), "in-use")), [String(process.ppid)], "the dead holder's file is gone");
+		// The holder reloads into the current release: the old one becomes prunable.
+		holdRelease(agentDir, currentRelease(agentDir)!.commit, process.ppid);
+		writeFileSync(join(source, "lib", "value.ts"), "export const value = 'last';\n");
+		commit("last");
+		await deployMain(validate);
+		assert.ok(!readdirSync(join(harnessDir(agentDir), "releases")).includes(first));
+	});
 });
 
 describe("source writes", () => {
@@ -247,6 +274,7 @@ describe("release extension", () => {
 	test("a session deploys a new commit and requests a reload into it, idle or running; the dashboard follows", async () => {
 		const first = (await deployMain()).commit;
 		const session = load(first);
+		assert.equal(readFileSync(join(harnessDir(agentDir), "in-use", String(process.pid)), "utf8"), first, "loading holds the release");
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
 		const second = commit("second");
 		await session.start();
