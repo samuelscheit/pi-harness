@@ -138,6 +138,12 @@ export function openStore(path: string): DatabaseSync {
 	const current = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get()
 		? (db.prepare("SELECT value FROM meta WHERE key = 'schema'").get() as { value: string } | undefined)?.value
 		: undefined;
+	// Never downgrade: a Pi process still running older harness code would otherwise drop the index a
+	// newer one built, and both would rebuild it in turn. The older process has to reload instead.
+	if (current !== undefined && Number(current) > SCHEMA_VERSION) {
+		db.close();
+		throw new Error(`the metrics index ${path} has schema ${current}, newer than this harness code (${SCHEMA_VERSION}); run /reload to load the newer code`);
+	}
 	if (current !== String(SCHEMA_VERSION)) {
 		const claude = current !== undefined && heldClaude(db);
 		const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
