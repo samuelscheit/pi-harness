@@ -95,6 +95,7 @@ describe("asar rewrite", () => {
 
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
+	const ALL = ["cache-warming", "dialogs", "session-questions"];
 	// An unpatched bundle: every anchor once, except those an earlier patch produces.
 	const bundle = PATCHES.flatMap((patch, i) =>
 		patch.edits
@@ -106,8 +107,9 @@ describe("patchBundle", () => {
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
 		const { text, applied } = patchBundle(bundle);
-		assert.deepEqual(applied, ["cache-warming", "dialogs"]);
+		assert.deepEqual(applied, ALL);
 		for (const patch of PATCHES) assert.ok(text.includes(patch.marker), patch.name);
+		assert.ok(text.includes('providerTurnId: method === "confirm" ? providerTurnId : null'), "a question still belongs to its turn");
 		assert.ok(text.includes('if (event["type"] === "cache_warming")'));
 		assert.ok(text.includes('if (method === "dismiss")'));
 		assert.ok(!text.includes("cancelPendingPrompts(completedAt)"), "turn end still cancels dialogs");
@@ -119,7 +121,7 @@ describe("patchBundle", () => {
 		const once = patchBundle(bundle, [cacheWarming]);
 		assert.deepEqual(once.applied, ["cache-warming"]);
 		const { text, applied } = patchBundle(once.text);
-		assert.deepEqual(applied, ["dialogs"]);
+		assert.deepEqual(applied, ["dialogs", "session-questions"]);
 		assert.equal(text, patchBundle(bundle).text);
 	});
 
@@ -138,7 +140,7 @@ describe("patchBundle", () => {
 			.find((text) => text.includes('"PiAdapter.cancelPrompt"'));
 		assert.ok(bundle, "no Pi adapter in t3's archive");
 		const { text, applied } = patchBundle(bundle);
-		assert.deepEqual(applied, ["cache-warming", "dialogs"]);
+		assert.deepEqual(applied, ALL);
 		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
 		try {
 			writeFileSync(join(dir, "bundle.mjs"), text);

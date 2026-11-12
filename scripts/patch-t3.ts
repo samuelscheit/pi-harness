@@ -13,6 +13,12 @@
 //   reached the agent as dismissed. Dialogs now live until answered, until Pi reports closing one
 //   itself (`dismiss`, sent by vendor/pi), or until the process exits; an open dialog keeps the
 //   session loaded.
+// - session-questions (same branch, "fix(provider-pi): a Pi question belongs to the session, so a
+//   turn's end leaves it open"): the orchestrator also closes a turn's pending questions when the
+//   turn ends (ProviderEventIngestor.dismissNativeUserInputs, matched by the request's turn), so the
+//   card still vanished, silently: Pi never heard of it and kept the dialog open. A select, input or
+//   editor dialog's runtime request now carries no turn; its card keeps the turn for display.
+//   Approvals (confirm) stay the turn's: that sweep never closes them.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -70,6 +76,16 @@ export const PATCHES: Patch[] = [
 			[
 				"hasPendingBackgroundWork: sync(() => pendingWake !== null || cacheWarmingPending),",
 				"hasPendingBackgroundWork: sync(() => pendingWake !== null || cacheWarmingPending || pendingPrompts.size > 0),",
+			],
+		],
+	},
+	{
+		name: "session-questions",
+		marker: "questionOwnedBySession",
+		edits: [
+			[
+				'nodeId,\n\t\t\t\t\tproviderTurnId,\n\t\t\t\t\tnativeRequestRef: providerRef(nativeRequestId),\n\t\t\t\t\tkind: method === "confirm" ? "command" : "user_input",',
+				'nodeId,\n\t\t\t\t\tproviderTurnId: method === "confirm" ? providerTurnId : null /* questionOwnedBySession */,\n\t\t\t\t\tnativeRequestRef: providerRef(nativeRequestId),\n\t\t\t\t\tkind: method === "confirm" ? "command" : "user_input",',
 			],
 		],
 	},
