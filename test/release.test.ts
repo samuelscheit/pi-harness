@@ -233,7 +233,7 @@ describe("release extension", () => {
 			pollMs: 20,
 			release: marker(loaded),
 			deploy: options.deploy ?? (() => deployMain()),
-			restartDashboard: async (commit) => restarted.push(commit),
+			ensureDashboard: async () => restarted.push(currentRelease(agentDir)!.commit),
 		});
 		const start = async (reason = "startup") => {
 			await handlers.get("session_start")!({ reason }, ctx);

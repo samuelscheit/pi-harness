@@ -2,7 +2,7 @@
 //
 // Every Pi process that runs a release watches the release's source branch. A new commit is
 // deployed by whichever process sees it first (the others find it deployed), after its extensions
-// pass an import check; a running dashboard of an older release is restarted on the new one. Each
+// pass an import check; the dashboard is moved to the new release. Each
 // session then reloads into the deployed release with `pi.requestReload()`: at once when idle,
 // else at the next turn boundary of its run (the run continues on the new tools and prompt; a tool
 // call running then finishes on the old code), else when the run settles. Pi itself (vendor/pi)
@@ -12,7 +12,7 @@
 
 import { statSync } from "node:fs";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { restartOutdated } from "../../dashboard/server/launch.ts";
+import { ensureDashboard } from "../../dashboard/server/launch.ts";
 import { changedBetween, currentRelease, type DeployOptions, type DeployResult, deploy, refFiles, shortCommit } from "../lib/release.ts";
 import { RELEASE, type ReleaseMarker } from "../lib/repository.ts";
 
@@ -26,14 +26,15 @@ export interface ReleaseOptions {
 	pollMs?: number;
 	release?: ReleaseMarker;
 	deploy?: (options: DeployOptions) => Promise<DeployResult>;
-	restartDashboard?: (deployed: string) => Promise<unknown>;
+	/** Move the dashboard to the deployed release (ensureDashboard). */
+	ensureDashboard?: () => Promise<unknown>;
 }
 
 export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) {
 	const loaded = options.release ?? RELEASE;
 	if (!loaded) return;
 	const { agentDir = getAgentDir(), pollMs = POLL_MS, deploy: deployRelease = deploy } = options;
-	const restartDashboard = options.restartDashboard ?? ((deployed: string) => restartOutdated({ agentDir, deployed }));
+	const dashboard = options.ensureDashboard ?? (() => ensureDashboard({ agentDir }));
 	const previous = processState.__harnessRelease?.loaded;
 	const state = (processState.__harnessRelease ??= { started: loaded.commit, loaded: loaded.commit });
 	state.loaded = loaded.commit;
@@ -63,7 +64,8 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 					reported.add(result.commit);
 					ctx.ui.notify(`Harness commit ${shortCommit(result.commit)} was not deployed; this session keeps ${shortCommit(loaded.commit)}.\n${result.error}`, "warning");
 				}
-				if (result.status === "deployed") await restartDashboard(result.commit).catch(() => undefined);
+				// Failures are reported by the metrics extension's periodic check, which retries.
+				if (result.status === "deployed") await dashboard().catch(() => undefined);
 			}
 			if (outdated()) pi.requestReload();
 		} catch (error) {

@@ -1,11 +1,15 @@
-// Start the usage dashboard detached, so it outlives the Pi process that asked for it
-// (`/harness dashboard`, `npm run dashboard -- --detach`), building the frontend first when its
-// sources changed.
+// Keep the usage dashboard running: `ensureDashboard` starts it detached (it outlives the Pi
+// process that started it) when none answers, and replaces one that runs another release than the
+// deployed one. Every Pi process running the installed harness calls it periodically
+// (extensions/metrics) and right after deploying a release (extensions/release), so the dashboard
+// runs while Pi does, also after a crash, and follows each release. `/harness dashboard` and
+// `npm run dashboard -- --detach` call it too.
 //
 // The detached server logs to <agent dir>/dashboard.log. A running server is recognised by its
-// /api/status answer and reused. When the harness runs from releases (extensions/lib/release.ts),
-// the server starts from the deployed release, whatever release the caller runs, and
-// `restartOutdated` replaces a server that still runs an older one.
+// /api/status answer. When the harness runs from releases (extensions/lib/release.ts), the server
+// starts from the deployed release, whatever release the caller runs. Starting and replacing hold
+// a lock (several Pi processes check at once), and the new release's frontend is built before the
+// old server stops, so a replacement is down only while the new server starts.
 
 import { execFile, spawn } from "node:child_process";
 import { existsSync, openSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -13,7 +17,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { currentLink } from "../../extensions/lib/release.ts";
+import { acquireLock } from "../../extensions/lib/lock.ts";
+import { currentLink, currentRelease } from "../../extensions/lib/release.ts";
 import { RELEASE } from "../../extensions/lib/repository.ts";
 import { APP, DEFAULT_PORT, HOST, type IndexStatus } from "./server.ts";
 
@@ -71,12 +76,8 @@ export async function build(log: (line: string) => void = () => {}, root = dashb
 	await run(["run", "build"]);
 }
 
-/** Start the server detached unless one runs; resolves with its URL once it answers. */
-export async function launch({ port = DEFAULT_PORT, agentDir = getAgentDir() } = {}): Promise<{ url: string; started: boolean }> {
-	const url = `http://${HOST}:${port}`;
-	if (await running(port)) return { url, started: false };
-	const root = dashboardRoot(agentDir);
-	await build(undefined, root);
+/** Start the server from `root` detached; resolves once it answers. */
+async function start(root: string, port: number, agentDir: string): Promise<void> {
 	const log = openSync(join(agentDir, "dashboard.log"), "a");
 	const child = spawn(process.execPath, [join(root, "server", "main.ts"), "--port", String(port)], {
 		cwd: resolve(root, ".."),
@@ -87,29 +88,48 @@ export async function launch({ port = DEFAULT_PORT, agentDir = getAgentDir() } =
 	child.unref();
 	const deadline = Date.now() + START_TIMEOUT_MS;
 	while (Date.now() < deadline) {
-		if (await running(port)) return { url, started: true };
+		if (await running(port)) return;
 		if (child.exitCode !== null) break;
 		await new Promise((wait) => setTimeout(wait, 200));
 	}
 	throw new Error(`the dashboard did not start; see ${join(agentDir, "dashboard.log")}`);
 }
 
-/**
- * Replace a running dashboard that runs another release than the deployed one: stop it, then
- * start the deployed release's. Does nothing when none runs or it is current. Returns whether it
- * restarted one.
- */
-export async function restartOutdated({ port = DEFAULT_PORT, agentDir = getAgentDir(), deployed }: { port?: number; agentDir?: string; deployed: string }): Promise<boolean> {
-	const current = await status(port);
-	// A server from before status carried its pid cannot be replaced from here.
-	if (!current || current.release === deployed || typeof current.pid !== "number") return false;
+/** Stop the server answering on `port` (by the pid its status reports); resolves once it no longer answers. */
+async function stop(pid: number, port: number): Promise<void> {
 	try {
-		process.kill(current.pid, "SIGTERM");
+		process.kill(pid, "SIGTERM");
 	} catch {
 		// Gone already.
 	}
 	const deadline = Date.now() + START_TIMEOUT_MS;
 	while ((await running(port)) && Date.now() < deadline) await new Promise((wait) => setTimeout(wait, 200));
-	await launch({ port, agentDir });
-	return true;
+}
+
+/** running: it answers on the deployed release; started / replaced: it does now; busy: another process is starting it. */
+export type EnsureResult = { url: string; state: "running" | "started" | "replaced" | "busy" };
+
+/**
+ * Make the dashboard run on the deployed release (this checkout's outside releases): start it
+ * when none answers, replace one on another release. A server that does not report its pid (older
+ * than that field) is left running.
+ */
+export async function ensureDashboard({ port = DEFAULT_PORT, agentDir = getAgentDir() } = {}): Promise<EnsureResult> {
+	const url = `http://${HOST}:${port}`;
+	const wanted = RELEASE ? (currentRelease(agentDir)?.commit ?? null) : null;
+	const current = (now: IndexStatus | undefined) => now !== undefined && (now.release === wanted || typeof now.pid !== "number");
+	if (current(await status(port))) return { url, state: "running" };
+	const unlock = acquireLock(join(agentDir, "dashboard.lock"));
+	if (!unlock) return { url, state: "busy" };
+	try {
+		const found = await status(port);
+		if (current(found)) return { url, state: "running" };
+		const root = dashboardRoot(agentDir);
+		await build(undefined, root);
+		if (found) await stop(found.pid, port);
+		await start(root, port, agentDir);
+		return { url, state: found ? "replaced" : "started" };
+	} finally {
+		unlock();
+	}
 }
