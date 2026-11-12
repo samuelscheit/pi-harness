@@ -451,3 +451,13 @@ When a run is about to settle (`agent_before_settle`), the extension runs one `p
 **Judged by:** cache-loss events and their waste per day (`requests.cache_event`, `cache_waste`); `drop_block` counts once the metrics record them.
 
 **Revert:** revert the commit. pi-lens then starts each activation with an empty ledger again.
+
+## 2026-11-12 — release: a running process keeps its release
+
+**Change:** each Pi process records the release it loaded in `<agent dir>/harness/in-use/<pid>` (`holdRelease`, written by `extensions/release` on every load). Pruning keeps every release a live process holds, besides the current one and the five newest. Holds of exited processes are removed.
+
+**Evidence:** a session whose Pi predated `requestReload` could not reload. Ten commits later, pruning deleted its release directory, `prompt/base.md` was gone, the prompt extension's handler threw on every run, and the session silently ran on Pi's default prompt: no base prompt, no global rules, no prompt rules.
+
+**Judged by:** no running session loses its harness sections after a deploy.
+
+**Revert:** revert the commit.

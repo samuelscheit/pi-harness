@@ -13,7 +13,7 @@
 import { statSync } from "node:fs";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ensureDashboard } from "../../dashboard/server/launch.ts";
-import { changedBetween, currentRelease, type DeployOptions, type DeployResult, deploy, refFiles, shortCommit } from "../lib/release.ts";
+import { changedBetween, currentRelease, type DeployOptions, type DeployResult, deploy, holdRelease, refFiles, shortCommit } from "../lib/release.ts";
 import { RELEASE, type ReleaseMarker } from "../lib/repository.ts";
 
 const POLL_MS = 3000;
@@ -38,6 +38,8 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 	const previous = processState.__harnessRelease?.loaded;
 	const state = (processState.__harnessRelease ??= { started: loaded.commit, loaded: loaded.commit });
 	state.loaded = loaded.commit;
+	// This process now runs `loaded`: deploys elsewhere must not prune it until the process reloads or exits.
+	holdRelease(agentDir, loaded.commit);
 
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let busy = false;
