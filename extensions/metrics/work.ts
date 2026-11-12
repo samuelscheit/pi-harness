@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, resolve } from "node:path";
 
-const PATH_KEYS = ["path", "file_path", "filePath", "file", "directory", "cwd"];
+const PATH_KEYS = ["path", "file_path", "filePath", "notebook_path", "file", "directory", "cwd"];
 // A path-like token in a shell command: has a slash (`src/a`, `docs/`) or a file extension (`a.ts`).
 const COMMAND_PATH = /(?:^|[\s"'=(])((?:~|\.{1,2}|[\w@.-]+)?(?:\/[\w@.+-]+)+\/?|[\w@.+-]+\/|[\w@+-]+(?:\.[\w-]+)*\.[A-Za-z][\w]{0,5})(?=$|[\s"'),;:|&>])/g;
 
@@ -46,7 +46,7 @@ export function toolFiles(tool: string, args: unknown, cwd: string): string[] {
 		const value = record[key];
 		if (typeof value === "string" && value.trim()) files.add(expand(value.trim(), cwd));
 	}
-	if (tool === "bash" && typeof record.command === "string") {
+	if (tool.toLowerCase() === "bash" && typeof record.command === "string") {
 		const command = record.command;
 		const base = commandCwd(command, cwd);
 		const withoutCd = shellWords(command).replace(/(?:^|&&|;|\|\|)\s*cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)/g, " ");
@@ -60,18 +60,28 @@ export function toolFiles(tool: string, args: unknown, cwd: string): string[] {
 	return [...files];
 }
 
-/** Whether `text` names `file` (by its file name, which is how agents refer to files they read). */
-export function mentions(text: string, file: string): boolean {
-	const name = basename(file);
-	if (name.length < 3) return false;
-	let at = text.indexOf(name);
-	while (at >= 0) {
-		const before = text[at - 1];
-		const after = text[at + name.length];
-		if ((!before || !/[\w.-]/.test(before)) && (!after || !/[\w-]/.test(after))) return true;
-		at = text.indexOf(name, at + 1);
-	}
-	return false;
+/** Words in an agent's text that can name a file: runs of file-name characters, trailing dots dropped. */
+export function namedWords(text: string): string[] {
+	return text.split(/[^\w.-]+/).map((word) => word.replace(/\.+$/, "")).filter((word) => word.length >= 3);
+}
+
+export interface Touch {
+	ts: number;
+	files: string[];
+}
+
+/**
+ * Whether a tool result was referenced again: a later call touched one of its files, or the agent
+ * later wrote one's file name. Undefined for results without files. Built in one pass over the
+ * session from each file's last touch and each word's last mention.
+ */
+export function referenceIndex(calls: Touch[], texts: { ts: number; text: string }[]): (ts: number, files: string[]) => boolean | undefined {
+	const lastTouched = new Map<string, number>();
+	for (const call of calls) for (const file of call.files) lastTouched.set(file, Math.max(lastTouched.get(file) ?? 0, call.ts));
+	const lastNamed = new Map<string, number>();
+	for (const { ts, text } of texts) for (const word of namedWords(text)) lastNamed.set(word, Math.max(lastNamed.get(word) ?? 0, ts));
+	return (ts, files) =>
+		files.length === 0 ? undefined : files.some((file) => (lastTouched.get(file) ?? 0) > ts || (lastNamed.get(basename(file)) ?? 0) > ts);
 }
 
 export const taskDigest = (task: string): string => createHash("sha256").update(task.trim()).digest("hex").slice(0, 16);

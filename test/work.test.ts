@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { describe, test } from "node:test";
-import { delegatedTaskDigest, delegation, mentions, taskDigest, toolFiles } from "../extensions/metrics/work.ts";
+import { delegatedTaskDigest, delegation, namedWords, referenceIndex, taskDigest, toolFiles } from "../extensions/metrics/work.ts";
 
 describe("toolFiles", () => {
 	const cwd = "/repo";
@@ -30,12 +30,36 @@ describe("toolFiles", () => {
 	});
 });
 
-describe("mentions", () => {
-	test("matches the file name as a word, not as part of another name", () => {
-		assert.equal(mentions("I changed indexer.ts to …", "/r/extensions/metrics/indexer.ts"), true);
-		assert.equal(mentions("see `indexer.ts:42`", "/r/indexer.ts"), true);
-		assert.equal(mentions("my-indexer.ts and indexer.tsx", "/r/indexer.ts"), false);
-		assert.equal(mentions("a b", "/r/a"), false);
+describe("referenceIndex", () => {
+	const calls = [
+		{ ts: 1, files: ["/r/src/a.ts"] },
+		{ ts: 5, files: ["/r/src/a.ts", "/r/b.md"] },
+	];
+	const texts = [
+		{ ts: 2, text: "I read indexer.ts and `store.ts:42`." },
+		{ ts: 6, text: "see my-indexer.ts, indexer.tsx and notes.md." },
+	];
+	const referenced = referenceIndex(calls, texts);
+
+	test("a later call on the same file counts, an earlier one does not", () => {
+		assert.equal(referenced(3, ["/r/src/a.ts"]), true);
+		assert.equal(referenced(5, ["/r/src/a.ts"]), false);
+	});
+
+	test("the agent naming the file later counts, by whole file name only", () => {
+		assert.equal(referenced(1, ["/x/indexer.ts"]), true);
+		assert.equal(referenced(1, ["/x/store.ts"]), true);
+		assert.equal(referenced(3, ["/x/indexer.ts"]), false);
+		assert.equal(referenced(3, ["/x/notes.md"]), true);
+	});
+
+	test("results without files are unknown, short names never match", () => {
+		assert.equal(referenced(0, []), undefined);
+		assert.equal(referenceIndex([], [{ ts: 9, text: "a b c" }])(0, ["/r/a"]), false);
+	});
+
+	test("words split on anything a file name cannot contain", () => {
+		assert.deepEqual(namedWords("cd ~/gw && sed -n 1,80p src/a.ts. Then (store.ts:12)"), ["sed", "80p", "src", "a.ts", "Then", "store.ts"]);
 	});
 });
 

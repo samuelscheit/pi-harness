@@ -19,6 +19,9 @@ import { count, minutes, money, percent, percentile, type Row, table } from "./f
 const SUMMARY_PRICE_SHARE = 0.2;
 const OUTPUT_TO_INPUT = 5;
 const SHORT_CACHE_MS = 5 * 60_000;
+// A subagent with a request this soon after a delegation was still working, so it could not take it.
+const BUSY_MS = 2 * 60_000;
+const MAX_ROWS = 12;
 const LONG_CACHE_MS = 60 * 60_000;
 
 export interface AgentState {
@@ -65,14 +68,12 @@ export interface Turn {
 }
 
 /**
- * The one compaction that would have saved the most, knowing how many requests followed: after
- * request `index` the context shrinks to what Pi's compaction keeps, so every later request reads
- * that much less, against the compaction's own cost (priced like Pi's economic compaction).
+ * The one compaction that would have saved the most, knowing the later requests: after request
+ * `index` the context shrinks to what Pi's compaction keeps, so each later request reads the
+ * dropped tokens less, but never more than it actually carried beyond the kept size (a later real
+ * compaction already shrank it). Against the compaction's own cost, priced like Pi's economic one.
  */
 export function bestCompaction(turns: Turn[], keepTokens = DEFAULT_COMPACTION_SETTINGS.keepRecentTokens): { index: number; saving: number } | undefined {
-	// Read-rate sums of all later requests, so each candidate costs O(1).
-	const laterRead = new Array<number>(turns.length + 1).fill(0);
-	for (let i = turns.length - 1; i >= 0; i--) laterRead[i] = laterRead[i + 1]! + turns[i]!.readRate;
 	let best: { index: number; saving: number } | undefined;
 	turns.forEach((turn, index) => {
 		const summaryInput = turn.inputRate * SUMMARY_PRICE_SHARE;
@@ -83,7 +84,12 @@ export function bestCompaction(turns: Turn[], keepTokens = DEFAULT_COMPACTION_SE
 			summaryOutput: summaryInput * OUTPUT_TO_INPUT,
 		});
 		if (!compaction) return;
-		const saving = (turn.promptTokens - compaction.keptTokens) * laterRead[index + 1]! - compaction.cost;
+		const dropped = turn.promptTokens - compaction.keptTokens;
+		let saving = -compaction.cost;
+		for (let later = index + 1; later < turns.length; later++) {
+			const next = turns[later]!;
+			saving += Math.min(dropped, Math.max(0, next.promptTokens - compaction.keptTokens)) * next.readRate;
+		}
 		if (saving > 0 && (!best || saving > best.saving)) best = { index, saving };
 	});
 	return best;
@@ -93,9 +99,11 @@ type All = (sql: string) => Row[];
 
 /** Resume-versus-new for every subagent started in scope. */
 export function subagentReport(db: DatabaseSync, all: All, scoped: string): string | undefined {
+	// Each call starts the first session with its task that began after it (the same task can run twice).
 	const delegations = all(
 		`SELECT d.session_id parent, d.ts, d.title, c.id child, c.started_at, c.ended_at, c.requests, c.cost
-		FROM delegations d JOIN sessions c ON c.prompt_digest = d.task_digest AND c.started_at >= d.ts - 60000
+		FROM delegations d JOIN sessions c ON c.id = (
+			SELECT id FROM sessions WHERE prompt_digest = d.task_digest AND started_at >= d.ts - 60000 ORDER BY started_at LIMIT 1)
 		WHERE d.kind = 'delegate' AND d.session_id IN (${scoped}) ORDER BY d.ts`,
 	);
 	if (delegations.length === 0) return undefined;
@@ -111,11 +119,13 @@ export function subagentReport(db: DatabaseSync, all: All, scoped: string): stri
 	);
 
 	const earlier = new Map<string, { title: string; child: string }[]>();
-	const rows: string[][] = [];
-	let newCost = 0;
-	let bestCost = 0;
+	const seen = new Set<string>();
+	const rows: { cells: string[]; difference: number }[] = [];
+	const totals = { count: 0, cost: 0, best: 0, rediscovery: 0, resumeWins: 0, compared: 0 };
 	for (const d of delegations) {
 		const child = String(d.child);
+		if (seen.has(child)) continue;
+		seen.add(child);
 		const turns = turnsOf.all(child) as Row[];
 		if (turns.length === 0) continue;
 		const first = turns[0]!;
@@ -146,15 +156,21 @@ export function subagentReport(db: DatabaseSync, all: All, scoped: string): stri
 		const at = Number(d.ts);
 		let alternative: { title: string; agent: AgentState; cost: number } | undefined;
 		for (const sibling of siblings) {
-			const last = (turnsOf.all(sibling.child) as Row[]).filter((t) => Number(t.ts) <= at).at(-1);
-			if (!last) continue;
+			const turns = turnsOf.all(sibling.child) as Row[];
+			const last = turns.filter((t) => Number(t.ts) <= at).at(-1);
+			// A sibling still working at that moment could not have taken the task.
+			if (!last || turns.some((t) => Number(t.ts) > at && Number(t.ts) <= at + BUSY_MS)) continue;
 			const agent = { contextTokens: Number(last.prompt_tokens), lastTs: Number(last.ts), longRetention: Number(last.long_retention) === 1 };
 			const cost = resumeCost(spec, agent, at);
 			if (!alternative || cost < alternative.cost) alternative = { title: sibling.title, agent, cost };
 		}
-		newCost += spec.cost;
-		bestCost += Math.min(spec.cost, alternative?.cost ?? Infinity);
-		rows.push([
+		totals.count += 1;
+		totals.cost += spec.cost;
+		totals.best += Math.min(spec.cost, alternative?.cost ?? Infinity);
+		totals.rediscovery += rediscovered.cost;
+		if (alternative) totals.compared += 1;
+		if (alternative && alternative.cost < spec.cost) totals.resumeWins += 1;
+		rows.push({ difference: alternative ? Math.abs(alternative.cost - spec.cost) : 0, cells: [
 			String(d.title ?? child.slice(0, 8)).slice(0, 36),
 			String(turns.length),
 			money(spec.cost),
@@ -166,13 +182,16 @@ export function subagentReport(db: DatabaseSync, all: All, scoped: string): stri
 				: "none",
 			alternative ? money(alternative.cost) : "",
 			alternative ? (alternative.cost < spec.cost ? `resume saves ${money(spec.cost - alternative.cost)}` : `new saved ${money(alternative.cost - spec.cost)}`) : "",
-		]);
+		] });
 	}
 	if (rows.length === 0) return undefined;
-	return `Subagents: new versus resuming the cheapest earlier one (${resumes} resumes by message; rediscovered = calls / tokens / cost of results the parent or an earlier subagent already had)\n${table(
-		["subagent", "requests", "cost", "wall", "startup", "rediscovered", "resume instead (context, idle)", "est. resume", "verdict"],
-		rows,
-	)}\nnew subagents ${money(newCost)}, with the cheaper choice each time ${money(bestCost)}`;
+	const shown = rows.length > MAX_ROWS ? [...rows].sort((a, b) => b.difference - a.difference).slice(0, MAX_ROWS) : rows;
+	return [
+		`Subagents: ${totals.count} started, ${money(totals.cost)}; ${resumes} resumes by message. Rediscovery (results the parent or an earlier subagent already had): ${money(totals.rediscovery)}.`,
+		`Resuming an idle earlier subagent instead was possible ${totals.compared} times and cheaper ${totals.resumeWins} times; the cheaper choice each time: ${money(totals.best)} (${percent(1 - totals.best / Math.max(totals.cost, 1e-9))} less).`,
+		`${rows.length > MAX_ROWS ? `The ${MAX_ROWS} largest differences` : "Per subagent"} (rediscovered = calls / tokens / cost):`,
+		table(["subagent", "requests", "cost", "wall", "startup", "rediscovered", "resume instead (context, idle)", "est. resume", "verdict"], shown.map((r) => r.cells)),
+	].join("\n");
 }
 
 /** Context sizes, never-referenced results and the best single compaction per session, in scope. */
