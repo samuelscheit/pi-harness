@@ -11,7 +11,7 @@
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
 // - settings.json: this repo and the vendored pi-lens as packages, Opus 5.5 as the startup model, and context
-//                  cost control: a one-hour cache, refreshed once while idle (cacheWarmingIdleMinutes), and
+//                  cost control: a one-hour cache, kept warm while idle for up to CACHE_WARMING_IDLE_MINUTES, and
 //                  compaction with Haiku before a run whose cache expired, when that costs less than writing the
 //                  context again (`warm` compaction stays off until its effect on quality is measured).
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
@@ -29,11 +29,17 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync,
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { patchApp } from "./patch-t3.ts";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
+const T3_APP = "/Applications/T3 Code (Nightly).app";
 // Compact only when the expected saving covers what the agent re-reads afterwards (measured over
 // 242 Claude Code compactions: $0.50–0.70 on average) with margin; detail lost beyond that is not priced.
 const COMPACTION_MIN_SAVING = 1;
+// Keep an idle session's one-hour cache warm this long. Of recorded pauses still idle at a refresh,
+// 37% / 14% / 11% / 10% resumed within the next hour at 54 / 114 / 174 / 234 minutes; a refresh pays
+// above ~5%. Four hours is also how long t3 keeps an idle session with pending background work.
+const CACHE_WARMING_IDLE_MINUTES = 240;
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const vendoredPi = join(root, "vendor/pi");
@@ -68,6 +74,9 @@ if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_P
 	npm(root, "uninstall", "-g", PI_PACKAGE);
 }
 npm(join(vendoredPi, "packages/coding-agent"), "link");
+// t3 unloads idle sessions unless they report background work; let pending cache warming count.
+// Every t3 update replaces the app, so this runs again on each install.
+if (existsSync(T3_APP)) console.log(patchApp(T3_APP));
 // pi-lens: install scripts skipped (its `prepare` also rewires git hooks); build and fetch the core grammars explicitly.
 npm(vendoredLens, "ci", "--ignore-scripts", "--no-audit", "--no-fund");
 npm(vendoredLens, "run", "build:dist");
@@ -107,7 +116,7 @@ writeJson(settingsFile, {
 	defaultProvider: "anthropic",
 	defaultModel: "claude-opus-5-5",
 	cacheRetention: "long",
-	cacheWarmingIdleMinutes: 60,
+	cacheWarmingIdleMinutes: CACHE_WARMING_IDLE_MINUTES,
 	compaction: {
 		...settings.compaction,
 		economic: { model: "anthropic/claude-haiku-5-5", minSaving: COMPACTION_MIN_SAVING },
