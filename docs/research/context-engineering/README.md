@@ -11,6 +11,7 @@ Researched 2026-11-12. This file condenses six detailed reports, which together 
 | 05 | [Memory and self-improvement](05-memory-and-self-improvement.md) | Letta, mem0, Zep, memory files, ACE playbooks, Reflexion/ExpeL, skill learning, prompt optimisation, memory security |
 | 06 | [Harness implementations](06-harness-implementations.md) | source-level comparison of Pi, Codex, Claude Code, Gemini CLI, opencode, OpenHands, Aider, Cline/Roo, Goose, Continue, Amp, Cursor, Factory, (mini-)SWE-agent, smolagents |
 | 07 | [Evidence from our sessions](07-evidence-from-our-sessions.md) | each candidate measured on 1,616 of our own sessions ($21k): simulations, labelled corrections, recurring rules. **Overrides the ranking below where they disagree.** |
+| 08 | [Thinking and cache-loss events](08-thinking-and-cache-loss.md) | replayed thinking is 8–11% of Pi spend (the metrics overstate it ~2×); 77% of cache-loss waste came from pi-lens's in-memory injection ledger (fixed) |
 
 ## The model in one paragraph
 
