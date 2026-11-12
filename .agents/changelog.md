@@ -37,3 +37,13 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Revert:** `/harness experiment parallel-tools stop` (or delete the file) ends the experiment; promoting it means moving the text back into `prompt/base.md`. Reverting the mechanism: revert this commit.
 
 **Non-prompt variants** (for example the compaction threshold 200k vs 300k): same file and arm entries; the frontmatter names the setting and value, and the extension owning the setting applies it after reading the session's arm. Not built yet (see `extensions/lib/experiments.ts`).
+
+## 2026-11-13 — experiment: single-edit
+
+**Change:** new experiment `prompt/experiments/single-edit.md` (arm B only): plan all changes to a file and send them in one `edit` call (several `edits[]`); split only when a later change needs feedback (check, test) from an earlier one.
+
+**Evidence:** law-formalization, 863 Claude Code sessions ($11.2k): 3,725 times the next call edited the same file again in a new turn with nothing in between ($315, 2.8% of cost); only 272 times were several edits to one file already in one turn. Pi's `edit` already takes several replacements. Scripts: `/tmp/subx/edits/` (`cycles.py`, `detail.py`).
+
+**Judged by:** turns and cost per package, edit calls per edited file; guardrail: edit error rate (`oldText` not found), tool error rate. Note: in law-formalization Pi agents edit almost only through `bash` (python heredocs, `cat >`, `sed -i`), which this rule does not reach.
+
+**Revert:** `/harness experiment single-edit stop`, or delete the file.
