@@ -9,14 +9,15 @@
 //                        node_modules and dashboard/node_modules, and `.release.json`
 //   current              link to the deployed release, switched atomically (rename)
 //   failed/<commit>.txt  why a commit was not deployed, so it is tried once
-//   .lock/               held while deploying (several Pi processes watch the same repository)
+//   .lock/               held while deploying (several Pi processes watch the same repository); holds
+//                        the holder's pid, and the holder touches it every few seconds
 //
 // A release is deployed only if every extension entry point imports in a fresh Node process: a
 // commit with a broken import or a syntax error stays undeployed and the previous release keeps
 // running.
 
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { RELEASE_MARKER, type ReleaseMarker } from "./repository.ts";
@@ -24,8 +25,11 @@ import { RELEASE_MARKER, type ReleaseMarker } from "./repository.ts";
 const exec = promisify(execFile);
 /** Releases kept besides the current one, for sessions that have not reloaded yet and for going back. */
 const KEEP = 5;
-/** A lock older than this is from a process that died while deploying. */
-const STALE_LOCK_MS = 5 * 60_000;
+/** The holder of the deploy lock touches it this often while deploying. */
+const LOCK_HEARTBEAT_MS = 2_000;
+/** A lock not touched for this long is abandoned (its holder hung, or its pid was reused). */
+const STALE_LOCK_MS = 15_000;
+const LOCK_OWNER = "pid";
 const VALIDATE_TIMEOUT_MS = 120_000;
 
 /** Paths in a release that link to the source repository instead of being copied. */
@@ -71,21 +75,83 @@ export async function importCheck(root: string): Promise<void> {
 	}
 }
 
+/** Whether a process runs (a process of another user counts as running). */
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/** Whether a lock was left by a holder that is gone: its process ended, or it stopped touching the lock. */
+function abandoned(path: string): boolean {
+	let touched: number;
+	try {
+		touched = statSync(path).mtimeMs;
+	} catch {
+		return false;
+	}
+	if (Date.now() - touched > STALE_LOCK_MS) return true;
+	try {
+		const pid = Number(readFileSync(join(path, LOCK_OWNER), "utf8"));
+		return Number.isInteger(pid) && pid > 0 && !pidAlive(pid);
+	} catch {
+		// Just created, the pid not written yet.
+		return false;
+	}
+}
+
+/**
+ * Take the deploy lock, or undefined while another live process holds it. An abandoned lock is
+ * moved aside (rename: only one waiter wins it) and taken over at once. While held, the lock is
+ * touched every LOCK_HEARTBEAT_MS, so a waiter can tell a hung holder from a slow one.
+ */
 function lock(agentDir: string): (() => void) | undefined {
 	const path = join(harnessDir(agentDir), ".lock");
 	mkdirSync(harnessDir(agentDir), { recursive: true });
-	try {
-		mkdirSync(path);
-	} catch {
+	const take = () => {
 		try {
-			if (Date.now() - statSync(path).mtimeMs < STALE_LOCK_MS) return undefined;
-			rmSync(path, { recursive: true, force: true });
 			mkdirSync(path);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	if (!take()) {
+		if (!abandoned(path)) return undefined;
+		const aside = `${path}.abandoned.${process.pid}`;
+		try {
+			renameSync(path, aside);
 		} catch {
 			return undefined;
 		}
+		rmSync(aside, { recursive: true, force: true });
+		if (!take()) return undefined;
 	}
-	return () => rmSync(path, { recursive: true, force: true });
+	writeFileSync(join(path, LOCK_OWNER), String(process.pid));
+	const heartbeat = setInterval(() => {
+		try {
+			const now = new Date();
+			utimesSync(path, now, now);
+		} catch {
+			// Taken over meanwhile; the deploy finishes either way (deploys of one commit agree).
+		}
+	}, LOCK_HEARTBEAT_MS);
+	heartbeat.unref();
+	return () => {
+		clearInterval(heartbeat);
+		rmSync(path, { recursive: true, force: true });
+	};
+}
+
+/** Remove builds that processes left behind when they died while deploying (`.<commit>.<pid>`). */
+function removeOrphanedBuilds(agentDir: string): void {
+	for (const name of readdirSync(releasesDir(agentDir))) {
+		const pid = Number(/^\.[0-9a-f]+\.(\d+)$/.exec(name)?.[1]);
+		if (pid && pid !== process.pid && !pidAlive(pid)) rmSync(join(releasesDir(agentDir), name), { recursive: true, force: true });
+	}
 }
 
 /** Point `current` at a release, atomically. */
@@ -134,6 +200,8 @@ export async function deploy({ source, branch, agentDir, validate = importCheck 
 		// Another process may have deployed it while this one waited.
 		if (currentRelease(agentDir)?.commit === commit) return { status: "current", commit };
 		const target = join(releasesDir(agentDir), commit);
+		mkdirSync(releasesDir(agentDir), { recursive: true });
+		removeOrphanedBuilds(agentDir);
 		if (!existsSync(target)) {
 			const temporary = join(releasesDir(agentDir), `.${commit}.${process.pid}`);
 			rmSync(temporary, { recursive: true, force: true });
@@ -149,7 +217,13 @@ export async function deploy({ source, branch, agentDir, validate = importCheck 
 				writeFileSync(failedFile(agentDir, commit), message);
 				return { status: "failed", commit, error: message, fresh: true };
 			}
-			renameSync(temporary, target);
+			try {
+				renameSync(temporary, target);
+			} catch (error) {
+				// A process that took over an abandoned lock built the same commit first: keep its build.
+				if (!existsSync(target)) throw error;
+				rmSync(temporary, { recursive: true, force: true });
+			}
 		}
 		switchTo(agentDir, commit);
 		prune(agentDir);
