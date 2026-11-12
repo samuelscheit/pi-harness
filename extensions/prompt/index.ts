@@ -22,12 +22,16 @@ import {
 	sectionName,
 	toolSwitches,
 } from "../lib/experiments.ts";
-import { HARNESS_ROOT } from "../lib/repository.ts";
+import { HARNESS_ROOT, inSource } from "../lib/repository.ts";
 import { applyRules, listRules, RULES_DIR } from "../lib/rules.ts";
 
 const PROMPT_DIR = join(HARNESS_ROOT, "prompt");
 const BASE_PROMPT = join(PROMPT_DIR, "base.md");
 const GLOBAL_RULES = join(PROMPT_DIR, "AGENTS.md");
+// The path the model sees: the file in the harness repository. A release's own copy sits under its
+// commit, so showing that path changed the project_context section with every release (a prompt
+// update per running session), and it is not the file to edit anyway.
+const GLOBAL_RULES_SHOWN = inSource(GLOBAL_RULES);
 
 export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DIR, rulesDir = RULES_DIR) {
 	let reported = "";
@@ -35,8 +39,8 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		const options = event.systemPromptOptions;
 		options.customPrompt = readFileSync(BASE_PROMPT, "utf8").trim();
 		options.contextFiles = [
-			{ path: GLOBAL_RULES, content: readFileSync(GLOBAL_RULES, "utf8").trim() },
-			...options.contextFiles.filter((file) => file.path !== GLOBAL_RULES),
+			{ path: GLOBAL_RULES_SHOWN, content: readFileSync(GLOBAL_RULES, "utf8").trim() },
+			...options.contextFiles.filter((file) => file.path !== GLOBAL_RULES && file.path !== GLOBAL_RULES_SHOWN),
 		];
 
 		// Rules before experiments, so an experiment section can never take a rule's name.

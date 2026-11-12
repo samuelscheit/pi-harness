@@ -438,7 +438,7 @@ describe("the ledger keeps rendered text only (acceptance 5)", () => {
 	});
 });
 
-describe("nothing retained outlives its transcript or its activation", () => {
+describe("retained entries end with their transcript, not with their activation", () => {
 	it("compaction drops every retained entry", async () => {
 		const cwd = `${fixture.root}/tail-compact/proj`;
 		fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
@@ -468,40 +468,33 @@ describe("nothing retained outlives its transcript or its activation", () => {
 		});
 	});
 
-	it("a resumed session starts with nothing retained", async () => {
-		const handle = await session("tail-resume", [
-			fauxAssistantMessage("first answer"),
-		]);
-		stage(handle.cwd, FIRST);
-		await handle.prompt("first question");
-		const file = handle.sessionFile();
-		if (!file) throw new Error("the session wrote no file");
-		const resumed = await handle.restart(
-			{ reason: "resume", sessionFile: file },
-			[fauxAssistantMessage("resumed answer")],
-		);
-		await resumed.prompt("second question");
-		const next = resumed.requests.at(-1);
-		if (!next) throw new Error("the resumed session sent no request");
-		// The resumed transcript is the same conversation: a ledger shared across
-		// activations would line up and re-send the finding here.
-		expect(JSON.stringify(next)).toContain("first question");
-		expect(count(next, FIRST)).toBe(0);
-	});
-
-	it("a reload starts with nothing retained", async () => {
-		const handle = await session("tail-reload", [
-			fauxAssistantMessage("first answer"),
-		]);
-		stage(handle.cwd, FIRST);
-		await handle.prompt("first question");
-		const reloaded = await handle.restart({ reason: "reload" }, [
-			fauxAssistantMessage("after reload"),
-		]);
-		await reloaded.prompt("second question");
-		const next = reloaded.requests.at(-1);
-		if (!next) throw new Error("the reloaded session sent no request");
-		expect(JSON.stringify(next)).toContain("first question");
-		expect(count(next, FIRST)).toBe(0);
-	});
+	// pi-harness: the ledger's records live in the session file, so a resumed
+	// session and a reload (a harness hot reload is one) re-send what earlier
+	// requests carried. Starting empty rewrote the whole conversation to the
+	// provider's cache (measured: 8% of a day's spend) and made Anthropic drop
+	// every later thinking block whose prefix binding no longer matched.
+	it.each(["resume", "reload"] as const)(
+		"a %s re-sends the earlier injection in place, so the earlier request stays a prefix",
+		async (reason) => {
+			const handle = await session(`tail-${reason}`, [
+				fauxAssistantMessage("first answer"),
+			]);
+			stage(handle.cwd, FIRST);
+			await handle.prompt("first question");
+			const before = handle.requests.at(-1);
+			if (!before) throw new Error("the session sent no request");
+			expect(count(before, FIRST)).toBe(1);
+			const file = handle.sessionFile();
+			if (!file) throw new Error("the session wrote no file");
+			const again = await handle.restart(
+				reason === "resume" ? { reason, sessionFile: file } : { reason },
+				[fauxAssistantMessage("second answer")],
+			);
+			await again.prompt("second question");
+			const next = again.requests.at(-1);
+			if (!next) throw new Error("the restarted session sent no request");
+			expect(count(next, FIRST)).toBe(1);
+			expect(firstPrefixBreak(before, next)).toBeUndefined();
+		},
+	);
 });

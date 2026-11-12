@@ -364,8 +364,48 @@ import {
 } from "./clients/cache-observability.js";
 import {
 	createInjectionLedger,
+	type LedgerRecord,
+	type LedgerStore,
 	retainedSnapshotLabel,
 } from "./clients/context-injection-ledger.js";
+
+/** The session entry type of the retained-injection ledger's records (#4743 persistence). */
+export const RETAINED_INJECTION_ENTRY = "pi-lens-retained-injection";
+
+/**
+ * The ledger store of the session a request belongs to: its records are
+ * custom session entries, which pi never sends to the model. Undefined when
+ * the context has no session manager.
+ */
+export function sessionLedgerStore(
+	ctx: unknown,
+	appendEntry: (customType: string, data: LedgerRecord) => void,
+): LedgerStore | undefined {
+	const manager = (
+		ctx as {
+			sessionManager?: {
+				getEntries?: () => ReadonlyArray<{
+					type: string;
+					customType?: string;
+					data?: unknown;
+				}>;
+			};
+		} | null
+	)?.sessionManager;
+	if (typeof manager?.getEntries !== "function") return undefined;
+	const entries = manager.getEntries.bind(manager);
+	return {
+		load: () =>
+			entries().flatMap((entry) =>
+				entry.type === "custom" &&
+				entry.customType === RETAINED_INJECTION_ENTRY &&
+				entry.data
+					? [entry.data as LedgerRecord]
+					: [],
+			),
+		save: (record) => appendEntry(RETAINED_INJECTION_ENTRY, record),
+	};
+}
 import {
 	buildStartupTimingRecords,
 	getPiLensEvalMs,
@@ -1393,10 +1433,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 	let contextInjectionEnabled = true;
 	// #4743: opt-in retained injections. The ledger belongs to this activation,
 	// and pi re-runs this factory for every new, resumed, forked or switched
-	// session and for /reload, so each of those starts with an empty ledger.
-	// The flag is read per request because pi applies extension flag values
-	// after the factory runs; its CLI value and the global config are fixed per
-	// load.
+	// session and for /reload. Its records are kept in the session file
+	// (sessionLedgerStore), so the first request of each of those restores what
+	// earlier requests carried instead of starting empty. The flag is read per
+	// request because pi applies extension flag values after the factory runs;
+	// its CLI value and the global config are fixed per load.
 	const injectionLedger = createInjectionLedger();
 	let lensWidgetVisible = globalConfig?.widget?.visible !== false;
 	let mountedLensWidgetUi: LensWidgetUi | undefined;
@@ -4942,7 +4983,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 			if (!effectiveInjectionEnabled) {
 				// #4743: injection switched off mid-session also stops re-sending
 				// what was retained, so no request carries pi-lens bytes while off.
-				ledger?.clearSession(prefixSessionId);
+				ledger?.clearSession(
+					prefixSessionId,
+					sessionLedgerStore(ctx, (type, data) => pi.appendEntry(type, data)),
+				);
 				logContextObservation(existingMessages, "none", []);
 				return;
 			}
@@ -4955,6 +4999,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 				prefixSessionId,
 				existingMessages,
 				appendToUserPromptContent,
+				sessionLedgerStore(ctx, (type, data) => pi.appendEntry(type, data)),
 			);
 			const base = rebuilt?.messages ?? existingMessages;
 			const retention = (

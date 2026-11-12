@@ -437,3 +437,17 @@ When a run is about to settle (`agent_before_settle`), the extension runs one `p
 **Judged by:** `cost_write` per token of workflow child sessions (sessions with `parent_session` from `workflow`/`fix_loop`) at the 1.25× rate; cache-read share unchanged.
 
 **Revert:** remove `CACHE_RETENTION` and its two uses.
+
+## 2026-11-12 — pi-lens: retained injections survive reloads and restarts; stable AGENTS.md path
+
+**Change:**
+
+- `vendor/pi-lens/clients/context-injection-ledger.ts`: the ledger takes an optional store. Every retain, and every clear, is saved as a record. The first rebuild of a session in an activation replays the records since the last clear. Restored entries pass the same digest check, so a changed transcript (a compaction) prunes them, and a full prune records a clear.
+- `vendor/pi-lens/index.ts` passes `sessionLedgerStore(ctx)`, which keeps the records as custom session entries (`pi-lens-retained-injection`, never sent to the model).
+- `extensions/prompt` shows the global AGENTS.md under its path in the harness repository, not under the release directory, whose path changes with every commit.
+
+**Evidence:** `docs/research/context-engineering/08-thinking-and-cache-loss.md`. The in-memory ledger emptied on every hot reload and restart, and the next request then diverged mid-transcript. That rewrote the cache ($31.93, 8.2% of a day's Pi spend) and made Anthropic silently drop 2,003 thinking blocks.
+
+**Judged by:** cache-loss events and their waste per day (`requests.cache_event`, `cache_waste`); `drop_block` counts once the metrics record them.
+
+**Revert:** revert the commit. pi-lens then starts each activation with an empty ledger again.

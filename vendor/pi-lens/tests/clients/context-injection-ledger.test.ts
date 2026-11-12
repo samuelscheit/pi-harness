@@ -10,9 +10,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	createInjectionLedger,
 	type LedgerMessage,
+	type LedgerRecord,
+	type LedgerStore,
 	MAX_RETAINED_BYTES,
 	MAX_RETAINED_ENTRIES,
 	MAX_RETAINED_SESSIONS,
+	replayRecords,
 } from "../../clients/context-injection-ledger.js";
 import {
 	getDegradationSummary,
@@ -262,5 +265,101 @@ describe("context-injection ledger (#4743)", () => {
 		);
 		expect(compacted.holds("BLOCKER-TEXT")).toBe(false);
 		expect(compacted.holds("AFTER-BLOCKER")).toBe(false);
+	});
+});
+
+describe("context-injection ledger persistence (pi-harness)", () => {
+	/** A session's records, as the session file keeps them. */
+	function memoryStore(records: LedgerRecord[] = []): LedgerStore & {
+		records: LedgerRecord[];
+		loads: number;
+	} {
+		const store = {
+			records,
+			loads: 0,
+			load: () => {
+				store.loads += 1;
+				return [...store.records];
+			},
+			save: (record: LedgerRecord) => {
+				store.records.push(record);
+			},
+		};
+		return store;
+	}
+
+	it("a new ledger (reload, restarted pi) re-sends exactly what the old one did", () => {
+		const store = memoryStore();
+		const first = [system, user("question")];
+		const before = createInjectionLedger();
+		before.rebuild("s1", first, append, store).retain({ kind: "user-text", text: "FINDING-A" });
+		const second = [...first, assistant("calls a tool"), user("tool output")];
+		before.rebuild("s1", second, append, store).retain({ kind: "after", messages: [user("FINDING-B")] });
+		const third = [...second, assistant("answer")];
+		const expected = before.rebuild("s1", third, append, store).messages;
+		expect(store.records.map((record) => record.op)).toEqual(["retain", "retain"]);
+
+		expect(store.loads).toBe(1);
+		const after = createInjectionLedger();
+		const restored = after.rebuild("s1", third, append, store);
+		expect(restored.messages).toEqual(expected);
+		expect(restored.reemitted).toBe(2);
+		after.rebuild("s1", third, append, store);
+		expect(store.loads).toBe(2);
+		// The records survive a JSON round trip, as session entries do.
+		const json = memoryStore(JSON.parse(JSON.stringify(store.records)));
+		expect(createInjectionLedger().rebuild("s1", third, append, json).messages).toEqual(expected);
+	});
+
+	it("restored entries are checked like any other: a changed transcript prunes them and records a clear", () => {
+		const store = memoryStore();
+		const raw = [system, user("old"), assistant("old answer"), user("question")];
+		createInjectionLedger().rebuild("s1", raw, append, store).retain({ kind: "user-text", text: "FINDING" });
+		const compacted = [system, user("summary"), raw[2]!, raw[3]!];
+		const rebuilt = createInjectionLedger().rebuild("s1", compacted, append, store);
+		expect(rebuilt.messages).toBe(compacted);
+		expect(rebuilt.pruned).toBe(1);
+		expect(store.records.at(-1)).toEqual({ op: "clear" });
+		expect(createInjectionLedger().rebuild("s1", raw, append, store).messages).toBe(raw);
+	});
+
+	it("clearSession records a clear only when something was held or stored", () => {
+		const store = memoryStore();
+		const ledger = createInjectionLedger();
+		ledger.clearSession("s1", store);
+		expect(store.records).toEqual([]);
+		const raw = [system, user("question")];
+		ledger.rebuild("s1", raw, append, store).retain({ kind: "user-text", text: "FINDING" });
+		ledger.clearSession("s1", store);
+		ledger.clearSession("s1", store);
+		expect(store.records.map((record) => record.op)).toEqual(["retain", "clear"]);
+		expect(createInjectionLedger().rebuild("s1", raw, append, store).messages).toBe(raw);
+
+		// A fresh ledger switched off clears what the store still holds, once.
+		const held = memoryStore([{ op: "retain", entry: { kind: "user-text", anchor: 1, prefixDigest: "x", text: "T", bytes: 1 } }]);
+		const off = createInjectionLedger();
+		off.clearSession("s1", held);
+		off.clearSession("s1", held);
+		expect(held.records.map((record) => record.op)).toEqual(["retain", "clear"]);
+	});
+
+	it("replayRecords keeps the entries after the last clear, in order", () => {
+		const entry = (text: string) => ({ op: "retain" as const, entry: { kind: "user-text" as const, anchor: 0, prefixDigest: "d", text, bytes: 1 } });
+		const texts = (records: LedgerRecord[]) => replayRecords(records).map((e) => (e.kind === "user-text" ? e.text : ""));
+		expect(texts([entry("a"), { op: "clear" }, entry("b"), entry("c")])).toEqual(["b", "c"]);
+		expect(texts([entry("a"), { op: "clear" }])).toEqual([]);
+		expect(texts([])).toEqual([]);
+	});
+
+	it("restores at most MAX_RETAINED_ENTRIES, the newest", () => {
+		const raw = [system, user("question")];
+		const store = memoryStore();
+		const ledger = createInjectionLedger();
+		for (let i = 0; i < MAX_RETAINED_ENTRIES; i++)
+			ledger.rebuild("s1", raw, append, store).retain({ kind: "user-text", text: `F${i}` });
+		store.records.unshift({ op: "retain", entry: { kind: "user-text", anchor: 1, prefixDigest: "stale", text: "OLD", bytes: 3 } });
+		const restored = createInjectionLedger();
+		restored.rebuild("s1", raw, append, store);
+		expect(restored.size("s1")).toBe(MAX_RETAINED_ENTRIES);
 	});
 });
