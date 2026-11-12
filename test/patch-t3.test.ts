@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
-import { EDITS, patchBundle } from "../scripts/patch-t3.ts";
-
-const edits = EDITS;
+import { PATCHES, patchBundle } from "../scripts/patch-t3.ts";
 
 /** A minimal asar writer (the format Electron reads), independent of the code under test. */
 function writeArchive(path: string, tree: Record<string, string | { unpacked: true }>): void {
@@ -95,17 +94,57 @@ describe("asar rewrite", () => {
 });
 
 describe("patchBundle", () => {
-	const bundle = edits.map(([anchor]) => `\t\t\t${anchor}\n`).join("const x = piRecordString;\n");
+	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
+	// An unpatched bundle: every anchor once, except those an earlier patch produces.
+	const bundle = PATCHES.flatMap((patch, i) =>
+		patch.edits
+			.map(([anchor]) => anchor)
+			.filter((anchor) => !PATCHES.slice(0, i).some((earlier) => earlier.edits.some(([, replacement]) => replacement.includes(anchor)))),
+	)
+		.map((anchor) => `\t\t\t${anchor}\n`)
+		.join("const x = piRecordString;\n");
 
-	test("applies every edit once and is idempotent", () => {
-		const patched = patchBundle(bundle)!;
-		for (const [, replacement] of edits) assert.ok(patched.includes(replacement));
-		assert.ok(patched.includes('if (event["type"] === "cache_warming")'));
-		assert.equal(patchBundle(patched), undefined);
+	test("applies every patch in order, each edit once, and is idempotent", () => {
+		const { text, applied } = patchBundle(bundle);
+		assert.deepEqual(applied, ["cache-warming", "dialogs"]);
+		for (const patch of PATCHES) assert.ok(text.includes(patch.marker), patch.name);
+		assert.ok(text.includes('if (event["type"] === "cache_warming")'));
+		assert.ok(text.includes('if (method === "dismiss")'));
+		assert.ok(!text.includes("cancelPendingPrompts(completedAt)"), "turn end still cancels dialogs");
+		assert.ok(text.includes("cacheWarmingPending || pendingPrompts.size > 0"));
+		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
-	test("refuses a bundle where an anchor is missing or ambiguous", () => {
-		assert.throws(() => patchBundle(bundle.replace(edits[2]![0], "")), /found it 0 times/);
-		assert.throws(() => patchBundle(bundle + edits[0]![0]), /found it 2 times/);
+	test("applies only the patches a bundle lacks", () => {
+		const once = patchBundle(bundle, [cacheWarming]);
+		assert.deepEqual(once.applied, ["cache-warming"]);
+		const { text, applied } = patchBundle(once.text);
+		assert.deepEqual(applied, ["dialogs"]);
+		assert.equal(text, patchBundle(bundle).text);
+	});
+
+	test("refuses a bundle where an anchor is missing or ambiguous, naming the patch", () => {
+		assert.throws(() => patchBundle(bundle.replace(cacheWarming.edits[0]![0], "")), /cache-warming patch\): expected the anchor once, found it 0 times/);
+		assert.throws(() => patchBundle(bundle + dialogs.edits[3]![0]), /dialogs patch\): expected the anchor once, found it 2 times/);
+	});
+
+	// t3's real bundle (the unpatched original the installer keeps), when this machine has it.
+	const original = "/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar.pre-pi-harness";
+	test("patches t3's installed Pi adapter into valid JavaScript", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const bundle = packedFiles(readHeader(original).header)
+			.map((f) => f.path)
+			.filter((path) => path.startsWith("apps/server/dist/") && path.endsWith(".mjs"))
+			.map((path) => readFile(original, path).toString("utf8"))
+			.find((text) => text.includes('"PiAdapter.cancelPrompt"'));
+		assert.ok(bundle, "no Pi adapter in t3's archive");
+		const { text, applied } = patchBundle(bundle);
+		assert.deepEqual(applied, ["cache-warming", "dialogs"]);
+		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
+		try {
+			writeFileSync(join(dir, "bundle.mjs"), text);
+			execFileSync(process.execPath, ["--check", join(dir, "bundle.mjs")]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

@@ -261,6 +261,8 @@ export type RpcExtensionUIRequest =
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string }
+	/** Pi closed the dialog with this id itself (abort signal or timeout); it takes no response. */
+	| { type: "extension_ui_request"; id: string; method: "dismiss" }
 	| {
 			type: "extension_ui_request";
 			id: string;
