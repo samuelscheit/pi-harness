@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { ARM_ENTRY } from "../extensions/lib/experiments.ts";
 import { indexSessions, parentSessionId } from "../extensions/metrics/indexer.ts";
@@ -239,5 +240,19 @@ describe("schema rebuild", () => {
 		const fresh = openStore(join(dir, "fresh.db"));
 		assert.equal(importedClaude(fresh), false);
 		fresh.close();
+	});
+
+	test("older code never downgrades a newer index: it refuses to open it and leaves the data", () => {
+		addTranscript("c1");
+		const path = join(dir, "metrics.db");
+		const db = openStore(path);
+		indexAll(db, { claude: true, agentDir: agentDir(), claudeDir: claudeDir() });
+		db.prepare("UPDATE meta SET value = ? WHERE key = 'schema'").run(String(SCHEMA_VERSION + 1));
+		db.close();
+		assert.throws(() => openStore(path), new RegExp(`schema ${SCHEMA_VERSION + 1}, newer than this harness code \\(${SCHEMA_VERSION}\\); run /reload`));
+		assert.throws(() => openStore(path), /newer than this harness code/, "still refused, nothing was dropped");
+		const raw = new DatabaseSync(path);
+		assert.equal(claudeCount(raw as ReturnType<typeof openStore>), 1, "the newer index keeps its rows");
+		raw.close();
 	});
 });
