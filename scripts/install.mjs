@@ -15,7 +15,8 @@
 //                  and a cold cache compacted with Haiku before a large context is written again.
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
 //                  Messages API), and a `gateway` provider for every other gateway model
-//                  (Responses API), with context windows from the gateway's /v1/models.
+//                  (Responses API), with context windows from the gateway's /v1/models and
+//                  mid-conversation developer messages, so prompt edits keep the prompt cache.
 //                  The gateway forwards Anthropic message threads, so Claude requests send only
 //                  what is new since the previous reply.
 // - auth.json:     both providers' key, read from the macOS Keychain item KEYCHAIN_SERVICE, so Pi
@@ -76,7 +77,10 @@ const models = readJson(modelsFile);
 models.providers = {
 	...models.providers,
 	anthropic: { baseUrl: origin, compat: { supportsMessageThreads: true } },
-	gateway: { baseUrl: v1, api: "openai-responses", models: gatewayModels },
+	// Prompt edits go out as developer messages appended to the conversation, so the cached
+	// prefix stays (test/prompt-cache.test.ts); without this flag Pi folds them into the
+	// instructions and the whole conversation is written again.
+	gateway: { baseUrl: v1, api: "openai-responses", compat: { supportsMidConvoSystemMessages: true }, models: gatewayModels },
 };
 writeJson(modelsFile, models);
 
