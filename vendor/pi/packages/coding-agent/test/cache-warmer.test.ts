@@ -1,6 +1,7 @@
 import {
 	type Api,
 	type AssistantMessage,
+	evaluateCacheWarming,
 	type AssistantMessageEventStream,
 	getCacheWarmingDelayMs,
 	getPromptCacheTtlMs,
@@ -21,6 +22,7 @@ import {
 	type CacheWarmRequest,
 	formatCacheWarmingStatus,
 	formatCacheWarmingUsage,
+	isPromptCacheCold,
 } from "../src/core/cache-warmer.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
@@ -87,6 +89,7 @@ function fakeRuntime(
 		decide?: (event: CacheWarmingDecisionEvent) => CacheWarmingAction | Promise<CacheWarmingAction>;
 		mode?: CacheWarmingMode;
 		branch?: SessionEntry[];
+		idleMaxAgeMs?: number;
 	} = {},
 ) {
 	const calls: Array<{ model: Model<Api>; options: ModelsSimpleStreamOptions | undefined }> = [];
@@ -110,6 +113,7 @@ function fakeRuntime(
 			events.push(event);
 			return options.decide?.(event) ?? event.action;
 		},
+		...(options.idleMaxAgeMs === undefined ? [] : [() => options.idleMaxAgeMs as number]),
 	);
 	warmer.onWarmed = (entry) => warmedEntries.push(entry);
 	return { warmer, calls, events, warmedEntries, appendUsage, state };
@@ -341,6 +345,81 @@ describe("cache warming", () => {
 		expect(formatCacheWarmingUsage(entry.usage.cost.total, entry.note)).toBe(
 			"Cache warmed (extension override): $0.029497",
 		);
+	});
+});
+
+describe("idle warming limit", () => {
+	it("stops at settle with the default 30 minutes when the next refresh of a one-hour cache is later", async () => {
+		vi.useFakeTimers();
+		const { warmer, calls } = fakeRuntime();
+		warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		warmer.onAgentSettled();
+		expect(warmer.status).toMatchObject({ state: "inactive", reason: "30-minute idle safety limit reached" });
+		await vi.advanceTimersByTimeAsync(3_600_000);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("refreshes a one-hour cache once at 54 minutes with a 60-minute limit", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { warmer, calls } = fakeRuntime({ idleMaxAgeMs: 60 * 60_000 });
+		warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		warmer.onAgentSettled();
+		expect(warmer.status).toMatchObject({ state: "scheduled", nextWarmAt: 3_240_000 });
+		await vi.advanceTimersByTimeAsync(3_240_000);
+		expect(calls).toHaveLength(1);
+		expect(warmer.status).toMatchObject({ state: "inactive", reason: "60-minute idle safety limit reached" });
+		await vi.advanceTimersByTimeAsync(3_600_000);
+		expect(calls).toHaveLength(1);
+	});
+});
+
+describe("one-hour cache economics", () => {
+	it("prices a miss of a one-hour cache at the one-hour write rate", () => {
+		const tokens = 100_000;
+		const { input, cacheRead, cacheWrite } = adaptiveModel.cost;
+		const short = evaluateCacheWarming(adaptiveModel, tokens, "idle");
+		const long = evaluateCacheWarming(adaptiveModel, tokens, "idle", "long");
+		expect(short.missCost).toBeCloseTo(((cacheWrite - cacheRead) * tokens) / 1e6);
+		expect(long.missCost).toBeCloseTo(((2 * input - cacheRead) * tokens) / 1e6);
+		expect(long.warmCost).toBeCloseTo(short.warmCost);
+	});
+});
+
+describe("isPromptCacheCold", () => {
+	const at = (ms: number) => new Date(ms).toISOString();
+	const assistant = (id: string, timestamp: number): SessionEntry => ({
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: at(timestamp),
+		message: { ...response(adaptiveModel), timestamp },
+	});
+	const warm = (id: string, timestamp: number): SessionEntry => ({
+		type: "usage",
+		id,
+		parentId: null,
+		timestamp: at(timestamp),
+		kind: "cache_warm",
+		provider: "anthropic",
+		model: "m",
+		usage: warmUsage,
+	});
+	const user: SessionEntry = { type: "message", id: "u", parentId: null, timestamp: at(0), message: { role: "user", content: "hi", timestamp: 0 } };
+
+	it("measures from the last request or warm refresh", () => {
+		expect(isPromptCacheCold([assistant("a", 0)], 300_000, 300_000)).toBe(false);
+		expect(isPromptCacheCold([assistant("a", 0)], 300_000, 300_001)).toBe(true);
+		expect(isPromptCacheCold([assistant("a", 0), warm("w", 280_000)], 300_000, 500_000)).toBe(false);
+		expect(isPromptCacheCold([assistant("a", 0), warm("w", 280_000)], 300_000, 580_001)).toBe(true);
+		expect(isPromptCacheCold([assistant("a", 0), user], 300_000, 400_000)).toBe(true);
+	});
+
+	it("is never cold without a lifetime, a request, or after a compaction", () => {
+		expect(isPromptCacheCold([assistant("a", 0)], undefined, 10_000_000)).toBe(false);
+		expect(isPromptCacheCold([user], 300_000, 10_000_000)).toBe(false);
+		const compaction: SessionEntry = { type: "compaction", id: "c", parentId: null, timestamp: at(0), summary: "s", firstKeptEntryId: "a", tokensBefore: 1 };
+		expect(isPromptCacheCold([assistant("a", 0), compaction], 300_000, 10_000_000)).toBe(false);
 	});
 });
 

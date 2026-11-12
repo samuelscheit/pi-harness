@@ -1,7 +1,7 @@
 // Prompt cache warming policy shared by pi's hosts: when a refresh is due, whether a request can be replayed, and
 // whether a refresh pays for itself. Hosts own the scheduling; this module owns the numbers.
 import { calculateCost } from "./models.ts";
-import type { Api, Model, SimpleStreamOptions, Usage } from "./types.ts";
+import type { Api, CacheRetention, Model, SimpleStreamOptions, Usage } from "./types.ts";
 import { getProviderEnvValue } from "./utils/provider-env.ts";
 
 /** Whether a refresh is sent ("warm") or warming ends until the next real request ("stop"). */
@@ -48,14 +48,19 @@ export function getCacheWarmingDelayMs(ttlMs: number): number | undefined {
 	return Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000)));
 }
 
+/** The retention a request uses: its own option, else PI_CACHE_RETENTION, else "short". */
+export function resolvePromptCacheRetention(options: SimpleStreamOptions | undefined): CacheRetention {
+	return (
+		options?.cacheRetention ?? (getProviderEnvValue("PI_CACHE_RETENTION", options?.env) === "long" ? "long" : "short")
+	);
+}
+
 /**
  * Lifetime of the prompt cache entry a request writes, from the model's `promptCache` tier for the retention the
  * request used. Undefined when the model has no lifetime for that tier or caching is off.
  */
 export function getPromptCacheTtlMs(model: Model<Api>, options: SimpleStreamOptions | undefined): number | undefined {
-	const retention =
-		options?.cacheRetention ??
-		(getProviderEnvValue("PI_CACHE_RETENTION", options?.env) === "long" ? "long" : "short");
+	const retention = resolvePromptCacheRetention(options);
 	if (retention === "none") return undefined;
 	const seconds = model.promptCache?.[retention];
 	return seconds === undefined ? undefined : seconds * 1000;
@@ -84,11 +89,17 @@ export function evaluateCacheWarming(
 	model: Model<Api>,
 	promptTokens: number,
 	phase: CacheWarmingPhase,
+	retention: CacheRetention = "short",
 ): CacheWarmingDecision {
 	const cacheHitCost = price(model, { cacheRead: promptTokens });
+	// A miss writes the prompt again with the same retention; a one-hour write costs twice the input price.
 	const cacheMissCost = price(
 		model,
-		model.cost.cacheWrite > 0 ? { cacheWrite: promptTokens } : { input: promptTokens },
+		retention === "long"
+			? { cacheWrite: promptTokens, cacheWrite1h: promptTokens }
+			: model.cost.cacheWrite > 0
+				? { cacheWrite: promptTokens }
+				: { input: promptTokens },
 	);
 	const warmCost = price(model, { cacheRead: promptTokens, output: 1 });
 	const missCost = Math.max(0, cacheMissCost - cacheHitCost);
@@ -108,7 +119,7 @@ export function evaluateCacheWarming(
 
 function price(
 	model: Model<Api>,
-	tokens: Partial<Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite">>,
+	tokens: Partial<Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "cacheWrite1h">>,
 ): number {
 	const usage: Usage = {
 		input: 0,

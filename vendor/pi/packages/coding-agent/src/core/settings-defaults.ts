@@ -59,6 +59,7 @@ export const SETTINGS_DEFAULTS = {
 		inlineBudget: 3000,
 	},
 	cacheWarming: "idle",
+	cacheWarmingIdleMinutes: 30,
 	tuiMode: "fullscreen",
 	fullscreenExitOutput: "transcript",
 	fullscreenScrollbar: "auto",

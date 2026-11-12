@@ -2,6 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ProgramStatus, Terminal } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import type { AgentSessionEvent } from "../src/core/agent-session.ts";
+import type { CompactionReason } from "../src/core/session-manager.ts";
 import { ProgramStatusReporter } from "../src/modes/interactive/program-status-reporter.ts";
 
 function setup(sessionName?: string) {
@@ -35,7 +36,7 @@ function assistantEnd(stopReason: AssistantMessage["stopReason"], errorMessage?:
 const settled: AgentSessionEvent = { type: "agent_settled", aborted: false };
 
 const compactionEnd = (
-	reason: "manual" | "threshold" | "overflow",
+	reason: CompactionReason,
 	options: { aborted?: boolean; errorMessage?: string } = {},
 ): AgentSessionEvent => ({
 	type: "compaction_end",

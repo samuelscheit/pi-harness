@@ -286,6 +286,7 @@ export {
 	buildSessionContext,
 	buildSessionProjection,
 	type CompactionEntry,
+	type CompactionReason,
 	type ContextEditableContent,
 	type ContextEditEntry,
 	CURRENT_SESSION_VERSION,

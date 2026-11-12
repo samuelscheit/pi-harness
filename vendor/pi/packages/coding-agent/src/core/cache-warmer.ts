@@ -13,6 +13,7 @@ import {
 	isCacheWarmingReplayable,
 	type Model,
 	type ModelsSimpleStreamOptions,
+	resolvePromptCacheRetention,
 } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { SessionEntry, SessionManager, UsageEntry } from "./session-manager.ts";
@@ -30,6 +31,22 @@ function lastPromptTokens(entries: SessionEntry[]): number {
 		}
 	}
 	return 0;
+}
+
+/**
+ * Whether the prompt cache entry the branch's next request would read has expired: neither the
+ * last request nor a warm refresh after it touched the entry within `ttlMs`. A branch that ends in
+ * a compaction has no entry for its new context yet, so there is nothing to lose.
+ */
+export function isPromptCacheCold(branch: SessionEntry[], ttlMs: number | undefined, now: number): boolean {
+	if (ttlMs === undefined) return false;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "compaction") return false;
+		if (entry.type === "usage" && entry.kind === "cache_warm") return now - Date.parse(entry.timestamp) > ttlMs;
+		if (entry.type === "message" && entry.message.role === "assistant") return now - entry.message.timestamp > ttlMs;
+	}
+	return false;
 }
 
 /**
@@ -94,6 +111,8 @@ export class CacheWarmer {
 	private readonly getMode: () => CacheWarmingMode;
 	/** Lets extensions override `event.action`; failures fall back to pi's decision. */
 	private readonly decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
+	/** How long after a request idle refreshes may still be sent. */
+	private readonly getIdleMaxAgeMs: () => number;
 	/** Called with the persisted usage entry after each successful refresh. */
 	onWarmed?: (entry: UsageEntry) => void;
 
@@ -102,11 +121,13 @@ export class CacheWarmer {
 		sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">,
 		getMode: () => CacheWarmingMode,
 		decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction> = async (event) => event.action,
+		getIdleMaxAgeMs: () => number = () => CACHE_WARMING_MAX_IDLE_AGE_MS,
 	) {
 		this.models = models;
 		this.sessionManager = sessionManager;
 		this.getMode = getMode;
 		this.decide = decide;
+		this.getIdleMaxAgeMs = getIdleMaxAgeMs;
 		this.inactive = { state: "inactive", reason: "waiting for first request" };
 	}
 
@@ -177,9 +198,9 @@ export class CacheWarmer {
 			return;
 		}
 		run.phase = "idle";
-		const deadline = run.startedAt + CACHE_WARMING_MAX_IDLE_AGE_MS;
+		const deadline = run.startedAt + this.getIdleMaxAgeMs();
 		if (run.nextWarmAt > deadline || Date.now() >= deadline) {
-			this.stop("30-minute idle safety limit reached");
+			this.stop(this.idleLimitReason());
 		}
 	}
 
@@ -215,10 +236,9 @@ export class CacheWarmer {
 		// the planned pre-expiry margin for that delay and request dispatch; a
 		// late refresh is likely a full-price cache write, not a cache warm.
 		run.refreshDeadlineAt = run.nextWarmAt + Math.floor((run.ttlMs - run.delayMs) / 2);
-		const deadline =
-			run.startedAt + (run.phase === "idle" ? CACHE_WARMING_MAX_IDLE_AGE_MS : CACHE_WARMING_MAX_AGE_MS);
+		const deadline = run.startedAt + (run.phase === "idle" ? this.getIdleMaxAgeMs() : CACHE_WARMING_MAX_AGE_MS);
 		if (run.nextWarmAt > deadline || Date.now() >= deadline) {
-			this.stop(run.phase === "idle" ? "30-minute idle safety limit reached" : "one-hour safety limit reached");
+			this.stop(run.phase === "idle" ? this.idleLimitReason() : "one-hour safety limit reached");
 			return;
 		}
 		run.timer = setTimeout(() => void this.refresh(run), Math.max(0, run.nextWarmAt - Date.now()));
@@ -277,6 +297,10 @@ export class CacheWarmer {
 		if (this.run === run) this.schedule(run);
 	}
 
+	private idleLimitReason(): string {
+		return `${Math.round(this.getIdleMaxAgeMs() / 60_000)}-minute idle safety limit reached`;
+	}
+
 	private refreshDeadlineMissed(run: ActiveRun): boolean {
 		if (Date.now() <= run.refreshDeadlineAt) return false;
 		this.stop("cache refresh deadline missed");
@@ -299,7 +323,12 @@ export class CacheWarmer {
 	}
 
 	private evaluate(run: ActiveRun): CacheWarmingDecision {
-		return evaluateCacheWarming(run.model, lastPromptTokens(this.sessionManager.getBranch()), run.phase);
+		return evaluateCacheWarming(
+			run.model,
+			lastPromptTokens(this.sessionManager.getBranch()),
+			run.phase,
+			resolvePromptCacheRetention(run.options),
+		);
 	}
 }
 

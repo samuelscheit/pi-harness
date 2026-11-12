@@ -2,7 +2,7 @@ import { type Static, type TSchemaOptions, Type } from "typebox";
 import { ModelThinkingLevelSchema } from "./pi-ai-schemas.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 
-function nonNegativeSafeInteger(options: { default?: number } = {}) {
+function nonNegativeSafeInteger(options: { default?: number; description?: string } = {}) {
 	return Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, ...options });
 }
 
@@ -23,6 +23,18 @@ const CompactionSettingsSchema = Type.Object({
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
 		}),
+	),
+	coldCache: Type.Optional(
+		Type.Object(
+			{
+				minTokens: nonNegativeSafeInteger({ description: "Compact only contexts of at least this many tokens." }),
+				model: Type.String({ description: 'The model that writes the summary, as "provider/modelId".' }),
+			},
+			{
+				description:
+					"Before a run whose prompt cache has expired, compact a large context with a cheaper model instead of writing it to the cache again. Off when unset.",
+			},
+		),
 	),
 });
 
@@ -416,6 +428,20 @@ export const SettingsSchema = Type.Object(
 				description:
 					'Cache-warming profile. "idle" also warms between agent runs. Global only because each refresh costs money.',
 				default: SETTINGS_DEFAULTS.cacheWarming,
+			}),
+		),
+		cacheWarmingIdleMinutes: Type.Optional(
+			Type.Number({
+				minimum: 1,
+				description:
+					"How long after a request idle cache warming may still refresh the prompt cache, in minutes. With a one-hour cache, 60 allows one refresh. Global only because each refresh costs money.",
+				default: SETTINGS_DEFAULTS.cacheWarmingIdleMinutes,
+			}),
+		),
+		cacheRetention: Type.Optional(
+			Type.Union([Type.Literal("none"), Type.Literal("short"), Type.Literal("long")], {
+				description:
+					'Prompt cache retention for providers that support it: "short" (Anthropic: 5 minutes), "long" (Anthropic: 1 hour, cache writes cost 2x input instead of 1.25x), "none". Defaults to PI_CACHE_RETENTION, else "short".',
 			}),
 		),
 		websocketConnectTimeoutMs: Type.Optional(
