@@ -262,6 +262,8 @@ describe("indexer", () => {
 				firstKeptEntryId: "u4",
 				tokensBefore: 2300,
 				usage: usage(2300, 0, 0, 300),
+				provider: "anthropic",
+				model: "claude-haiku-4-5",
 				systemMessage: head,
 			}),
 			message("u5", "cmp", user("continue")),
@@ -320,6 +322,12 @@ describe("indexer", () => {
 			{ kind: "tool: read", n: 1 },
 			{ kind: "turn", n: 6 },
 		]);
+		const sideModels = db.prepare("SELECT kind, provider, model FROM requests WHERE kind != 'turn' ORDER BY kind").all();
+		assert.deepEqual(sideModels.map((r) => ({ ...r })), [
+			{ kind: "cache_warm", provider: "anthropic", model: "claude-opus-5-5" },
+			{ kind: "compaction", provider: "anthropic", model: "claude-haiku-4-5" },
+			{ kind: "tool: read", provider: "", model: "" },
+		], "a compaction is attributed to the model that ran it");
 
 		for (const row of db.prepare(
 			`SELECT r.entry_id, r.cost, SUM(c.read_cost + c.write_cost + c.uncached_cost) parts

@@ -176,6 +176,9 @@ describe("AgentSession compaction characterization", () => {
 		const compactionEntry = compactionEntries[0];
 		if (compactionEntry?.type === "compaction") {
 			expect(compactionEntry.usage).toEqual(summaryUsage);
+			// An extension's compaction names no model unless it says which one it used.
+			expect(compactionEntry).not.toHaveProperty("provider");
+			expect(compactionEntry).not.toHaveProperty("model");
 		}
 		const statsAfter = harness.session.getSessionStats();
 		expect(statsAfter.tokens.input).toBe(statsBefore.tokens.input + summaryUsage.input);
@@ -378,6 +381,36 @@ describe("AgentSession compaction characterization", () => {
 		expect(compactionEntries[0]?.type === "compaction" ? compactionEntries[0].usage : undefined).toEqual(
 			createUsage(10),
 		);
+		const model = harness.getModel();
+		expect(result.generatedBy).toEqual({ provider: model.provider, model: model.id });
+		expect(compactionEntries[0]).toMatchObject({ provider: model.provider, model: model.id });
+	});
+
+	it("records the model an extension's compaction says it used", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary from extension",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							generatedBy: { provider: "elsewhere", model: "small" },
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const result = await harness.session.compact();
+
+		expect(result.generatedBy).toEqual({ provider: "elsewhere", model: "small" });
+		const entry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
+		expect(entry).toMatchObject({ provider: "elsewhere", model: "small" });
 	});
 
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {

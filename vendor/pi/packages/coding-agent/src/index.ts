@@ -30,6 +30,7 @@ export {
 	type BranchPreparation,
 	type BranchSummaryResult,
 	type CollectEntriesResult,
+	type CompactionModel,
 	type CompactionResult,
 	type CutPointResult,
 	calculateContextTokens,

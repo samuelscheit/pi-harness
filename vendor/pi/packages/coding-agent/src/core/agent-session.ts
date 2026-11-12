@@ -512,7 +512,10 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 
 	private _modelRuntime: ModelRuntime;
-	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "onStatusChanged">;
+	private _cacheWarmer?: Pick<
+		CacheWarmer,
+		"cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "onStatusChanged"
+	>;
 	/** The last cache warming state emitted, to emit changes only. */
 	private _cacheWarmingEmitted?: string;
 
@@ -871,7 +874,8 @@ export class AgentSession {
 		const cold = isPromptCacheCold(branch, ttlMs, Date.now());
 		if (!cold && !economic.warm) return;
 		// Anthropic bills a one-hour cache write at twice the input price (see calculateCost).
-		const writePerMillion = resolvePromptCacheRetention(streamOptions) === "long" ? model.cost.input * 2 : model.cost.cacheWrite;
+		const writePerMillion =
+			resolvePromptCacheRetention(streamOptions) === "long" ? model.cost.input * 2 : model.cost.cacheWrite;
 		const saving = compactionSaving({
 			contextTokens: estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens,
 			keepTokens: this.settingsManager.getCompactionKeepRecentTokens(model),
@@ -1088,6 +1092,8 @@ export class AgentSession {
 						draft.details,
 						true,
 						draft.usage,
+						undefined,
+						draft.generatedBy,
 					);
 					break;
 				}
@@ -3051,40 +3057,32 @@ export class AgentSession {
 				}
 			}
 
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let usage: Usage | undefined;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				usage = extensionCompaction.usage;
-				details = extensionCompaction.details;
-			} else {
-				// Shared default summary generator, also used by automatic compaction.
-				const result = await this._runDefaultCompaction(
+			// Extension provided compaction content, else the shared default summary generator, also used by automatic compaction.
+			const compacted =
+				extensionCompaction ??
+				(await this._runDefaultCompaction(
 					preparation,
 					model,
 					customInstructions,
 					this._compactionAbortController.signal,
 					"manual",
-				);
-				summary = result.summary;
-				firstKeptEntryId = result.firstKeptEntryId;
-				tokensBefore = result.tokensBefore;
-				usage = result.usage;
-				details = result.details;
-			}
+				));
+			const { summary, firstKeptEntryId, tokensBefore, usage, details, generatedBy } = compacted;
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, "manual");
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				"manual",
+				generatedBy,
+			);
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3110,6 +3108,7 @@ export class AgentSession {
 				tokensBefore,
 				estimatedTokensAfter,
 				usage,
+				generatedBy,
 				details,
 			};
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
@@ -3384,37 +3383,29 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			let summary: string;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let usage: Usage | undefined;
-			let details: unknown;
-
-			if (extensionCompaction) {
-				// Extension provided compaction content
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				usage = extensionCompaction.usage;
-				details = extensionCompaction.details;
-			} else {
-				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this._runDefaultCompaction(
+			// Extension provided compaction content, else the shared default summary generator, also used by manual compaction.
+			const compacted =
+				extensionCompaction ??
+				(await this._runDefaultCompaction(
 					preparation,
 					summaryModel ?? model,
 					undefined,
 					abortController.signal,
 					reason,
-				);
-				summary = compactResult.summary;
-				firstKeptEntryId = compactResult.firstKeptEntryId;
-				tokensBefore = compactResult.tokensBefore;
-				usage = compactResult.usage;
-				details = compactResult.details;
-			}
+				));
+			const { summary, firstKeptEntryId, tokensBefore, usage, details, generatedBy } = compacted;
 			abortController.signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, reason);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				reason,
+				generatedBy,
+			);
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3440,6 +3431,7 @@ export class AgentSession {
 				tokensBefore,
 				estimatedTokensAfter,
 				usage,
+				generatedBy,
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });

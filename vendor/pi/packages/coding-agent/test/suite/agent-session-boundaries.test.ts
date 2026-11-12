@@ -37,6 +37,7 @@ describe("AgentSession actionable boundaries", () => {
 									summary: "exact handoff",
 									firstKeptEntryId: null,
 									details: { source: "test" },
+									generatedBy: { provider: "elsewhere", model: "small" },
 								},
 							],
 							continue: true,
@@ -57,7 +58,12 @@ describe("AgentSession actionable boundaries", () => {
 		await harness.session.prompt("discarded prompt");
 
 		const compaction = harness.sessionManager.getEntries().find((entry) => entry.type === "compaction");
-		expect(compaction).toMatchObject({ type: "compaction", summary: "exact handoff" });
+		expect(compaction).toMatchObject({
+			type: "compaction",
+			summary: "exact handoff",
+			provider: "elsewhere",
+			model: "small",
+		});
 		if (compaction?.type !== "compaction") throw new Error("expected compaction");
 		expect(compaction.firstKeptEntryId).toBe(compaction.id);
 		expect(requests).toHaveLength(1);

@@ -109,8 +109,16 @@ export interface CompactionResult<T = unknown> {
 	estimatedTokensAfter?: number;
 	/** Usage from the LLM call(s) that generated this summary, if available */
 	usage?: Usage;
+	/** The model that generated this summary, if known */
+	generatedBy?: CompactionModel;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+}
+
+/** The model a compaction summary was generated with. */
+export interface CompactionModel {
+	provider: string;
+	model: string;
 }
 
 // ============================================================================
@@ -1052,6 +1060,7 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		usage: summaryUsage,
+		generatedBy: { provider: model.provider, model: model.id },
 		details: { readFiles, modifiedFiles } as CompactionDetails,
 	};
 }

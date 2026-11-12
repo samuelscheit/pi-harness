@@ -18,17 +18,24 @@ async function economicHarness(minSaving: number | undefined, warm = true): Prom
 			{ id: "summary", cost: SUMMARY_COST },
 		],
 		// Five-minute cache, whatever PI_CACHE_RETENTION the environment sets.
-		settings: { cacheRetention: "short", compaction: { keepRecentTokens: 1_000, ...(minSaving === undefined ? {} : { economic: { model: "faux/summary", minSaving, warm } }) } },
+		settings: {
+			cacheRetention: "short",
+			compaction: {
+				keepRecentTokens: 1_000,
+				...(minSaving === undefined ? {} : { economic: { model: "faux/summary", minSaving, warm } }),
+			},
+		},
 	});
 	for (const model of harness.models) (model as Model<string>).promptCache = { short: 300, long: 3600 };
 	return harness;
 }
 
 /** A response that records which model produced it. */
-const reply = (text: string, calls: string[]) => (_context: unknown, _options: unknown, _state: unknown, model: Model<string>) => {
-	calls.push(model.id);
-	return fauxAssistantMessage(text) as AssistantMessage;
-};
+const reply =
+	(text: string, calls: string[]) => (_context: unknown, _options: unknown, _state: unknown, model: Model<string>) => {
+		calls.push(model.id);
+		return fauxAssistantMessage(text) as AssistantMessage;
+	};
 
 const compactions = (harness: Harness) =>
 	harness.sessionManager.getEntries().filter((entry): entry is CompactionEntry => entry.type === "compaction");
@@ -36,7 +43,13 @@ const compactions = (harness: Harness) =>
 /** Two big prompts, then a third after `delay`; returns the models called. */
 async function run(harness: Harness, delay: number): Promise<string[]> {
 	const calls: string[] = [];
-	harness.setResponses([reply("one", calls), reply("two", calls), reply("## Goal\nsummary", calls), reply("prefix summary", calls), reply("three", calls)]);
+	harness.setResponses([
+		reply("one", calls),
+		reply("two", calls),
+		reply("## Goal\nsummary", calls),
+		reply("prefix summary", calls),
+		reply("three", calls),
+	]);
 	await harness.session.prompt(`first ${BIG}`);
 	await harness.session.prompt(`second ${BIG}`);
 	expect(compactions(harness)).toHaveLength(0);
@@ -63,6 +76,11 @@ describe("economic compaction", () => {
 		expect(harness.session.model?.id).toBe("main");
 		expect(compactions(harness).map((entry) => entry.reason)).toEqual(["economic"]);
 		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["economic"]);
+		// The entry names the summary model that ran it, not the session's model.
+		expect(compactions(harness).map((entry) => [entry.provider, entry.model])).toEqual([["faux", "summary"]]);
+		expect(harness.eventsOfType("compaction_end").map((event) => event.result?.generatedBy)).toEqual([
+			{ provider: "faux", model: "summary" },
+		]);
 	});
 
 	it("an expired cache adds the rewrite to the saving: compacts cold where warm would not pay enough", async () => {
@@ -100,7 +118,11 @@ describe("economic compaction", () => {
 		] as const) {
 			const harness = await economicHarness(minSaving);
 			harnesses.push(harness);
-			harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
+			harness.setResponses([
+				fauxAssistantMessage("one"),
+				fauxAssistantMessage("two"),
+				fauxAssistantMessage("three"),
+			]);
 			await harness.session.prompt(big ? `first ${BIG}` : "first");
 			await harness.session.prompt(big ? `second ${BIG}` : "second");
 			const now = Date.now();
@@ -118,7 +140,14 @@ describe("economic compaction", () => {
 		await harness.session.prompt(`first ${BIG}`);
 		await harness.session.prompt(`second ${BIG}`);
 		const now = Date.now();
-		const usage = { input: 0, output: 1, cacheRead: 10, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+		const usage = {
+			input: 0,
+			output: 1,
+			cacheRead: 10,
+			cacheWrite: 0,
+			totalTokens: 11,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
 		vi.useFakeTimers({ toFake: ["Date"], now: now + FIVE_MINUTES - 30_000 });
 		harness.sessionManager.appendUsage("cache_warm", "faux", "main", usage);
 		vi.useRealTimers();
