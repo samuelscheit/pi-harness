@@ -1,0 +1,1003 @@
+import { existsSync, readFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	lintLocalPrBody,
+	lintPullRequestEvent,
+	lintPrBody,
+	referencedIssues,
+	resolveBugClosing,
+	resolveBugClosingViaGh,
+	resolveBugReferenced,
+	resolveRefsRemainderTrackers,
+	resolveRefsRemainderTrackersViaGh,
+} from "../../scripts/check-pr-body.mjs";
+
+// Recurrence (#4968): the detection audit of 2026-10-29 found 24 bug-linked PRs
+// merged in one week with no `## Detection` section, because each said
+// `Refs #N` where the lint only read `Closes`/`Fixes`/`Resolves`. #4769 and
+// #4808 were p2 external-bug fixes with no lesson recorded. The rule is keyed
+// on the issue's LABEL (`bug`, `nightly-drift`), not on the keyword, and it
+// refuses where it cannot read the label or cannot parse the reference.
+//
+// Closing-PR behaviour is unchanged and pinned by the #4288 suites in
+// check-pr-body.test.ts; this file owns the reference-only seam.
+const base = (summary: string, tail = "") =>
+	[
+		"## Why",
+		"The body gate records the detection lesson.",
+		"",
+		"## Notes for the reviewer",
+		"- None.",
+		"",
+		"## Change outline",
+		"- scripts/check-pr-body.mjs",
+		"",
+		"## Summary",
+		summary,
+		"",
+		"## Proof and checks",
+		"The proof sections follow.",
+		"",
+		"## Tests",
+		"Targeted tests pass.",
+		"",
+		"## Blast radius",
+		"No runtime module touched.",
+		"",
+		"## Class sweep",
+		'Defect shape: a gate keyed on the keyword. Search: `rg -n "bugClosing" scripts`. Verdict: stay specific.',
+		"Alignment: none: this fixture touches no family.",
+		"",
+		"## Fold check",
+		"none: the search listed no candidate",
+		"",
+		"## Observability",
+		"No new failure path; no record added.",
+		tail,
+	].join("\n");
+const detection = (shape = "new: stale mirror", enforcer = "#4439") =>
+	`\n## Detection\n\nCaught by: external user\nShould have been caught by: CI unit\nGap: none: no layer would have seen it\nShape: ${shape}\nEnforcer: ${enforcer}\n`;
+const refsOnly = base(
+	"Fixes the reader. Refs #4321 for the rest.\nRemaining #4321: the follow-up stays open.",
+);
+// Recurrence (#4968 F1): merged PR #4924 carried `(refs #4532)` in its title and
+// named the bug in its body only as `Part (a) of #4532 gap 13 only`, a form no
+// keyword list reads. #4532 is `bug`, and #4924 merged with no `## Detection`.
+const title4924 =
+	"fix: sweep held-document drift before lsp answers (refs #4532)";
+const body4924 = base(
+	"Part (a) of #4532 gap 13 only: files pi (the language server) already holds. Files pi does NOT hold (part (b)) are a separate lane; `clients/out-of-band-changes.ts` is untouched.\nRemaining #4532: the held-document drift follow-up stays open.",
+);
+const noGit = (() => "") as never;
+
+describe("Refs remainder alignment (#5326)", () => {
+	afterEach(() => vi.unstubAllEnvs());
+
+	const lint = (summary: string, title = "fix: keep the follow-up") =>
+		lintPrBody(base(summary), {
+			workingTree: true,
+			title,
+			refsRemainderTrackers: [],
+		});
+	const refusesRefs = (result: { errors: string[] }) =>
+		result.errors.some((error) => error.includes("with Refs but has no"));
+
+	it("refuses Refs without a line-start Remaining line", () => {
+		const result = lint("Fixes the reader. Refs #5323 for the rest.");
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("Remaining #5323:");
+	});
+
+	it("refuses a Remaining line placed after other text", () => {
+		const result = lint(
+			"Fixes the reader. Refs #5323. Remaining #5323: still open.",
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("on its own line");
+	});
+
+	it.each(["Remaining #5323: still open.", "- Remaining #5323: still open."])(
+		"accepts a line-start remainder: %s",
+		(remaining) => {
+			const result = lint(`Fixes the reader. Refs #5323.\n${remaining}`);
+			expect(result.errors.join(" ")).not.toContain("Remaining #5323");
+		},
+	);
+
+	it("does not count Refs inside an inline code span", () => {
+		expect(
+			lint("Fixes the reader. Use `Refs #5323` as an example.").valid,
+		).toBe(true);
+	});
+
+	// #5328 r3: land.sh deletes every `[^`]*` pair of title + " " + body (a jq
+	// gsub, not a Markdown lexer). The r2 lint blanked only lexed code spans,
+	// so it refused a fenced Refs land.sh pairs away, and passed a span glued
+	// inside a word that land.sh's deletion joins into `Refs #N`.
+	it.each([
+		[
+			"a fenced Refs, paired away",
+			"Fixes the reader.\n\n```text\nRefs #5323\n```",
+			"fix: keep the follow-up",
+			true,
+		],
+		[
+			"Refs in an inline span",
+			"Fixes the reader. Use `Refs #5323` as an example.",
+			"fix: keep the follow-up",
+			true,
+		],
+		[
+			"a span deleted from inside the word",
+			"Fixes the reader. Re`x`fs #5323.",
+			"fix: keep the follow-up",
+			false,
+		],
+		[
+			"a title backtick paired with a body one",
+			"Fixes the reader. A ` mark.",
+			"fix: keep `it (refs #5323)",
+			true,
+		],
+	])(
+		"deletes backtick pairs as land.sh does: %s",
+		(_, summary, title, valid) => {
+			expect(refusesRefs(lint(summary, title))).toBe(!valid);
+		},
+	);
+
+	it("accepts a closed issue without a remainder", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify({ state: "closed", title: "ordinary issue" }),
+				{
+					status: 200,
+				},
+			),
+		);
+		expect(
+			await resolveRefsRemainderTrackers(
+				base("Fixes the reader. Refs #5323."),
+				fetchImpl,
+			),
+		).toEqual([5323]);
+		expect(
+			lintPrBody(base("Fixes the reader. Refs #5323."), {
+				workingTree: true,
+				refsRemainderTrackers: [5323],
+			}).valid,
+		).toBe(true);
+		vi.unstubAllEnvs();
+	});
+
+	it("reads repeated references once and keeps unreadable issues unexempt", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ state: "open", title: "ordinary issue" }), {
+				status: 200,
+			}),
+		);
+		expect(
+			await resolveRefsRemainderTrackers(
+				base("Fixes the reader. Refs #5323 and refs #5323."),
+				fetchImpl,
+			),
+		).toEqual([]);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		const unreadable = vi
+			.fn()
+			.mockResolvedValue(new Response("denied", { status: 500 }));
+		expect(
+			await resolveRefsRemainderTrackers(
+				base("Fixes the reader. Refs #5323."),
+				unreadable,
+			),
+		).toEqual([]);
+		vi.unstubAllEnvs();
+	});
+
+	it("does not require a remainder for Closes alone", () => {
+		expect(lint("Fixes the reader. Closes #5323.").valid).toBe(true);
+	});
+
+	it("counts a reference in the title", () => {
+		const result = lint("Fixes the reader.", "fix: follow-up (refs #5323)");
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("Remaining #5323:");
+	});
+
+	// #5328 r3 (HIGH, parity): the r2 lint added every `#N` of the title, so a
+	// conventional "(closes #N)" title demanded `Remaining #N:` and PR #5328's
+	// own body lint refused itself. land.sh reads only `refs #N` in the title.
+	it.each([
+		"fix: follow-up (closes #5323)",
+		"fix: follow-up (fixes #5323)",
+		"fix: follow-up #5323",
+	])("owes no remainder for a title that does not say Refs: %s", (title) => {
+		expect(lint("Fixes the reader.", title).valid).toBe(true);
+	});
+
+	it("passes PR #5328's own title and body shape", () => {
+		expect(
+			lint(
+				"The local PR-body lint now requires the line-start `Remaining #N:` line that land.sh requires for open `Refs #N` issues. Closes #5326",
+				"fix(check-pr-body): require a line-start Remaining line for each Refs issue (closes #5326)",
+			).valid,
+		).toBe(true);
+	});
+
+	// #5328 r3: land.sh's closes_of skips an issue the raw body closes, in any
+	// line and inside a code span too, but one line at a time and only for the
+	// exact number. The r2 lint had no such skip.
+	it.each([
+		["a Closes line", "Refs #5323 for context.\nCloses #5323.", true],
+		["a closing keyword mid-line", "This closes #5323 and refs #5323.", true],
+		["Fixes with a colon", "Refs #5323.\nFixes: #5323", true],
+		["Closes inside a code span", "Refs #5323.\n`Closes #5323`", true],
+		["Closes of a longer number", "Refs #5323.\nCloses #53230", false],
+		["Closes split over two lines", "Refs #5323.\nCloses\n#5323", false],
+	])(
+		"skips an issue the body closes as land.sh does: %s",
+		(_, summary, valid) => {
+			expect(refusesRefs(lint(`Fixes the reader. ${summary}`))).toBe(!valid);
+		},
+	);
+
+	it("accepts a tracker issue only when its title was resolved", () => {
+		expect(
+			lint("Fixes the routine. Refs #4907.", "fix: routine (refs #4907)").valid,
+		).toBe(false);
+		expect(
+			lintPrBody(base("Fixes the routine. Refs #4907."), {
+				workingTree: true,
+				title: "fix: routine (refs #4907)",
+				refsRemainderTrackers: [4907],
+			}).valid,
+		).toBe(true);
+	});
+
+	it("reads tracker titles through the same API seam as other issue metadata", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ title: "tracking: scheduled routines" }), {
+				status: 200,
+			}),
+		);
+		try {
+			expect(
+				await resolveRefsRemainderTrackers(
+					base("Fixes the routine. Refs #4907."),
+					fetchImpl,
+					"fix: routine (refs #4907)",
+				),
+			).toEqual([4907]);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("keeps an unreadable tracker out of the exemption", async () => {
+		const exec = vi.fn().mockImplementation(() => {
+			throw new Error("offline");
+		});
+		expect(
+			await resolveRefsRemainderTrackersViaGh(
+				base("Fixes the routine. Refs #4907."),
+				process.cwd(),
+				exec as never,
+				"fix: routine (refs #4907)",
+			),
+		).toEqual([]);
+	});
+
+	it.skipIf(
+		!existsSync(
+			"/home/akis/.cache/pi-lens-orchestrator/bin/refs-remainder-check.sh",
+		),
+	)(
+		"pins the land.sh remainder expression when the orchestrator script is present",
+		() => {
+			const path =
+				"/home/akis/.cache/pi-lens-orchestrator/bin/refs-remainder-check.sh";
+			const script = readFileSync(path, "utf8");
+			expect(script).toContain(
+				"s/^[[:space:]]*([-*][[:space:]]+)?Remaining #$1:[[:space:]]*(.+[^[:space:]])[[:space:]]*$/\\2/p",
+			);
+		},
+	);
+
+	it("refuses a one-character remainder", () => {
+		expect(lint("Fixes the reader. Refs #5323.\nRemaining #5323:x").valid).toBe(
+			false,
+		);
+	});
+
+	// #5328 r3: land.sh's `:[[:space:]]*(.+[^[:space:]])` takes the space
+	// after the colon as the first character, so "Remaining #N: x" passes it.
+	// The r2 lint's `(\S.*\S)` refused that line.
+	it("accepts a one-character remainder after a space", () => {
+		expect(
+			lint("Fixes the reader. Refs #5323.\nRemaining #5323: x").valid,
+		).toBe(true);
+	});
+
+	// #5328 r3: land.sh tests the tracker prefix with a case-sensitive bash
+	// `=~`, so "Tracking:" is not exempt there. The r2 lint matched it with /i
+	// and passed a body land.sh refuses.
+	it.each([
+		["tracking: scheduled routines", [4907]],
+		["Umbrella: scheduled routines", [4907]],
+		["Tracking: scheduled routines", []],
+		["umbrella: scheduled routines", []],
+	])(
+		"exempts the tracker prefix case-sensitively: %s",
+		async (issueTitle, expected) => {
+			vi.stubEnv("GITHUB_TOKEN", "t");
+			vi.stubEnv("GITHUB_API_URL", "https://api.example");
+			vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+			const fetchImpl = vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ state: "open", title: issueTitle }), {
+					status: 200,
+				}),
+			);
+			expect(
+				await resolveRefsRemainderTrackers(
+					base("Fixes the routine. Refs #4907."),
+					fetchImpl,
+				),
+			).toEqual(expected);
+		},
+	);
+
+	// #5328 r3: land.sh reads the whole body, bot blocks included. The CI path
+	// passed `refsBody: fullBody`; the local path (pr-body.sh edit) passed only
+	// the author text, so a Refs after the cut passed locally and failed land.
+	it("reads Refs after the author-text cut in the local preflight", () => {
+		const result = lintLocalPrBody(
+			`${base("Fixes the reader.")}\n\n<!-- bot block -->\nRefs #5323 in a quoted commit.`,
+			process.cwd(),
+			noGit,
+			{ bugClosing: false, bugReferenced: false },
+		);
+		expect(result.errors.join(" ")).toContain("Remaining #5323:");
+	});
+});
+
+describe("referencedIssues (#4968)", () => {
+	it.each([
+		["Refs #12", [12]],
+		["refs: #12", [12]],
+		["REFS #12, #13 and #14", [12, 13, 14]],
+		["- **Refs** #12", [12]],
+		["> Refs #12", [12]],
+		["Fixes #12", [12]],
+		["Resolved GH-12", [12]],
+		["Ref #12", [12]],
+		// A wrapped reference: the keyword or a trailing comma ends the line.
+		["Otherwise Refs\n#12 and the rest.", [12]],
+		["Refs #11,\n#12", [11, 12]],
+		["Refs #11, #13 and\n#12", [11, 13, 12]],
+		["Refs #11.\n#12 is unrelated.", [11]],
+		["The fix (refs: [#12](https://example.test/i/12)) lands.", [12]],
+		["Landed with refs - #12.", [12]],
+		["Landed with **refs** **#12**.", [12]],
+		["References #12", [12]],
+		["Refs the audit in #12", [12]],
+		["The change (refs #12) lands here.", [12]],
+		["See Refs #12 and #13 and Closes #14", [12, 13, 14]],
+		["No keyword mentions #12 here.", []],
+		["```\nRefs #12\n```", []],
+		// Quoted material in a fence is not a reference; an inline code span is
+		// (fail closed: `Refs` before a code-spanned number still names it).
+		["Refs `#12`", [12]],
+		["Use `Refs #12` for a remainder.", [12]],
+		["Refs the template placeholder #NNN", []],
+		// Recurrence: PR 4641 opened a bullet with the verb "Fix" and linked a
+		// review comment; a URL after the keyword's own span is prose.
+		[
+			"- Fix round 1 answers review [F1](https://github.com/o/r/pull/9#issuecomment-1).",
+			[],
+		],
+	])("reads %j as %j", (text, expected) => {
+		expect(referencedIssues(text)).toEqual({
+			issues: expected,
+			unrecognised: [],
+		});
+	});
+
+	// A form the reader cannot turn into this repository's `#N` is returned for
+	// the gate to refuse, never skipped (fails closed).
+	it.each([
+		["Refs owner/repo#12", "owner/repo#12"],
+		[
+			"Refs: https://github.com/o/r/issues/12",
+			"https://github.com/o/r/issues/12",
+		],
+		["Closes https://github.com/o/r/pull/9", "https://github.com/o/r/pull/9"],
+		// A link destination behind the keyword is still a reference.
+		[
+			"Refs [the bug](https://github.com/o/r/issues/12).",
+			"https://github.com/o/r/issues/12",
+		],
+		["Refs\nowner/repo#12", "owner/repo#12"],
+		// The destination reached through a definition, and mid-line.
+		[
+			"Refs [the bug][1]\n\n[1]: https://github.com/o/r/issues/12",
+			"https://github.com/o/r/issues/12",
+		],
+		[
+			"Refs [bug]\n\n[bug]: https://github.com/o/r/issues/12",
+			"https://github.com/o/r/issues/12",
+		],
+		[
+			"Landed (refs [the bug](https://github.com/o/r/issues/12)).",
+			"https://github.com/o/r/issues/12",
+		],
+	])("returns %j as unrecognised", (text, token) => {
+		expect(referencedIssues(text)).toEqual({
+			issues: [],
+			unrecognised: [token],
+		});
+	});
+});
+
+describe("resolveBugReferenced (#4968)", () => {
+	const labelFetch = (names: string[]) =>
+		vi
+			.fn()
+			.mockImplementation(
+				async () =>
+					new Response(
+						JSON.stringify({ labels: names.map((name) => ({ name })) }),
+						{ status: 200 },
+					),
+			);
+	beforeEach(() => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => vi.unstubAllEnvs());
+
+	it.each([["bug"], ["nightly-drift"]])(
+		"is true for a %s label",
+		async (name) => {
+			expect(await resolveBugReferenced(refsOnly, labelFetch([name]))).toBe(
+				true,
+			);
+		},
+	);
+
+	it("is false for a label that is neither", async () => {
+		expect(
+			await resolveBugReferenced(refsOnly, labelFetch(["enhancement"])),
+		).toBe(false);
+	});
+
+	it("is false and never fetches when nothing is referenced", async () => {
+		const fetchImpl = vi.fn();
+		expect(await resolveBugReferenced(base("A plain change."), fetchImpl)).toBe(
+			false,
+		);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("reads only the issues the body does not close", async () => {
+		const fetchImpl = labelFetch(["enhancement"]);
+		await resolveBugReferenced(base("Closes #11. Refs #12."), fetchImpl);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		expect(String(fetchImpl.mock.calls[0][0])).toContain("/issues/12");
+	});
+
+	it("is null on a failed read", async () => {
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(new Response("denied", { status: 500 }));
+		expect(await resolveBugReferenced(refsOnly, fetchImpl)).toBe(null);
+	});
+
+	it("is null with no API credentials", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "");
+		expect(await resolveBugReferenced(refsOnly, labelFetch(["bug"]))).toBe(
+			null,
+		);
+	});
+
+	it("is null for a reference form it cannot read, without fetching", async () => {
+		const fetchImpl = labelFetch(["enhancement"]);
+		expect(
+			await resolveBugReferenced(base("Refs owner/repo#12."), fetchImpl),
+		).toBe(null);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	// The title channel (#4968 F1): the template makes the title carry the
+	// issue, so a bug named there owes the lesson whatever the body's wording.
+	it("reads a bug named only in the title (PR #4924)", async () => {
+		expect(
+			await resolveBugReferenced(body4924, labelFetch(["bug"]), title4924),
+		).toBe(true);
+		expect(await resolveBugReferenced(body4924, labelFetch(["bug"]))).toBe(
+			false,
+		);
+	});
+
+	it("reads a nightly-drift issue named in the title", async () => {
+		expect(
+			await resolveBugReferenced(
+				base("A plain change."),
+				labelFetch(["nightly-drift"]),
+				"fix: tidy (refs #12)",
+			),
+		).toBe(true);
+	});
+
+	it("is false for a title issue that is not a bug", async () => {
+		expect(
+			await resolveBugReferenced(
+				body4924,
+				labelFetch(["enhancement"]),
+				title4924,
+			),
+		).toBe(false);
+	});
+
+	it("reads an issue the title and the body both name once", async () => {
+		const fetchImpl = labelFetch(["enhancement"]);
+		await resolveBugReferenced(
+			base("Refs #12."),
+			fetchImpl,
+			"fix: tidy (refs #12)",
+		);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it("leaves an issue the body closes to the closing route", async () => {
+		const fetchImpl = labelFetch(["bug"]);
+		expect(
+			await resolveBugReferenced(
+				base("Closes #12."),
+				fetchImpl,
+				"fix: tidy (closes #12)",
+			),
+		).toBe(false);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("is null when the title issue's label cannot be read", async () => {
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(new Response("denied", { status: 500 }));
+		expect(await resolveBugReferenced(body4924, fetchImpl, title4924)).toBe(
+			null,
+		);
+	});
+
+	it("does not read a number in a title that has none", async () => {
+		const fetchImpl = labelFetch(["bug"]);
+		expect(
+			await resolveBugReferenced(
+				base("A plain change."),
+				fetchImpl,
+				"docs: tidy v4.4 notes for owner/repo#12 and 2026-10-29",
+			),
+		).toBe(false);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("ignores a reference behind a bot block", async () => {
+		const fetchImpl = labelFetch(["bug"]);
+		const text = `${base("A plain change.")}\n\n<!-- greptile -->\nLast reviewed commit (refs #77)\n`;
+		expect(await resolveBugReferenced(text, fetchImpl)).toBe(false);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+});
+
+describe("a PR that only references a bug issue (#4968)", () => {
+	const eventFetch = (
+		labels: string[] | "fail",
+		text: string,
+		liveTitle?: string,
+	) =>
+		vi.fn().mockImplementation(async (url: string) => {
+			if (String(url).includes("/files"))
+				return new Response(JSON.stringify([]), { status: 200 });
+			if (String(url).includes("/issues/"))
+				return labels === "fail"
+					? new Response("denied", { status: 500 })
+					: new Response(
+							JSON.stringify({ labels: labels.map((name) => ({ name })) }),
+							{ status: 200 },
+						);
+			return new Response(JSON.stringify({ body: text, title: liveTitle }), {
+				status: 200,
+			});
+		});
+	const runEvent = async (
+		text: string,
+		labels: string[] | "fail",
+		title?: string,
+		liveTitle?: string,
+	) => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const result = await lintPullRequestEvent(
+				eventFetch(labels, text, liveTitle),
+				{ pull_request: { number: 4968, body: text, title } },
+				() => "",
+			);
+			return {
+				result,
+				errors: errors.mock.calls.flat().join("\n"),
+				warnings: warnings.mock.calls.flat().join("\n"),
+			};
+		} finally {
+			errors.mockRestore();
+			warnings.mockRestore();
+		}
+	};
+	beforeEach(() => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		vi.stubEnv("GITHUB_ACTIONS", "true");
+	});
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("CI reds a Refs-only bug body that has no Detection section", async () => {
+		const run = await runEvent(refsOnly, ["bug"]);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('missing "## Detection"');
+	});
+
+	it("CI reds a nightly-drift reference too", async () => {
+		const run = await runEvent(refsOnly, ["nightly-drift"]);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('missing "## Detection"');
+	});
+
+	it("CI passes a Refs-only bug body with a complete Detection section", async () => {
+		const run = await runEvent(`${refsOnly}\n${detection()}`, ["bug"]);
+		expect(run.errors).toBe("");
+		expect(run.result.valid).toBe(true);
+	});
+
+	// The audit's blank and absent Shape/Enforcer lines (#4860, #4863 had none;
+	// #4771 a stub name): each reds on the reference seam like on a closing PR.
+	it.each([
+		["a blank Shape", detection("", "#4439")],
+		["an unnamed new Shape", detection("new:", "#4439")],
+		["a blank Enforcer", detection("new: stale mirror", "")],
+		[
+			"no Shape or Enforcer line",
+			"\n## Detection\n\nCaught by: dogfood\nShould have been caught by: this layer\nGap: none: docs only\n",
+		],
+	])("CI reds %s on a Refs-only bug body", async (_name, section) => {
+		const run = await runEvent(`${refsOnly}\n${section}`, ["bug"]);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('"## Detection"');
+	});
+
+	it("CI refuses an unknown answer on a referenced bug", async () => {
+		const run = await runEvent(
+			`${refsOnly}\n${detection("new: stale mirror", "#4439").replace("external user", "unknown")}`,
+			["bug"],
+		);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain("not a detection lesson");
+	});
+
+	it("CI passes a Refs-only body for a non-bug issue", async () => {
+		const run = await runEvent(refsOnly, ["enhancement"]);
+		expect(run.result.valid).toBe(true);
+	});
+
+	it("CI refuses when the referenced label cannot be read", async () => {
+		const run = await runEvent(refsOnly, "fail");
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toMatch(/#4321.*could not be read/s);
+	});
+
+	it("CI refuses a reference form it cannot resolve", async () => {
+		const run = await runEvent(base("Refs owner/repo#12."), ["enhancement"]);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain("owner/repo#12");
+	});
+
+	// Recurrence guarded (#4976 CodeRabbit thread): a PR that closes a bug owes
+	// the full section already, so a cross-repository `Refs` beside it changes no
+	// requirement. Refusing it would redden a legitimate upstream citation
+	// (#4755 cites hashicorp/vscode-...#N) for a label read the verdict never uses.
+	it("CI passes a bug-closing PR that also cites an upstream issue", async () => {
+		const closing = base("Closes #4321. Refs owner/repo#12 upstream.");
+		const run = await runEvent(`${closing}\n${detection()}`, ["bug"]);
+		expect(run.errors).toBe("");
+		expect(run.result.valid).toBe(true);
+	});
+
+	it("CI still reds that bug-closing PR when the section is missing", async () => {
+		const run = await runEvent(
+			base("Closes #4321. Refs owner/repo#12 upstream."),
+			["bug"],
+		);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('missing "## Detection"');
+		expect(run.errors).not.toContain("cannot be judged");
+	});
+
+	it("CI reds a bug named only in the title (PR #4924)", async () => {
+		const run = await runEvent(body4924, ["bug"], title4924);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('missing "## Detection"');
+	});
+
+	it("CI passes a title-named bug with a complete Detection section", async () => {
+		const run = await runEvent(
+			`${body4924}\n${detection()}`,
+			["bug"],
+			title4924,
+		);
+		expect(run.errors).toBe("");
+		expect(run.result.valid).toBe(true);
+	});
+
+	// Recurrence (#4976 CodeRabbit thread, the #2083 shape): "Re-run jobs"
+	// replays the opened-event payload, so a title edited afterwards is stale
+	// there. The body already came from the live PR; the title read from the
+	// payload judged a title the author no longer has.
+	it("CI reads a bug added to the title after the event", async () => {
+		const run = await runEvent(
+			body4924,
+			["bug"],
+			"fix: sweep held-document drift before lsp answers",
+			title4924,
+		);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('missing "## Detection"');
+	});
+
+	it("CI drops a bug removed from the title after the event", async () => {
+		const run = await runEvent(
+			body4924,
+			["bug"],
+			title4924,
+			"fix: sweep held-document drift before lsp answers",
+		);
+		expect(run.errors).toBe("");
+		expect(run.result.valid).toBe(true);
+	});
+
+	// The same live title reaches the refusal for an unreadable label and the
+	// `refactor:` gate of lintPrBody (a retitle to refactor owes a table).
+	it("CI refuses a label it cannot read for a bug added to the title", async () => {
+		const run = await runEvent(
+			body4924,
+			"fail",
+			"fix: sweep held-document drift before lsp answers",
+			title4924,
+		);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toMatch(/#4532.*could not be read/s);
+	});
+
+	it("CI applies the refactor gate to a title retitled after the event", async () => {
+		const run = await runEvent(
+			body4924,
+			["enhancement"],
+			"fix: sweep held-document drift (refs #4532)",
+			"refactor: sweep held-document drift (refs #4532)",
+		);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain("Behavior equivalence");
+	});
+
+	// F2: CI has the token, so an unreadable label refuses there. The message
+	// does not tell the author to rewrite a reference that was already readable.
+	it("CI refuses a title issue whose label cannot be read", async () => {
+		const run = await runEvent(body4924, "fail", title4924);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toMatch(/#4532.*could not be read/s);
+		expect(run.errors).not.toContain("Write each reference");
+	});
+
+	it("CI tells the author to rewrite a reference it cannot read", async () => {
+		const run = await runEvent(base("Refs owner/repo#12."), ["enhancement"]);
+		expect(run.errors).toContain('Write each reference as "Refs #N"');
+	});
+
+	// F7: the unknown refusal also binds a PR that only references the bug.
+	it("CI names a referenced bug in the unknown refusal", async () => {
+		const run = await runEvent(
+			`${refsOnly}\n${detection().replace("external user", "unknown")}`,
+			["bug"],
+		);
+		expect(run.errors).not.toContain("a bug-closing PR names");
+		expect(run.errors).toContain("closes or references a bug");
+	});
+
+	// F3: #4968 names `nightly-drift` for Closes too; 17 of 20 nightly-drift
+	// issues carry no `bug` label, so a bug-only closing route left them out.
+	it("CI reds a Closes of a nightly-drift-only issue", async () => {
+		const run = await runEvent(base("Closes #4321."), ["nightly-drift"]);
+		expect(run.result.valid).toBe(false);
+		expect(run.errors).toContain('missing "## Detection"');
+	});
+
+	// The closing path is unchanged: an unreadable closed-issue label still
+	// warns and skips (#4288), so a closing-only PR is not newly refused.
+	it("CI keeps warn-and-skip for an unreadable closed issue", async () => {
+		const run = await runEvent(base("Closes #4321."), "fail");
+		expect(run.result.valid).toBe(true);
+		expect(run.warnings).toContain("could not read the closed issue label");
+	});
+});
+
+describe("the local preflight reads a referenced bug (#4968)", () => {
+	it("reds a Refs-only body whose reference is a bug", () => {
+		const result = lintLocalPrBody(refsOnly, process.cwd(), noGit, {
+			bugClosing: false,
+			bugReferenced: true,
+		});
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('missing "## Detection"');
+	});
+
+	it("passes a Refs-only body with a complete Detection section", () => {
+		const result = lintLocalPrBody(
+			`${refsOnly}\n${detection()}`,
+			process.cwd(),
+			noGit,
+			{ bugClosing: false, bugReferenced: true },
+		);
+		expect(result.errors).toEqual([]);
+	});
+
+	it("passes a Refs-only body for a non-bug reference", () => {
+		const result = lintLocalPrBody(refsOnly, process.cwd(), noGit, {
+			bugClosing: false,
+			bugReferenced: false,
+		});
+		expect(result.errors).toEqual([]);
+	});
+
+	// F2: a worker without gh (a write-confined sandbox) cannot read a label.
+	// Locally that warns and skips, as the closing route does; CI, which has the
+	// token, refuses (pinned above). Before, every `Refs #N` body reddened offline.
+	const localWarnings = (run: () => unknown) => {
+		const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			run();
+			return warnings.mock.calls.flat().join("\n");
+		} finally {
+			warnings.mockRestore();
+		}
+	};
+
+	it("warns and skips when the referenced label is unreadable", () => {
+		let result: ReturnType<typeof lintLocalPrBody> | undefined;
+		const warned = localWarnings(() => {
+			result = lintLocalPrBody(refsOnly, process.cwd(), noGit, {
+				bugClosing: false,
+				bugReferenced: null,
+			});
+		});
+		expect(result?.errors).toEqual([]);
+		expect(result?.valid).toBe(true);
+		expect(warned).toMatch(/could not read the label of #4321.*skipped/s);
+	});
+
+	it("warns and skips when the caller supplies no label reader at all", () => {
+		let result: ReturnType<typeof lintLocalPrBody> | undefined;
+		const warned = localWarnings(() => {
+			result = lintLocalPrBody(refsOnly, process.cwd(), noGit, {
+				bugClosing: false,
+			});
+		});
+		expect(result?.valid).toBe(true);
+		expect(warned).toContain("#4321");
+	});
+
+	// The skip covers the label read only. A reference the reader cannot turn
+	// into `#N` needs no network, so it still refuses offline.
+	it("still refuses a reference form it cannot read when labels are unreadable", () => {
+		const result = lintLocalPrBody(
+			base("Refs owner/repo#12."),
+			process.cwd(),
+			noGit,
+			{ bugClosing: false, bugReferenced: null },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("owner/repo#12");
+		expect(result.errors.join(" ")).toContain(
+			'Write each reference as "Refs #N"',
+		);
+	});
+
+	it("hands the whole body and the title to an injected reader", () => {
+		const resolve = vi.fn().mockReturnValue(false);
+		const result = lintLocalPrBody(body4924, process.cwd(), noGit, {
+			bugClosing: false,
+			resolveBugReferenced: resolve,
+			title: title4924,
+		});
+		expect(resolve).toHaveBeenCalledWith(body4924, title4924);
+		expect(result.errors).toEqual([]);
+	});
+
+	// F4: the light validator runs only when no route already required the
+	// section. A referenced bug with an `unknown` answer is reported once.
+	it("reports an unknown answer on a referenced bug once", () => {
+		const result = lintLocalPrBody(
+			`${refsOnly}\n${detection().replace("external user", "unknown")}`,
+			process.cwd(),
+			noGit,
+			{ bugClosing: false, bugReferenced: true },
+		);
+		const detectionErrors = result.errors.filter((error) =>
+			error.includes('"## Detection"'),
+		);
+		expect(detectionErrors).toHaveLength(1);
+		expect(detectionErrors[0]).toContain("not a detection lesson");
+	});
+
+	it("does not read references when the body already closes a bug", () => {
+		const resolve = vi.fn();
+		lintLocalPrBody(
+			`${base("Closes #4320. Refs #4321.")}\n${detection()}`,
+			process.cwd(),
+			noGit,
+			{ bugClosing: true, resolveBugReferenced: resolve },
+		);
+		expect(resolve).not.toHaveBeenCalled();
+	});
+});
+
+// F3 (#4968): the closing route reads the same label list as a reference. A
+// `Closes` of a nightly-drift-only issue owed no section before.
+describe("the closing route reads nightly-drift (#4968)", () => {
+	const labelFetch = (names: string[]) =>
+		vi
+			.fn()
+			.mockImplementation(
+				async () =>
+					new Response(
+						JSON.stringify({ labels: names.map((name) => ({ name })) }),
+						{ status: 200 },
+					),
+			);
+	beforeEach(() => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("resolveBugClosing is true for a nightly-drift label", async () => {
+		expect(
+			await resolveBugClosing("Closes #12.", labelFetch(["nightly-drift"])),
+		).toBe(true);
+	});
+
+	it("resolveBugClosingViaGh is true for a nightly-drift label", async () => {
+		const exec = vi
+			.fn()
+			.mockReturnValue(JSON.stringify({ labels: [{ name: "nightly-drift" }] }));
+		expect(
+			await resolveBugClosingViaGh("Closes #12.", process.cwd(), exec as never),
+		).toBe(true);
+	});
+
+	it("resolveBugClosing stays false for an unrelated label", async () => {
+		expect(
+			await resolveBugClosing("Closes #12.", labelFetch(["enhancement"])),
+		).toBe(false);
+	});
+});

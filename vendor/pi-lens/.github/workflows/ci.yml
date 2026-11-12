@@ -1,0 +1,1421 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # #3754: the merge queue tests each queued PR merged onto the latest master
+  # in a `gh-readonly-queue/master/pr-N-<sha>` ref and waits for the required
+  # checks to report on THAT commit. Every workflow that produces a required
+  # check must therefore also run on `merge_group`, or the queue waits forever
+  # (tests/config/merge-queue-workflows.test.ts pins the list). PR-only jobs
+  # carry `if: github.event_name == 'pull_request'` and are skipped there.
+  merge_group:
+    types: [checks_requested]
+  # #5062: a PR a workflow opens with GITHUB_TOKEN starts no `pull_request` run.
+  # The opening job dispatches this workflow on the bot branch instead; the run
+  # reports the same required check names on the branch head and takes the
+  # push-shaped full-suite path (docs/ci-bot-pr-checks.md).
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# #5420: one transient registry 5xx must not red npm ci or npx; npm's default
+# is 2 retries. The gate (workflow-level, literal, floored) is
+# tests/config/release-download-helper-workflow.test.ts.
+env:
+  npm_config_fetch_retries: 5
+  npm_config_fetch_retry_maxtimeout: 120000
+
+jobs:
+  # #3801: classify the diff once. `code` is false ONLY for a pull_request whose
+  # every changed path is on the strict docs allowlist (root *.md, docs/**,
+  # .changelog/**; scripts/ci-changed-files.mjs); it is not a job output because no job reads it. The
+  # Unit shards and every other test job run for a docs-only diff (the
+  # `Install test` legs report without installing, #5112): a docs edit can red
+  # tests/clients and tests/scripts (docs/public-api-stability.md,
+  # docs/*_rules_catalog.md are read by them), so the suite is never skipped.
+  # `formal` is true when the diff touches formal/ (or what runs it), and then
+  # the `tla-shards` matrix model-checks. Push and any other event
+  # get code=true formal=true, so master keeps the full suite, and every doubt
+  # (unreadable or empty file list, API cap) resolves to the full suite too.
+  #
+  # `TLA+ models` is a REQUIRED check and never skips at job level: a job `if:`
+  # that evaluates false reports `skipped`, which GitHub counts as passing, but
+  # ci-verdict demands a literal `success` on a
+  # required row (#2618). The aggregate `tla-models` therefore always starts and
+  # reports. The four `tla-shards` MATRIX jobs are not required rows, so they
+  # skip at job level when `formal` is proven 'false' (#5082): a skipped job
+  # takes no runner, where the step-level skip they used before held one of the
+  # 20 concurrent slots for each of four jobs on 72 of 73 pull requests. The
+  # name of this job ends in `(advisory)`: it reports, never gates.
+  changes:
+    name: Changed files (advisory)
+    runs-on: ubuntu-latest
+    # A sparse checkout, one API read and a script: 10 min is the repo's floor
+    # (refs #3123).
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      formal: ${{ steps.classify.outputs.formal }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: false
+          node-version: '22'
+      - name: Classify the changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ci-changed-files.mjs --event "$EVENT_NAME" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
+
+  # #1844: the changelog-fragment format error hit four PRs in one day, each
+  # costing a full ~4-minute Unit-tests lap to discover. This job runs ONLY
+  # the fragment parser (no `npm install`, no `npm run build` -- it is pure
+  # Node against .changelog/*.md) so a bad fragment fails in seconds. It is
+  # additive early signal, not a replacement for the Unit-tests job below,
+  # which still runs the full changelog-entries.test.ts as part of the suite.
+  changelog-fragment-fastfail:
+    name: Changelog fragment (fast-fail)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request so --branch master matched no runs; measured max over 6
+    # successful runs regardless of branch: 10s; timeout = floor of 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Fetch the PR base for the fragment-diff check
+        run: git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}"
+
+      - name: Fetch the PR head for the fragment-diff check
+        run: git fetch --no-tags origin "${{ github.event.pull_request.head.sha }}"
+
+      # Compare the PR head with the event base. The merge ref also contains
+      # master commits made after a stale PR base; diffing it would count those
+      # master-only fragments as additions by this PR (#4033).
+      - name: Validate changelog fragments
+        run: node scripts/check-changelog-fragments.mjs --base "${{ github.event.pull_request.base.sha }}" --head "${{ github.event.pull_request.head.sha }}"
+
+  # #3918: TLC over formal/*/*.cfg runs as parallel `--shard i/N` jobs, N being
+  # the matrix length (`strategy.job-total`, so the count has ONE source). The
+  # single job reached its 12-minute cap at 514 configs (master 623 s; PR heads
+  # cancelled at 736 s, 881 s and 12m15s), because the population outgrew the
+  # estimate this comment used to carry. The job id `tla-models` and the check
+  # name `TLA+ models` stay with the aggregate below (the ruleset requires that
+  # name); the shard jobs are `tla-shards`.
+  # Measured per-shard WALL time on master run 39380875926 (attempt 1):
+  # 268 s, 349 s, 494 s and 726 s -- the round-robin split was unbalanced by
+  # ~2.7x and shard 4 owned the tail. That shard hit the 12-minute cap TWICE,
+  # every step of it concluded `success` both times: attempt 1 job
+  # 118491126416 was `cancelled` at 735 s, attempt 2 job 118632989721 at 726 s.
+  # Each cancellation reded the required `TLA+ models` check with no model
+  # violation, and a rerun lost the same race.
+  #
+  # #4672: scripts/check-tla-models.mjs now partitions by MEASURED COST
+  # (longest-processing-time pack over scripts/tla-model-costs.json), not
+  # round-robin by config count. Round-robin was the defect: configs' TLC times
+  # run 1.2 s to 422 s, so on that run the four shards summed 733 s / 1255 s /
+  # 1617 s / 2148 s of TLC time (2.9x). Same four shards, measured cost table,
+  # summed work per shard: 1538 s / 1539 s / 1538 s / 1538 s (1.00x).
+  # tests/config/tla-models-shard-workflow.test.ts pins that every config lands
+  # in exactly one shard and that the measured split stays balanced.
+  # Measured per-shard WALL time over 15 model-checking runs (master pushes and
+  # PR heads, 2026-10-20; `started_at` -> `completed_at` of each
+  # `TLA+ models (shard k/N)` job): per-shard-position p50/p90 465/510 s
+  # (shard 1), 334/357 s (shard 2), 337/348 s (shard 3), 685/700 s (shard 4).
+  # The balanced partition's projected worst shard is 1538 s of TLC work, which
+  # is 505 s at that run's measured 3.05 s-of-work-per-second-of-wall. The
+  # first CI run on this change observes it (a ci.yml or checker edit is a
+  # `formal` trigger).
+  tla-shards:
+    name: TLA+ models (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: changes
+    # #3801 (verify r2 V1): failed classification must not skip the model
+    # shards. Empty `formal` output runs every config; only a proven 'false'
+    # skips them. #5082: the skip is at JOB level so the four shards start no
+    # runner when formal/ is unchanged; the `tla-models` aggregate below reports
+    # the required check either way and reds when a shard that ran is red.
+    if: ${{ !cancelled() && needs.changes.outputs.formal != 'false' }}
+    runs-on: ubuntu-latest
+    strategy:
+      # One red shard must not cancel its siblings: the log of every red shard
+      # then names its own mismatched models.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    # refs #3572, #3517: each shard runs its configs through the CPU-sized
+    # concurrency pool in scripts/check-tla-models.mjs, one TLC worker per
+    # config (deterministic first violation).
+    #
+    # #4672 cap sizing (the #3123 rule: measured maximum plus margin). The
+    # 12-minute cap was AT the measured maximum, so a slower runner turned
+    # finished work into `cancelled`: 735 s and then 726 s against 720 s on run
+    # 39380875926, with every step `success` both times, and 20 minutes is the
+    # floor of the next whole step above that tail (the way #3591 raised the
+    # pre-shard job 10 -> 20). Measured over 15 model-checking runs
+    # (2026-10-20, both master pushes and PR heads): per-shard-position p90
+    # 510 s (shard 1), 357 s (shard 2), 348 s (shard 3), 700 s (shard 4) --
+    # that window excludes the two attempts the 720 s cap cut short, so its
+    # 724 s maximum is not the worst shard ever observed: the censored 735 s
+    # attempt named above is. The tail is shard 4 because the old partition packed
+    # it by count while its configs cost 2.9x the others. After the
+    # cost-weighted partition the projected worst shard is 505 s of wall, so
+    # 20 min is 2.4x the projected worst and 1.63x the worst shard ever
+    # observed (735 s), the `test` job's
+    # documented measured-max x2 rule (#3111). The cap is the SECOND mechanism:
+    # the partition removes the tail, the cap and the cancelled-shard verdict
+    # keep a slow runner's teardown race from reddening a required check.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      # #3801: the models depend only on formal/ and the checker, so a diff that
+      # touches neither (the `changes` job) never reaches these steps (#5082:
+      # the job-level `if` above). `!= 'false'`: only a proven-unchanged
+      # formal/ skips; an unreadable classification runs the full check.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: false
+          node-version: '22'
+
+      # #5409: the jar comes through the fetch-verified helper (cache, --fail,
+      # retries) before the checker runs. The checker keeps its own sha256 check
+      # and its Node fetch, which only a run with no jar at .cache/ reaches.
+      - name: Fetch and verify tla2tools.jar (pinned like scripts/check-tla-models.mjs)
+        uses: ./.github/actions/fetch-verified
+        with:
+          tool: tla2tools
+          version: v1.7.4
+          url: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          sha256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+          path: .cache/tla2tools.jar
+
+      # The runner image ships a JDK on PATH; the checker reads the jar and
+      # verifies its sha256 before running it.
+      - name: Model-check formal/ against each config's expected verdict
+        run: |
+          java -version
+          node scripts/check-tla-models.mjs --shard ${{ matrix.shard }}/${{ strategy.job-total }}
+
+  # #3918: the ONE check-run named exactly `TLA+ models`, the name branch
+  # protection requires. A job whose `needs` failed is SKIPPED by default, and
+  # GitHub counts a skipped required check as passing, so `if: always()` is
+  # what makes a red shard red here instead of green-by-skip.
+  #
+  # #4672: the verdict itself is `scripts/check-shard-verdict.mjs`, the ONE
+  # seam both sharded aggregates share. `needs.tla-shards.result == 'success'`
+  # still passes without any API read; any other result is classified from the
+  # run's own job list, because a shard that FINISHED its model check and then
+  # lost the race against its own `timeout-minutes` reports `cancelled` with
+  # every step `success` (run 39380875926, shard 4/4, 735 s against 720 s).
+  # That reading is kept as a pass with a recorded `::warning::`; a shard
+  # cancelled BEFORE its model-check step finished stays red, and unreadable
+  # evidence fails closed. The reasoning is in the script's header.
+  #
+  # #5082: when `changes` proved formal/ unchanged, the `tla-shards` jobs are
+  # skipped at job level and this aggregate is the ONLY TLA+ job that starts.
+  # It reports success without a checkout or a verdict read, but only when BOTH
+  # facts hold (`formal` is the literal 'false' AND the shard job's result is
+  # `skipped`). Any other pairing -- a shard that ran and failed, an empty
+  # classification, a skipped shard job under a formal change -- reads the
+  # verdict seam, and `skipped` rows without a proven-unchanged formal/ fail
+  # there ("a shard row is missing from the evidence").
+  tla-models:
+    name: TLA+ models
+    needs: [changes, tla-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
+    # (refs #3123).
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # #4672: the cancelled-shard verdict reads this run's job list
+      # (GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs). Read-only, and
+      # the narrowest scope that endpoint accepts.
+      actions: read
+    env:
+      SHARDS_RESULT: ${{ needs.tla-shards.result }}
+    steps:
+      - name: Report that no TLA+ model job was needed (formal/ unchanged)
+        if: needs.changes.outputs.formal == 'false' && needs.tla-shards.result == 'skipped'
+        run: echo "formal/ and scripts/check-tla-models.mjs are unchanged in this diff; the TLA+ shard jobs were not started (they run on every formal change and on master pushes)"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: needs.changes.outputs.formal != 'false' || needs.tla-shards.result != 'skipped'
+        with:
+          persist-credentials: false
+
+      - name: Require every TLA+ models shard to succeed
+        if: needs.changes.outputs.formal != 'false' || needs.tla-shards.result != 'skipped'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SHARD_JOB_PATTERN: '^TLA\+ models \(shard [0-9]+/[0-9]+\)$'
+          SHARD_CHECK_STEP: "Model-check formal/ against each config's expected verdict"
+        run: |
+          echo "TLA+ models shard jobs (tla-shards): ${SHARDS_RESULT}"
+          node scripts/check-shard-verdict.mjs \
+            --label "TLA+ models" \
+            --result "${SHARDS_RESULT}" \
+            --shard-pattern "${SHARD_JOB_PATTERN}" \
+            --check-step "${SHARD_CHECK_STEP}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --run "${GITHUB_RUN_ID}"
+
+  lint-and-typecheck:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 32s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: true
+          node-version: '22'
+
+      - name: Lockfile complete under the CI npm pin
+        run: npm run check:lockfile -- --complete
+
+      # #1185: the whole dependency tree installs through the pinned npm with
+      # --strict-allow-scripts, so a lifecycle script package.json's allowScripts
+      # does not decide fails the install (ESTRICTALLOWSCRIPTS) instead of being
+      # skipped with a warning. The runner's bundled npm does not know the flag.
+      - name: Install dependencies
+        run: |
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --strict-allow-scripts --no-audit --no-fund
+
+      - name: Lockfile in sync with package.json
+        run: npm run check:lockfile
+
+      # #1185: names the package, resolved version, phase and fix for a missing,
+      # mismatched, stale or name-only approval, or a floating direct range --
+      # the cases npm's own strict flag does not report (#1176).
+      - name: allowScripts policy matches the resolved lockfile
+        run: npm run check:allow-scripts
+
+      # `npm install` above ran `prepare` → downloaded the core grammars into
+      # grammars/ with provenance sidecars. Verify their bytes/versions match the
+      # committed manifest so a stale or tampered/ABI-mismatched wasm can't slip in
+      # against the pinned web-tree-sitter (#177).
+      - name: Grammar provenance in sync with manifest
+        run: npm run check:grammars
+
+      # Fail on known-vulnerable PRODUCTION deps (what actually ships to users via
+      # `npm install --omit=dev`). Scoped to high/critical to avoid blocking PRs on
+      # fix-less moderate advisories; transitive moderate ones are handled by
+      # Dependabot security updates. DevDeps are excluded — they never reach users.
+      # Bounded + retried (scripts/audit-prod-deps.mjs): a registry outage
+      # (2026-09-04: ~5 min hang then 400 from the retired quick endpoint) must
+      # not red the job the way a real high/critical finding does. The script
+      # fails only on findings, retries transport errors, and on exhaustion
+      # passes with a visible warning annotation.
+      - name: Audit production dependencies
+        run: node scripts/audit-prod-deps.mjs
+
+      # `npm run lint` chains tsc (the TS project) with `lint:js` (oxlint over
+      # scripts/**/*.mjs, root *.mjs, tests/**/*.mjs, and other non-TS JS) —
+      # #2439: tsc alone never covered plain .mjs, so an undefined identifier
+      # there passed both this step and CI.
+      - name: TypeScript & JS lint
+        run: npm run lint
+
+      # Catches accidental duplicate ast-grep rule bodies across language
+      # tags (#657) — e.g. a `-js` twin whose language tag never got updated
+      # off its copy-pasted `TypeScript` value, so both rules always fired
+      # under the SAME language and the twin's JS coverage was silently dead.
+      - name: ast-grep rule pair audit
+        run: npm run audit:astgrep-rule-pairs
+
+      # #5002: was its own `Dependency boundaries` row. `!cancelled()` keeps it
+      # reporting after a lint red, as the separate job did.
+      - name: Build compiled clients
+        if: ${{ !cancelled() }}
+        run: npm run build
+
+      - name: Check client dependency boundaries
+        if: ${{ !cancelled() }}
+        run: npm run depcruise:check
+
+  # #4397: a test file that depends on case order or on a sibling file passes
+  # in CI's file order and reds on a reorder or a shard split (#4390, #4391).
+  # Run the test files this PR adds or changes under two fixed shuffle seeds,
+  # and each alone. Nothing else reorders a PR's own tests before merge. This
+  # job is what remained of `Targeted tests (advisory)` (#3215): its selection
+  # step caught the failing file on 26.7% of real Unit reds (50 of 187 heads,
+  # measured 2026-10-31) and was removed; the CI-only suites it admitted run in
+  # the gating `Unit tests` shards too. Advisory: `continue-on-error` keeps a
+  # red from gating, and the step still reds so the job row shows it. Flip
+  # plan: when 20 consecutive PR runs show no false red, drop the
+  # `continue-on-error` below, drop `(advisory)` from the name, and add
+  # `Changed tests shuffled` to the required set. The script bounds itself to
+  # 7 min (BUDGET_MS), 1 min under the step's cap; setup measured 23-43 s over
+  # 23 PR runs (2026-10-31), so the 10 min job cap holds the 8 min step plus
+  # setup with margin. Files the PR adds run alone first; the time budget is
+  # the only bound (#4456). The SHAs reach the script through `env`, never the
+  # `run:` text.
+  changed-tests-shuffled:
+    name: Changed tests shuffled (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: true
+          node-version: '22'
+
+      # Lockfile-locked and script-free (SonarCloud githubactions:S8543 /
+      # S6505 flagged the copied `npm install` here); the one piece of
+      # `prepare` the changed vitest files need is the grammar download, run
+      # explicitly below. The Unit job keeps `npm install` because its
+      # lockfile-in-sync check depends on it.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+
+      - name: Build
+        run: npm run build
+
+      # #4003: `--ignore-scripts` above skips `prepare`, so nothing here builds
+      # dist/; a changed LSP fixture file imports it and fails with a named
+      # "run npm run build:dist first" precondition without it.
+      - name: Build dist
+        run: npm run build:dist
+
+      - name: Changed test files, alone and shuffled
+        timeout-minutes: 8
+        env:
+          # The interleaving kit's waitFor budget scales by this (#4437).
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci-shuffle-changed-tests.mjs --base "$BASE_SHA" --head "$HEAD_SHA"
+
+  # #3753: the suite runs as parallel `vitest --shard=k/N` jobs, N being the
+  # matrix length (`strategy.job-total`, so the count has ONE source). This job
+  # id stays `test` (the matrix-shard aggregate `needs:` it, and a matrix
+  # job's `needs.test.result` is success only when EVERY shard
+  # succeeded). The check-run the ruleset requires is the `unit-tests`
+  # aggregate below, named exactly `Unit tests`.
+  #
+  # Why five, and why balanced (#3771, #3801): vitest's own `--shard` assigns
+  # files by sha1 of the path in equal COUNTS, not equal duration, and the
+  # serialized projects (wall-clock-budget, real-harness, lsp-spawn-heavy) are a
+  # per-shard floor, so #3756's five shards ran `Run tests` from 107 s to 252 s
+  # (max/mean 1.4). vitest.config.ts now installs a sequencer that packs the
+  # files by recorded per-file seconds (scripts/test-shard-weights.json,
+  # scripts/lib/test-shard-assignment.mjs). Measured on the same runner pool
+  # (scratch run 36776021055 of branch ci/3801-exp-shards, the `test` job
+  # copied at N = 3, 4, 5; slowest shard job / max over mean of `Run tests` /
+  # total runner-minutes):
+  #
+  #   N=3  390 s  1.10  17.8 min
+  #   N=4  301 s  1.09  18.4 min
+  #   N=5  248 s  1.07  19.2 min   (hash-count N=5 before: 274-292 s, 1.4, 19.2 min)
+  #
+  # The current target is a <=6-minute required-check median (#3801). Five is
+  # the measured choice: it buys 53 s over four for 0.8 more runner-minutes.
+  # The repo sits at the 20-concurrent-job cap, so this is the largest tested
+  # count retained only because its measured slowest shard is 53 s faster.
+  test:
+    name: Unit tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One red shard must not cancel its siblings: ci-verdict then names the
+      # failing tests of every red shard, not just the first to finish.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    # Bounds the job so a reader that is alive but never drains (e.g. an
+    # unbounded stdout stall in the mem-watch wrapper, #3106) cannot hold the
+    # runner for GitHub's 360-minute default. Sized at measured-max x2 plus margin
+    # headroom: the longest Unit job over 9 successful master runs
+    # (2026-09-15/16) was 12m42s; 26m would sit exactly on a 2x-slow runner, so 30m (refs #3111).
+    # A shard runs a fraction of that suite, so this is looser than before.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # #3753: pinned so the tmp-fixture-hygiene owner step below shares this
+      # shard's run id (baseline, run-file manifest, owner markers) with the
+      # sharded `Run tests` step. vitest.config.ts mints a fresh id only when
+      # this is unset.
+      PI_LENS_TMP_HYGIENE_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      # #5082: this job restored ~/.npm twice. setup-node auto-caches npm
+      # (package.json names it in `packageManager`) under
+      # `node-cache-Linux-x64-npm-<lockfile hash>`, and the step below restores
+      # the same directory under `npm-Linux-node-22-<hash>`. The setup-node
+      # Linux entry is first-writer-wins and holds 676 bytes in the cache
+      # listing (2026-10-31), against 162 MB for the `npm-` entry, so it
+      # restores nothing. The `npm-` entry, which the push-to-master run saves
+      # and pull requests restore, is the one kept.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Cache npm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-node-22-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Verify ast-grep CLI is on PATH
+        run: node_modules/.bin/ast-grep --version
+
+      - name: Build
+        run: npm run build
+
+      # #3684: the advisory registry-subset rule reports only in files the PR
+      # changed. The checkout is the PR merge commit at depth 1, so fetch the
+      # base tip; the wrapper diffs the working tree against origin/<base ref>
+      # (GITHUB_BASE_REF is set on pull_request runs). Advisory never gates.
+      - name: Fetch PR base for advisory self-scan
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" || true
+
+      # #1718: dogfoods the pi-lens-self-scan ast-grep rule subset (recurring
+      # AI-authorship defect shapes from #1158) against pi-lens's own
+      # clients/ + tests/ trees. ~3.5s on 1073 files — cheap enough for every
+      # PR rather than nightly. Fails on any finding not already triaged into
+      # the committed rules/ast-grep-rules/self-scan-baseline.json. The
+      # registered-or-fail proof that this scan mechanism actually executes
+      # lives in tests/support/astgrep-self-scan.test.ts (Run tests, below).
+      - name: Ast-grep self-scan
+        run: npm run astgrep:self-scan
+
+      # #2042: the size of the box the fork pool is budgeted against. The suite
+      # was OOM-killed here repeatedly and no log line said how much memory the
+      # runner actually had, so every diagnosis started from a guess.
+      - name: Runner capacity
+        run: |
+          echo "nproc=$(nproc)"
+          free -m
+          # 2026-09-15: this read the ROOT cgroup's memory.max, which cgroup v2
+          # never populates, so it printed nothing on every run in the dataset
+          # the 2026-09-15 diagnosis assembled — the same defect the sibling
+          # kernel-kill-evidence step further down was fixed for (#2230 round 2
+          # F1), four lines away, and never swept onto this one. Walk to this
+          # process's own cgroup the same way that step does.
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null || true)
+          p="$cg"
+          found=""
+          while [ -n "$p" ]; do
+            f="/sys/fs/cgroup${p%/}/memory.max"
+            if [ -r "$f" ]; then
+              echo "cgroup=${p} file=${f}"
+              cat "$f"
+              found=1
+              break
+            fi
+            if [ "$p" = "/" ]; then break; fi
+            p=$(dirname "$p")
+          done
+          if [ -z "$found" ]; then
+            echo "(memory.max absent or unreadable from '${cg:-unknown}' up to root)"
+          fi
+
+      - name: Run tests
+        env:
+          # Spawn-heavy MCP smokes retain a 20s local deadline but need room
+          # for loaded shared runners (#860).
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          # The #1101 machine-wide test-suite lock (scripts/with-test-lock.mjs)
+          # exists to serialize concurrent full-suite runs on a SHARED dev
+          # machine. CI runners are isolated (one job per VM), so there is
+          # never contention to serialize — skip it explicitly rather than
+          # relying on it being harmless.
+          PI_LENS_TEST_NO_LOCK: '1'
+          # #2042 2026-09-15 cheapest probe: a 2s MemAvailable poll cannot see a
+          # sub-2-second spike, so sample five times faster. The env var already
+          # existed for exactly this; only the value is new.
+          PI_LENS_MEM_WATCH_INTERVAL_MS: '200'
+          # Shared with the "Memory sample tail" step below so both read/write
+          # the same file. runner.temp, not the checkout, so it never shows up
+          # in `git status` and is cleaned up with the rest of the job's scratch
+          # space regardless of how the job ends.
+          PI_LENS_MEM_WATCH_SAMPLE_FILE: ${{ runner.temp }}/pi-lens-mem-watch-samples.log
+        # #2042: the wrapper changes nothing about what runs and forwards the
+        # child's exit code unchanged. It prints the host's memory low-water
+        # mark and a verdict line, so the next `Killed npm test` / exit 137 —
+        # which carries no failing assertion and reads as infrastructure noise —
+        # arrives with a number attached.
+        run: node scripts/with-memory-watch.mjs -- npm test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} --reporter=default --reporter=json --outputFile=${{ runner.temp }}/vitest-results.json
+
+      # #3753: tmp-fixture-hygiene is the serialized owner that reds on tmp
+      # entries any OTHER file leaked during the run. `--shard` hands it to
+      # exactly one shard, which would leave the other two shards' leaks
+      # unjudged, so every shard re-runs it here as a second invocation. The
+      # shared PI_LENS_TMP_HYGIENE_RUN_ID (job env) makes it read this shard's
+      # baseline and run-file manifest. In the one shard `--shard` also gave it
+      # to, it ran already (and cleaned its records), so this run is a cheap
+      # no-op there; it never weakens the check.
+      - name: Tmp-fixture hygiene owner
+        env:
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          PI_LENS_TEST_NO_LOCK: '1'
+        run: npm test -- tests/config/tmp-fixture-hygiene.test.ts
+
+      # Listener input for #3215. The default reporter remains explicit above,
+      # so this adds a file reporter in the same invocation and preserves the
+      # existing result sections and npm/vitest exit status. Vitest also emits
+      # one `JSON report written to <path>` line; that additive console
+      # contract is pinned in `tests/scripts/test-history-rollup.test.ts` by
+      # driving the installed vitest JsonReporter directly, and the local
+      # `npm test` script adds no JSON reporter at all.
+      #
+      # The metadata basename below is `METADATA_FILENAME` from
+      # `scripts/test-history-rollup.mjs` — the consumer's own constant.
+      # `tests/config/test-history-workflow.test.ts` asserts this step against
+      # it, because a producer/consumer basename drift made the nightly rollup
+      # exit 2 on every real artifact (round 3, F8).
+      - name: Write test-history artifact metadata
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: 'node -e "require(\"node:fs\").writeFileSync(process.env.RUNNER_TEMP + \"/test-history-metadata.json\", JSON.stringify({headSha: process.env.HEAD_SHA, runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT, lane: \"linux\", recordedAt: new Date().toISOString()}))"'
+
+      - name: Upload per-file test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-test-results-linux-shard-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/vitest-results.json
+            ${{ runner.temp }}/test-history-metadata.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # #2042 2026-09-15: the wrapper's console line is a step-crossing summary
+      # of host memory only — it cannot show per-cgroup RSS, PID-count churn, or
+      # PSI stall, and the 1701d01 red proved the console line can be lost
+      # entirely when the wrapper itself is the kill's victim. The wrapper
+      # appends every sample (per-cgroup memory.current/memory.peak/pids.current
+      # plus PSI) to the file below regardless; `if: always()` reads it even
+      # when the job never reaches a later step, so a killed run still yields
+      # its samples. Round-2 review F2: the file itself is unbounded (append-
+      # only, so an earlier low-water sample can never be scrolled out by a
+      # rewrite); `tail` bounds only what THIS step prints.
+      - name: Memory sample tail
+        if: always()
+        env:
+          PI_LENS_MEM_WATCH_SAMPLE_FILE: ${{ runner.temp }}/pi-lens-mem-watch-samples.log
+        run: |
+          f="$PI_LENS_MEM_WATCH_SAMPLE_FILE"
+          if [ -r "$f" ]; then
+            total=$(wc -l < "$f")
+            echo "--- mem-sample tail (last 300 of ${total} lines) ---"
+            tail -n 300 "$f"
+          else
+            echo "(no sample file at $f - the wrapper wrote nothing before the job ended)"
+          fi
+
+      # #2042 round 2: the low-water mark falsified the memory story (three
+      # kills at 13.0-13.3 GB available of 16 GB, a green run LOWER at 13.1 GB)
+      # but it cannot name what sent the SIGKILL. The kernel can. `dmesg` says
+      # in one line whether the OOM killer fired and on whom; systemd-oomd
+      # kills on PSI pressure while memory still reads available, so it is the
+      # other authority worth asking. Every command is best-effort: this step
+      # must add evidence to a failure, never change its cause.
+      - name: Kernel kill evidence
+        if: failure()
+        run: |
+          set +e
+          # Round-2 review F2: an empty arm must distinguish "asked, nothing
+          # there" from "could not ask". Silence alone reads as the first and
+          # can be the second.
+          echo "--- kernel OOM/kill records ---"
+          dm=$(sudo dmesg -T 2>/dev/null)
+          if [ -z "$dm" ]; then
+            echo "(dmesg unavailable or empty - no evidence either way)"
+          else
+            hits=$(printf '%s\n' "$dm" |
+              grep -iE 'out of memory|oom-kill|oom_reaper|killed process' |
+              tail -40)
+            if [ -z "$hits" ]; then
+              echo "(dmesg readable, zero OOM/kill records - the kernel OOM killer did not fire)"
+            else
+              printf '%s\n' "$hits"
+            fi
+          fi
+          echo "--- systemd-oomd ---"
+          sudo journalctl -u systemd-oomd --no-pager -n 40 2>/dev/null ||
+            echo "(journalctl unavailable)"
+          # Round-2 review F1: reading /sys/fs/cgroup/memory.events reads the
+          # ROOT cgroup, which cgroup v2 does not populate. It printed nothing
+          # whether or not an event had occurred, so it could never support a
+          # claim either way. Resolve this process's OWN cgroup and walk up to
+          # the first ancestor that actually has the file.
+          echo "--- cgroup memory.events ---"
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+          p="$cg"
+          found=""
+          while [ -n "$p" ]; do
+            f="/sys/fs/cgroup${p%/}/memory.events"
+            if [ -r "$f" ]; then
+              echo "cgroup=${p} file=${f}"
+              cat "$f"
+              found=1
+              break
+            fi
+            if [ "$p" = "/" ]; then break; fi
+            p=$(dirname "$p")
+          done
+          if [ -z "$found" ]; then
+            echo "(memory.events absent or unreadable from '${cg:-unknown}' up to root - no cgroup evidence either way)"
+          fi
+          echo "--- memory now ---"
+          free -m
+          exit 0
+
+  # #3753: the ONE check-run named exactly `Unit tests`, the name the ruleset
+  # requires and every tool (ci-verdict) keys on. A job
+  # whose `needs` failed is SKIPPED by default, and GitHub
+  # counts a skipped required check as passing, so `if: always()` is what
+  # makes a red shard red here instead of green-by-skip.
+  #
+  # #4672: same verdict seam as `tla-models` above
+  # (`scripts/check-shard-verdict.mjs`), with this aggregate's own shard-job
+  # pattern and check step. The shard count is NOT baked in anywhere: the
+  # pattern matches `Unit tests (shard k/N)` for any N, so a future re-shard
+  # (#3753) moves the matrix and nothing here.
+  unit-tests:
+    name: Unit tests
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
+    # (refs #3123).
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # #4672: readable job list for the cancelled-shard verdict, as above.
+      actions: read
+    env:
+      SHARDS_RESULT: ${{ needs.test.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Require every Unit tests shard to succeed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SHARD_JOB_PATTERN: '^Unit tests \(shard [0-9]+/[0-9]+\)$'
+          # The step that runs the tests...
+          SHARD_CHECK_STEP: 'Run tests'
+          # ...and the gate that runs AFTER it in the same job. `--check-step`
+          # is repeatable and every listed step must have concluded: a cancel
+          # between `Run tests` and this step leaves a real gate (tmp entries
+          # another file leaked) unjudged, so one step was not enough (#4672
+          # review, V2b). A NEW gating step added after `Run tests` belongs in
+          # this list -- tests/config/unit-tests-shard-workflow.test.ts reds
+          # until it is, because it reads the job's own step order.
+          SHARD_TRAILING_CHECK_STEP: 'Tmp-fixture hygiene owner'
+        run: |
+          echo "Unit tests shard jobs (test): ${SHARDS_RESULT}"
+          node scripts/check-shard-verdict.mjs \
+            --label "Unit tests" \
+            --result "${SHARDS_RESULT}" \
+            --shard-pattern "${SHARD_JOB_PATTERN}" \
+            --check-step "${SHARD_CHECK_STEP}" \
+            --check-step "${SHARD_TRAILING_CHECK_STEP}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --run "${GITHUB_RUN_ID}"
+
+  # GATING since #4518 (maintainer decision, 2026-10-17): the Windows unit leg
+  # runs the real `win32` gates, and advisory reds were waved through (#4566
+  # r14's `.cmd` branch, #4551). It therefore starts on every event like the
+  # Unit shards, and it is not named `(advisory)` any more, so
+  # ci-verdict gates it, and branch protection requires it.
+  unit-tests-windows:
+    name: Unit tests Windows
+    runs-on: windows-latest
+    outputs:
+      windows_vitest: ${{ steps.windows-vitest.outcome }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      # #3926: leave `ref` unset. The pinned action then fetches the captured
+      # commit (`github.sha`, the validated test-merge tree), so this checkout
+      # survives a merge that deletes the mutable `refs/pull/<n>/merge` while
+      # the lane is queued.
+      # Do not restore `ref: ${{ github.ref }}`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # actionlint: the `runner` context is not available in job-level `env`,
+      # so the probe home is pinned from a step (same value, exported for the
+      # rest of the job).
+      - name: Pin PI_LENS_HOME under the runner temp dir
+        shell: bash
+        run: echo "PI_LENS_HOME=$RUNNER_TEMP/pi-lens-home" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: true
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      # Keep this population derived from the source tree. A new Windows path
+      # or platform-gated test joins the lane without a hand-maintained list.
+      - name: Enumerate Windows Vitest subset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(node scripts/lib/win32-gate-population.mjs --files)
+          [[ ${#FILES[@]} -eq 0 ]] && { echo "::error::enumeration empty"; exit 1; }
+          printf '%s\n' "${FILES[@]}" | sort -u | tee "$RUNNER_TEMP/windows-vitest-files.txt"
+          printf 'Windows Vitest subset: %s files\n' "$(sort -u "$RUNNER_TEMP/windows-vitest-files.txt" | wc -l)"
+
+      - name: Run Windows Vitest subset
+        id: windows-vitest
+        shell: bash
+        env:
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < "$RUNNER_TEMP/windows-vitest-files.txt"
+          node_modules/.bin/vitest run "${FILES[@]}" --configLoader runner 2>&1 | tee "$RUNNER_TEMP/windows-vitest.log"
+
+      - name: Record Windows Vitest outcome
+        # #3926: a failed checkout leaves no repository, so the summary must not
+        # invoke the checked-out population script. Report that the subset was
+        # not executed and preserve the original checkout failure as the cause.
+        if: always()
+        shell: bash
+        run: |
+          outcome="${{ steps.windows-vitest.outcome }}"
+          {
+            echo "## Windows Vitest subset"
+            if [[ -f "$RUNNER_TEMP/windows-vitest-files.txt" ]]; then
+              node scripts/lib/win32-gate-population.mjs --summary --executed-file-list "$RUNNER_TEMP/windows-vitest-files.txt"
+            else
+              echo "Not executed: no executed-file list was produced (the checkout or enumeration step did not complete), so the Windows subset summary is unavailable."
+            fi
+            if [[ -f "$RUNNER_TEMP/windows-vitest.log" ]]; then
+              failures="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log")"
+              echo "Windows Vitest failures: ${failures:-unknown}"
+            else
+              echo "Windows Vitest failures: unavailable"
+            fi
+            echo "Windows Vitest subset step outcome: $outcome"
+            echo "windows_vitest=$outcome"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail a failed or under-executed Windows Vitest subset
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.windows-vitest.outcome }}" == "failure" ]]; then
+            failures="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log")"
+            echo "::error title=Windows Vitest subset::${failures:-unknown} Vitest tests failed"
+            exit 1
+          fi
+          # #4518: a subset whose files all skip (or whose log has no summary) is
+          # green on the outcome alone. 2516 tests ran on the measured leg
+          # (tests/fixtures/nightly-floors/measurements.json); the floor is just over half.
+          executed="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log" --executed 2>/dev/null || true)"
+          node scripts/assert-evaluated.mjs --count "windows-vitest=${executed}" --floor 1260
+
+  # Simulates pi's real install path: a `git:` install runs `npm install
+  # --omit=dev`, which triggers `prepare` → `build:dist` FROM SOURCE with the
+  # dev-only @types/node ABSENT. That's the path that broke with TS2688 (#193)
+  # and that the tarball-based install-test never exercises (#194) — the tarball
+  # ships pre-built dist/, so it never re-runs the build under --omit=dev.
+  prod-install-build:
+    name: Production install build (--omit=dev, from source)
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 72s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: true
+          node-version: '22'
+
+      # npm 11.11 restored libc descriptors in lockfile v3 (#9025). Older npm
+      # silently removes them and installs both glibc and musl optional binaries.
+      # Keep this version in sync with the pin in release.yml (publish-npm job).
+      - name: Pin npm with libc-aware lockfile metadata
+        run: |
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          test "$(npx -y "npm@${npm_pin}" --version)" = "${npm_pin}"
+
+      # #437: typescript is a devDependency (#402), so --omit=dev omits it. pi builds
+      # the GitHub install from source under --omit=dev, so `build:dist` must resolve
+      # tsc WITHOUT a local typescript. GitHub runners ship typescript GLOBALLY, which
+      # would let a bare `tsc` leak off PATH and hide the regression — so remove it
+      # first, forcing build:dist to resolve tsc itself (npx -p typescript). If this
+      # step ever fails, the from-source --omit=dev build is broken for real users.
+      - name: Remove global typescript (kill the PATH leak that hid #437)
+        run: |
+          npm rm -g typescript 2>/dev/null || true
+          if command -v tsc >/dev/null 2>&1; then
+            echo "note: a tsc still on PATH at $(command -v tsc) — build must not depend on it"
+          else
+            echo "no global tsc — clean"
+          fi
+
+      - name: Install without devDeps (--omit=dev)
+        run: |
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --omit=dev --strict-allow-scripts --no-audit --no-fund
+
+      - name: Build dist from source under --omit=dev (the prepare path)
+        run: npm run build:dist
+
+      # #1926: pi supplies the host-provided packages from its own runtime, so a
+      # production install must not vendor a private second copy. One vendored
+      # copy cost the git install 760ms of extra module evaluation at load.
+      - name: Verify no host-provided package was vendored (#1926)
+        run: node scripts/check-prod-install-shape.mjs
+
+      # ...and now put them there. `node dist/index.js` is not pi, so without
+      # these two the entry throws on the FIRST one it imports and the load
+      # check below never reaches a genuinely missing dep like minimatch —
+      # which is the regression this job exists to catch (#1926).
+      - name: Supply host-provided packages the way pi does (#1926)
+        run: | # zizmor: ignore[adhoc-packages]
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          HOST_PKGS=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && HOST_PKGS+=("$pkg")
+          done < <(node "$SUPPLY" --install-args)
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund "${HOST_PKGS[@]}"
+
+      - name: Verify dist built and the compiled entry loads
+        run: |
+          test -f dist/index.js || \
+            (echo "ERROR: dist/index.js not built under --omit=dev (TS2688? prepare/build:dist failed)" && exit 1)
+          # ERR_MODULE_NOT_FOUND = a runtime dep was wrongly in devDependencies.
+          # Only the TYPE-ONLY host SDK may be missing here: the step above
+          # supplied the runtime ones, so if one of THOSE is still missing the
+          # grep must fail. That is what keeps this check able to fail at all.
+          # The allowlist derives from scripts/lib/host-provided-deps.mjs, so it
+          # cannot drift from the dependency shape (#1926).
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          node dist/index.js 2>&1 | tee /tmp/load.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/load.txt \
+             && ! grep -Eq "$ALLOW" /tmp/load.txt; then
+            echo "FAILED: missing runtime module under --omit=dev"
+            echo "(host-provided allowlist: $ALLOW)"
+            cat /tmp/load.txt
+            exit 1
+          fi
+          echo "Production --omit=dev build + load OK"
+
+      # The faithful reproduction of `pi install git:github.com/apmantza/pi-lens`
+      # (#437): pi CLONES the repo and runs `npm install --omit=dev` in a PRISTINE
+      # tree (no pre-existing node_modules / dev artifacts), which runs the WHOLE
+      # `prepare` — build:dist (npx-resolved tsc, since typescript is a devDep and
+      # global tsc was removed above) AND the grammar download. This catches the
+      # from-source install class end-to-end, the way a real user hits it.
+      - name: Simulate `pi install git:…` (clean clone + --omit=dev)
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/gh-install"
+          git clone --quiet . "$RUNNER_TEMP/gh-install"
+          cd "$RUNNER_TEMP/gh-install"
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --omit=dev --strict-allow-scripts --no-audit --no-fund
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+            echo "ERROR: npm install --omit=dev changed tracked source files"
+            git status --short --untracked-files=no
+            git diff
+            exit 1
+          fi
+          test -f dist/index.js || \
+            (echo "ERROR: dist/index.js not built from a clean clone under --omit=dev" && exit 1)
+          # #1926: the clean clone is the shape real users get. Assert pi's
+          # host-provided packages were not vendored into it.
+          node scripts/check-prod-install-shape.mjs
+          # Then supply them, as pi does, so the load check can still see a
+          # genuinely missing dep instead of stopping at the first host package.
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          HOST_PKGS=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && HOST_PKGS+=("$pkg")
+          done < <(node "$SUPPLY" --install-args)
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund "${HOST_PKGS[@]}"
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          node dist/index.js 2>&1 | tee /tmp/gh-load.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/gh-load.txt \
+             && ! grep -Eq "$ALLOW" /tmp/gh-load.txt; then
+            echo "FAILED: missing runtime module from a clean GitHub-style install"
+            cat /tmp/gh-load.txt
+            exit 1
+          fi
+          echo "GitHub-style install (clean clone + --omit=dev) OK"
+
+      # #2700 (refs #2587): #2587's manifest entry escaped four releases
+      # because nothing inspected the published tarball. `npm pack` runs the
+      # repo's own prepack/postpack (scripts/strip-dev-deps-for-pack.mjs --
+      # strips devDependencies from package.json/package-lock.json for the
+      # pack, restores them after), so the packed tarball is exactly what
+      # `npm publish` would ship.
+      - name: Pack the built package
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+          tarball="$RUNNER_TEMP/pack/$(ls "$RUNNER_TEMP/pack")"
+          echo "PACK_TARBALL=$tarball" >> "$GITHUB_ENV"
+
+      # publint is a devDependency, but this job installed --omit=dev above
+      # (the shape under test), so it is fetched here as a single pinned
+      # binary -- same pattern as lint.yml's oxfmt job: version read from the
+      # devDependency pin (single source of truth), --no-save keeps it off
+      # package.json/package-lock.json, --ignore-scripts blocks lifecycle
+      # script execution (SonarCloud S6505, the #1923 posture).
+      - name: Install publint (version pinned by the devDependency)
+        run: |
+          set -eu
+          version=$(node -p "require('./package.json').devDependencies.publint")
+          npm install --no-save --no-audit --no-fund --ignore-scripts "publint@${version}"
+
+      # Gating: publint's findings are packaging errors (wrong `files`,
+      # unresolvable `main`/`exports`, etc.), not style. Exit code read
+      # directly, no pipe -- a `| tee`/`| cat` would hide a non-zero status
+      # behind the pipeline's last command.
+      #
+      # attw (arethetypeswrong, #2700 acceptance) is deliberately NOT run
+      # here: the package ships no `.d.ts` at all (tsconfig.dist.json sets
+      # `"declaration": false`, package.json has neither `types` nor
+      # `exports`, and a fresh `npm run build:dist` produces zero `*.d.ts`
+      # files under dist/ -- confirmed on this PR's branch and quoted in the
+      # PR body). attw's whole job is grading a typed package's resolution
+      # across node10/node16/bundler; against an untyped package it can only
+      # ever report "no types found", which restates the manifest shape
+      # above rather than checking anything -- the "pull-only observability"
+      # shape (AGENTS.md) a no-op step would add. Re-add it, gating (a first
+      # clean run would already be trivially clean), the day this package
+      # publishes types.
+      - name: publint the packed tarball
+        run: node_modules/.bin/publint "$PACK_TARBALL"
+
+  install-test:
+    name: Install test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (30 matrix legs,
+    # windows-latest slowest): 272s (4m32s); sized at ~2x + margin.
+    # refs #3098: that 272s PREDATES the macOS-only build + Vitest step below,
+    # which is not covered by the measurement above. The value is left alone
+    # and re-measured from the first green macOS legs before it is resized.
+    timeout-minutes: 15
+    # #3801: Install no longer waits for `lint-and-typecheck` or the Unit shards.
+    # That `needs:` was a cost gate, not a data dependency (the legs pack and
+    # install the repo's own tarball), and it made Install the LAST required
+    # check in 35 of 37 green runs, landing a median 3.5 minutes after Unit
+    # tests. Every required check on this workflow still runs to completion.
+    #
+    # #5112: ALWAYS REPORTS, INSTALLS ONLY WHEN IT CAN CATCH SOMETHING. The three
+    # legs are required contexts (`Install test (ubuntu-latest|windows-latest|
+    # macos-latest)`) and cost 10,875 runner minutes in 30 days for 0 real
+    # catches (#3995 slice A). On a pull request the first step asks
+    # scripts/ci-changed-files.mjs whether the diff touches INSTALL_PATHS
+    # (manifests, install and postinstall scripts, the scripts this job runs,
+    # `bin/`, the install workflows). When it does not, every step after it is
+    # skipped and the leg passes in seconds with the line "no install files
+    # changed". The job is never skipped at job level: a skipped job reports
+    # `skipped`, and ci-verdict demands a literal `success` on a required row
+    # (#2618), the way hot-path-latency.yml reports. A master push, the merge
+    # queue and a dispatch run every step: the script
+    # reads any non-pull_request event as install=true, and so does an
+    # unreadable or empty file list (shape 48, doubt installs).
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          package-manager-cache: true
+          node-version: '22'
+
+      # `shell: bash` on every leg: the Windows default is pwsh, which does not
+      # expand "$EVENT_NAME". The step has no `if`, so the verdict is written on
+      # every event and a crashed classifier reds the leg instead of passing it.
+      # The steps below test `!= 'false'`: an empty output installs.
+      - name: Classify the changed files
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ci-changed-files.mjs --event "$EVENT_NAME" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
+
+      - name: No install files changed
+        if: steps.scope.outputs.install == 'false'
+        shell: bash
+        run: |
+          line="no install files changed: nothing to install, passing"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        if: steps.scope.outputs.install != 'false'
+        run: npm install --no-audit --no-fund
+
+      # refs #3098: the ONLY case-insensitive POSIX filesystem in CI is this
+      # leg's macOS APFS. The cross-case anchor cases in these two files
+      # manufacture their fixture with a case-variant symlink on the
+      # case-sensitive ubuntu lane; here they exercise the real aliasing, which
+      # is where #1024 was actually live. No extra install cost: `npm install`
+      # above already ran `prepare`, so devDependencies and the 12 core grammars
+      # are present; the vitest globalSetup fetches the other grammars once
+      # before the files run (#4342).
+      # ADVISORY for now (`continue-on-error`) while this job's install/pack/
+      # smoke steps gate: a macOS-only unit flake must not block an unrelated PR
+      # on its first outings. Promotion to gating is a separate decision after
+      # several green legs (#3159 round 3).
+      - name: POSIX case-insensitive anchors (APFS)
+        if: github.event_name != 'pull_request' && matrix.os == 'macos-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          node_modules/.bin/vitest run tests/clients/path-utils.test.ts tests/clients/diagnostic-dispositions.test.ts --configLoader runner --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/apfs-anchors.json"
+
+      # #4518: the step above stays advisory about test RESULTS, but a run that
+      # evaluated nothing (a build that did not compile, a file that did not
+      # load, a reporter that wrote no file) read as an ordinary advisory red,
+      # or as green when vitest's filter matched nothing. This step is NOT
+      # continue-on-error: it fails the leg only when fewer than 100 tests ran
+      # (passed plus failed; 223 ran on the measured macOS leg, tests/fixtures/
+      # nightly-floors/measurements.json). The summary table it appends is the
+      # counter the promotion decision above reads. 100 is under half of the
+      # measured 223: the step exists to catch a run that executed nothing, and
+      # a tight margin would red the required leg on a legitimate test removal.
+      #
+      # #5112: not a pull_request step, and neither is the step above. They
+      # share one condition so the floor never outlives its site, and the
+      # evaluated-floors registry admits a comparison of the event name. The
+      # anchors test is advisory and added a macOS build and a Vitest run to a
+      # leg a docs-only pull request now ends after the classify step. Master
+      # pushes keep it, after the merge, and the step is continue-on-error, so a
+      # case-insensitive regression shows as a failed step on a green leg.
+      - name: APFS anchors evaluated floor
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && matrix.os == 'macos-latest' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          count="$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(j.numFailedTests!==0){console.error("APFS anchors recorded "+j.numFailedTests+" failed test file(s)");process.exit(1)}console.log(j.numPassedTests+j.numFailedTests)}catch{process.exit(1)}' "$RUNNER_TEMP/apfs-anchors.json")"
+          node scripts/assert-evaluated.mjs --count "apfs-anchors=${count}" --floor 100
+
+      - name: Rule catalog report (non-blocking)
+        if: steps.scope.outputs.install != 'false'
+        continue-on-error: true
+        run: npm run audit:rule-catalog
+
+      - name: Pack tarball
+        if: steps.scope.outputs.install != 'false'
+        run: npm pack
+
+      - name: Verify required files in tarball
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: |
+          TARBALL=$(ls pi-lens-*.tgz)
+          echo "Checking tarball: $TARBALL"
+          REQUIRED_RE="scripts/download-grammars\.js"
+          REQUIRED_RE="${REQUIRED_RE}|dist/index\.js|package\.json"
+          tar -tzf "$TARBALL" | grep -E "$REQUIRED_RE" | sort
+          tar -tzf "$TARBALL" | grep "scripts/download-grammars.js" || {
+            echo "ERROR: scripts/download-grammars.js missing"
+            exit 1
+          }
+          # The published entry is compiled JS (prepare builds dist/); pi loads
+          # it directly instead of jiti-transpiling source on startup (#182).
+          tar -tzf "$TARBALL" | grep "package/dist/index.js" || {
+            echo "ERROR: dist/index.js missing from tarball"
+            exit 1
+          }
+          # Skills ship at package root (skills/), and pi.skills is "./skills":
+          # pi resolves a non-glob manifest entry against the PACKAGE ROOT
+          # (collectFilesFromManifestEntries), so anything with ../ escapes the
+          # published package and loads nothing (#2587).
+          tar -tzf "$TARBALL" | grep "package/skills/" || {
+            echo "ERROR: skills/ missing from tarball"
+            exit 1
+          }
+          # Guard against shipping TS source again (jiti startup cost).
+          SOURCE_RE="package/(index\.ts|clients/.*\.ts)"
+          if tar -tzf "$TARBALL" | grep -E "$SOURCE_RE"; then
+            echo "ERROR: TypeScript source leaked into the tarball"
+            exit 1
+          fi
+
+      - name: Verify package.json entry points exist in tarball
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: |
+          TARBALL=$(ls pi-lens-*.tgz)
+          TMPDIR=$(mktemp -d)
+          tar -xzf "$TARBALL" -C "$TMPDIR"
+
+          check_field() {
+            local field="$1" value="$2"
+            if [ ! -f "$TMPDIR/package/$value" ]; then
+              echo "ERROR: package.json '$field' points to missing '$value'"
+              exit 1
+            fi
+            echo "OK: $field -> $value"
+          }
+
+          # Pass package paths via env vars for cross-platform Node calls.
+          export PI_LENS_PKG_DIR="$TMPDIR/package"
+          export PI_LENS_PKG_JSON="$TMPDIR/package/package.json"
+          MAIN=$(node -p "require(process.env.PI_LENS_PKG_JSON).main || ''")
+          [ -n "$MAIN" ] && check_field "main" "$MAIN"
+
+          # Check pi.extensions entries — this is what pi actually loads.
+          node <<'NODE'
+          const path = require("path");
+          const fs = require("fs");
+          const pkgDir = process.env.PI_LENS_PKG_DIR;
+          const pkg = require(path.join(pkgDir, "package.json"));
+          const exts = (pkg.pi && pkg.pi.extensions) || [];
+          if (exts.length === 0) {
+            console.error("ERROR: no pi.extensions declared");
+            process.exit(1);
+          }
+          for (const e of exts) {
+            if (!fs.existsSync(path.join(pkgDir, e))) {
+              console.error("ERROR: pi.extensions entry missing: " + e);
+              process.exit(1);
+            }
+            console.log("OK: pi.extensions -> " + e);
+          }
+          NODE
+
+          # Check exports map entries (string values only).
+          node <<'NODE'
+          const path = require("path");
+          const fs = require("fs");
+          const pkgDir = process.env.PI_LENS_PKG_DIR;
+          const pkg = require(path.join(pkgDir, "package.json"));
+          const exp = pkg.exports;
+          if (!exp) process.exit(0);
+          const collect = (v) => {
+            if (typeof v === "string") return [v];
+            if (v && typeof v === "object") {
+              return Object.values(v).flatMap(collect);
+            }
+            return [];
+          };
+          collect(exp).forEach((f) => {
+            const full = path.join(pkgDir, f);
+            if (!fs.existsSync(full)) {
+              console.error("ERROR: exports entry missing: " + f);
+              process.exit(1);
+            }
+            console.log("OK: exports -> " + f);
+          });
+          NODE
+          rm -rf "$TMPDIR"
+
+      # Intentional: this job verifies the package installs like pi installs it.
+      - name: Install from tarball (simulates pi install npm:pi-lens)
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: | # zizmor: ignore[adhoc-packages]
+          TARBALL=$(ls pi-lens-*.tgz)
+          npm install -g "$TARBALL"
+
+      - name: Verify bundled core grammars shipped in the tarball
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: |
+          # Core grammars ship bundled in pi-lens/grammars (via prepare + files[]);
+          # the tail lazy-fetches at runtime. There is no postinstall now.
+          GLOBAL_MODULES=$(npm root -g)
+          GRAMMARS_DIR="$GLOBAL_MODULES/pi-lens/grammars"
+          echo "Checking bundled core grammars at: $GRAMMARS_DIR"
+          ls "$GRAMMARS_DIR"
+          test -f "$GRAMMARS_DIR/tree-sitter-typescript.wasm" || \
+            (echo "ERROR: bundled tree-sitter-typescript.wasm missing from tarball" && exit 1)
+          echo "Bundled core grammar checks passed"
+
+      - name: Load each extension entry point (catches missing files)
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: |
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          node scripts/check-extensions.mjs "$INSTALL_DIR"
+
+      # #1926: the tarball must not vendor a package pi already supplies. This
+      # runs from the checkout against the GLOBAL install the earlier step made,
+      # so it inspects what a real `pi install npm:pi-lens` produces.
+      - name: Verify no host-provided package shipped in the tarball (#1926)
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: node scripts/check-prod-install-shape.mjs "$(npm root -g)/pi-lens"
+
+      # ...and having proved they are absent, put them there, because the next
+      # step is a bare `node` and bare node is not pi. pi resolves these two
+      # specifiers from its own runtime; without them the entry throws at import
+      # and neither the load check nor the #182 dist check below proves
+      # anything. Names and ranges come from scripts/lib/host-provided-deps.mjs,
+      # never hardcoded here. The type-only host SDK is deliberately NOT
+      # installed (Windows MAX_PATH, #1334 S6).
+      - name: Supply host-provided packages the way pi does (#1926)
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: | # zizmor: ignore[adhoc-packages]
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          HOST_PKGS=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && HOST_PKGS+=("$pkg")
+          done < <(node "$SUPPLY" --install-args)
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund \
+            --prefix "$INSTALL_DIR" "${HOST_PKGS[@]}"
+
+      - name: Verify extension entry loads (catches missing node_modules deps)
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: |
+          # Build the allowlist BEFORE leaving the checkout: the global install
+          # ships no scripts/, so the module is only reachable from here.
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          cd "$INSTALL_DIR"
+          # Simulate how pi loads the extension: compiled entry, loaded by node.
+          # ERR_MODULE_NOT_FOUND = missing dep (e.g. 'minimatch') → fail. That
+          # is this check's whole job, so a miss OUTSIDE the host-provided list
+          # still fails. Any other error is expected in CI (no pi API) → pass.
+          ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
+          echo "Loading entry: $ENTRY"
+          echo "Host-provided allowlist: $ALLOW"
+          node "$ENTRY" 2>&1 | tee /tmp/load-output.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" \
+               /tmp/load-output.txt \
+             && ! grep -Eq "$ALLOW" /tmp/load-output.txt; then
+            echo "FAILED: missing module dependency detected"
+            cat /tmp/load-output.txt
+            exit 1
+          fi
+          echo "Extension import check passed"
+
+      - name: Startup not weakened — entry loads from precompiled dist (#182)
+        if: steps.scope.outputs.install != 'false'
+        shell: bash
+        run: |
+          # Loading the entry above made pi-lens self-report its load source to
+          # ~/.pi-lens/sessionstart.log.
+          # A source/jiti regression (or missing dist) would weaken cold start.
+          START_LOG="$HOME/.pi-lens/sessionstart.log"
+          START_LINE=$(
+            grep "pi-lens loaded:" "$START_LOG" 2>/dev/null \
+              | tail -1 \
+              || true
+          )
+          echo "Startup line: ${START_LINE:-<none>}"
+          if [ -z "$START_LINE" ]; then
+            echo "ERROR: no startup line logged"
+            exit 1
+          fi
+          echo "$START_LINE" | grep -q "from dist" || {
+            echo "ERROR: extension loaded from source, not dist"
+            exit 1
+          }
+          echo "Startup loads from dist ✓"

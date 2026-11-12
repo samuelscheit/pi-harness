@@ -1,0 +1,356 @@
+# Agent-Facing Tools
+
+pi-lens registers the following tools with the pi agent. Most are also exposed
+through the MCP mirror (`clients/lens-engine.ts` is the seam both adapters
+share) — current exception: `ast_grep_outline`
+(module_report supersedes them for discovery), and `lens_diagnostic_mark`
+(pi-lens-internal for now). `read_enclosing` gained MCP parity
+(`pilens_read_enclosing`) as of #536, closing #522 item 1. The standalone
+`lsp_diagnostics` tool was folded into `lens_diagnostics` (`source=lsp`,
+#2860). The retired MCP name remains a one-release compatibility redirect to
+`pilens_diagnostics` with `source=lsp` and `scope=paths` (`mcp/server.ts`),
+logging one `lsp-diagnostics-compatibility` degradation per session. Callers
+should move to `pilens_diagnostics`.
+
+
+**Dynamic tooling.** Seven tools stay always-active on pi unless
+`tools.<name>.enabled: false` turns one off: `lens_diagnostics`,
+`module_report`, `project_report`, `read_symbol`, `read_enclosing`,
+`symbol_search`, `effective_config`. Five situational tools — `ast_grep_search`, `ast_grep_replace`,
+`ast_grep_outline`, `lsp_navigation`, `lens_diagnostic_mark` —
+are registered but
+inactive by default under pi's lazy posture (`tools.lazy: false`, or a host
+without the dynamic-tool API, keeps them active); the model activates the ones it needs via the always-active
+loader tool `pi_lens_activate_tools`, per pi's dynamic-tool-loading API
+(`pi.setActiveTools`/`pi.getActiveTools`). The loader explicitly reports
+"Available starting next turn"; do not retry the tool in the same turn.
+Feature-detected: on hosts without that API, the five situational tools fall back
+to being statically active, exactly as before (`tools/activate-tools.ts`, wired
+in `index.ts`).
+
+Tool descriptions contain the contract sentence and one example. Operational
+guidance, including cache state, scan scope, safety details, and lifecycle
+results, belongs in the returned result so it is paid only when the tool runs.
+
+**Result contract.** One post-result gate per surface — `finalizeToolResult` /
+`finalizeToolResultWithDelivery` in `tools/render-compact.ts`, wired into every
+pi tool's `execute` wrapper in `index.ts` and into the MCP `tools/call`
+dispatcher in `mcp/server.ts` — bounds every delivered result to 40 KiB
+(`MAX_RESULT_BYTES`) and stamps a trailing usage footer describing what was
+actually sent: `usage tokens=<n> elapsed-ms=<n> bytes=<n> truncated=<true|false>`.
+A rejected call (e.g. MCP's "Unknown or disabled tool") is rendered through the
+same gate rather than bypassing it.
+
+**MCP argument handling (#3749).** The MCP `tools/call` dispatcher compares the
+call's argument keys with the `inputSchema` the tool advertises in `tools/list`
+(`findIgnoredArguments`, `mcp/tool-arguments.ts`), once, for every tool. An
+undeclared top-level key is never silently dropped (keys inside a nested
+object argument such as `callHierarchyItem`, `rule` or `flags` are not checked):
+
+- the result's first line is ``Ignored unknown argument(s) for <tool>: `key`
+  (did you mean `nearest`?). They had no effect on this call.`` (the suggestion
+  appears only when a declared key is near), followed by the tool's own result;
+- the result carries `structuredContent: { ignoredArguments: [...],
+  ignoredArgumentCount: N }` (at most 8 keys, each cut at 64 characters; the
+  count is exact);
+- when an ignored key leaves the call without something it needed, the tool
+  does not run and the result is an error whose first line is the same
+  sentence, followed by `Not run: ...`. That is the case when a
+  schema-`required` input is missing (``Not run: required argument(s) `lang`
+  missing.``), or when the ignored key is a declared parameter the call did not
+  send, written another way: a case or punctuation variant (`Path` for `path`),
+  a plural (`paths` for `path`), or a key whose last word is a declared
+  parameter (`file_path` for the declared `filePath`). The single-file
+  parameter is `path`. Three MCP tools (`pilens_analyze`, `pilens_diagnostics`
+  and `pilens_lsp_navigation`) also declare `file` and `filePath` beside it as
+  accepted aliases (#5041), so those spellings run on them. The four tools whose
+  schema comes from the pi tool definition (`pilens_module_report`,
+  `pilens_read_symbol`, `pilens_read_enclosing` and `pilens_effective_config`)
+  declare `path` alone (#5138). Without `path`, a `file`, `filePath` or
+  `file_path` send to the first three is refused for missing required arguments
+  (``Not run: required argument(s) `path` missing.`` for `pilens_module_report`;
+  `read_symbol` also requires `symbol`, and `read_enclosing` requires `line`).
+  For `pilens_effective_config`, a `filePath` or `file_path` send without `path`
+  is reported as a mistyped `path`, naming the sent key (``Not run: `filePath`
+  looks like a mistyped `path`, which was not sent.``). Sending `path` avoids
+  that refusal, but conflicting `filePath` values still refuse with
+  `name different files — send one spelling`. The exact predicate is named in
+  [public-api-stability.md](public-api-stability.md). Anything looser (a typo,
+  an abbreviation, `files` for `maxLspFiles`, or a count, flag or output key
+  such as `maxFiles`, `includeFiles`, `outFile` or `cwdPath` where `cwd` is
+  declared) stays a warning;
+- each such call adds one count to the `mcp-ignored-arguments` degradation
+  group (subject: the tool name), visible in `pilens_health`.
+
+Unknown keys are still not rejected outright: a caller that passes an extra key
+that is not a declared parameter written another way (or that comes with the
+parameter it resembles) keeps getting its answer, with the report above. Hard rejection is a change to the
+public MCP input contract and is owned by the stability policy
+([public-api-stability.md](public-api-stability.md)). A schema declares only
+what the tool reads, so `cwd` on a tool whose handler never reads it
+(`pilens_health`, `pilens_latency`, `pilens_session_end`, `pilens_rebuild`;
+the dispatcher uses it only to decide whether the tool is enabled) is reported
+as an ignored key, a warning, because nothing it resembles is missing. The
+retired `pilens_lsp_diagnostics` name is checked against `pilens_diagnostics`'s
+schema; the retired `pilens_ast_grep_dump` name has no schema and is not
+checked. A non-object `arguments` is a JSON-RPC `-32602` error; absent, `null`
+and `[]` mean no arguments.
+
+**The `paths` argument.** `ast_grep_search`, `ast_grep_replace`,
+`ast_grep_outline`, `lens_diagnostics` and `symbol_search` read `paths` through
+one reader (`readPathsArgument`, `tools/shared.ts`), so an entry means the same
+in each. An entry that exists on disk is always a literal, so
+`app/[id]/page.tsx` works as written. Any other entry with a glob character
+(`src/**/*.ts`) expands once, against the call's own root, into the files and
+directories it matches. A matched directory scopes its whole subtree: `src/*` can include
+`src/pkg/nested.ts` through `src/pkg`, even though the file itself does not
+match the glob. A glob that matches nothing answers `no file matches`, and a
+glob that reaches outside the workspace is refused, as is an entry that starts with `!`
+(`paths` names what to include; leave files out through the project ignore
+config). The argument holds at most 100 entries, and the list a tool
+receives after expansion is capped at the same 100 (`MAX_PATHS_ENTRIES`), counting
+a matched directory once rather than counting its descendants; a
+tool that is handed a list and not a filter refuses a larger scope rather than
+narrowing it. `symbol_search` filters an index, so the file cap is lifted for
+it and only the walk bound applies. A literal outside the workspace is left
+alone.
+
+## Per-edit
+
+- **`lens_diagnostics`** — Session-cache or LSP-probe diagnostic state, selected
+  by `source` (`session` default, or `lsp`) and `scope` (`paths` or
+  `workspace`; explicit `paths` always win over `scope`). `severity` is a
+  threshold, not an exact filter: `error` shows only errors; `warning` adds
+  warnings; `information` adds information; `hint`/`all` (default) show every
+  tier. `source=lsp` reads a file's on-disk content and will not sync it to a
+  language server past **2 MiB or 5000 lines** (`clients/runtime-config.ts`
+  `pipeline.lspMaxFileBytes`/`lspMaxFileLines`, checked in
+  `clients/lsp/content-limits.ts`) — not env-tunable. A file over that
+  bound gets an explicit `file too large for LSP diagnostics (<N> bytes/lines
+  > <limit>)` result instead of stale or partial diagnostics. One
+  exception for the line limit: the explicit single-file query (`path`, not
+  `paths`) takes the user-level `lsp.queryMaxFileLines` config key (suggested
+  `20000`, maximum `40000`; see
+  [globalconfig](globalconfig.md#explicit-diagnostics-query-line-limit)); a
+  project config or a tool argument cannot raise it. On that same single-file
+  query an explicit `waitMs` sets the wait past the language server's usual
+  per-server wait, up to 30000 ms, and a shorter one never shortens it, so a
+  large file's server can finish; batch and directory queries keep their
+  per-server budgets, except that a batch's 20 s pre-sweep warm-up still opens
+  a file past the bound (a named residual, #5306). A timed-out wait
+  reports `check timed out`, never a clean file. This is a
+  *different* 2 MiB from the auto-fix full-content attachment cap described in
+  [agent-guide.md](agent-guide.md), section 6 ("Auto-format / auto-fix
+  timing") — the two caps currently share one constant
+  (`RUNTIME_CONFIG.pipeline.lspMaxFileBytes`) but gate unrelated behaviors
+  (LSP sync vs. tool-result content attachment) and can diverge independently
+  in the future. Separately, every save-triggered edit now sends the server a
+  `textDocument/didSave` when it declared `textDocumentSync.save` — with the
+  file text when the server asked for it (`includeText`) and the file is
+  within the same bound, otherwise the save is still sent but without `text`
+  (never dropped outright); this is what makes save-triggered servers like
+  Expert (Elixir) re-diagnose an edit made through pi-lens (refs #3405,
+  #3408). Legacy `mode`: `delta` (current turn), `all` (resurfaces stale
+  blockers dropped from turn context), `full` (project-wide scan). When the delta
+  has no findings, files no check completed on are reported as not checked (`⚠ N files not checked, so no
+  findings is not a clean result`), naming at most five files and counting
+  the rest (`+2 more`, for example). A delta with findings omits this line.
+- **`lens_diagnostic_mark`** — Triage a diagnostic: `false-positive` /
+  `suppress` (writes an inline `pi-lens-ignore` comment) / `defer`
+  (session-only) / `flagged` (persists, rendered `📌 flagged-to-fix`).
+  Content-anchored so marks survive edits; every mark is logged and published
+  on the bus. See [dispositions.md](dispositions.md).
+- **`lsp_navigation`** — IDE-style navigation, 19 operations: `definition`,
+  `typeDefinition`, `declaration`, `references`, `hover`, `signatureHelp`,
+  `documentSymbol`, `findSymbol`, `workspaceSymbol`, `codeAction`, `rename`,
+  `rename_file`, `implementation`, `prepareCallHierarchy`, `incomingCalls`,
+  `outgoingCalls`, `executeCommand`, `workspaceDiagnostics`, and `capabilities`
+  (`tools/lsp-navigation.ts` operation description). Position-based operations
+  accept a `path`/`line`/`character` triple. `documentSymbol` accepts a `kinds`
+  filter (e.g. `function`, `class`) and a `maxResults` cap (default 20, max 100)
+  to keep large files bounded. A request that outlasts its deadline (10 s by
+  default for navigation requests) is reported as a timeout, never as a silent
+  empty answer, so a slow server is not read as "no references". Depending on
+  the operation the timeout arrives as an error result, a note beside the
+  answer it does have (a `definition` that the `documentSymbol` fallback
+  answered, or a partial `workspaceDiagnostics` pull), or `executed: false`
+  with a reason (`executeCommand`). Full per-operation parameter reference:
+  [skills/pi-lens-lsp-navigation/SKILL.md](../skills/pi-lens-lsp-navigation/SKILL.md).
+  Output is Neovim-style text by default (a `path:line:col` location list,
+  `hover` markdown, an indented `start-end kind name` symbol tree,
+  `path:line:col: severity: message` diagnostics, the rename summary); pass
+  `view: "json"` for the structured envelope (refs #1449).
+- **`ast_grep_search`** — AST-aware structural search across ~40 languages via
+  the `sg` CLI. Supports metavariables (`$VAR`, `$$$ARGS`), `strictness`
+  modes (`smart`, `relaxed`, `ast`, `cst`, `signature`, `template`), structural
+  constraints (`insideKind`, `hasKind`, `hasDescendantKind`, `follows`,
+  `precedes`), raw YAML `rule` passthrough, `validateOnly` for compile/shape
+  checks without scanning project files, and pagination via `skip` / `maxMatches`
+  (per-call cap, default 50, max 200; also sets the pagination step).
+  `nodeKind` is an expert grammar-specific escape hatch: it finds every node of
+  the exact kind used by the target grammar. Node kinds are not universal across
+  languages; use `dump=true` with the representative snippet in `pattern` to discover the kind in the target language. It is mutually exclusive with `rule`.
+  `hasKind` retains ast-grep's immediate-child semantics; use
+  `hasDescendantKind` for an explicit recursive descendant search. A future
+  canonical `find`/`query` facade (call/function/import/etc.) should map to
+  this same synthesized YAML path, with per-language templates and a clear
+  unsupported-concept error — it is intentionally not a second search engine
+  in this patch.
+  `groupByFile: true` renders a compact one-line-per-file distribution
+  (`L<line>:<col>` locations) instead of each match body — for high-volume
+  searches. `pattern` is optional when a `rule` or `nodeKind` is given.
+  Results include `details.matchLocations[]` — each hit carries a ready
+  `readSlice` (`path`/`offset`/`limit`) for a bounded context read; zero-match
+  results include a `suggestedDump` hint pointing at `ast_grep_search` with `dump=true`.
+- **`ast_grep_replace`** — AST-aware structural replace. Re-validates the pattern
+  against the current file before writing and reports a clear error if the
+  file changed since the preview. Under `--no-autofix` (`autofix.enabled:
+  false`) a preview with `apply: false` still runs and `apply: true` is
+  refused before any scan (`tools/ast-grep-replace.ts`). An apply also refuses
+  a file outside the session's writable roots, as `lens_diagnostic_mark` and a
+  language-server workspace edit do (#5417).
+- **`ast_grep_search` with `dump=true`** — Dumps the raw tree-sitter AST for a source snippet. Use
+  this when an `ast_grep_search` or `ast_grep_replace` pattern returns zero
+  matches and the correct node kind or field name is unknown. `includeAnonymous`
+  shows punctuation/CST nodes.
+- **`ast_grep_outline`** — Syntax-only code structure (symbols, imports, exports,
+  members) for files or directories via `ast-grep outline`. Fast, local, no
+  index/LSP/cross-file semantics. Supports `items`/`view`/`type`/`match`/
+  `pubMembers`/`globs`; returns a compact text tree, one
+  `start-end [import|export ]kind name[ — signature]` line per symbol (members
+  indented, files sorted by path, a visible line when files or items were cut);
+  read a range with `offset=start`, `limit=end-start+1`. Prefer `module_report` for pi-lens-aware navigation; reach
+  for this when the syntax tree's own view is enough or pi-lens's extractor is
+  weak for a language.
+
+## Project intelligence
+
+- **`symbol_search`** — Ranked identifier search over the persisted word index
+  (BM25 + priors demoting tests/vendor/docs, optional graph-centrality boost).
+  Answers "which files are most relevant to `<query>`" by identifier — the
+  first step of the discovery funnel: `symbol_search` finds candidates,
+  `module_report` explains one, `read_symbol` reads its body. Complements
+  `grep` (raw substrings) and `lsp_navigation` (exact references). Returns
+  `available: false` with a retry hint when the index isn't built yet — it
+  self-builds in the background and never blocks the call. The answer is one
+  ranked table: a `symbol` row per file with its path, best-matching line,
+  score, hit count and any graph annotations, or a `file` listing row with just
+  its path when the query carries a scope (`paths`, `lang`, or an inline
+  `lang:`, `file:` or `ext:` filter) but no terms. A call with neither terms nor
+  scope is an error on the pi tool and over MCP alike, and an unknown `lang`
+  value is refused with the accepted file kinds and language ids. Then a footer with
+  index coverage and a
+  next-step line naming the top-ranked hit (`module_report <path>`) — read that
+  line with `offset=<line>, limit=1`. Both surfaces render it through
+  `renderCompactSymbolSearch`, so no JSON payload rides along. See
+  [docs/word-index.md](word-index.md) for how the index is built and kept
+  warm.
+- **`project_report`** — Project orientation from the cached review graph, the
+  top of the discovery funnel (`project_report` → `module_report` →
+  `read_symbol`). Returns ranked hubs (top fan-in files), entry points,
+  subsystem cycles and layering violations, risk hotspots, and low-confidence
+  dead weight. `limit` scales every section's cap (default 10), `focus` re-ranks
+  toward a task hint without widening scope. Returns a line-oriented TEXT
+  report by default; pass `view: "json"` for the full JSON payload. Read-only:
+  a cold cache returns
+  `available: false` with a retry hint and starts a non-blocking background
+  build. On a project over `maxProjectFiles` that first build records a
+  size-skip verdict; later calls name the cap and start no build, so raise it
+  in `.pi-lens.json` instead of retrying.
+- **`effective_config`** — Explains the resolved configuration and its
+  provenance. Pass `path` to add that file's language and the per-server and
+  per-runner selection decisions. A runner's decision is `selected`,
+  `disabled-by-config`, `no-project-config` (a runner that declares it needs
+  project config and would skip without it), `not-registered-for-kind` or
+  `no-dispatch-plan`. The result holds no
+  environment values and no command arguments beyond the binary, and it shows
+  paths under the home folder home-relative (a path outside it stays absolute).
+  `path` must resolve inside `cwd`. See
+  [configuration.md](configuration.md#asking-what-is-actually-in-effect).
+- **`module_report`** — Navigable outline of a file: every symbol's name/kind/
+  startLine/endLine/signature, exported vs internal split, class/interface
+  member nesting, who-uses-this, fanout/complexity risk flags, and a
+  `recommendedReads` top-3 ranked by usage + complexity. No per-symbol `read`
+  block (#512) — `offset`/`limit` are pure derivations of `startLine`/`endLine`
+  on the report's own `path`; to read a symbol call `read`/`read_symbol` with
+  `offset=startLine, limit=endLine-startLine+1` on that path. Cross-file
+  entries (`blastRadius.files[].read`, `usedBy[].file`) keep their own path.
+  Each entry also carries a first-line `doc` summary (whitespace-collapsed,
+  ~120 chars) extracted from an attached doc comment when the language uses
+  tree-sitter's conventional `comment` node — JS/TS is the primary target;
+  languages sharing that node shape (confirmed: Python, and any grammar whose
+  comment nodes are plain preceding siblings) get it for free with no
+  per-grammar query work. A Python def or class also reads its docstring (a
+  plain, `r` or `u` string that is the first statement of the body); when
+  both a `#` comment above the def and a docstring exist, a docstring with text
+  wins; an empty docstring falls back to the comment.
+  When a file has syntax errors, tree-sitter recovers and drops the
+  declarations it cannot parse, so the report carries a `warnings` entry saying
+  the symbol list may be incomplete. `exported` stays a boolean field only — it
+  is NOT also repeated inside `flags` (#512); `flags` carries only non-derivable
+  signals (`async`, `high fanout`, `high complexity`, `boundary wrapper`).
+  Each entry carries a `decorators[]` array — the declaration's
+  decorators/attributes/annotations (`@app.get("/x")`, `#[tokio::main]`,
+  `@Override`) — so the agent reads a symbol's role (route/test/fixture/
+  entrypoint) without opening the body. Also emits a `callbacks[]` section for
+  high-signal inline executables (event handlers, timers, promise callbacks,
+  object/dict function props, assigned closures) with stable synthetic
+  handles and flags. The optional `focus` string re-ranks `recommendedReads`
+  without expanding scope. `callbackSupport` (`tuned`/`generic`) reports
+  whether language-specific callback rules applied — the callback *node
+  kinds* are language-uniform, but the semantics are per-language (JS/TS-tuned
+  by default, plus Go goroutine/defer, Python scheduler/future lambda, Rust
+  spawn/move-closure, Swift weak/strong-self capture, C++ by-reference-
+  capture, Kotlin coroutine-builder, Java thread/executor/listener, and C#
+  Task.Run/event-`+=` slices); named symbols span all tree-sitter
+  `SYMBOL_QUERIES` languages. `view` selects an output preset, projection ×
+  format: `"summary-text"` (default) = metrics off (no `usedBy`, `fanout`,
+  `complexity`), text; `"summary-json"` = same fields, JSON; `"full-text"`
+  = every field, text; `"full-json"` = every field, JSON. The text cell is
+  lossless against its JSON payload (metrics as a `cx:`/`fan:` suffix, each
+  flag in its own bracket, `used-by:` continuation lines, plus
+  `IMPORTS:`/`CALL GRAPH:`/`BLAST RADIUS:` blocks and a `PROVENANCE:` footer),
+  so the default text preset leaves out `usedBy`, `fanout` and `complexity`
+  and runs at roughly half the byte
+  size of JSON. A `maxRefsPerSymbol` argument promotes the projection to
+  `full` and keeps the format. Reports section-level `provenance`
+  for syntax, cached-graph, and heuristic sections. Pass `blastRadius: true`
+  for cross-file transitive dependents (read-only over the cached graph).
+- **`read_symbol`** — One symbol's verbatim source body, by name or by a
+  `module_report` callback handle. Returned body is recorded as genuine
+  read-guard coverage for that symbol/callback's line range. In a file with
+  syntax errors a miss carries the same incomplete-symbol-list warning, so a
+  miss is not proof the symbol is absent.
+- **`read_enclosing`** — Maps a `path` + `line` (from `ast_grep_search`,
+  diagnostics, or LSP locations) to the verbatim body of the smallest enclosing
+  symbol or callback. Tree-sitter only — no LSP or graph build. Optional `kinds`
+  filter and `maxLines` cap; records read-guard coverage for the returned range.
+  When the body exceeds `maxLines`, `onOversize` controls the fallback: `error`
+  (default) returns metadata only, `slice` returns a bounded partial read around
+  the line (size via `aroundLine`, default `maxLines` then 80), and `outline`
+  returns the nested symbols/callbacks with read handles.
+
+## Session
+
+- **Health, latency and the cheap project scan are not pi tools.** pi has the
+  `/lens-health` slash command ([tools.md](tools.md)); the MCP mirror alone
+  exposes `pilens_health`, `pilens_latency` and `pilens_project_scan`
+  ([mcp.md](mcp.md)).
+- **`lens_diagnostics mode=full`** — full project-wide review: LSP + the cached
+  heavyweight analyzers (jscpd, madge, gitleaks, govulncheck, trivy, dead-code)
+  folded in via `refreshRunners`.
+
+## Codemode
+
+- When lazy tool loading is active (`tools.lazy: true`, the default, or
+  `"auto"` on a model that supports mid-conversation system messages), the situational pi-lens tools are not callable from a
+  codemode script until `pi_lens_activate_tools` has run. They become
+  callable from the next turn.
+- pi's error for such a tool lists the available tools but not
+  `pi_lens_activate_tools`.
+- `--no-lazy-tools` (`tools.lazy: false`) makes every enabled pi-lens tool
+  callable from the first script. A tool disabled with
+  `tools.<name>.enabled: false` or `--no-tool` stays unavailable.
+- Scripts receive each tool's text, including pi-lens notes such as a blocker
+  note, never `details`.
+- Nested writes are recorded like top-level ones.

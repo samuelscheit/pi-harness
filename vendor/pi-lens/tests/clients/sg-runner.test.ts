@@ -1,0 +1,1255 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { capKilledSpawnResult } from "../support/spawn-shapes.js";
+import { removeTempDirSync } from "./test-utils.js";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../clients/project-trust.js";
+
+// All hoisted: importing `spawn-shapes.js` below reaches the mocked safe-spawn
+// module, so every mock factory here runs during the import phase — a plain
+// `const` would still be in its temporal dead zone when it does.
+const { safeSpawnAsync, safeSpawn, ensureTool } = vi.hoisted(() => ({
+	safeSpawnAsync: vi.fn(),
+	safeSpawn: vi.fn(),
+	ensureTool: vi.fn(),
+}));
+const fsFault = vi.hoisted(() => ({
+	kind: "",
+	writeCall: 0,
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		mkdirSync: (...args: any[]) => {
+			if (fsFault.kind === "mkdir") throw new Error("mkdir fault");
+			return (actual.mkdirSync as any)(...args);
+		},
+		writeFileSync: (...args: any[]) => {
+			fsFault.writeCall += 1;
+			if (fsFault.kind === "config write" && fsFault.writeCall === 1)
+				throw new Error("config write fault");
+			if (fsFault.kind === "rule write" && fsFault.writeCall === 2)
+				throw new Error("rule write fault");
+			return (actual.writeFileSync as any)(...args);
+		},
+	};
+});
+
+// `importOriginal`, not a bare stub: the cap-kill tests build the REAL
+// truncation result, and that needs safe-spawn's own `SpawnFailureError`.
+vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/safe-spawn.js")>()),
+	safeSpawnAsync,
+	safeSpawn,
+}));
+vi.mock("../../clients/installer/index.js", () => ({
+	ensureTool,
+	// #1500: the durable-absence arm reads the installer's own attempt record to
+	// tell an attempt that failed from one that never ran.
+	getInstallAttempt: vi.fn(() => undefined),
+}));
+// The untrusted-candidate witnesses below must not answer from a machine-global
+// npm/pnpm/bun install; the test environment has no ast-grep there, but pinning
+// it makes the verdict depend on the code under test rather than the box.
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
+	findGlobalBinary: vi.fn(async () => undefined),
+}));
+vi.mock(
+	"../../clients/dispatch/runners/utils/runner-helpers.js",
+	async (importOriginal) => ({
+		...(await importOriginal<
+			typeof import("../../clients/dispatch/runners/utils/runner-helpers.js")
+		>()),
+		resolveManagedToolClient: vi.fn(async ({ acceptInstalled }) => {
+			const installed = await ensureTool("ast-grep");
+			if (!installed) return { outcome: "missing" };
+			const value = await acceptInstalled(installed);
+			return value === null
+				? { outcome: "non-installable" }
+				: { outcome: "success", value };
+		}),
+	}),
+);
+
+/** The `@ast-grep/cli` platform suffix for the host, or `undefined` off the six supported targets. */
+function astGrepPlatformSuffix(): string | undefined {
+	const { platform, arch } = process;
+	if (platform === "linux" && arch === "x64") return "linux-x64-gnu";
+	if (platform === "linux" && arch === "arm64") return "linux-arm64-gnu";
+	if (platform === "darwin" && arch === "arm64") return "darwin-arm64";
+	if (platform === "darwin" && arch === "x64") return "darwin-x64";
+	if (platform === "win32" && arch === "x64") return "win32-x64-msvc";
+	if (platform === "win32" && arch === "arm64") return "win32-arm64-msvc";
+	return undefined;
+}
+
+describe("SgRunner", () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+		setProjectTrustState("trusted");
+		safeSpawnAsync.mockResolvedValue({
+			status: 1,
+			error: new Error("not found"),
+			stdout: "",
+			stderr: "",
+		});
+		safeSpawn.mockReturnValue({
+			status: 0,
+			stdout: "",
+			stderr: "",
+			error: undefined,
+		});
+		ensureTool.mockResolvedValue(null);
+	});
+
+	describe("spawn-failure taxonomy consumption (#1214/#1199)", () => {
+		it("cwd-unresolvable with an ENOENT cause is NOT unavailable and does NOT reinstall", async () => {
+			const enoent = Object.assign(new Error("spawn ast-grep ENOENT"), {
+				code: "ENOENT",
+			});
+			safeSpawnAsync.mockResolvedValue({
+				status: null,
+				error: enoent,
+				failure: "spawn",
+				spawnFailure: { kind: "cwd-unresolvable", cause: enoent },
+				stdout: "",
+				stderr: "",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const result = await runner.execRaw(["run", "--pattern", "x"]);
+			// A raw `error.code === "ENOENT"` consumer regression maps this to
+			// unavailable and drives the #1199 reinstall loop — both must stay off.
+			expect(result.failure).not.toBe("unavailable");
+			expect(ensureTool).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("ensureAvailable()", () => {
+		// #4193: prove the runner's own fallback selects the package and reaches execRaw.
+		it("executes through the scoped cache-only CLI fallback (#4193)", async () => {
+			safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+				const scoped =
+					cmd === "npx" &&
+					args.includes("--no") &&
+					args[args.indexOf("--package") + 1] === "@ast-grep/cli";
+				if (!scoped) return { status: 1, stdout: "", stderr: "missing" };
+				return {
+					status: 0,
+					stdout: args.includes("--version") ? "ast-grep 0.45.3" : "[]",
+					stderr: "",
+				};
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			expect(await runner.ensureAvailable()).toBe(true);
+			const result = await runner.execRaw(["run", "--pattern", "x"]);
+			expect(result.failure).toBeUndefined();
+			expect(result.stdout).toBe("[]");
+			expect(safeSpawnAsync.mock.calls.at(-1)?.slice(0, 2)).toEqual([
+				"npx",
+				[
+					"--no",
+					"--package",
+					"@ast-grep/cli",
+					"--",
+					"ast-grep",
+					"run",
+					"--pattern",
+					"x",
+				],
+			]);
+			expect(ensureTool).not.toHaveBeenCalled();
+		});
+
+		it("isolates the fallback from an untrusted project npmrc (#4193)", async () => {
+			const env = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-trust-"));
+			const project = path.join(env, "project");
+			const piLensHome = path.join(env, "pi-lens-home");
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(
+				path.join(project, ".npmrc"),
+				"registry=http://127.0.0.1:9/poison\n",
+			);
+			const previousCwd = process.cwd();
+			setProjectTrustState("untrusted");
+			vi.stubEnv("PI_LENS_HOME", piLensHome);
+			vi.stubEnv("NPM_CONFIG_USERCONFIG", path.join(project, ".npmrc"));
+			try {
+				process.chdir(project);
+				safeSpawnAsync.mockImplementation(
+					async (
+						cmd: string,
+						args: string[],
+						options?: { cwd?: string; stripNpmConfig?: boolean },
+					) => {
+						if (cmd !== "npx")
+							return { status: 1, stdout: "", stderr: "missing" };
+						// The shared seam strips npm_config_* at the child boundary inside
+						// `getSpawnEnvironment`; the caller's half is the flag.
+						expect(options?.stripNpmConfig).toBe(true);
+						expect(options?.cwd).toBe(path.join(piLensHome, "tools"));
+						expect(options?.cwd).not.toBe(project);
+						expect(
+							fs.readFileSync(path.join(project, ".npmrc"), "utf8"),
+						).toContain("127.0.0.1:9");
+						return {
+							status: 0,
+							stdout: args.includes("--version") ? "ast-grep 0.45.3" : "[]",
+							stderr: "",
+						};
+					},
+				);
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				expect(await runner.ensureAvailable()).toBe(true);
+				expect(
+					(await runner.execRaw(["run", "--pattern", "x"])).failure,
+				).toBeUndefined();
+			} finally {
+				process.chdir(previousCwd);
+				resetProjectTrust();
+				vi.unstubAllEnvs();
+				removeTempDirSync(env);
+			}
+		});
+
+		// #4233 V3-MED-01: a forced-trust mutation made the untrusted sweep execute a
+		// PATH ast-grep. This is the failing-without-it proof for that guard.
+		it("does not execute a PATH ast-grep on an untrusted project (#4233 V3-MED-01)", async () => {
+			const env = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-untrusted-"),
+			);
+			const project = path.join(env, "project");
+			const piLensHome = path.join(env, "pi-lens-home");
+			fs.mkdirSync(project, { recursive: true });
+			const previousCwd = process.cwd();
+			setProjectTrustState("untrusted");
+			vi.stubEnv("PI_LENS_HOME", piLensHome);
+			const probed: string[] = [];
+			safeSpawnAsync.mockImplementation(async (cmd: string) => {
+				probed.push(cmd);
+				if (cmd === "npx" || cmd === "ast-grep" || cmd === "sg")
+					return { status: 0, stdout: "ast-grep 0.45.3", stderr: "" };
+				return { status: 1, stdout: "", stderr: "missing" };
+			});
+			try {
+				process.chdir(project);
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				expect(await runner.ensureAvailable()).toBe(true);
+				// The scoped npx fallback wins; a project-derived candidate never runs.
+				expect(probed[0]).toBe("npx");
+				expect(probed).not.toContain("ast-grep");
+				expect(probed).not.toContain("sg");
+			} finally {
+				process.chdir(previousCwd);
+				resetProjectTrust();
+				vi.unstubAllEnvs();
+				removeTempDirSync(env);
+			}
+		});
+
+		// #4233 V3-MED-01: a forced-platform-package mutation executed a
+		// project-supplied `node_modules/@ast-grep/cli-<os>-<arch>/sg`.
+		// lane: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64, win32-arm64
+		it(
+			"does not execute a project-local platform package on an untrusted project (#4233 V3-MED-01)",
+			{ skip: !astGrepPlatformSuffix() },
+			async () => {
+				const suffix = astGrepPlatformSuffix() as string;
+				const env = fs.mkdtempSync(
+					path.join(os.tmpdir(), "pi-lens-sg-untrusted-pkg-"),
+				);
+				const project = path.join(env, "project");
+				fs.mkdirSync(project, { recursive: true });
+				const pkgDir = path.join(
+					project,
+					"node_modules",
+					`@ast-grep/cli-${suffix}`,
+				);
+				fs.mkdirSync(pkgDir, { recursive: true });
+				const platformBin = path.join(
+					pkgDir,
+					process.platform === "win32" ? "sg.exe" : "sg",
+				);
+				fs.writeFileSync(platformBin, "#!/bin/sh\nexit 0\n");
+				const previousCwd = process.cwd();
+				setProjectTrustState("untrusted");
+				const probed: string[] = [];
+				safeSpawnAsync.mockImplementation(async (cmd: string) => {
+					probed.push(cmd);
+					if (cmd === platformBin)
+						return { status: 0, stdout: "ast-grep 0.45.3", stderr: "" };
+					return { status: 1, stdout: "", stderr: "missing" };
+				});
+				try {
+					process.chdir(project);
+					const { SgRunner } = await import("../../clients/sg-runner.js");
+					const runner = new SgRunner();
+					// npx is missing, so the sweep reaches (and, if correct, skips) Step 2.
+					expect(await runner.ensureAvailable()).toBe(false);
+					expect(probed).not.toContain(platformBin);
+				} finally {
+					process.chdir(previousCwd);
+					resetProjectTrust();
+					removeTempDirSync(env);
+				}
+			},
+		);
+
+		// #4233 V3-HIGH-02: both temp-scan members must use the same isolated
+		// seam the exec path uses, so a hostile project `.npmrc` never reaches the
+		// scan's npx child. #5247: the command is the one THIS instance resolved,
+		// so the sweep has to run first, as every tool handler does.
+		it("runs the temp-scan npx fallback from the isolated seam (#4233 V3-HIGH-02)", async () => {
+			const env = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-tempscan-"),
+			);
+			const project = path.join(env, "project");
+			const piLensHome = path.join(env, "pi-lens-home");
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(
+				path.join(project, ".npmrc"),
+				"registry=http://127.0.0.1:9/poison\n",
+			);
+			vi.stubEnv("PI_LENS_HOME", piLensHome);
+			const scanOptions: Array<{ cwd?: string; stripNpmConfig?: boolean }> = [];
+			safeSpawnAsync.mockImplementation(
+				async (
+					cmd: string,
+					args: string[],
+					options?: { cwd?: string; stripNpmConfig?: boolean },
+				) => {
+					if (cmd !== "npx")
+						return { status: 1, error: undefined, stdout: "", stderr: "" };
+					if (args.includes("--version"))
+						return { status: 0, stdout: "ast-grep 0.45.3", stderr: "" };
+					scanOptions.push(options ?? {});
+					return { status: 1, error: undefined, stdout: "", stderr: "" };
+				},
+			);
+			try {
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				expect(await runner.ensureAvailable()).toBe(true);
+				const rule =
+					"id: r\nlanguage: TypeScript\nrule: { kind: function_declaration }\n";
+				await runner.tempScanDetailedAsync(project, "r", rule);
+				await runner.tempScanWithFixAsync(project, "r", rule, false);
+				expect(scanOptions.length).toBeGreaterThanOrEqual(2);
+				for (const options of scanOptions) {
+					expect(options.cwd).toBe(path.join(piLensHome, "tools"));
+					expect(options.cwd).not.toBe(project);
+					expect(options.stripNpmConfig).toBe(true);
+				}
+			} finally {
+				vi.unstubAllEnvs();
+				removeTempDirSync(env);
+			}
+		});
+
+		// #5247: the temp scans ran the module-level sweep's command, which falls
+		// back to `npx --no ...` before the module sweep ran and appended the npx
+		// preamble to a resolved bare binary after it. A structural ast_grep_replace
+		// (insideKind, hasKind, follows, ...) in a project without @ast-grep/cli
+		// failed with "npm ERR! canceled" / "unexpected argument '--no'". The
+		// binary here is the one pi-lens installed (the empty-prefix case): both
+		// temp-scan entry points, dry run and apply, must spawn exactly it.
+		it("spawns the instance-resolved binary with an empty prefix, never npx, from every temp-scan entry point (#5247)", async () => {
+			const env = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-managed-"));
+			const project = path.join(env, "project");
+			const managed = path.join(
+				env,
+				"tools",
+				"node_modules",
+				".bin",
+				"ast-grep",
+			);
+			fs.mkdirSync(project, { recursive: true });
+			ensureTool.mockResolvedValue(managed);
+			const spawned: Array<{ cmd: string; args: string[] }> = [];
+			safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+				spawned.push({ cmd, args });
+				if (cmd === managed)
+					return args.includes("--version")
+						? { status: 0, stdout: "ast-grep 0.45.3", stderr: "" }
+						: { status: 0, stdout: "[]", stderr: "" };
+				return { status: 1, error: undefined, stdout: "", stderr: "" };
+			});
+			try {
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				expect(await runner.ensureAvailable()).toBe(true);
+				spawned.length = 0;
+				const rule =
+					"id: r\nlanguage: TypeScript\nrule: { kind: function_declaration }\nfix: x\n";
+				const detailed = await runner.tempScanDetailedAsync(project, "r", rule);
+				const dry = await runner.tempScanWithFixAsync(
+					project,
+					"r",
+					rule,
+					false,
+				);
+				const applied = await runner.tempScanWithFixAsync(
+					project,
+					"r",
+					rule,
+					true,
+				);
+				expect(detailed.error).toBeUndefined();
+				expect(dry.error).toBeUndefined();
+				expect(applied.error).toBeUndefined();
+				// detailed + dry + (apply: json pass + --update-all pass)
+				expect(spawned).toHaveLength(4);
+				for (const call of spawned) {
+					expect(call.cmd).toBe(managed);
+					expect(call.args[0]).toBe("scan");
+					expect(call.args).not.toContain("--no");
+				}
+			} finally {
+				removeTempDirSync(env);
+			}
+		});
+
+		// #4233 V3-MED-01: a dropped `...this.sgSpawnOptions` in `exec` survived the
+		// suite because only the `execRaw` half was asserted.
+		it("spreads the isolated options onto exec as well as execRaw (#4233 V3-MED-01)", async () => {
+			const env = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-exec-iso-"),
+			);
+			const piLensHome = path.join(env, "pi-lens-home");
+			vi.stubEnv("PI_LENS_HOME", piLensHome);
+			setProjectTrustState("untrusted");
+			const calls: Array<{
+				args: string[];
+				options?: { cwd?: string; stripNpmConfig?: boolean };
+			}> = [];
+			safeSpawnAsync.mockImplementation(
+				async (
+					cmd: string,
+					args: string[],
+					options?: { cwd?: string; stripNpmConfig?: boolean },
+				) => {
+					calls.push({ args, options });
+					if (cmd === "npx" && args.includes("--version"))
+						return { status: 0, stdout: "ast-grep 0.45.3", stderr: "" };
+					if (args.includes("--version"))
+						return { status: 1, stdout: "", stderr: "missing" };
+					return { status: 0, stdout: "[]", stderr: "" };
+				},
+			);
+			try {
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				expect(await runner.ensureAvailable()).toBe(true);
+				await runner.exec(["run", "--pattern", "x"]);
+				const execCall = calls.find((call) => call.args.includes("--pattern"));
+				expect(
+					execCall,
+					"the exec() spawn reached safeSpawnAsync",
+				).toBeDefined();
+				expect(execCall?.options?.cwd).toBe(path.join(piLensHome, "tools"));
+				expect(execCall?.options?.stripNpmConfig).toBe(true);
+			} finally {
+				resetProjectTrust();
+				vi.unstubAllEnvs();
+				removeTempDirSync(env);
+			}
+		});
+
+		it("returns true when ast-grep is in PATH", async () => {
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 0,
+				error: null,
+				stdout: "ast-grep 0.42.1",
+				stderr: "",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const result = await runner.ensureAvailable();
+			expect(result).toBe(true);
+		});
+
+		it("rejects Linux group-switch sg and returns false when fallbacks fail", async () => {
+			safeSpawnAsync
+				.mockResolvedValueOnce({
+					status: 1,
+					error: new Error("not found"),
+					stdout: "",
+					stderr: "",
+				})
+				.mockResolvedValueOnce({
+					status: 0,
+					error: null,
+					stdout: "sg from util-linux 2.39",
+					stderr: "",
+				})
+				.mockResolvedValueOnce({
+					status: 1,
+					error: new Error("not found"),
+					stdout: "",
+					stderr: "",
+				});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const result = await runner.ensureAvailable();
+			expect(result).toBe(false);
+			expect(ensureTool).toHaveBeenCalledWith("ast-grep");
+		});
+
+		it("returns false when ast-grep not found and installer fails", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const result = await runner.ensureAvailable();
+			expect(result).toBe(false);
+		});
+
+		it("caches true result on second call", async () => {
+			safeSpawnAsync.mockResolvedValue({
+				status: 0,
+				error: null,
+				stdout: "ast-grep 0.42.1",
+				stderr: "",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			await runner.ensureAvailable();
+			await runner.ensureAvailable();
+			expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+		});
+
+		it("dedupes concurrent first-time callers to a single probe (#113)", async () => {
+			let resolveProbe: ((value: unknown) => void) | undefined;
+			safeSpawnAsync.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						resolveProbe = resolve;
+					}),
+			);
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const a = runner.ensureAvailable();
+			const b = runner.ensureAvailable();
+			const c = runner.ensureAvailable();
+			expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+			resolveProbe?.({
+				status: 0,
+				error: null,
+				stdout: "ast-grep 0.42.1",
+				stderr: "",
+			});
+			const results = await Promise.all([a, b, c]);
+			expect(results).toEqual([true, true, true]);
+			// Cache is now hot — additional calls don't even reach safeSpawnAsync.
+			await runner.ensureAvailable();
+			expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not re-serve a retained ast-grep winner this sweep just proved durably missing (#1593)", async () => {
+			try {
+				vi.useFakeTimers({ toFake: ["Date"] });
+				vi.setSystemTime(new Date(1_700_000_000_000));
+
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+
+				// Sweep 1: the direct candidates (ast-grep, sg) stall (transient);
+				// the npx fallback answers, so the win is provisional and memoized
+				// as the npx command.
+				safeSpawnAsync.mockImplementation(async (cmd: string) => {
+					if (cmd === "npx") {
+						return {
+							status: 0,
+							error: null,
+							stdout: "ast-grep 0.42.1",
+							stderr: "",
+						};
+					}
+					return {
+						status: null,
+						error: undefined,
+						stdout: "",
+						stderr: "",
+						failure: "timeout" as const,
+						spawnFailure: { kind: "timeout" as const },
+					};
+				});
+				expect(await runner.ensureAvailable()).toBe(true);
+
+				// Let the provisional cooldown expire so the next call re-sweeps
+				// instead of serving the memoized verdict straight from the latch.
+				vi.setSystemTime(new Date(Date.now() + 301_000));
+
+				// Sweep 2: the memoized winner (npx) now ENOENTs — durably missing —
+				// while ast-grep/sg merely stall again. The retained arm must NOT
+				// re-serve the dead `npx` command just because a sibling stalled in
+				// the same sweep.
+				safeSpawnAsync.mockImplementation(async (cmd: string) => {
+					if (cmd === "npx") {
+						return {
+							status: null,
+							error: Object.assign(new Error("npx ENOENT"), { code: "ENOENT" }),
+							stdout: "",
+							stderr: "",
+							failure: "spawn" as const,
+							spawnFailure: { kind: "tool-not-found" as const },
+						};
+					}
+					return {
+						status: null,
+						error: undefined,
+						stdout: "",
+						stderr: "",
+						failure: "timeout" as const,
+						spawnFailure: { kind: "timeout" as const },
+					};
+				});
+				expect(await runner.ensureAvailable()).toBe(false);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	describe("tempScanAsync()", () => {
+		it("removes the allocated scan root when mkdir or either config write fails", async () => {
+			for (const label of ["mkdir", "config write", "rule write"] as const) {
+				const before = new Set(
+					fs
+						.readdirSync(os.tmpdir())
+						.filter((name) => name.startsWith("pi-lens-temp-fault-")),
+				);
+				fsFault.kind = label;
+				fsFault.writeCall = 0;
+				try {
+					const { SgRunner } = await import("../../clients/sg-runner.js");
+					await expect(
+						new SgRunner().tempScanDetailedAsync(
+							os.tmpdir(),
+							"fault",
+							"id: fault\nrule: { kind: function_declaration }\n",
+						),
+					).rejects.toThrow(`${label} fault`);
+				} finally {
+					fsFault.kind = "";
+				}
+				const after = fs
+					.readdirSync(os.tmpdir())
+					.filter(
+						(name) =>
+							name.startsWith("pi-lens-temp-fault-") && !before.has(name),
+					);
+				expect(after, `${label} left a generated scan directory`).toEqual([]);
+			}
+		});
+
+		it("passes centralized gitignore globs to ast-grep scan", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-ignore-"));
+			try {
+				fs.writeFileSync(path.join(root, ".gitignore"), "/profiles/\n*.snap\n");
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 0,
+					error: null,
+					stdout: "[]",
+					stderr: "",
+				});
+
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				await runner.tempScanAsync(
+					root,
+					"find",
+					"id: find\nrule: { kind: function_declaration }\n",
+				);
+
+				const args = safeSpawnAsync.mock.calls[0][1] as string[];
+				expect(args).toContain("--globs");
+				expect(args).toContain("!profiles/**");
+				expect(args).toContain("!**/*.snap");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("creates the scan root under PI_LENS_TEST_SCANNER_TMPDIR when set", async () => {
+			// #4347: session_start's ast-grep exports scan reaches this root
+			// unawaited, as jscpd does. A test or harness that owns a scanner root
+			// must catch this one too, or a fork killed before the `finally`
+			// strands it in the shared tmpdir.
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-owned-"));
+			const scannerRoot = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-owned-root-"),
+			);
+			vi.stubEnv("PI_LENS_TEST_SCANNER_TMPDIR", scannerRoot);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 0,
+					error: null,
+					stdout: "[]",
+					stderr: "",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				await new SgRunner().tempScanAsync(
+					root,
+					"owned",
+					"id: owned\nrule: { kind: function_declaration }\n",
+				);
+
+				const args = safeSpawnAsync.mock.calls[0][1] as string[];
+				const scanRoot = path.dirname(args[args.indexOf("--config") + 1]);
+				expect(path.dirname(scanRoot)).toBe(scannerRoot);
+				expect(path.basename(scanRoot)).toMatch(/^pi-lens-temp-owned-/);
+			} finally {
+				vi.unstubAllEnvs();
+				removeTempDirSync(root);
+				removeTempDirSync(scannerRoot);
+			}
+		});
+
+		it("reports invalid generated-rule CLI output instead of an empty success", async () => {
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-invalid-"),
+			);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 8,
+					error: undefined,
+					stdout: "",
+					stderr: "invalid node kind: definitely_not_a_kind",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"bad",
+					"id: bad\nlanguage: TypeScript\nrule: { kind: definitely_not_a_kind }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBe("cli-failure");
+				expect(result.error).toContain("invalid node kind");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("treats status-1 with valid JSON matches as success (severity:error linter contract)", async () => {
+			// #1087 P1 regression: ast-grep's linter-style contract — a rule with
+			// `severity: error` that MATCHES exits 1 with valid JSON matches on
+			// stdout and stderr "Scan succeeded and found error level diagnostics".
+			// The old code only exempted status-1 with NO output, so real matches
+			// were dropped as a cli-failure. Verified first-hand against the bundled
+			// ast-grep 0.45.0 binary during the fix.
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-err-sev-"),
+			);
+			try {
+				const matchJson = JSON.stringify([
+					{
+						file: path.join(root, "target.js"),
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 7 },
+						},
+						text: "eval(x)",
+						ruleId: "no-eval-test",
+						severity: "error",
+					},
+				]);
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: matchJson,
+					stderr:
+						"Error: 1 error(s) found in code.\nHelp: Scan succeeded and found error level diagnostics in the codebase.",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"no-eval-test",
+					"id: no-eval-test\nlanguage: JavaScript\nseverity: error\nrule: { pattern: eval($ARG) }\n",
+				);
+
+				expect(result.matches).toHaveLength(1);
+				expect(result.matches[0].ruleId).toBe("no-eval-test");
+				expect(result.failure).toBeUndefined();
+				expect(result.error).toBeUndefined();
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("rejects a status-1 JSON scalar/null stdout as a failure (no phantom match)", async () => {
+			// tryParseSgMatches only accepts an array or object — a JSON scalar
+			// (e.g. an error report serialized as `null`) must not become a match.
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-scalar-"));
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: "null",
+					stderr: "Error: scan aborted",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"scalar",
+					"id: scalar\nlanguage: TypeScript\nrule: { kind: function_declaration }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBe("cli-failure");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("keeps status-1 with stderr but unparseable stdout as a failure", async () => {
+			// The complement of the case above: a nonzero status whose stdout is
+			// NOT valid JSON is a real CLI diagnostic, not a match set.
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sg-err-bad-"),
+			);
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: "not json at all",
+					stderr: "Error: something went wrong",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"bad",
+					"id: bad\nlanguage: TypeScript\nrule: { kind: function_declaration }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBe("cli-failure");
+				expect(result.error).toContain("something went wrong");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("preserves status-one empty output as a genuine no-match", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-empty-"));
+			try {
+				safeSpawnAsync.mockResolvedValueOnce({
+					status: 1,
+					error: undefined,
+					stdout: "",
+					stderr: "",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const result = await new SgRunner().tempScanDetailedAsync(
+					root,
+					"empty",
+					"id: empty\nrule: { kind: function_declaration }\n",
+				);
+
+				expect(result.matches).toEqual([]);
+				expect(result.failure).toBeUndefined();
+				expect(result.error).toBeUndefined();
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+	});
+
+	describe("formatMatches()", () => {
+		it("includes [Language] suffix in formatMatches when language field is present", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const matches = [
+				{
+					file: "src/foo.ts",
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 10 },
+					},
+					text: "console.log(x)",
+					language: "TypeScript",
+				},
+			];
+			const output = runner.formatMatches(matches as any);
+			expect(output).toContain("[TypeScript]");
+			expect(output).toContain("src/foo.ts:1:1");
+		});
+
+		it("omits language suffix when language field is absent", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const matches = [
+				{
+					file: "src/foo.ts",
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 10 },
+					},
+					text: "console.log(x)",
+				},
+			];
+			const output = runner.formatMatches(matches as any);
+			expect(output).not.toContain("[");
+		});
+
+		it("shows metavar captures below match line", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			const matches = [
+				{
+					file: "src/foo.ts",
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 20 },
+					},
+					text: "console.log(msg)",
+					language: "TypeScript",
+					metaVariables: {
+						single: {
+							MSG: {
+								text: "msg",
+								range: {
+									start: { line: 0, column: 12 },
+									end: { line: 0, column: 15 },
+								},
+							},
+						},
+						multi: {},
+						transformed: {},
+					},
+				},
+			];
+			const output = runner.formatMatches(matches as any);
+			expect(output).toContain("[TypeScript]");
+			expect(output).toContain("$MSG=msg");
+		});
+	});
+
+	describe("tempScanWithFixAsync() — apply reports the pre-apply match count", () => {
+		it("counts what was changed even though the rule no longer matches post-apply", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-apply-"));
+			try {
+				const oneMatch = JSON.stringify([
+					{
+						file: path.join(root, "a.ts"),
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 5 },
+						},
+						text: "var x",
+					},
+				]);
+				// Real-world semantics: once --update-all rewrites the file the rule
+				// stops matching, so a json pass AFTER apply returns zero. The mock
+				// encodes that ordering dependency — the count pass must run first.
+				let applied = false;
+				const jsonAppliedState: boolean[] = [];
+				safeSpawnAsync.mockImplementation(
+					async (_cmd: string, args: string[]) => {
+						if (args.includes("--update-all")) {
+							applied = true;
+							return { status: 0, error: null, stdout: "", stderr: "" };
+						}
+						if (args.includes("--json")) {
+							jsonAppliedState.push(applied);
+							return {
+								status: 0,
+								error: null,
+								stdout: applied ? "[]" : oneMatch,
+								stderr: "",
+							};
+						}
+						return { status: 0, error: null, stdout: "", stderr: "" };
+					},
+				);
+
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				const result = await runner.tempScanWithFixAsync(
+					root,
+					"agent-rule",
+					"id: agent-rule\nrule: { pattern: var $X }\nfix: let $X\n",
+					true,
+				);
+
+				// The count (json) pass must run BEFORE --update-all so it still
+				// sees the match. The old code ran it after and reported zero.
+				expect(jsonAppliedState).toEqual([false]);
+				expect(result.error).toBeUndefined();
+				expect(result.matches).toHaveLength(1);
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+
+		it("dry-run (applyFixes=false) never writes — no --update-all", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-dry-"));
+			try {
+				safeSpawnAsync.mockResolvedValue({
+					status: 0,
+					error: null,
+					stdout: "[]",
+					stderr: "",
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+				await runner.tempScanWithFixAsync(
+					root,
+					"agent-rule",
+					"id: agent-rule\nrule: { pattern: var $X }\nfix: let $X\n",
+					false,
+				);
+				const allArgs = safeSpawnAsync.mock.calls.flatMap(
+					(c) => c[1] as string[],
+				);
+				expect(allArgs).not.toContain("--update-all");
+			} finally {
+				removeTempDirSync(root);
+			}
+		});
+	});
+
+	describe("exec() honors the status-1-with-matches linter contract (#1087)", () => {
+		it("parses matches when a severity:error rule exits 1 with JSON stdout", async () => {
+			const matchJson = JSON.stringify([
+				{
+					file: "src/a.js",
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 0, column: 7 },
+					},
+					text: "eval(x)",
+				},
+			]);
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 1,
+				error: undefined,
+				stdout: matchJson,
+				stderr: "Scan succeeded and found error level diagnostics",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toHaveLength(1);
+			expect(result.totalMatches).toBe(1);
+			expect(result.error).toBeUndefined();
+		});
+
+		it("still reports a failure when status-1 stdout is not JSON", async () => {
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 1,
+				error: undefined,
+				stdout: "garbage",
+				stderr: "Error: bad rule",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toContain("bad rule");
+		});
+
+		it("reports a failure for exit 2 even when stdout parses as match JSON", async () => {
+			// Only exit 1 carries the "scan succeeded with findings" linter
+			// contract — any other nonzero exit is a real CLI failure and must
+			// NOT be laundered into matches, however plausible stdout looks.
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 2,
+				error: undefined,
+				stdout: JSON.stringify([
+					{
+						file: "src/a.js",
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 7 },
+						},
+						text: "eval(x)",
+					},
+				]),
+				stderr: "Error: invalid scan configuration",
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toContain("invalid scan configuration");
+		});
+
+		it("treats truncated status-1 stdout as a failure, not as matches", async () => {
+			// A truncated JSON payload may still happen to parse (e.g. cut
+			// exactly at a match boundary) — the truncation flag must veto it.
+			safeSpawnAsync.mockResolvedValueOnce({
+				status: 1,
+				error: undefined,
+				stdout: JSON.stringify([
+					{
+						file: "src/a.js",
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 0, column: 7 },
+						},
+						text: "eval(x)",
+					},
+				]),
+				stderr: "Scan succeeded and found error level diagnostics",
+				outputTruncated: true,
+			});
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toBeDefined();
+		});
+
+		// #2100: the cap kill is OUR SIGTERM, so a truncated run also looks like
+		// a killed spawn. Read after the failure gate, these guards could only
+		// ever describe a tool that exited before the signal reached it.
+		it("names the truncation, not a CLI failure, when the output cap killed the exec", async () => {
+			safeSpawnAsync.mockResolvedValueOnce(
+				capKilledSpawnResult({ stdout: '[{"file":"src/a.js"' }),
+			);
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+
+			expect(result.matches).toEqual([]);
+			expect(result.error).toContain("truncated");
+		});
+
+		// #2100 review F5: the invariant this PR writes into AGENTS.md says every
+		// maxOutputBytes is pinned by a test. These four are the rest of the tree.
+		it.each([
+			[
+				"execRaw",
+				(runner: { execRaw: (args: string[]) => Promise<unknown> }) =>
+					runner.execRaw(["run", "-p", "x", "--lang", "ts", "."]),
+			],
+			[
+				"exec",
+				(runner: { exec: (args: string[]) => Promise<unknown> }) =>
+					runner.exec(["scan", "--json", "."]),
+			],
+			[
+				"tempScanDetailedAsync",
+				(runner: {
+					tempScanDetailedAsync: (
+						dir: string,
+						id: string,
+						yaml: string,
+					) => Promise<unknown>;
+				}) => runner.tempScanDetailedAsync(os.tmpdir(), "r", "id: r\n"),
+			],
+			[
+				"tempScanWithFixAsync",
+				(runner: {
+					tempScanWithFixAsync: (
+						dir: string,
+						id: string,
+						yaml: string,
+						apply: boolean,
+					) => Promise<unknown>;
+				}) => runner.tempScanWithFixAsync(os.tmpdir(), "r", "id: r\n", false),
+			],
+		])(
+			"caps %s output so its truncation guard can fire",
+			async (_name, call) => {
+				safeSpawnAsync.mockResolvedValue({
+					status: 0,
+					stdout: "[]",
+					stderr: "",
+					error: undefined,
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+
+				// biome-ignore lint/suspicious/noExplicitAny: one shared arrow per row
+				await call(new SgRunner() as any);
+
+				expect(safeSpawnAsync).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.any(Array),
+					expect.objectContaining({ maxOutputBytes: 8 * 1024 * 1024 }),
+				);
+			},
+		);
+
+		it("names the truncation, not a CLI failure, when the output cap killed a scan", async () => {
+			safeSpawnAsync.mockResolvedValueOnce(
+				capKilledSpawnResult({ stdout: '[{"file":"src/a.js"' }),
+			);
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+
+			const result = await new SgRunner().tempScanDetailedAsync(
+				os.tmpdir(),
+				"agent-rule",
+				"id: x\nlanguage: TypeScript\nrule: { kind: call_expression }",
+			);
+
+			expect(result.matches).toEqual([]);
+			expect(result.failure).toBe("parse-failure");
+			expect(result.error).toContain("truncated");
+		});
+	});
+
+	describe("buildBashRunArgs (Git Bash exec path — injection safety, code-scanning #12)", () => {
+		it("passes cmd + args as positional params with a constant -c script", async () => {
+			const { buildBashRunArgs } = await import("../../clients/sg-runner.js");
+			expect(
+				buildBashRunArgs("ast-grep", ["run", "-p", "console.log($MSG)"]),
+			).toEqual([
+				"-c",
+				'"$0" "$@"',
+				"ast-grep",
+				"run",
+				"-p",
+				"console.log($MSG)",
+			]);
+		});
+
+		it("never interpolates the command path into the script (no env-path injection)", async () => {
+			const { buildBashRunArgs } = await import("../../clients/sg-runner.js");
+			// A hostile env-derived path stays argv[0] verbatim — not part of the
+			// `-c` string — so the shell cannot evaluate it.
+			const evil = "/tmp/$(touch pwned)/ast-grep";
+			const argv = buildBashRunArgs(evil, ["-p", "x"]);
+			expect(argv[1]).toBe('"$0" "$@"'); // script is a constant
+			expect(argv[2]).toBe(evil); // path is a discrete positional arg
+			expect(argv[1]).not.toContain("$("); // never concatenated into the script
+		});
+
+		it("keeps $-metavariable patterns as a single literal arg (not shell-expanded)", async () => {
+			const { buildBashRunArgs } = await import("../../clients/sg-runner.js");
+			const argv = buildBashRunArgs("sg", ["-p", "$A && $B || $$$REST"]);
+			expect(argv).toContain("$A && $B || $$$REST");
+		});
+	});
+
+	// #533 — the pidusage bug class: a SYNCHRONOUS `spawn()` throw inside
+	// `exec()`'s Promise executor (Windows `spawn UNKNOWN`/EINVAL) must not
+	// reject/crash the host — `exec` is contracted to always resolve with an
+	// `error`, exactly like an asynchronously-emitted spawn `'error'` event.
+	describe("exec() contains a synchronous spawn throw (#533)", () => {
+		it("resolves gracefully instead of rejecting when spawn throws sync", async () => {
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			// A NUL byte in an argv element makes Node's real `spawn()` throw
+			// SYNCHRONOUSLY (ERR_INVALID_ARG_VALUE) from inside the executor — the
+			// same detached-throw shape as the Windows `spawn UNKNOWN` failure.
+			(runner as unknown as { sgCommand: string }).sgCommand = process.execPath;
+			(runner as unknown as { sgArgsPrefix: string[] }).sgArgsPrefix = [
+				String.fromCharCode(0), // NUL byte -> spawn() throws synchronously
+			];
+
+			// Must RESOLVE (never reject); the failure surfaces in `error`.
+			const result = await runner.exec(["-p", "x"]);
+			expect(result.matches).toEqual([]);
+			expect(result.error).toBeTruthy();
+		});
+	});
+});

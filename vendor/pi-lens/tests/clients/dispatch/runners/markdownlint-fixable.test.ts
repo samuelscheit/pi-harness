@@ -1,0 +1,211 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
+import { setupTestEnvironment } from "../../test-utils.js";
+
+const safeSpawnAsync = vi.fn();
+const hasMarkdownlintConfigMock = vi.fn(() => true);
+
+vi.mock("../../../../clients/safe-spawn.js", () => ({
+	safeSpawn: vi.fn(),
+	safeSpawnAsync,
+}));
+
+vi.mock(
+	"../../../../clients/dispatch/runners/utils/runner-helpers.js",
+	async (importOriginal) => ({
+		...(await importOriginal<
+			typeof import("../../../../clients/dispatch/runners/utils/runner-helpers.js")
+		>()),
+		resolveToolCommandWithInstallFallback: vi.fn(
+			async () => "markdownlint-cli2",
+		),
+	}),
+);
+
+vi.mock("../../../../clients/tool-policy.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../../../clients/tool-policy.js")>();
+	return {
+		...actual,
+		getLinterPolicyForCwd: () => null,
+		hasMarkdownlintConfig: hasMarkdownlintConfigMock,
+		// The runner now consumes the shared config-args builder, which calls
+		// the predicate module-internally — route the builder through the mock
+		// so "config present → no --config" still holds (#1247 review P1b).
+		markdownlintConfigArgs: (cwd: string) =>
+			hasMarkdownlintConfigMock() ? [] : actual.markdownlintConfigArgs(cwd),
+	};
+});
+
+function createCtx(filePath: string, cwd: string) {
+	return makeRunnerCtx(filePath, cwd, { kind: "markdown" });
+}
+
+describe("markdownlint runner — fixable metadata", () => {
+	// #5119: with a markdownlint-cli2 package beside the command (a global
+	// install on PATH) the runner spawns its no-fix wrapper, not the bare command
+	// these cases pin; an empty PATH leaves only the fallback spawn on every host.
+	beforeEach(() => {
+		vi.stubEnv("PATH", "");
+		vi.resetModules();
+		safeSpawnAsync.mockReset();
+		hasMarkdownlintConfigMock.mockReset().mockReturnValue(true);
+	});
+
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	// markdownlint-cli2 has no `--version`; a probe that asks for one reads
+	// stdin until its budget expires. Since #5410 the runner resolves through
+	// the registry-driven resolver, so the real resolver must send the bounded
+	// stdin probe.
+	it("constructs the bounded stdin availability probe", async () => {
+		const helpers = await vi.importActual<
+			typeof import("../../../../clients/dispatch/runners/utils/runner-helpers.js")
+		>("../../../../clients/dispatch/runners/utils/runner-helpers.js");
+		const env = setupTestEnvironment("pi-lens-markdownlint-probe-");
+		try {
+			safeSpawnAsync.mockResolvedValue({
+				error: null,
+				status: 0,
+				stdout: "",
+				stderr: "",
+			});
+			await helpers.resolveToolCommandWithInstallFallback(
+				env.tmpDir,
+				"markdownlint",
+			);
+			expect(safeSpawnAsync).toHaveBeenCalledWith(
+				"markdownlint-cli2",
+				["--no-globs", "-"],
+				expect.objectContaining({ input: "" }),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("marks known-fixable MD rules as fixable with a fixSuggestion", async () => {
+		const env = setupTestEnvironment("pi-lens-markdownlint-fixable-");
+		try {
+			const filePath = path.join(env.tmpDir, "README.md");
+			fs.writeFileSync(filePath, "# Title\n");
+
+			// MD009 (trailing spaces) is fixable; MD013 (line-length) is not.
+			safeSpawnAsync.mockResolvedValueOnce({
+				error: null,
+				status: 1,
+				stdout: [
+					`${filePath}:1 MD009/no-trailing-spaces Trailing spaces`,
+					`${filePath}:2 MD013/line-length Line length`,
+				].join("\n"),
+				stderr: "",
+			});
+
+			const runner = (
+				await import("../../../../clients/dispatch/runners/markdownlint.js")
+			).default;
+			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
+
+			// #5119 review r1 F1: the 15 s kill is what bounds a spinning rule now
+			// that cli2 runs in a child, so the runner's budget is pinned.
+			expect(safeSpawnAsync).toHaveBeenCalledWith(
+				"markdownlint-cli2",
+				[filePath],
+				expect.objectContaining({ cwd: env.tmpDir, timeout: 15000 }),
+			);
+			expect(result.diagnostics.length).toBeGreaterThanOrEqual(2);
+			const md009 = result.diagnostics.find((d) => d.rule === "MD009");
+			const md013 = result.diagnostics.find((d) => d.rule === "MD013");
+			expect(md009?.fixable).toBe(true);
+			expect(md009?.fixSuggestion).toMatch(/markdownlint-cli2 --fix/);
+			expect(md013?.fixable).toBeFalsy();
+			expect(md013?.fixSuggestion).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("uses the package-owned MD013-disabled config when no project config exists", async () => {
+		const env = setupTestEnvironment("pi-lens-markdownlint-default-config-");
+		try {
+			const filePath = path.join(env.tmpDir, "README.md");
+			fs.writeFileSync(filePath, "# Title\n");
+			hasMarkdownlintConfigMock.mockReturnValue(false);
+			safeSpawnAsync.mockResolvedValueOnce({
+				error: null,
+				status: 0,
+				stdout: "",
+				stderr: "",
+			});
+
+			const runner = (
+				await import("../../../../clients/dispatch/runners/markdownlint.js")
+			).default;
+			await runner.run(createCtx(filePath, env.tmpDir) as never);
+
+			const [, args] = safeSpawnAsync.mock.calls[0] as [
+				string,
+				string[],
+				unknown,
+			];
+			expect(args[0]).toBe("--config");
+			expect(args).not.toContain("--disable");
+			expect(args).not.toContain("MD013");
+			expect(args.at(-1)).toBe(filePath);
+			expect(args[1]).toMatch(/config[\\/]markdownlint[\\/]core\.json$/);
+			expect(fs.existsSync(args[1])).toBe(true);
+			expect(path.resolve(args[1])).not.toContain(path.basename(env.tmpDir));
+			const bundledConfig = JSON.parse(fs.readFileSync(args[1], "utf8")) as {
+				MD013?: boolean;
+				MD024?: { siblings_only?: boolean };
+			};
+			expect(bundledConfig.MD013).toBe(false);
+			expect(bundledConfig.MD024?.siblings_only).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Regression for #212: markdownlint-cli2 emits a severity token (`error`/
+	// `warning`) between the col and the rule code, and some rules carry multiple
+	// slash-separated names — both of which the old parser missed, silently
+	// returning 0 diagnostics.
+	it("parses the markdownlint-cli2 format (severity token + multi-segment rule)", async () => {
+		const env = setupTestEnvironment("pi-lens-markdownlint-cli2fmt-");
+		try {
+			const filePath = path.join(env.tmpDir, "README.md");
+			fs.writeFileSync(filePath, "#Title\n");
+
+			safeSpawnAsync.mockResolvedValueOnce({
+				error: null,
+				status: 1,
+				stdout: [
+					`${filePath}:1:1 error MD018/no-missing-space-atx No space after hash`,
+					`${filePath}:1 error MD041/first-line-heading/first-line-h1 First line should be a top-level heading`,
+					`${filePath}:2:14 warning MD009/no-trailing-spaces Trailing spaces`,
+				].join("\n"),
+				stderr: "",
+			});
+
+			const runner = (
+				await import("../../../../clients/dispatch/runners/markdownlint.js")
+			).default;
+			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
+
+			expect(result.diagnostics.length).toBe(3);
+			expect(result.diagnostics.map((d) => d.rule).sort()).toEqual([
+				"MD009",
+				"MD018",
+				"MD041",
+			]);
+			const md041 = result.diagnostics.find((d) => d.rule === "MD041");
+			expect(md041?.line).toBe(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+});

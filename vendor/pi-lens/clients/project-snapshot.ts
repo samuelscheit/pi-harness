@@ -1,0 +1,2616 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
+import { gunzipSync, gzipSync } from "node:zlib";
+import { writeFileAtomic } from "./atomic-write.js";
+import { registerBackgroundWriteDrain } from "./background-write-drains.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
+import { getProjectDataDir } from "./file-utils.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	readGzipStageWorkerResult,
+	reapStageFile,
+} from "./gzip-stage-write.js";
+import { withGenerationLockSync } from "./generation-lock.js";
+import { isStaleStageFile } from "./instance-reaper.js";
+import { readJsonCache } from "./json-cache-read.js";
+import { logLatency } from "./latency-logger.js";
+import { normalizeMapKey } from "./path-utils.js";
+import { fingerprintProjectSnapshotJson } from "./project-snapshot-fingerprint.js";
+import type {
+	ProjectSnapshotPersistWorkerRequest,
+	ProjectSnapshotPersistWorkerResult,
+} from "./project-snapshot-persist-worker.js";
+import type { ProjectLanguageProfile } from "./language-policy.js";
+import {
+	detectProjectConventions,
+	type ProjectConventions,
+} from "./project-conventions.js";
+import type { RuleScanResult } from "./rules-scanner.js";
+import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import type { StartupScanContext } from "./startup-scan.js";
+import {
+	notePersistWorkerMessageFault,
+	readWorkerHeapStatistics,
+	type PersistWorkerHeapStatistics,
+} from "./persist-worker-stats.js";
+import {
+	deserializeWordIndex,
+	recordPersistedWordIndexWireBytes,
+	serializeWordIndex,
+	type SerializedWordIndex,
+} from "./word-index.js";
+
+// v2: added `wordIndex` (identifier inverted index + BM25, #162). Bumping the
+// version invalidates pre-v2 snapshots so they rebuild with the new field.
+export const PROJECT_SNAPSHOT_VERSION = 2;
+
+export interface ProjectSnapshotFile {
+	path: string;
+	mtimeMs: number;
+	size: number;
+	hash?: string;
+	language?: string;
+	lineCount?: number;
+	imports?: string[];
+	symbolCount?: number;
+	lastSeq: number;
+}
+
+interface ProjectSnapshotSymbol {
+	name: string;
+	kind: string;
+	filePath: string;
+	startLine?: number;
+	endLine?: number;
+}
+
+/**
+ * The derived project-changes sequence index as of `ProjectSnapshot.seq`
+ * (#1019). Persisting it lets session-start BOUND the change-log replay: hydrate
+ * this (O(files)) then fold only entries with `seq > snapshot.seq`
+ * (O(changes-since-snapshot)) instead of replaying the entire append-only log.
+ * `projectSeq` is `=== snapshot.seq` (both come from the same
+ * `runtime.projectSeq` moment) unless the snapshot carries the never-fresh
+ * stamp (#3511), whose negative seq makes the replay fold the whole log on
+ * top of this index; `fileSeqByPath` uses the same
+ * `normalizeMapKey(path.resolve())` keys as the change-log replay, so no
+ * re-normalization (and no per-key `realpath` syscall) is needed on hydrate.
+ */
+interface SnapshotSequenceIndex {
+	projectSeq: number;
+	fileSeqByPath: Array<[filePath: string, fileSeq: number]>;
+}
+
+export interface ProjectSnapshot {
+	version: typeof PROJECT_SNAPSHOT_VERSION;
+	projectRoot: string;
+	generatedAt: string;
+	seq: number;
+	files: Record<string, ProjectSnapshotFile>;
+	symbols: Record<string, ProjectSnapshotSymbol[]>;
+	reverseDeps: Record<string, string[]>;
+	cachedExports: Array<[name: string, filePath: string]>;
+	/**
+	 * #3511: the writing runtime missed a logged entry at or below `seq` (a
+	 * sibling process logged it). Such a snapshot is never fresh and carries
+	 * no `sequenceIndex`, but `seq` is still its real, log-allocated seq, so
+	 * it takes part in the promotion compare-and-set (#3509) like any other.
+	 * It is stored with its seq encoded (`INCOMPLETE_STORED_SEQ`).
+	 */
+	incomplete?: true;
+	/**
+	 * #3511 review round 2 (R2-F1): the change-log entries the writing runtime
+	 * folded at its seed or late merge. An `unlocked` log entry after them
+	 * may share a seq the runtime holds, so the snapshot is not fresh then
+	 * (`ProjectSequenceIndex.unlockedThrough`). Absent means 0.
+	 */
+	logEntries?: number;
+	sequenceIndex?: SnapshotSequenceIndex;
+	wordIndex?: SerializedWordIndex;
+	projectRulesScan?: RuleScanResult;
+	startupScan?: StartupScanContext;
+	languageProfile?: ProjectLanguageProfile;
+	conventions?: ProjectConventions;
+}
+
+function parseSequenceIndex(value: unknown): SnapshotSequenceIndex | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const index = value as Partial<SnapshotSequenceIndex>;
+	if (typeof index.projectSeq !== "number") return undefined;
+	if (!Array.isArray(index.fileSeqByPath)) return undefined;
+	const fileSeqByPath = index.fileSeqByPath.filter(
+		(entry): entry is [string, number] =>
+			Array.isArray(entry) &&
+			typeof entry[0] === "string" &&
+			typeof entry[1] === "number",
+	);
+	return { projectSeq: index.projectSeq, fileSeqByPath };
+}
+
+// #958 item 2: the canonical snapshot body is now streamed gzip
+// (`project-snapshot.json.gz`), written by a worker thread off the save path
+// (see the persist plumbing below). The previous uncompressed
+// `project-snapshot.json` remains readable for ONE compatibility release so an
+// upgrading user doesn't lose their snapshot — see loadSnapshotBody's legacy
+// fallback. gzip measured 5-10x on top of the #957 compaction win (the
+// review-graph's own measurement was 60MB → 1.4MB).
+export function getProjectSnapshotPath(cwd: string): string {
+	return path.join(getProjectDataDir(cwd), "cache", "project-snapshot.json.gz");
+}
+
+/**
+ * Pre-#958 uncompressed body path. Read as a one-release fallback when no
+ * `.json.gz` is present; deleted whenever a fresh gz body is promoted so the
+ * two never coexist.
+ */
+export function getProjectSnapshotLegacyPath(cwd: string): string {
+	return path.join(getProjectDataDir(cwd), "cache", "project-snapshot.json");
+}
+
+export function getProjectSnapshotMetaPath(cwd: string): string {
+	return path.join(
+		getProjectDataDir(cwd),
+		"cache",
+		"project-snapshot.meta.json",
+	);
+}
+
+/**
+ * #3511 review round 2 (R2-F2): how an incomplete snapshot's seq is stored. A
+ * reader from before #3511 knows no `incomplete` flag and compares the stored
+ * `seq` with the log's max seq (never negative), or with -1 after a timed-out
+ * sequence read (runtime-session.ts `UNKNOWN_PROJECT_SEQ`). The legacy field
+ * therefore holds -2, which it can never match, and the real seq travels in
+ * `incompleteSeq`. A complete snapshot is stored unchanged.
+ */
+const INCOMPLETE_STORED_SEQ = -2;
+
+function storedSeq(snapshot: { seq: number; incomplete?: true }) {
+	return snapshot.incomplete
+		? { seq: INCOMPLETE_STORED_SEQ, incompleteSeq: snapshot.seq }
+		: { seq: snapshot.seq };
+}
+
+/** The body as stored: the snapshot, with an incomplete seq encoded. */
+function storedSnapshot(snapshot: ProjectSnapshot): object {
+	if (!snapshot.incomplete) return snapshot;
+	const stored: Partial<ProjectSnapshot> = { ...snapshot };
+	delete stored.incomplete;
+	return { ...stored, ...storedSeq(snapshot) };
+}
+
+/** The seq and incomplete flag of a stored body or meta, or null. */
+function readStoredSeq(stored: {
+	seq?: unknown;
+	incompleteSeq?: unknown;
+}): { seq: number; incomplete?: true } | null {
+	if (typeof stored.incompleteSeq === "number") {
+		return { seq: stored.incompleteSeq, incomplete: true };
+	}
+	return typeof stored.seq === "number" ? { seq: stored.seq } : null;
+}
+
+export function isProjectSnapshotFresh(
+	snapshot: ProjectSnapshot | null | undefined,
+	currentProjectSeq: number,
+	/** `ProjectSequenceIndex.unlockedThrough` of the log read (#3511). */
+	unlockedThrough = 0,
+): snapshot is ProjectSnapshot {
+	return (
+		!!snapshot &&
+		snapshot.version === PROJECT_SNAPSHOT_VERSION &&
+		!snapshot.incomplete &&
+		(snapshot.logEntries ?? 0) >= unlockedThrough &&
+		snapshot.seq === currentProjectSeq
+	);
+}
+
+function parseSnapshot(value: unknown): ProjectSnapshot | null {
+	if (!value || typeof value !== "object") return null;
+	const snapshot = value as Partial<ProjectSnapshot>;
+	if (snapshot.version !== PROJECT_SNAPSHOT_VERSION) return null;
+	if (typeof snapshot.projectRoot !== "string") return null;
+	if (typeof snapshot.generatedAt !== "string") return null;
+	const stored = readStoredSeq(value);
+	if (!stored) return null;
+	if (!Array.isArray(snapshot.cachedExports)) return null;
+	return {
+		version: PROJECT_SNAPSHOT_VERSION,
+		projectRoot: snapshot.projectRoot,
+		generatedAt: snapshot.generatedAt,
+		seq: stored.seq,
+		files: snapshot.files ?? {},
+		symbols: snapshot.symbols ?? {},
+		reverseDeps: snapshot.reverseDeps ?? {},
+		cachedExports: snapshot.cachedExports.filter(
+			(entry): entry is [string, string] =>
+				Array.isArray(entry) &&
+				typeof entry[0] === "string" &&
+				typeof entry[1] === "string",
+		),
+		...(stored.incomplete ? { incomplete: true as const } : {}),
+		logEntries:
+			typeof snapshot.logEntries === "number" ? snapshot.logEntries : undefined,
+		sequenceIndex: parseSequenceIndex(snapshot.sequenceIndex),
+		wordIndex: snapshot.wordIndex,
+		projectRulesScan: snapshot.projectRulesScan,
+		startupScan: snapshot.startupScan,
+		languageProfile: snapshot.languageProfile,
+		conventions: snapshot.conventions,
+	};
+}
+
+export interface ProjectSnapshotMeta {
+	timestamp: string;
+	version: number;
+	seq: number;
+	/** SHA-256 of the snapshot body with volatile `generatedAt` omitted (#1997). */
+	fingerprint?: string;
+	/**
+	 * #2008: on-disk byte length of the gz body at the last successful persist.
+	 * The dedupe skip decision compares it against a live stat so a torn or
+	 * truncated gzip under an intact meta cannot keep winning unchanged-skip.
+	 * Absent on legacy metas → dedupe is withheld (always publish) until the
+	 * next successful write populates it.
+	 */
+	gzBytes?: number;
+	/** #3511: mirrors `ProjectSnapshot.incomplete`; such a meta is never fresh. */
+	incomplete?: true;
+	/** #3511 review round 2: mirrors `ProjectSnapshot.logEntries`. */
+	logEntries?: number;
+	/**
+	 * The derived sequence index as of `seq` (#1019), MIRRORED here from the
+	 * snapshot body so session-start can bound the change-log replay WITHOUT
+	 * parsing the (40-112MB) body — which would forfeit the #947 skip-stale
+	 * optimization. Absent on legacy metas (pre-#1019) → callers full-replay.
+	 */
+	sequenceIndex?: SnapshotSequenceIndex;
+}
+
+function parseSnapshotMeta(value: unknown): ProjectSnapshotMeta | null {
+	if (!value || typeof value !== "object") return null;
+	const meta = value as Partial<ProjectSnapshotMeta>;
+	if (typeof meta.version !== "number") return null;
+	const stored = readStoredSeq(value);
+	if (!stored) return null;
+	return {
+		timestamp: typeof meta.timestamp === "string" ? meta.timestamp : "",
+		version: meta.version,
+		seq: stored.seq,
+		fingerprint:
+			typeof meta.fingerprint === "string" &&
+			/^[a-f0-9]{64}$/.test(meta.fingerprint)
+				? meta.fingerprint
+				: undefined,
+		gzBytes:
+			typeof meta.gzBytes === "number" &&
+			Number.isInteger(meta.gzBytes) &&
+			meta.gzBytes > 0
+				? meta.gzBytes
+				: undefined,
+		...(stored.incomplete ? { incomplete: true as const } : {}),
+		logEntries:
+			typeof meta.logEntries === "number" ? meta.logEntries : undefined,
+		sequenceIndex: parseSequenceIndex(meta.sequenceIndex),
+	};
+}
+
+/**
+ * Read the tiny meta sidecar (`project-snapshot.meta.json`) WITHOUT parsing
+ * the (potentially 40-112MB) snapshot body. Written on every save; absent on
+ * legacy installs — callers must treat a `null` return as "no opinion" and
+ * fall through to parsing the body. #947.
+ */
+export function readProjectSnapshotMeta(
+	cwd: string,
+): ProjectSnapshotMeta | null {
+	const meta = readJsonCache<ProjectSnapshotMeta>(
+		getProjectSnapshotMetaPath(cwd),
+		(parsed) => parseSnapshotMeta(parsed) ?? undefined,
+	);
+	return meta ?? null;
+}
+
+/**
+ * Cheap staleness verdict from the meta sidecar alone. When this returns
+ * true, the snapshot body CANNOT be fresh (isProjectSnapshotFresh would
+ * reject it on the same two fields), so the expensive body parse can be
+ * skipped entirely. #947.
+ */
+export function isProjectSnapshotMetaStale(
+	meta: ProjectSnapshotMeta,
+	currentProjectSeq: number,
+	/** `ProjectSequenceIndex.unlockedThrough` of the log read (#3511). */
+	unlockedThrough = 0,
+): boolean {
+	return (
+		meta.version !== PROJECT_SNAPSHOT_VERSION ||
+		meta.incomplete === true ||
+		(meta.logEntries ?? 0) < unlockedThrough ||
+		meta.seq !== currentProjectSeq
+	);
+}
+
+/**
+ * In-process parse cache for the snapshot body, keyed by file path and
+ * validated by mtime+size. The body is large (40-112MB observed) and several
+ * session-start/background consumers parse it seconds after we ourselves
+ * wrote it — `saveRuntimeProjectSnapshot` alone re-parsed the file it had
+ * just written 2-3x per session (~300-600ms of event-loop blocks). A hit
+ * returns the already-parsed object; any external write changes the mtime
+ * and forces a re-parse. #947. This tier serves READER processes (module_report,
+ * mcp/analyze) that never write; the writer process's read-your-writes is
+ * served by the authoritative map below.
+ */
+interface SnapshotParseCacheEntry {
+	mtimeMs: number;
+	/**
+	 * On-disk file size in bytes at cache time. FAT/exFAT round `mtime` to a 2s
+	 * bucket, so two writes inside the same bucket can report an IDENTICAL
+	 * `mtimeMs` even though the body changed — mtime alone would then serve a
+	 * stale cached parse for a file that was, in fact, just rewritten. `size`
+	 * is a free, defensive tiebreaker: a same-bucket rewrite that also keeps
+	 * the exact same byte length still slips through, but that residual case is
+	 * the same fail-open/self-healing posture as the rest of this cache. NOTE
+	 * (#958): for the gz body this is the COMPRESSED file size; the
+	 * cache-eligibility gate below uses the UNCOMPRESSED byte length instead,
+	 * because that is what actually bounds resident heap.
+	 */
+	size: number;
+	snapshot: ProjectSnapshot | null;
+}
+export const SNAPSHOT_PARSE_CACHE_MAX = 4;
+// #957 review: the cache exists to avoid re-parsing NORMAL snapshots within a
+// session. A 112MB-class body parses to hundreds of MB of heap — pinning that
+// for process lifetime inverts the win, so oversized bodies are simply never
+// cached (they re-parse per read, exactly the pre-#947 behavior). Measured
+// against the UNCOMPRESSED body size, never the (much smaller) gz file size.
+const SNAPSHOT_PARSE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
+const snapshotParseCache = new BoundedFifoMap<string, SnapshotParseCacheEntry>(
+	SNAPSHOT_PARSE_CACHE_MAX,
+);
+
+function withoutWordIndex(
+	snapshot: ProjectSnapshot | null,
+): ProjectSnapshot | null {
+	if (!snapshot?.wordIndex) return snapshot;
+	const { wordIndex: _releasedPostings, ...stripped } = snapshot;
+	return stripped;
+}
+
+function cacheParsedSnapshot(
+	snapshotPath: string,
+	entry: SnapshotParseCacheEntry,
+): void {
+	// Refresh recency (delete then set moves the key to the newest position;
+	// BoundedFifoMap itself never reorders an already-present key on set()).
+	snapshotParseCache.delete(snapshotPath);
+	snapshotParseCache.set(snapshotPath, entry);
+}
+
+/**
+ * Authoritative in-process "latest write" for a snapshot, keyed by canonical
+ * cwd (#958 item 2). The body is now written by a worker thread AFTER
+ * `saveProjectSnapshot` returns, so between a save and the worker's promotion
+ * the on-disk gz still holds the PREVIOUS generation. Reading disk in that
+ * window would serve stale data to the merge-write callers
+ * (`saveRuntimeProjectSnapshot`, word-index, reverse-deps) that do
+ * load→mutate→save and would silently drop each other's fields. Because every
+ * write in a process funnels through `saveProjectSnapshot` — and each process
+ * runs in its own worktree cwd, so there is effectively one writer per snapshot
+ * — the in-memory object we just handed the worker IS the authoritative truth
+ * for this process. `loadProjectSnapshot` consults it first and only falls
+ * through to disk when the on-disk file has an mtime STRICTLY NEWER than the
+ * one we last observed for our own write (an external writer we should honor).
+ */
+interface AuthoritativeSnapshotEntry {
+	snapshot: ProjectSnapshot;
+	/**
+	 * The mtime of the body file as we last wrote/observed it. Set to the
+	 * pre-write file's mtime at save time (or -Infinity when no file exists
+	 * yet), then updated to the promoted file's mtime once the worker (or the
+	 * sync fallback) lands the write. Load prefers this entry while the on-disk
+	 * mtime is `<=` this value and its size still matches `knownSize`. The size
+	 * axis detects coarse-mtime collisions without hashing this hot read path;
+	 * a same-size, same-mtime external rewrite remains invisible by design.
+	 */
+	knownMtime: number;
+	knownSize: number;
+	lastUsedAt: number;
+	idleTimer?: ReturnType<typeof setTimeout>;
+}
+const authoritativeSnapshots = new Map<string, AuthoritativeSnapshotEntry>();
+export const PROJECT_SNAPSHOT_MAX_WARM_ROOTS = 8;
+const PROJECT_SNAPSHOT_IDLE_EVICT_MS_DEFAULT = 20 * 60_000;
+
+function projectSnapshotIdleEvictMs(): number {
+	const value = Number.parseInt(
+		process.env.PI_LENS_PROJECT_SNAPSHOT_IDLE_EVICT_MS ?? "",
+		10,
+	);
+	return Number.isSafeInteger(value) && value > 0
+		? value
+		: PROJECT_SNAPSHOT_IDLE_EVICT_MS_DEFAULT;
+}
+
+function clearAuthoritativeSnapshotTimer(
+	entry: AuthoritativeSnapshotEntry,
+): void {
+	if (entry.idleTimer) clearTimeout(entry.idleTimer);
+	entry.idleTimer = undefined;
+}
+
+function deleteAuthoritativeSnapshot(key: string): void {
+	const entry = authoritativeSnapshots.get(key);
+	if (entry) clearAuthoritativeSnapshotTimer(entry);
+	authoritativeSnapshots.delete(key);
+}
+
+function scheduleAuthoritativeSnapshotEviction(
+	key: string,
+	entry: AuthoritativeSnapshotEntry,
+): void {
+	clearAuthoritativeSnapshotTimer(entry);
+	const generation = entry.lastUsedAt;
+	entry.idleTimer = setTimeout(() => {
+		entry.idleTimer = undefined;
+		if (
+			authoritativeSnapshots.get(key) !== entry ||
+			entry.lastUsedAt !== generation
+		)
+			return;
+		deleteAuthoritativeSnapshot(key);
+	}, projectSnapshotIdleEvictMs());
+	entry.idleTimer.unref?.();
+}
+
+function touchAuthoritativeSnapshot(
+	key: string,
+	entry: AuthoritativeSnapshotEntry,
+): void {
+	entry.lastUsedAt = Date.now();
+	scheduleAuthoritativeSnapshotEviction(key, entry);
+}
+
+function enforceAuthoritativeSnapshotCap(): void {
+	while (authoritativeSnapshots.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
+		const victim = [...authoritativeSnapshots.entries()].sort(
+			([, a], [, b]) => a.lastUsedAt - b.lastUsedAt,
+		)[0];
+		if (!victim) return;
+		clearAuthoritativeSnapshotTimer(victim[1]);
+		deleteAuthoritativeSnapshot(victim[0]);
+	}
+}
+
+/** Test-only cache keys, in LRU order from oldest to newest. */
+export function _getAuthoritativeSnapshotCacheKeysForTests(): string[] {
+	return [...authoritativeSnapshots.entries()]
+		.sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)
+		.map(([key]) => key);
+}
+
+/** Test hook: drop all cached parses + authoritative writes (per-worker isolation). */
+export function _resetProjectSnapshotParseCacheForTests(): void {
+	snapshotParseCache.clear();
+	for (const entry of authoritativeSnapshots.values())
+		clearAuthoritativeSnapshotTimer(entry);
+	authoritativeSnapshots.clear();
+}
+
+/** Test hook: prove the parse-cache tier never owns serialized postings. */
+export function _projectSnapshotParseCacheRetainsWordIndexForTests(): boolean {
+	return [...snapshotParseCache.values()].some(
+		(entry) => entry.snapshot?.wordIndex !== undefined,
+	);
+}
+
+/** Resolve which body file is currently on disk: gz canonical, else legacy. */
+function resolveSnapshotBodyPath(cwd: string): {
+	path: string;
+	gz: boolean;
+	mtimeMs: number;
+	size: number;
+} | null {
+	const gzPath = getProjectSnapshotPath(cwd);
+	try {
+		const stat = fs.statSync(gzPath);
+		return { path: gzPath, gz: true, mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch {
+		/* fall through to the legacy uncompressed body */
+	}
+	const legacyPath = getProjectSnapshotLegacyPath(cwd);
+	try {
+		const stat = fs.statSync(legacyPath);
+		return {
+			path: legacyPath,
+			gz: false,
+			mtimeMs: stat.mtimeMs,
+			size: stat.size,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Read + parse the body off disk, transparently gunzipping the `.json.gz`
+ * canonical form and falling back to the pre-#958 uncompressed `.json` body
+ * for one compatibility release. Returns the parsed snapshot (or null on any
+ * failure) plus the UNCOMPRESSED byte length, so the caller can apply the
+ * heap-bounded cache gate against the real body size rather than the gz size.
+ */
+// Test-observable count of ACTUAL disk body reads (both gz and legacy), so the
+// #947 meta-gate tests can assert "body parsed / not parsed" independently of
+// the compression format — the pre-#958 tests keyed this off a readJsonCache
+// spy, which the gz path (gunzip + JSON.parse) legitimately bypasses.
+let _snapshotBodyReadCountForTests = 0;
+export function getSnapshotBodyReadCountForTests(): number {
+	return _snapshotBodyReadCountForTests;
+}
+export function resetSnapshotBodyReadCountForTests(): void {
+	_snapshotBodyReadCountForTests = 0;
+}
+
+function readSnapshotBody(
+	bodyPath: string,
+	gz: boolean,
+): {
+	snapshot: ProjectSnapshot | null;
+	rawBytes: number;
+} {
+	_snapshotBodyReadCountForTests++;
+	if (!gz) {
+		const snapshot =
+			readJsonCache<ProjectSnapshot>(
+				bodyPath,
+				(parsed) => parseSnapshot(parsed) ?? undefined,
+			) ?? null;
+		let rawBytes = 0;
+		try {
+			rawBytes = fs.statSync(bodyPath).size;
+		} catch {
+			/* best-effort */
+		}
+		return { snapshot, rawBytes };
+	}
+	try {
+		const json = gunzipSync(fs.readFileSync(bodyPath)).toString("utf-8");
+		const snapshot = parseSnapshot(JSON.parse(json)) ?? null;
+		return { snapshot, rawBytes: Buffer.byteLength(json) };
+	} catch (err) {
+		// Corrupt / truncated gz, or a parse failure: fail open exactly like
+		// readJsonCache does — a null return rebuilds the snapshot. Log it so a
+		// corrupt body is diagnosable rather than indistinguishable from "no
+		// snapshot yet" (both return a null snapshot here).
+		logLatency({
+			type: "phase",
+			phase: "project_snapshot_body_corrupt",
+			filePath: bodyPath,
+			durationMs: 0,
+			metadata: { error: err instanceof Error ? err.message : String(err) },
+		});
+		return { snapshot: null, rawBytes: 0 };
+	}
+}
+
+/**
+ * Scan a JSON value starting at `start` (skipping any leading whitespace)
+ * and return the index one past its end. Handles strings, objects, arrays,
+ * and bare scalars (numbers/`true`/`false`/`null`) — correctly skipping
+ * nested strings/braces/brackets (respecting `\"` escapes) WITHOUT ever
+ * constructing a JS value for them. This is the primitive
+ * `stripTopLevelJsonKeys` (#1785 F5) is built on: `JSON.parse` has no way to
+ * skip a subtree's construction cost — a reviver only prunes the
+ * already-built result — so avoiding a field's parse cost requires never
+ * handing its text to `JSON.parse` in the first place.
+ */
+function skipJsonValue(text: string, start: number): number {
+	let i = start;
+	while (i < text.length && /\s/.test(text[i]!)) i++;
+	const ch = text[i];
+	if (ch === '"') {
+		i++;
+		while (i < text.length) {
+			if (text[i] === "\\") {
+				i += 2;
+				continue;
+			}
+			if (text[i] === '"') {
+				i++;
+				break;
+			}
+			i++;
+		}
+		return i;
+	}
+	if (ch === "{" || ch === "[") {
+		const open = ch;
+		const close = open === "{" ? "}" : "]";
+		let depth = 0;
+		let inString = false;
+		for (; i < text.length; i++) {
+			const c = text[i];
+			if (inString) {
+				if (c === "\\") {
+					i++;
+					continue;
+				}
+				if (c === '"') inString = false;
+				continue;
+			}
+			if (c === '"') {
+				inString = true;
+				continue;
+			}
+			if (c === open) depth++;
+			else if (c === close) {
+				depth--;
+				if (depth === 0) {
+					i++;
+					break;
+				}
+			}
+		}
+		return i;
+	}
+	// A bare scalar (number/true/false/null): scan to the next structural
+	// character. Every snapshot value is one of the five JSON kinds above, so
+	// this branch only ever fires for those scalars.
+	while (i < text.length && !",}]".includes(text[i]!)) i++;
+	return i;
+}
+
+/**
+ * Reconstruct a JSON object literal with the given top-level keys removed,
+ * without ever materializing their values as JS objects (#1785 F5). Used to
+ * excise the expensive fields — `wordIndex`'s postings graph above all,
+ * `files`/`symbols`/`reverseDeps` too — before `JSON.parse` ever sees them,
+ * so a caller that only needs a few small top-level fields (`seq`,
+ * `cachedExports`, `projectRulesScan`, …) doesn't pay to construct the
+ * fields it's about to discard. Correctness relies only on the writer
+ * (`JSON.stringify(snapshot)`, `clients/gzip-stage-write.ts`) never emitting
+ * pretty-printed/indented output — compact `JSON.stringify` output is what
+ * every persist path in this file produces.
+ */
+function stripTopLevelJsonKeys(
+	text: string,
+	keysToStrip: ReadonlySet<string>,
+): string {
+	const objStart = text.indexOf("{");
+	if (objStart === -1) return text;
+	let out = text.slice(0, objStart + 1);
+	let i = objStart + 1;
+	let wroteField = false;
+	while (i < text.length) {
+		while (i < text.length && /\s/.test(text[i]!)) i++;
+		if (text[i] === "}" || i >= text.length) {
+			out += text.slice(i);
+			break;
+		}
+		if (text[i] === ",") {
+			i++;
+			continue;
+		}
+		const keyStart = i;
+		const keyTextEnd = skipJsonValue(text, keyStart);
+		let key: string;
+		try {
+			key = JSON.parse(text.slice(keyStart, keyTextEnd)) as string;
+		} catch {
+			// Malformed key text — bail out to the untouched original rather
+			// than risk producing invalid JSON; the caller's own JSON.parse
+			// on the result will then fail loudly instead of silently.
+			return text;
+		}
+		let j = keyTextEnd;
+		while (j < text.length && /\s/.test(text[j]!)) j++;
+		// text[j] is ':' for a well-formed object.
+		const valueStart = j + 1;
+		const valueEnd = skipJsonValue(text, valueStart);
+		if (!keysToStrip.has(key)) {
+			out += (wroteField ? "," : "") + text.slice(keyStart, valueEnd);
+			wroteField = true;
+		}
+		i = valueEnd;
+	}
+	return out;
+}
+
+/**
+ * Test-only direct access to the raw-text stripper (#1785 F5). Unlike
+ * asserting on `loadProjectSnapshotExportsAndRules`'s RETURN shape — which
+ * only proves the output omits the heavy fields, not that their parse cost
+ * was ever avoided (the function could strip nothing and still hand-pick 4
+ * fields out of a fully-parsed object) — this lets a test inspect the
+ * INTERMEDIATE text `JSON.parse` actually receives, which is the only way to
+ * prove the expensive fields' text never reached `JSON.parse` at all.
+ */
+export function _stripTopLevelJsonKeysForTests(
+	text: string,
+	keysToStrip: readonly string[],
+): string {
+	return stripTopLevelJsonKeys(text, new Set(keysToStrip));
+}
+
+// A fixed, 4-entry, import-time constant — not per-session accumulating
+// state, so it needs no session_start reset (counted in
+// tests/support/session-state-registry.ts's SESSION_STATE_SYMBOL_COUNTS
+// pin for "project-snapshot.ts", alongside the bounded digest hook below).
+//
+// Adding a key here? Add it to `NARROW_DIGEST_HEAVY_KEY_LITERALS` too (~40
+// lines down) — it's a DELIBERATELY separate, independent list (#1785 F7: a
+// digest that reads its own containsHeavyKey answer off THIS set can't
+// detect this set failing/emptying, so it must not).
+const HEAVY_SNAPSHOT_KEYS: ReadonlySet<string> = new Set([
+	"wordIndex",
+	"files",
+	"symbols",
+	"reverseDeps",
+]);
+
+/** The subset of `ProjectSnapshot` the retroactive-hydration path needs. */
+export interface ProjectSnapshotExportsAndRules {
+	version: typeof PROJECT_SNAPSHOT_VERSION;
+	seq: number;
+	incomplete?: true;
+	logEntries?: number;
+	cachedExports: Array<[name: string, filePath: string]>;
+	projectRulesScan?: RuleScanResult;
+}
+
+/**
+ * Test-observable DIGEST of the text `parseExportsAndRulesOnly` hands to
+ * `JSON.parse` — never the text itself. #1785 F6 (review round 4): an
+ * earlier version of this hook retained the full narrowed text at module
+ * scope, unconditionally, with no cap and no reset on the hot path — the
+ * EXACT retention class the narrow loader exists to close, reintroduced by
+ * its own observability hook (measured: 28.2MB retained on a production
+ * body). `session-state-conformance.test.ts`'s registry didn't catch it
+ * because `project-snapshot.ts` carries a file-level exemption written for
+ * the bounded parse caches elsewhere in this file — this variable rode that
+ * exemption instead of declaring its own bound. A length + a "does the text
+ * still contain a heavy key" boolean is everything a test needs to prove the
+ * strip ran, without ever holding the (potentially many-MB) text itself.
+ */
+interface NarrowParseDigest {
+	length: number;
+	containsHeavyKey: boolean;
+}
+// #1785 F7 (review round 5): a FIXED LITERAL list, independent of
+// `HEAVY_SNAPSHOT_KEYS` — the digest below exists to detect a broken/emptied
+// `HEAVY_SNAPSHOT_KEYS`, so deriving `containsHeavyKey` from that same
+// constant makes the check vacuous by construction: empty the set and the
+// stripper strips nothing AND `[...HEAVY_SNAPSHOT_KEYS].some(...)` iterates
+// zero entries and reports `false` — the exact failure mode this hook exists
+// to catch, silently passing. Verified: with the shared-constant version,
+// emptying `HEAVY_SNAPSHOT_KEYS` left 38 tests green instead of red.
+const NARROW_DIGEST_HEAVY_KEY_LITERALS = [
+	"wordIndex",
+	"files",
+	"symbols",
+	"reverseDeps",
+] as const;
+
+let _lastNarrowParseDigestForTests: NarrowParseDigest | undefined;
+export function getLastNarrowParseDigestForTests():
+	| NarrowParseDigest
+	| undefined {
+	return _lastNarrowParseDigestForTests;
+}
+export function resetLastNarrowParseDigestForTests(): void {
+	_lastNarrowParseDigestForTests = undefined;
+}
+
+function parseExportsAndRulesOnly(
+	json: string,
+): ProjectSnapshotExportsAndRules | null {
+	const narrowed = stripTopLevelJsonKeys(json, HEAVY_SNAPSHOT_KEYS);
+	_lastNarrowParseDigestForTests = {
+		length: narrowed.length,
+		containsHeavyKey: NARROW_DIGEST_HEAVY_KEY_LITERALS.some((key) =>
+			narrowed.includes(`"${key}":`),
+		),
+	};
+	const parsed = JSON.parse(narrowed) as Partial<ProjectSnapshot>;
+	if (parsed.version !== PROJECT_SNAPSHOT_VERSION) return null;
+	const stored = readStoredSeq(parsed);
+	if (!stored) return null;
+	if (!Array.isArray(parsed.cachedExports)) return null;
+	return {
+		version: PROJECT_SNAPSHOT_VERSION,
+		seq: stored.seq,
+		...(stored.incomplete ? { incomplete: true as const } : {}),
+		logEntries:
+			typeof parsed.logEntries === "number" ? parsed.logEntries : undefined,
+		cachedExports: parsed.cachedExports.filter(
+			(entry): entry is [string, string] =>
+				Array.isArray(entry) &&
+				typeof entry[0] === "string" &&
+				typeof entry[1] === "string",
+		),
+		projectRulesScan: parsed.projectRulesScan,
+	};
+}
+
+function readSnapshotExportsAndRulesBody(
+	bodyPath: string,
+	gz: boolean,
+): ProjectSnapshotExportsAndRules | null {
+	try {
+		const json = gz
+			? gunzipSync(fs.readFileSync(bodyPath)).toString("utf-8")
+			: fs.readFileSync(bodyPath, "utf-8");
+		return parseExportsAndRulesOnly(json);
+	} catch (err) {
+		logLatency({
+			type: "phase",
+			phase: "project_snapshot_body_corrupt",
+			filePath: bodyPath,
+			durationMs: 0,
+			metadata: {
+				error: err instanceof Error ? err.message : String(err),
+				narrow: true,
+			},
+		});
+		return null;
+	}
+}
+
+/**
+ * #1785 F5: a narrow counterpart to `loadProjectSnapshot` for callers that
+ * only need `seq`/`version`/`cachedExports`/`projectRulesScan` — critically,
+ * NOT `wordIndex`, `files`, `symbols`, or `reverseDeps`. The full
+ * `loadProjectSnapshot` (even `loadProjectSnapshotWithoutWordIndex`, which
+ * only strips the RETAINED copy AFTER a full parse) pays `gunzip` +
+ * `JSON.parse` for the ENTIRE body regardless — dominated by `wordIndex`'s
+ * postings graph (measured: +200ms warm / +700ms cold on a 29MB body,
+ * 209-278ms on this repo's own 16.7MB snapshot). This function excises the
+ * heavy fields from the raw text BEFORE parsing (`stripTopLevelJsonKeys`),
+ * so their construction cost is never paid at all; the remaining cost is
+ * dominated by `cachedExports` (typically a small array), not the postings.
+ *
+ * Consults the same in-process authoritative-write cache
+ * `loadProjectSnapshotInternal` does, for the same read-your-own-write
+ * reason — a save's in-memory object is cheap to narrow (no parse needed at
+ * all) and must win over a possibly-stale on-disk body exactly like the full
+ * loader.
+ */
+export function loadProjectSnapshotExportsAndRules(
+	cwd: string,
+): ProjectSnapshotExportsAndRules | null {
+	const key = normalizeMapKey(cwd);
+	const body = resolveSnapshotBodyPath(cwd);
+	const authoritative = authoritativeSnapshots.get(key);
+	if (authoritative) {
+		// `body === null` means nothing is on disk — that is never "the body
+		// changed size", so it must not be read as superseding our own write.
+		// See the matching comment in loadProjectSnapshotInternal.
+		const notSuperseded =
+			body === null ||
+			(body.mtimeMs <= authoritative.knownMtime &&
+				body.size === authoritative.knownSize);
+		if (notSuperseded) {
+			const {
+				version,
+				seq,
+				incomplete,
+				logEntries,
+				cachedExports,
+				projectRulesScan,
+			} = authoritative.snapshot;
+			return {
+				version,
+				seq,
+				...(incomplete ? { incomplete } : {}),
+				logEntries,
+				cachedExports,
+				projectRulesScan,
+			};
+		}
+		// On mismatch, unlike the full loader, this narrow loader neither
+		// deletes the entry nor touches its idle timer (it never calls
+		// touchAuthoritativeSnapshot even on a hit). The stale entry is safe to
+		// leave in place: nothing here re-arms its eviction, so it is still
+		// bounded by whatever idle window the full loader (or the original
+		// write) last set, not left to live indefinitely.
+	}
+	if (!body) return null;
+	return readSnapshotExportsAndRulesBody(body.path, body.gz);
+}
+
+function loadProjectSnapshotInternal(
+	cwd: string,
+	requireWordIndex: boolean,
+): ProjectSnapshot | null {
+	const key = normalizeMapKey(cwd);
+	const body = resolveSnapshotBodyPath(cwd);
+	// Authoritative in-process write wins while our own (possibly still
+	// in-flight) write has not been superseded on disk by a newer external mtime
+	// or a different-size body in the same/coarser bucket. `body === null` means
+	// nothing is on disk — either our just-scheduled write hasn't landed yet, or
+	// something removed the body after we wrote it (e.g. a cleared cache dir).
+	// Neither case is "the body changed size", so serve the in-process object.
+	const authoritative = authoritativeSnapshots.get(key);
+	if (authoritative) {
+		const notSuperseded =
+			body === null ||
+			(body.mtimeMs <= authoritative.knownMtime &&
+				body.size === authoritative.knownSize);
+		if (notSuperseded) {
+			touchAuthoritativeSnapshot(key, authoritative);
+			return authoritative.snapshot;
+		}
+		// An external writer changed the body beyond our metadata stamp — honor
+		// disk and stop serving the now-stale in-memory object.
+		deleteAuthoritativeSnapshot(key);
+	}
+	if (!body) {
+		snapshotParseCache.delete(getProjectSnapshotPath(cwd));
+		return null;
+	}
+	const cacheKey = body.path;
+	const cached = snapshotParseCache.get(cacheKey);
+	// Both mtime AND size must match (see the `size` field doc on
+	// SnapshotParseCacheEntry for why: coarse FAT/exFAT mtime resolution can
+	// otherwise alias a just-rewritten file onto a stale cache entry).
+	if (cached && cached.mtimeMs === body.mtimeMs && cached.size === body.size) {
+		if (!requireWordIndex || !cached.snapshot || cached.snapshot.wordIndex) {
+			return cached.snapshot;
+		}
+	}
+	const { snapshot, rawBytes } = readSnapshotBody(body.path, body.gz);
+	// Serialized postings expand into a much larger object graph. Cache only a
+	// shallow postings-stripped body: metadata/report consumers stay warm while
+	// the live warm WordIndex remains the sole retained postings graph (#1370).
+	const cacheSnapshot = withoutWordIndex(snapshot);
+	if (
+		rawBytes > 0 &&
+		(rawBytes <= SNAPSHOT_PARSE_CACHE_MAX_BYTES || snapshot?.wordIndex)
+	) {
+		cacheParsedSnapshot(cacheKey, {
+			mtimeMs: body.mtimeMs,
+			size: body.size,
+			snapshot: cacheSnapshot,
+		});
+	} else {
+		snapshotParseCache.delete(cacheKey);
+	}
+	return snapshot;
+}
+
+/** Load the canonical body, including serialized postings when present. */
+export function loadProjectSnapshot(cwd: string): ProjectSnapshot | null {
+	return loadProjectSnapshotInternal(cwd, true);
+}
+
+/**
+ * Load snapshot metadata without retaining or re-reading serialized postings.
+ * After publication this is served by the postings-stripped parse cache.
+ */
+export function loadProjectSnapshotWithoutWordIndex(
+	cwd: string,
+): ProjectSnapshot | null {
+	return loadProjectSnapshotInternal(cwd, false);
+}
+
+// --- Worker-thread body persist (gzip off the save path, #958 item 2) --------
+//
+// Mirrors clients/review-graph/persist-worker.ts's parent plumbing: a monotonic
+// per-cwd `generation`, a worker that stringifies+gzips a per-generation stage
+// file, and generation-gated promotion (rename stage → canonical) so a slow
+// write for generation N can never clobber a newer generation N+1 already on
+// disk. When the worker is unavailable/dies, the pending body falls back to a
+// synchronous main-thread gzip write (the degraded path only — the #950 review
+// measured a naïve sync gzip as the DEFAULT save path regressing host memory by
+// +656MB, which is exactly why the worker exists).
+
+interface PendingSnapshotBody {
+	key: string;
+	cwd: string;
+	gzPath: string;
+	legacyPath: string;
+	stagePath: string;
+	snapshot: ProjectSnapshot;
+	generation: number;
+	durablePersist?: SnapshotPersistRecord;
+	dedupeFingerprints: string[];
+	/** Main-thread serialize time of the worker dispatch (#3789); the worker's own is 0. */
+	serializeMs?: number;
+	/** UTF-8 length of the word index's JSON, taken while encoding the body. */
+	wordIndexWireBytes?: number | undefined;
+}
+
+interface SnapshotPersistRecord {
+	seq: number;
+	fingerprint: string;
+	generatedAt: string;
+	generation: number;
+	rawBytes?: number;
+	gzBytes?: number;
+}
+
+interface SnapshotPersistStats {
+	rawBytes: number;
+	gzBytes: number;
+	serializeMs: number;
+	writeMs: number;
+	offloaded: boolean;
+}
+const _snapshotGenerationStates = new Map<
+	string,
+	{ generation: number; seq: number }
+>();
+const _successfulSnapshotPersists = new BoundedFifoMap<
+	string,
+	SnapshotPersistRecord
+>(PROJECT_SNAPSHOT_MAX_WARM_ROOTS);
+const _failedSnapshotPersists = new BoundedFifoMap<
+	string,
+	{ seq: number; generation: number }
+>(PROJECT_SNAPSHOT_MAX_WARM_ROOTS);
+const _activeSnapshotPersists = new Map<string, PendingSnapshotBody>();
+const _queuedSnapshotPersists = new Map<string, PendingSnapshotBody>();
+const _snapshotWorkerRequests = new Map<number, PendingSnapshotBody>();
+let _snapshotPersistWorker: Worker | undefined;
+let _snapshotWorkerRequestId = 0;
+let _snapshotWorkerDisabled = false;
+let _snapshotGenerationGateEnabledForTests = true;
+let _snapshotPromotionSeamForTests: (() => Promise<void>) | undefined;
+let _lastSnapshotPersistErrorForTests: string | undefined;
+let _snapshotExiting = false;
+let _snapshotWorkerBodyWritesForTests = 0;
+
+let _snapshotPersistWorkerHeapStatistics: PersistWorkerHeapStatistics | null =
+	null;
+
+/**
+ * Refreshes a bounded, last-known view; Worker#getHeapStatistics is async.
+ * The sampler does not await the result (the reading lags one sample); tests
+ * await it instead of polling ticks.
+ */
+export function refreshProjectSnapshotPersistWorkerHeapStatistics(): Promise<void> {
+	const worker = _snapshotPersistWorker;
+	if (!worker || typeof worker.getHeapStatistics !== "function") {
+		return Promise.resolve();
+	}
+	return readWorkerHeapStatistics(worker)
+		.then((stats) => {
+			// An answer that lands after the worker's exit or death clear belongs
+			// to a dead isolate; every clear also drops the worker reference.
+			if (_snapshotPersistWorker === worker)
+				_snapshotPersistWorkerHeapStatistics = stats;
+		})
+		.catch(() => {});
+}
+
+export function getProjectSnapshotPersistWorkerHeapStatistics(): PersistWorkerHeapStatistics | null {
+	return _snapshotPersistWorkerHeapStatistics;
+}
+
+export function snapshotWorkerEnabled(): boolean {
+	// The synchronous fallback writer is a legitimate degraded mode (hosts that
+	// can't spawn a worker); tests also force it so a save→load is fully
+	// synchronous. Production defaults to the worker.
+	// Only the literal `"1"` selects the synchronous writer (#5419).
+	return process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC !== "1";
+}
+
+function pendingSnapshotIsCurrent(pending: PendingSnapshotBody): boolean {
+	return (
+		!_snapshotGenerationGateEnabledForTests ||
+		_snapshotGenerationStates.get(pending.key)?.generation ===
+			pending.generation
+	);
+}
+
+function rememberSuccessfulSnapshotPersist(
+	key: string,
+	record: SnapshotPersistRecord,
+): void {
+	_successfulSnapshotPersists.delete(key);
+	_successfulSnapshotPersists.set(key, record);
+}
+
+/**
+ * #2008 verdict on the durable meta+body pair. Absent from the baselines when
+ * there is no evidence to judge (no meta fingerprint or no body on disk).
+ * Anything other than `"ok"` means a same-fingerprint skip must NOT be
+ * trusted: the persisted body may be torn under an intact meta.
+ */
+type SnapshotBodyIntegrity = "ok" | "legacy-meta" | "size-mismatch";
+
+interface SnapshotPersistBaselines {
+	durable?: SnapshotPersistRecord;
+	fingerprints: string[];
+	integrity?: SnapshotBodyIntegrity;
+}
+
+function assessSnapshotBodyIntegrity(
+	meta: ProjectSnapshotMeta,
+	body: { gz: boolean; size: number },
+): {
+	outcome: SnapshotBodyIntegrity;
+	expectedGzBytes?: number;
+	actualBytes: number;
+} {
+	if (meta.gzBytes === undefined) {
+		// Legacy meta (pre-#2008): nothing to compare against, so the evidence is
+		// untrusted until the next successful persist populates gzBytes.
+		return { outcome: "legacy-meta", actualBytes: body.size };
+	}
+	if (!body.gz || body.size !== meta.gzBytes) {
+		return {
+			outcome: "size-mismatch",
+			expectedGzBytes: meta.gzBytes,
+			actualBytes: body.size,
+		};
+	}
+	return {
+		outcome: "ok",
+		expectedGzBytes: meta.gzBytes,
+		actualBytes: body.size,
+	};
+}
+
+/**
+ * Bounded observability for #2008: the degradation ledger keeps one entry per
+ * corrupted subject with the exact detection count for the session; every
+ * detection also emits one `project_snapshot_body_integrity` latency row
+ * naming expected vs actual bytes, so an operator can confirm both the
+ * detection and the forced republish from logs alone.
+ */
+function noteSnapshotBodyIntegrityWithheld(args: {
+	gzPath: string;
+	verdict: Exclude<SnapshotBodyIntegrity, "ok">;
+	seq?: number;
+	expectedGzBytes?: number;
+	actualBytes: number;
+}): void {
+	incrementDegradationCount({
+		kind: "snapshot-integrity",
+		subject: args.gzPath,
+		reason: args.verdict,
+	});
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_body_integrity",
+		filePath: args.gzPath,
+		durationMs: 0,
+		metadata: {
+			outcome: "dedupe_withheld",
+			reason: args.verdict,
+			...(args.seq !== undefined ? { seq: args.seq } : {}),
+			...(args.expectedGzBytes === undefined
+				? {}
+				: { expectedGzBytes: args.expectedGzBytes }),
+			actualBytes: args.actualBytes,
+		},
+	});
+}
+
+/** Log one row naming a skip that was refused because integrity regressed. */
+function noteSnapshotSkipRefused(args: {
+	gzPath: string;
+	verdict: Exclude<SnapshotBodyIntegrity, "ok">;
+	seq: number;
+}): void {
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_body_integrity",
+		filePath: args.gzPath,
+		durationMs: 0,
+		metadata: {
+			outcome: "skip_refused_rewrite",
+			reason: args.verdict,
+			seq: args.seq,
+		},
+	});
+}
+
+/**
+ * PURE READ of the durable meta+body evidence for a snapshot key (#2008
+ * refactor): it must never mutate {@link _successfulSnapshotPersists}. This
+ * runs up to three times per persist — admission in saveProjectSnapshot, the
+ * dispatch-time refresh, and the skip-honor re-read — including on results
+ * whose fingerprints are only partially used, so the seeding write lives in
+ * {@link seedSnapshotPersistBaselineFromDurable} and is called only by the
+ * seam that owns the persist lifecycle (dispatchSnapshotPersist).
+ */
+function snapshotPersistBaselinesFor(
+	cwd: string,
+	key: string,
+): SnapshotPersistBaselines {
+	const local = _successfulSnapshotPersists.get(key);
+	const meta = readProjectSnapshotMeta(cwd);
+	const body = resolveSnapshotBodyPath(cwd);
+	// No body means no dedupe evidence. This keeps same-seq deletion repair live.
+	if (!meta?.fingerprint || !body) {
+		if (!body) _successfulSnapshotPersists.delete(key);
+		return { fingerprints: [] };
+	}
+	// #2008: a meta whose recorded gz size no longer matches the on-disk body
+	// describes evidence we cannot trust — a truncated/torn gzip under an
+	// intact meta used to win same-fingerprint dedupe forever, keeping the
+	// corrupt body canonical until seq advanced. Withhold the fingerprints so
+	// the pending save republishes (and rewrites) the body.
+	const integrity = assessSnapshotBodyIntegrity(meta, body);
+	if (integrity.outcome !== "ok") {
+		noteSnapshotBodyIntegrityWithheld({
+			gzPath: getProjectSnapshotPath(cwd),
+			verdict: integrity.outcome,
+			seq: meta.seq,
+			expectedGzBytes: integrity.expectedGzBytes,
+			actualBytes: integrity.actualBytes,
+		});
+		return { fingerprints: [] };
+	}
+	const durable: SnapshotPersistRecord = {
+		seq: meta.seq,
+		fingerprint: meta.fingerprint,
+		generatedAt: meta.timestamp,
+		generation: _snapshotGenerationStates.get(key)?.generation ?? 0,
+		gzBytes: meta.gzBytes,
+	};
+	const fingerprints = [durable.fingerprint];
+	// A sibling process may have advanced durable state from local A to B. An
+	// unchanged replay of A is stale work and must not overwrite B. A third
+	// semantic state C matches neither fingerprint and still publishes.
+	if (local && local.fingerprint !== durable.fingerprint) {
+		fingerprints.push(local.fingerprint);
+	}
+	return { durable, fingerprints, integrity: "ok" };
+}
+
+/**
+ * Seed the in-process baseline for `key` from freshly-read durable state.
+ * Deliberately separate from {@link snapshotPersistBaselinesFor} so the read
+ * stays pure; called only at the dispatch seam where the persist lifecycle
+ * begins.
+ */
+function seedSnapshotPersistBaselineFromDurable(
+	key: string,
+	durable: SnapshotPersistRecord | undefined,
+): void {
+	if (!durable || _successfulSnapshotPersists.has(key)) return;
+	rememberSuccessfulSnapshotPersist(key, durable);
+}
+
+function writeProjectSnapshotMeta(
+	metaPath: string,
+	snapshot: ProjectSnapshot,
+	bodyRecord?: Pick<
+		SnapshotPersistRecord,
+		"fingerprint" | "generatedAt" | "gzBytes"
+	>,
+): void {
+	writeFileAtomic(
+		metaPath,
+		JSON.stringify({
+			timestamp: bodyRecord?.generatedAt ?? snapshot.generatedAt,
+			version: snapshot.version,
+			...storedSeq(snapshot),
+			...(bodyRecord
+				? {
+						fingerprint: bodyRecord.fingerprint,
+						...(bodyRecord.gzBytes === undefined
+							? {}
+							: { gzBytes: bodyRecord.gzBytes }),
+					}
+				: {}),
+			logEntries: snapshot.logEntries,
+			...(snapshot.sequenceIndex
+				? { sequenceIndex: snapshot.sequenceIndex }
+				: {}),
+		}),
+		{ bestEffort: false },
+	);
+}
+
+function recordSnapshotPersistFailure(
+	pending: PendingSnapshotBody,
+	error: string,
+	bodyPersisted = false,
+): void {
+	// Honesty (#533): a failed async body write must be surfaced, never left to
+	// masquerade as a saved snapshot. The meta gate is already self-healing (an
+	// old body under a newer-seq meta is rejected on the body's own embedded
+	// seq), and dropping the authoritative entry means the next load reflects
+	// what is ACTUALLY on disk rather than the object we failed to persist.
+	_lastSnapshotPersistErrorForTests = error;
+	_failedSnapshotPersists.set(pending.key, {
+		seq: pending.snapshot.seq,
+		generation: pending.generation,
+	});
+	deleteAuthoritativeSnapshot(pending.key);
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_persist_failed",
+		filePath: pending.gzPath,
+		durationMs: 0,
+		metadata: {
+			error,
+			seq: pending.snapshot.seq,
+			outcome: bodyPersisted ? "metadata_repair_required" : "failed",
+			...(bodyPersisted ? { bodyPersisted: true } : {}),
+		},
+	});
+	// #1333: the logLatency call above already carries this failure to
+	// latency.log — the console.error was a duplicate RAW write into pi's frame.
+}
+
+function logSnapshotPersistSuccess(
+	pending: PendingSnapshotBody,
+	fingerprint: string,
+	stats: SnapshotPersistStats,
+): void {
+	rememberSuccessfulSnapshotPersist(pending.key, {
+		seq: pending.snapshot.seq,
+		fingerprint,
+		generatedAt: pending.snapshot.generatedAt,
+		generation: pending.generation,
+		rawBytes: stats.rawBytes,
+		gzBytes: stats.gzBytes,
+	});
+	_failedSnapshotPersists.delete(pending.key);
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_persist",
+		filePath: pending.gzPath,
+		durationMs: stats.serializeMs + stats.writeMs,
+		metadata: { seq: pending.snapshot.seq, outcome: "executed", ...stats },
+	});
+}
+
+function logSnapshotPersistDecision(args: {
+	cwd: string;
+	seq: number;
+	fingerprint?: string;
+	decision:
+		| "requested"
+		| "coalesced"
+		| "skipped_unchanged"
+		| "retry"
+		| "superseded_on_disk";
+	avoidedRawBytes?: number;
+	avoidedGzipBytes?: number;
+	/** The newer seq a sibling already published (`superseded_on_disk`). */
+	diskSeq?: number;
+}): void {
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_persist_decision",
+		filePath: getProjectSnapshotPath(args.cwd),
+		durationMs: 0,
+		metadata: {
+			seq: args.seq,
+			decision: args.decision,
+			...(args.fingerprint
+				? { fingerprint: args.fingerprint.slice(0, 12) }
+				: {}),
+			...(args.avoidedRawBytes === undefined
+				? {}
+				: { avoidedRawBytes: args.avoidedRawBytes }),
+			...(args.avoidedGzipBytes === undefined
+				? {}
+				: { avoidedGzipBytes: args.avoidedGzipBytes }),
+			...(args.diskSeq === undefined ? {} : { diskSeq: args.diskSeq }),
+		},
+	});
+}
+
+/**
+ * Reconcile the authoritative in-process entry with a body that just landed on
+ * disk: update its `knownMtime` so a subsequent load keeps serving our own
+ * object without re-parsing, and DROP oversized bodies (their post-promotion
+ * disk read is the pre-#947 behavior — we won't pin hundreds of MB of heap).
+ */
+function reconcileAuthoritativeAfterWrite(
+	pending: PendingSnapshotBody,
+	rawBytes: number,
+): void {
+	const entry = authoritativeSnapshots.get(pending.key);
+	// Only reconcile the entry that still belongs to THIS (latest) generation —
+	// a superseding save already replaced it with a newer object.
+	if (!entry || entry.snapshot !== pending.snapshot) return;
+	// The worker needs the serialized snapshot until promotion completes, but
+	// retaining it afterward duplicates the mutable warm index's postings. A
+	// shared reference is unsafe: ProjectSnapshot stores serialized arrays while
+	// WordIndex owns mutable Map/PathKeyedMap state. Drop the authoritative copy
+	// after publication; later merge-writers rehydrate the canonical disk body.
+	if (pending.snapshot.wordIndex) {
+		try {
+			const stat = fs.statSync(pending.gzPath);
+			cacheParsedSnapshot(pending.gzPath, {
+				mtimeMs: stat.mtimeMs,
+				size: stat.size,
+				snapshot: withoutWordIndex(pending.snapshot),
+			});
+		} catch {
+			// A cache miss is safe: the first metadata consumer reconstructs it.
+		}
+		deleteAuthoritativeSnapshot(pending.key);
+		logLatency({
+			type: "phase",
+			phase: "project_snapshot_word_index_released",
+			filePath: pending.gzPath,
+			durationMs: 0,
+			metadata: { rawBytes },
+		});
+		return;
+	}
+	if (rawBytes > SNAPSHOT_PARSE_CACHE_MAX_BYTES) {
+		// Benign but invisible otherwise: the next load will re-parse this body
+		// from disk instead of serving the in-process object.
+		logLatency({
+			type: "phase",
+			phase: "project_snapshot_authoritative_dropped_oversized",
+			filePath: pending.gzPath,
+			durationMs: 0,
+			metadata: { rawBytes, maxBytes: SNAPSHOT_PARSE_CACHE_MAX_BYTES },
+		});
+		deleteAuthoritativeSnapshot(pending.key);
+		return;
+	}
+	try {
+		const stat = fs.statSync(pending.gzPath);
+		entry.knownMtime = stat.mtimeMs;
+		entry.knownSize = stat.size;
+	} catch {
+		// If we can't stat our own write, leave the metadata as-is; the worst case
+		// is one extra disk re-parse on the next load.
+	}
+}
+
+function finalizeProjectSnapshotMeta(
+	pending: PendingSnapshotBody,
+	record: Pick<
+		SnapshotPersistRecord,
+		"fingerprint" | "generatedAt" | "gzBytes"
+	>,
+): boolean {
+	try {
+		writeProjectSnapshotMeta(
+			getProjectSnapshotMetaPath(pending.cwd),
+			pending.snapshot,
+			record,
+		);
+		return true;
+	} catch (err) {
+		recordSnapshotPersistFailure(
+			pending,
+			err instanceof Error ? err.message : String(err),
+			true,
+		);
+		return false;
+	}
+}
+
+function completeSnapshotPersist(pending: PendingSnapshotBody): void {
+	if (_activeSnapshotPersists.get(pending.key) !== pending) return;
+	_activeSnapshotPersists.delete(pending.key);
+	if (_snapshotExiting) return;
+	const queued = _queuedSnapshotPersists.get(pending.key);
+	if (!queued) return;
+	_queuedSnapshotPersists.delete(pending.key);
+	dispatchSnapshotPersist(queued);
+}
+
+// #3509: more than one process writes a project's snapshot (a pi session and
+// the MCP server's word-index writer, or two sessions in one checkout). Every
+// meta check, body publish and meta write runs under this cache-dir lock. The
+// gzip runs before the lock is taken, so the hold is a small read, a rename
+// (the worker) or one write of the compressed body (the sync writer), and a
+// small write: far inside the lease.
+const SNAPSHOT_CACHE_LOCK = { staleMs: 5_000, waitMs: 500 };
+
+function withSnapshotCacheLock<T>(
+	gzPath: string,
+	purpose: string,
+	op: () => T,
+): { held: true; value: T } | { held: false } {
+	const result = withGenerationLockSync(
+		`${gzPath}.locks`,
+		SNAPSHOT_CACHE_LOCK,
+		op,
+	);
+	if (!result.held) {
+		const code = (result.cause as NodeJS.ErrnoException | undefined)?.code;
+		incrementDegradationCount({
+			kind: "project-snapshot-lock-unavailable",
+			subject: gzPath,
+			reason: `${purpose} skipped: ${code ? `lock failed (${code})` : "lock wait ran out"}`,
+		});
+	}
+	return result;
+}
+
+/**
+ * #3509: publish a body (the worker's stage file, or the sync writer's gzip)
+ * as a compare-and-set. It lands only while the durable meta is not ahead of
+ * this save's seq, with its meta written in the same critical section;
+ * otherwise a sibling already published a newer view, which keeps its body,
+ * and ours is dropped. Returns true only when body and meta both landed. A
+ * write or rename error propagates.
+ */
+function promoteSnapshotBody(
+	pending: PendingSnapshotBody,
+	body: { stagePath: string } | { gzip: Buffer },
+	record: Pick<
+		SnapshotPersistRecord,
+		"fingerprint" | "generatedAt" | "gzBytes"
+	>,
+): boolean {
+	const dropStage = () => {
+		if ("stagePath" in body) fs.rmSync(body.stagePath, { force: true });
+	};
+	const locked = withSnapshotCacheLock(pending.gzPath, "body promotion", () => {
+		const onDisk = readProjectSnapshotMeta(pending.cwd);
+		if (onDisk && onDisk.seq > pending.snapshot.seq) {
+			dropStage();
+			return onDisk.seq;
+		}
+		if ("stagePath" in body) fs.renameSync(body.stagePath, pending.gzPath);
+		else writeFileAtomic(pending.gzPath, body.gzip, { bestEffort: false });
+		fs.rmSync(pending.legacyPath, { force: true });
+		return finalizeProjectSnapshotMeta(pending, record);
+	});
+	if (!locked.held) {
+		dropStage();
+		recordSnapshotPersistFailure(
+			pending,
+			"project snapshot cache lock unavailable",
+		);
+		return false;
+	}
+	if (typeof locked.value === "boolean") return locked.value;
+	// The refused view must stop serving in-process readers. When the sibling's
+	// body landed before our admission, the loader's mtime/size baseline is the
+	// sibling's own body, so it cannot tell ours is stale. A newer in-process
+	// save would carry a newer generation and be gated out before this point,
+	// so the entry is ours, as on the failure path.
+	deleteAuthoritativeSnapshot(pending.key);
+	logSnapshotPersistDecision({
+		cwd: pending.cwd,
+		seq: pending.snapshot.seq,
+		decision: "superseded_on_disk",
+		diskSeq: locked.value,
+	});
+	return false;
+}
+
+/**
+ * The one place a pending snapshot becomes its stored JSON, as UTF-8 bytes
+ * (#3789). The worker path transfers these bytes instead of structured-cloning
+ * the object graph into the worker heap (the clone's several-hundred-MB RSS
+ * jump); the synchronous writer gzips the same bytes. A fresh `TextEncoder`
+ * buffer is never one of Node's pooled `Buffer` slabs, so it is always
+ * transferable.
+ */
+function serializeSnapshotBody(snapshot: ProjectSnapshot): {
+	bytes: Uint8Array<ArrayBuffer>;
+	serializeMs: number;
+	wordIndexWireBytes?: number | undefined;
+} {
+	const started = performance.now();
+	const stored = storedSnapshot(snapshot) as { wordIndex?: unknown };
+	const spliced =
+		stored.wordIndex === undefined ? undefined : spliceWordIndexBody(stored);
+	const bytes =
+		spliced?.bytes ?? new TextEncoder().encode(JSON.stringify(stored));
+	return {
+		bytes,
+		serializeMs: performance.now() - started,
+		wordIndexWireBytes: spliced?.wordIndexWireBytes,
+	};
+}
+
+/** Stands in for the word index while the rest of the body is stringified. */
+const WORD_INDEX_PLACEHOLDER = `\u0000pi-lens-word-index-${process.pid}-${Date.now()}\u0000`;
+const WORD_INDEX_KEY_JSON = '"wordIndex":';
+const WORD_INDEX_PLACEHOLDER_JSON = `${WORD_INDEX_KEY_JSON}${JSON.stringify(
+	WORD_INDEX_PLACEHOLDER,
+)}`;
+
+/**
+ * Encode the stored body with the word index stringified on its own, so its
+ * UTF-8 length is known without reading the body in JavaScript (#4129). The
+ * index is stringified once, the rest of the body once with a placeholder in
+ * its slot; native `indexOf` finds the placeholder and `encodeInto` writes the
+ * three pieces into one buffer, byte-identical to encoding
+ * `JSON.stringify(stored)`. Returns undefined when the placeholder is absent
+ * (a `toJSON` that rewrites the body), and the caller encodes the plain
+ * stringify. The placeholder carries a NUL, the pid and the module load time,
+ * and its quoted `"wordIndex":` form cannot occur inside a JSON string (quotes
+ * are escaped there), so the first match is the top-level slot.
+ */
+function spliceWordIndexBody(stored: {
+	wordIndex?: unknown;
+}): { bytes: Uint8Array<ArrayBuffer>; wordIndexWireBytes: number } | undefined {
+	const marker = WORD_INDEX_PLACEHOLDER_JSON;
+	const head = JSON.stringify({ ...stored, wordIndex: WORD_INDEX_PLACEHOLDER });
+	const at = head.indexOf(marker);
+	if (at < 0) return undefined;
+	const prefix = head.slice(0, at + WORD_INDEX_KEY_JSON.length);
+	const suffix = head.slice(at + marker.length);
+	const wordIndex = JSON.stringify(stored.wordIndex);
+	const prefixBytes = Buffer.byteLength(prefix);
+	const wordIndexWireBytes = Buffer.byteLength(wordIndex);
+	const bytes = new Uint8Array(
+		prefixBytes + wordIndexWireBytes + Buffer.byteLength(suffix),
+	);
+	const encoder = new TextEncoder();
+	encoder.encodeInto(prefix, bytes.subarray(0, prefixBytes));
+	encoder.encodeInto(
+		wordIndex,
+		bytes.subarray(prefixBytes, prefixBytes + wordIndexWireBytes),
+	);
+	encoder.encodeInto(suffix, bytes.subarray(prefixBytes + wordIndexWireBytes));
+	return { bytes, wordIndexWireBytes };
+}
+
+function writeSnapshotBodyOnMainThread(
+	pending: PendingSnapshotBody,
+	reason?: string,
+): void {
+	if (!pendingSnapshotIsCurrent(pending)) {
+		completeSnapshotPersist(pending);
+		return;
+	}
+	if (reason) {
+		// We took the synchronous main-thread gzip path (the +656MB-risk path,
+		// #950) instead of the worker. Surface it rather than burying it in an
+		// `offloaded:false` success line below. `degraded` distinguishes a REAL
+		// degradation (worker died/unavailable/promote-failed) from the benign
+		// `exit_hook` teardown flush, so an operator triaging worker health isn't
+		// misled by normal process-exit flushes.
+		logLatency({
+			type: "phase",
+			phase: "project_snapshot_worker_fallback",
+			filePath: pending.gzPath,
+			durationMs: 0,
+			metadata: {
+				reason,
+				seq: pending.snapshot.seq,
+				degraded: reason !== "exit_hook",
+			},
+		});
+	}
+	try {
+		const { bytes, serializeMs, wordIndexWireBytes } = serializeSnapshotBody(
+			pending.snapshot,
+		);
+		pending.wordIndexWireBytes = wordIndexWireBytes;
+		const rawBytes = bytes.byteLength;
+		const fingerprint = fingerprintProjectSnapshotJson(
+			bytes,
+			pending.snapshot.generatedAt,
+		);
+		if (pending.dedupeFingerprints.includes(fingerprint)) {
+			// Re-read the tiny durable sidecar before honoring a fingerprint
+			// captured at dispatch time (#2008): a body torn between dispatch and
+			// execution must fall through to the full write, not skip.
+			const current = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+			if (current.integrity === "ok") {
+				const prior = current.durable ?? pending.durablePersist;
+				if (
+					authoritativeSnapshots.get(pending.key)?.snapshot === pending.snapshot
+				) {
+					deleteAuthoritativeSnapshot(pending.key);
+				}
+				logSnapshotPersistDecision({
+					cwd: pending.cwd,
+					seq: pending.snapshot.seq,
+					fingerprint,
+					decision: "skipped_unchanged",
+					avoidedRawBytes: rawBytes,
+					avoidedGzipBytes: prior?.gzBytes,
+				});
+				return;
+			}
+			if (current.integrity !== undefined) {
+				noteSnapshotSkipRefused({
+					gzPath: pending.gzPath,
+					verdict: current.integrity,
+					seq: pending.snapshot.seq,
+				});
+			}
+			// integrity === undefined: the meta/body evidence vanished entirely
+			// since dispatch — falling through to the full write repairs it, the
+			// same contract as deletion-before-dispatch.
+		}
+		const writeStarted = performance.now();
+		const gzip = gzipSync(bytes);
+		fs.mkdirSync(path.dirname(pending.gzPath), { recursive: true });
+		const promoted = promoteSnapshotBody(
+			pending,
+			{ gzip },
+			{
+				fingerprint,
+				generatedAt: pending.snapshot.generatedAt,
+				gzBytes: gzip.byteLength,
+			},
+		);
+		if (!promoted) return;
+		recordPersistedWordIndexWireBytes(
+			pending.snapshot.wordIndex,
+			pending.wordIndexWireBytes,
+		);
+		reconcileAuthoritativeAfterWrite(pending, rawBytes);
+		logSnapshotPersistSuccess(pending, fingerprint, {
+			rawBytes,
+			gzBytes: gzip.byteLength,
+			serializeMs,
+			writeMs: performance.now() - writeStarted,
+			offloaded: false,
+		});
+		if (reason) _lastSnapshotPersistErrorForTests = reason;
+	} catch (err) {
+		recordSnapshotPersistFailure(
+			pending,
+			err instanceof Error ? err.message : String(err),
+		);
+	} finally {
+		completeSnapshotPersist(pending);
+	}
+}
+
+/**
+ * The ForTests promotion seam covers worker-message and every main-thread
+ * fallback promotion. It stays sync and seam-free in production, identical to
+ * calling the writer directly. The process-exit hook is deliberately the sole
+ * direct write because an exit handler cannot await this asynchronous seam.
+ */
+function dispatchMainThreadWriteThroughSeam(
+	pending: PendingSnapshotBody,
+	reason: string | undefined,
+): void {
+	if (_snapshotPromotionSeamForTests) {
+		void _snapshotPromotionSeamForTests().then(() =>
+			writeSnapshotBodyOnMainThread(pending, reason),
+		);
+		return;
+	}
+	writeSnapshotBodyOnMainThread(pending, reason);
+}
+
+/**
+ * Remove a stage file from inside the worker `message` listener without ever
+ * throwing out of it (#4400): the caller's next step (the main-thread fallback,
+ * or completing the key) must still run. A failure is one ledger count per
+ * subject, not one record per message.
+ */
+function reapSnapshotStage(stagePath: string, subject: string): void {
+	const failure = reapStageFile(stagePath);
+	if (failure === undefined) return;
+	incrementDegradationCount({
+		kind: "project-snapshot-stage-reap-failed",
+		subject,
+		reason: `snapshot stage reap failed: ${failure.message}`,
+	});
+}
+
+function handleSnapshotWorkerResult(
+	result: ProjectSnapshotPersistWorkerResult,
+): void {
+	const pending = _snapshotWorkerRequests.get(result.id);
+	if (!pending) {
+		// Late result for a request the host no longer tracks: the echoed path is
+		// the only name left, and it is wire data (#4400).
+		if (typeof result.stagePath === "string") {
+			reapSnapshotStage(result.stagePath, result.stagePath);
+		}
+		return;
+	}
+	_snapshotWorkerRequests.delete(result.id);
+	// #4400: the host sent `pending.stagePath`, so every cleanup and promotion
+	// below uses its own record, never the worker's echo of it.
+	if (
+		result.error ||
+		result.rawBytes === undefined ||
+		result.gzBytes === undefined ||
+		result.serializeMs === undefined ||
+		result.writeMs === undefined ||
+		result.semanticFingerprint === undefined
+	) {
+		reapSnapshotStage(pending.stagePath, pending.gzPath);
+		dispatchMainThreadWriteThroughSeam(
+			pending,
+			result.error ?? "invalid worker result",
+		);
+		return;
+	}
+	// Generation gate: a newer save already superseded this one — discard the
+	// stale stage file rather than promote it over the fresher body.
+	if (!result.skippedUnchanged) _snapshotWorkerBodyWritesForTests++;
+	if (
+		_snapshotGenerationGateEnabledForTests &&
+		_snapshotGenerationStates.get(pending.key)?.generation !== result.generation
+	) {
+		// The stale stage is part of the promotion transaction: remove it before
+		// returning so a superseded save cannot leave an orphan behind.
+		reapSnapshotStage(pending.stagePath, pending.gzPath);
+		completeSnapshotPersist(pending);
+		return;
+	}
+	if (result.skippedUnchanged) {
+		// Re-read the tiny durable sidecar at the decision seam. A sibling process
+		// may have advanced B after this request captured A. A stale replay of A
+		// must preserve B's body metadata, not restore the captured A sidecar.
+		const baselines = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+		if (baselines.integrity !== "ok") {
+			// The worker skipped WITHOUT staging a body, trusting the durable
+			// fingerprint captured at dispatch. The re-read says that evidence no
+			// longer passes the #2008 integrity gate — refuse the skip and rewrite
+			// synchronously so a torn/missing body cannot outlive this save. The
+			// sync writer recomputes the same baselines, finds them untrusted, and
+			// performs the full gzip+stage+promote (its finally completes this
+			// pending, so do not complete it twice here).
+			if (baselines.integrity !== undefined) {
+				noteSnapshotSkipRefused({
+					gzPath: pending.gzPath,
+					verdict: baselines.integrity,
+					seq: pending.snapshot.seq,
+				});
+			}
+			dispatchMainThreadWriteThroughSeam(
+				pending,
+				"snapshot body integrity regressed",
+			);
+			return;
+		}
+		const prior = baselines.durable ?? pending.durablePersist;
+		if (
+			authoritativeSnapshots.get(pending.key)?.snapshot === pending.snapshot
+		) {
+			deleteAuthoritativeSnapshot(pending.key);
+		}
+		logSnapshotPersistDecision({
+			cwd: pending.cwd,
+			seq: pending.snapshot.seq,
+			fingerprint: result.semanticFingerprint,
+			decision: "skipped_unchanged",
+			avoidedRawBytes: result.rawBytes,
+			avoidedGzipBytes: prior?.gzBytes,
+		});
+		completeSnapshotPersist(pending);
+		return;
+	}
+	try {
+		const promoted = promoteSnapshotBody(
+			pending,
+			{ stagePath: pending.stagePath },
+			{
+				fingerprint: result.semanticFingerprint,
+				generatedAt: pending.snapshot.generatedAt,
+				gzBytes: result.gzBytes,
+			},
+		);
+		if (!promoted) {
+			completeSnapshotPersist(pending);
+			return;
+		}
+		recordPersistedWordIndexWireBytes(
+			pending.snapshot.wordIndex,
+			pending.wordIndexWireBytes,
+		);
+		reconcileAuthoritativeAfterWrite(pending, result.rawBytes);
+		logSnapshotPersistSuccess(pending, result.semanticFingerprint, {
+			rawBytes: result.rawBytes,
+			gzBytes: result.gzBytes,
+			serializeMs: pending.serializeMs ?? result.serializeMs,
+			writeMs: result.writeMs,
+			offloaded: true,
+		});
+		completeSnapshotPersist(pending);
+	} catch (err) {
+		fs.rm(pending.stagePath, { force: true }, () => {});
+		dispatchMainThreadWriteThroughSeam(
+			pending,
+			err instanceof Error ? err.message : String(err),
+		);
+	}
+}
+
+function dispatchSnapshotPersist(pending: PendingSnapshotBody): void {
+	// A queued request may have waited behind the publication that created its
+	// best dedupe evidence. Refresh only the tiny sidecar/body stat here; never
+	// retain the stale admission-time baseline through dispatch.
+	const baselines = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+	pending.durablePersist = baselines.durable;
+	pending.dedupeFingerprints = baselines.fingerprints;
+	seedSnapshotPersistBaselineFromDurable(pending.key, baselines.durable);
+	_activeSnapshotPersists.set(pending.key, pending);
+	if (!snapshotWorkerEnabled()) {
+		dispatchMainThreadWriteThroughSeam(pending, undefined);
+		return;
+	}
+	const worker = getSnapshotPersistWorker();
+	if (!worker) {
+		dispatchMainThreadWriteThroughSeam(pending, "persist worker unavailable");
+		return;
+	}
+	let serialized: ReturnType<typeof serializeSnapshotBody>;
+	try {
+		serialized = serializeSnapshotBody(pending.snapshot);
+	} catch (err) {
+		// The worker would have failed on the same stringify. Nothing was handed
+		// off, so there is no stage to clean and no fallback worth a second
+		// attempt: record the failure and free the active slot for the queue.
+		const message = err instanceof Error ? err.message : String(err);
+		incrementDegradationCount({
+			kind: "project-snapshot-serialize-failed",
+			subject: pending.gzPath,
+			reason: `snapshot body serialization failed: ${message}`,
+		});
+		recordSnapshotPersistFailure(pending, message);
+		completeSnapshotPersist(pending);
+		return;
+	}
+	pending.serializeMs = serialized.serializeMs;
+	pending.wordIndexWireBytes = serialized.wordIndexWireBytes;
+	const id = ++_snapshotWorkerRequestId;
+	_snapshotWorkerRequests.set(id, pending);
+	const request: ProjectSnapshotPersistWorkerRequest = {
+		id,
+		generation: pending.generation,
+		stagePath: pending.stagePath,
+		data: serialized.bytes,
+		generatedAt: pending.snapshot.generatedAt,
+		priorFingerprints: pending.dedupeFingerprints,
+		testDelayMs:
+			process.env.NODE_ENV === "test"
+				? Number(process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS) ||
+					undefined
+				: undefined,
+	};
+	try {
+		worker.postMessage(request, [serialized.bytes.buffer]);
+	} catch (err) {
+		_snapshotWorkerRequests.delete(id);
+		dispatchMainThreadWriteThroughSeam(
+			pending,
+			err instanceof Error ? err.message : String(err),
+		);
+	}
+}
+
+function handleSnapshotWorkerDeath(reason: string): void {
+	_snapshotPersistWorker = undefined;
+	_snapshotPersistWorkerHeapStatistics = null;
+	_snapshotWorkerDisabled = true;
+	const requests = [..._snapshotWorkerRequests.values()];
+	_snapshotWorkerRequests.clear();
+	for (const pending of requests)
+		dispatchMainThreadWriteThroughSeam(pending, reason);
+}
+
+function resolveSnapshotPersistWorkerPath(): string | undefined {
+	// esbuild does NOT rewrite new URL(...) asset refs, so from the bundled
+	// dist/index.js a sibling ./project-snapshot-persist-worker.js resolves
+	// beside the BUNDLE where nothing exists. Try the compiled-sibling layout
+	// first (source checkout / tsc emit), then the bundled worker entry
+	// (#3219: dist/workers/, never the unbundled dist/clients tree, which the
+	// package no longer ships) — from dist/index.js or a dist/ chunk, then from
+	// a bin under dist/mcp/. Same shape as the review graph's
+	// resolvePersistWorkerPath (#950 review F1).
+	const candidates = [
+		new URL("./project-snapshot-persist-worker.js", import.meta.url),
+		new URL("./workers/project-snapshot-persist-worker.js", import.meta.url),
+		new URL("../workers/project-snapshot-persist-worker.js", import.meta.url),
+	];
+	for (const url of candidates) {
+		try {
+			const resolved = fileURLToPath(url);
+			if (fs.existsSync(resolved)) return resolved;
+		} catch {
+			/* try next layout */
+		}
+	}
+	return undefined;
+}
+
+function getSnapshotPersistWorker(): Worker | undefined {
+	if (_snapshotWorkerDisabled) return undefined;
+	if (_snapshotPersistWorker) return _snapshotPersistWorker;
+	try {
+		const workerPath = resolveSnapshotPersistWorkerPath();
+		if (workerPath === undefined) {
+			handleSnapshotWorkerDeath(
+				"persist worker script not found in any layout",
+			);
+			return undefined;
+		}
+		const worker = new Worker(workerPath);
+		// The ForTests promotion seam wraps ONLY when set — the production path
+		// binds the sync handler directly, so scheduling is byte-identical when
+		// no test seam is installed (the async-handler variant of this shifted
+		// promotion timing under full-suite load and flaked the round-trip test).
+		// #4402: the message is wire data (#4400). It passes the shape check or is
+		// dropped and counted, and a throw below is counted here instead of
+		// leaving the listener, which would end the host.
+		worker.on("message", (message: unknown) => {
+			try {
+				const result = readGzipStageWorkerResult(message);
+				if (typeof result === "string") {
+					notePersistWorkerMessageFault("project-snapshot", "rejected", result);
+					return;
+				}
+				if (_snapshotPromotionSeamForTests) {
+					void _snapshotPromotionSeamForTests()
+						.then(() => handleSnapshotWorkerResult(result))
+						.catch((err: unknown) =>
+							notePersistWorkerMessageFault("project-snapshot", "threw", err),
+						);
+					return;
+				}
+				handleSnapshotWorkerResult(result);
+			} catch (err) {
+				notePersistWorkerMessageFault("project-snapshot", "threw", err);
+			}
+		});
+		worker.on("error", (err: Error) => handleSnapshotWorkerDeath(err.message));
+		worker.on("exit", (code) => {
+			if (_snapshotPersistWorker === worker) {
+				_snapshotPersistWorker = undefined;
+				_snapshotPersistWorkerHeapStatistics = null;
+			}
+			// Any body still queued when the worker exits was abandoned mid-flight
+			// (a crash, a `terminate()`, or host recycling) — it will never be
+			// promoted by this worker, so fall it back to the sync writer rather
+			// than let it vanish (honesty, #533). `terminate()` can report a 0
+			// exit code on some platforms, so this cannot key off `code !== 0`.
+			const stranded = [..._snapshotWorkerRequests.values()];
+			if (stranded.length > 0) {
+				_snapshotWorkerRequests.clear();
+				for (const pending of stranded) {
+					dispatchMainThreadWriteThroughSeam(
+						pending,
+						`persist worker exited with code ${code}`,
+					);
+				}
+			}
+			// Only an ABNORMAL exit disables respawning; a clean idle exit (nothing
+			// stranded) just drops the reference so the next persist respawns.
+			if (code !== 0) _snapshotWorkerDisabled = true;
+		});
+		// #1148: adding a message listener refs the Worker's public MessagePort.
+		// Unref only after every listener is installed so it stays background-only.
+		worker.unref();
+		_snapshotPersistWorker = worker;
+		return worker;
+	} catch (err) {
+		handleSnapshotWorkerDeath(err instanceof Error ? err.message : String(err));
+		return undefined;
+	}
+}
+
+// #950 review F3: a process that dies between a worker's staged write and its
+// promotion leaves project-snapshot.json.gz.stage-<pid>-<gen> (and the worker's
+// .tmp-<pid>) behind forever. Sweep leftovers from DEAD processes once per
+// cache dir. A live sibling's in-flight stage is kept (#3510): removing it
+// sent the sibling's promotion to the synchronous main-thread gzip.
+const _sweptSnapshotStageDirs = new Set<string>();
+function sweepStaleSnapshotStageFiles(cacheDir: string): void {
+	if (_sweptSnapshotStageDirs.has(cacheDir)) return;
+	_sweptSnapshotStageDirs.add(cacheDir);
+	fs.readdir(cacheDir, (err, entries) => {
+		if (err) return;
+		for (const entry of entries) {
+			if (!isStaleStageFile(entry, "project-snapshot.json.gz.stage-")) continue;
+			fs.rm(path.join(cacheDir, entry), { force: true }, () => {});
+		}
+	});
+}
+
+/**
+ * Flush any in-flight worker writes synchronously at process teardown so a
+ * body whose worker hasn't promoted yet isn't lost. Sync writes only (no
+ * child spawn — the teardown libuv hazard); best-effort.
+ *
+ * #3594: `latestByKey`'s own construction below already keeps, per key, only
+ * the pending whose generation is the CURRENT one `_snapshotGenerationStates`
+ * holds for that key — the queued map is re-derived from that same state on
+ * every dispatch (`saveProjectSnapshot`), and the in-flight map only ever
+ * holds the dispatch that came right before it, so a superseded generation is
+ * never the survivor here. A generation check this loop used to repeat right
+ * before calling `writeSnapshotBodyOnMainThread` duplicated exactly the gate
+ * that function's own `pendingSnapshotIsCurrent` already runs first — no
+ * second check is needed for it to reach the write.
+ */
+function flushSnapshotPersistsAtExit(): void {
+	_snapshotExiting = true;
+	const latestByKey = new Map<string, PendingSnapshotBody>();
+	for (const pending of _snapshotWorkerRequests.values()) {
+		latestByKey.set(pending.key, pending);
+	}
+	for (const pending of _queuedSnapshotPersists.values()) {
+		const prior = latestByKey.get(pending.key);
+		// Queued work is later admission order. Equal-seq requests deliberately
+		// share a gate generation, so a tie must still select the queued payload.
+		if (!prior || prior.generation <= pending.generation) {
+			latestByKey.set(pending.key, pending);
+		}
+	}
+	_snapshotWorkerRequests.clear();
+	_queuedSnapshotPersists.clear();
+	_activeSnapshotPersists.clear();
+	for (const pending of latestByKey.values()) {
+		writeSnapshotBodyOnMainThread(pending, "exit_hook");
+	}
+	void _snapshotPersistWorker?.terminate();
+}
+
+let _snapshotExitHookInstalled = false;
+function ensureSnapshotPersistExitHook(): void {
+	if (_snapshotExitHookInstalled) return;
+	_snapshotExitHookInstalled = true;
+	process.once("exit", flushSnapshotPersistsAtExit);
+}
+
+/**
+ * Test-only: run the real process-exit flush without exiting the process,
+ * so its own generation selection (`latestByKey`) and the writer's gate
+ * (`pendingSnapshotIsCurrent`, inside `writeSnapshotBodyOnMainThread`) can be
+ * driven end to end (#3594) — this loop had no test coverage before.
+ */
+export function runSnapshotPersistExitFlushForTests(): void {
+	flushSnapshotPersistsAtExit();
+}
+
+export function saveProjectSnapshot(
+	cwd: string,
+	snapshot: ProjectSnapshot,
+): void {
+	const gzPath = getProjectSnapshotPath(cwd);
+	const legacyPath = getProjectSnapshotLegacyPath(cwd);
+	const metaPath = getProjectSnapshotMetaPath(cwd);
+	const cacheDir = path.dirname(gzPath);
+	const key = normalizeMapKey(cwd);
+	fs.mkdirSync(cacheDir, { recursive: true });
+	const baselines = snapshotPersistBaselinesFor(cwd, key);
+	const priorPersist = baselines.durable;
+	logSnapshotPersistDecision({
+		cwd,
+		seq: snapshot.seq,
+		decision: "requested",
+	});
+	if (_failedSnapshotPersists.delete(key)) {
+		logSnapshotPersistDecision({ cwd, seq: snapshot.seq, decision: "retry" });
+	}
+
+	// #958: for a new seq, meta is written FIRST and body SECOND. A crash or
+	// failure between the two writes can now only produce
+	// "meta already claims the new seq, body hasn't caught up yet" (the meta
+	// races ahead). The meta-first gate (isProjectSnapshotMetaStale) reads
+	// that as *fresh* and falls through to parsing the body, whose own
+	// embedded `seq` is still the old one, so `isProjectSnapshotFresh`
+	// correctly rejects it as stale on the body's own merits — one wasted
+	// parse, self-healing, no data lost. The OLD body-then-meta order could
+	// instead leave an old-seq meta sitting over a freshly written body,
+	// which the meta-first gate discards WITHOUT ever reading it — throwing
+	// away a genuinely fresh snapshot. That direction is not recoverable
+	// until the next save, so it's the one this reorder eliminates.
+	//
+	// The new-seq meta write stays synchronous and throwing. Same-seq work does
+	// not need to advance the freshness gate, so it leaves the current sidecar
+	// untouched until the worker has a semantic verdict. This prevents a stale
+	// local request from replacing a
+	// newer sibling process's same-seq fingerprint before it can coalesce.
+	//
+	// #3509: the write only ever RAISES the meta seq, read and written under
+	// the cache lock. A sibling process that already published a newer view
+	// keeps its meta; this save's promotion is then refused on the same check.
+	withSnapshotCacheLock(gzPath, "admission meta write", () => {
+		const onDisk = readProjectSnapshotMeta(cwd);
+		if (!onDisk || onDisk.seq < snapshot.seq) {
+			writeProjectSnapshotMeta(metaPath, snapshot);
+		}
+	});
+
+	// Record the authoritative in-process write BEFORE handing the body off, so
+	// a merge-read between now and the worker's promotion sees our own object
+	// (the on-disk body still holds the previous generation until promotion). The
+	// pre-write mtime is our baseline: while disk stays at it (or below), our
+	// object wins; a promotion or an external write moves past it. Baseline off
+	// the CURRENTLY-RESOLVED body — which is the legacy uncompressed
+	// `project-snapshot.json` in the one-release upgrade window before the first
+	// gz promotion — not gz-only: statting only gzPath there would leave the
+	// baseline at -Infinity, so the load gate (which resolves the legacy body's
+	// real, positive mtime) would reject our own fresh write and serve the stale
+	// legacy body to a merge-consumer, silently dropping this snapshot's fields.
+	const priorBody = resolveSnapshotBodyPath(cwd);
+	const knownMtime = priorBody ? priorBody.mtimeMs : Number.NEGATIVE_INFINITY;
+	const knownSize = priorBody ? priorBody.size : Number.NEGATIVE_INFINITY;
+	const authoritativeEntry: AuthoritativeSnapshotEntry = {
+		snapshot,
+		knownMtime,
+		knownSize,
+		lastUsedAt: Date.now(),
+	};
+	const previousAuthoritativeEntry = authoritativeSnapshots.get(key);
+	if (previousAuthoritativeEntry)
+		clearAuthoritativeSnapshotTimer(previousAuthoritativeEntry);
+	authoritativeSnapshots.set(key, authoritativeEntry);
+	scheduleAuthoritativeSnapshotEviction(key, authoritativeEntry);
+	enforceAuthoritativeSnapshotCap();
+	// A stale disk-parse-cache entry for this path must not out-vote the fresh
+	// authoritative write once the latter is dropped (oversized bodies).
+	snapshotParseCache.delete(gzPath);
+
+	const generationState = _snapshotGenerationStates.get(key);
+	const generation =
+		generationState?.seq === snapshot.seq
+			? generationState.generation
+			: (generationState?.generation ?? 0) + 1;
+	_snapshotGenerationStates.set(key, { generation, seq: snapshot.seq });
+	const stagePath = `${gzPath}.stage-${process.pid}-${generation}`;
+	const pending: PendingSnapshotBody = {
+		key,
+		cwd,
+		gzPath,
+		legacyPath,
+		stagePath,
+		snapshot,
+		generation,
+		durablePersist: priorPersist,
+		dedupeFingerprints: baselines.fingerprints,
+	};
+	sweepStaleSnapshotStageFiles(cacheDir);
+	ensureSnapshotPersistExitHook();
+
+	if (_activeSnapshotPersists.has(key)) {
+		_queuedSnapshotPersists.set(key, pending);
+		logSnapshotPersistDecision({
+			cwd,
+			seq: snapshot.seq,
+			decision: "coalesced",
+		});
+		return;
+	}
+	dispatchSnapshotPersist(pending);
+}
+
+// --- Test hooks for the worker persist path ---------------------------------
+
+/** Test-only: wait until worker requests have either landed or degraded. */
+export async function waitForProjectSnapshotPersistsForTests(): Promise<void> {
+	for (
+		let attempts = 0;
+		attempts < 200 &&
+		(_snapshotWorkerRequests.size > 0 ||
+			_activeSnapshotPersists.size > 0 ||
+			_queuedSnapshotPersists.size > 0);
+		attempts++
+	) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+/**
+ * Test-only strict form of {@link waitForProjectSnapshotPersistsForTests}: that
+ * wait is a bounded poll (200 x 10 ms) and resolves with work outstanding, so a
+ * persist slower than the bound would land after a fixture root was removed.
+ * This one reports what remains (any request, active persist or queued persist).
+ */
+async function settleProjectSnapshotPersistsForTests(): Promise<
+	string | undefined
+> {
+	await waitForProjectSnapshotPersistsForTests();
+	const pending =
+		_snapshotWorkerRequests.size +
+		_activeSnapshotPersists.size +
+		_queuedSnapshotPersists.size;
+	return pending > 0
+		? "project-snapshot persists still pending after the bounded wait"
+		: undefined;
+}
+
+// #4937: the loaded extension copy's in-flight worker write is invisible to a
+// test's own import of this module; the tier-2 harness joins it through the
+// registry (`clients/background-write-drains.ts`).
+registerBackgroundWriteDrain(settleProjectSnapshotPersistsForTests);
+
+/** Test-only: force any in-flight worker body write to the sync main-thread path. */
+export function flushProjectSnapshotPersistsForTests(): void {
+	const requests = [..._snapshotWorkerRequests.values()];
+	_snapshotWorkerRequests.clear();
+	for (const pending of requests) {
+		dispatchMainThreadWriteThroughSeam(pending, undefined);
+	}
+}
+
+/** Test-only: exercise the degraded worker-death path. */
+export async function terminateProjectSnapshotPersistWorkerForTests(): Promise<void> {
+	const worker = _snapshotPersistWorker;
+	if (worker) await worker.terminate();
+}
+
+/** Test-only: restore worker creation + clear generation state after a deliberate death. */
+export function resetProjectSnapshotPersistWorkerForTests(): void {
+	_snapshotWorkerDisabled = false;
+	_snapshotGenerationGateEnabledForTests = true;
+	_snapshotPromotionSeamForTests = undefined;
+	_snapshotPersistWorker = undefined;
+	_snapshotPersistWorkerHeapStatistics = null;
+	_snapshotWorkerRequests.clear();
+	_snapshotGenerationStates.clear();
+	_successfulSnapshotPersists.clear();
+	_failedSnapshotPersists.clear();
+	_activeSnapshotPersists.clear();
+	_queuedSnapshotPersists.clear();
+	_snapshotExiting = false;
+	_snapshotWorkerBodyWritesForTests = 0;
+	_lastSnapshotPersistErrorForTests = undefined;
+}
+
+/** Test-only: expose bounded queue state without retaining snapshot bodies. */
+export function getProjectSnapshotPersistStateForTests(cwd: string): {
+	active: boolean;
+	queued: boolean;
+	successfulFingerprint?: string;
+	workerBodyWrites: number;
+} {
+	const key = normalizeMapKey(cwd);
+	return {
+		active: _activeSnapshotPersists.has(key),
+		queued: _queuedSnapshotPersists.has(key),
+		successfulFingerprint: _successfulSnapshotPersists.get(key)?.fingerprint,
+		workerBodyWrites: _snapshotWorkerBodyWritesForTests,
+	};
+}
+
+/** Test-only mutation switch for proving the supersession invariant. */
+export function setProjectSnapshotGenerationGateForTests(
+	enabled: boolean,
+): void {
+	_snapshotGenerationGateEnabledForTests = enabled;
+}
+
+/** Test-only seam immediately before generation-gated promotion. */
+export function setProjectSnapshotPromotionSeamForTests(
+	seam: (() => Promise<void>) | undefined,
+): void {
+	_snapshotPromotionSeamForTests = seam;
+}
+
+export function getProjectSnapshotPersistErrorForTests(): string | undefined {
+	return _lastSnapshotPersistErrorForTests;
+}
+
+// ── #2442 test-only seams: exercise the three BoundedFifoMap-backed caches ──
+// through the exact same write path production uses (cacheParsedSnapshot /
+// rememberSuccessfulSnapshotPersist's delete+set refresh, and a direct write
+// mirroring recordSnapshotPersistFailure's), without the real gzip/worker
+// persistence pipeline or a full ProjectSnapshot fixture.
+
+/** Test-only: seed the parse cache exactly as `cacheParsedSnapshot` would. */
+export function _seedSnapshotParseCacheForTests(
+	key: string,
+	entry: { mtimeMs: number; size: number; snapshot: ProjectSnapshot | null },
+): void {
+	cacheParsedSnapshot(key, entry);
+}
+export function _snapshotParseCacheKeysForTests(): string[] {
+	return [...snapshotParseCache.keys()];
+}
+/**
+ * #2442 test-only: the exact `snapshotParseCache.get(key)` the production
+ * read at {@link loadProjectSnapshot}'s parse-cache hit performs. A `.has()`
+ * would not do — `.has()` reorders nothing on either bounded class, so a
+ * has-based test cannot tell FIFO from LRU, which is the axis these bounded
+ * tests exist to pin (#2442 review F4).
+ */
+export function _snapshotParseCacheGetForTests(key: string): boolean {
+	return snapshotParseCache.get(key) !== undefined;
+}
+
+/** Test-only: seed the successful-persist cache exactly as production would. */
+export function _seedSuccessfulSnapshotPersistForTests(
+	key: string,
+	record: {
+		seq: number;
+		fingerprint: string;
+		generatedAt: string;
+		generation: number;
+	},
+): void {
+	rememberSuccessfulSnapshotPersist(key, record);
+}
+export function _successfulSnapshotPersistKeysForTests(): string[] {
+	return [..._successfulSnapshotPersists.keys()];
+}
+/** #2442 test-only: the same `_successfulSnapshotPersists.get(key)` the
+ *  persist-dedupe read and `getProjectSnapshotPersistStateForTests` perform.
+ *  See {@link _snapshotParseCacheGetForTests} for why `.has()` will not do. */
+export function _successfulSnapshotPersistGetForTests(key: string): boolean {
+	return _successfulSnapshotPersists.get(key) !== undefined;
+}
+
+/** Test-only: seed the failed-persist cache with the same write
+ *  `recordSnapshotPersistFailure` performs, without its side effects
+ *  (deleteAuthoritativeSnapshot / logLatency) or a full PendingSnapshotBody. */
+export function _seedFailedSnapshotPersistForTests(
+	key: string,
+	record: { seq: number; generation: number },
+): void {
+	_failedSnapshotPersists.set(key, record);
+}
+export function _failedSnapshotPersistKeysForTests(): string[] {
+	return [..._failedSnapshotPersists.keys()];
+}
+
+export function buildProjectSnapshotFromRuntime(args: {
+	cwd: string;
+	runtime: RuntimeCoordinator;
+	startupScan?: StartupScanContext;
+	languageProfile?: ProjectLanguageProfile;
+	conventions?: ProjectConventions;
+}): ProjectSnapshot {
+	// #3511: a runtime that missed a sibling's logged entry at or below its seq
+	// cannot vouch for that seq, and its index is not the fold of the log up to
+	// it. Its seq still orders the promotion compare-and-set (#3509).
+	const incomplete = args.runtime.viewMissesLoggedEntries;
+	return {
+		version: PROJECT_SNAPSHOT_VERSION,
+		projectRoot: normalizeMapKey(path.resolve(args.cwd)),
+		generatedAt: new Date().toISOString(),
+		seq: args.runtime.projectSeq,
+		...(incomplete ? { incomplete: true as const } : {}),
+		logEntries: args.runtime.viewLogEntries,
+		files: {},
+		symbols: {},
+		reverseDeps: {},
+		cachedExports: [...args.runtime.cachedExports.entries()].sort((a, b) =>
+			a[0].localeCompare(b[0]),
+		),
+		// #1019: capture the runtime's live sequence index AT this seq. The runtime
+		// is seeded from the change log at session start and bumped in lockstep with
+		// every append, so `getFileSeqEntries()` IS the fold of the log up to
+		// `projectSeq` — and its keys are already `normalizeMapKey(path.resolve())`,
+		// the exact form the change-log replay produces.
+		sequenceIndex: incomplete
+			? undefined
+			: {
+					projectSeq: args.runtime.projectSeq,
+					fileSeqByPath: args.runtime.getFileSeqEntries(),
+				},
+		wordIndex: args.runtime.wordIndex
+			? serializeWordIndex(args.runtime.wordIndex)
+			: undefined,
+		projectRulesScan: args.runtime.projectRulesScan,
+		startupScan: args.startupScan,
+		languageProfile: args.languageProfile,
+		conventions: args.conventions,
+	};
+}
+
+export function hydrateRuntimeFromProjectSnapshot(
+	runtime: RuntimeCoordinator,
+	snapshot: ProjectSnapshot,
+): void {
+	runtime.cachedExports.clear();
+	for (const [name, filePath] of snapshot.cachedExports) {
+		runtime.cachedExports.set(name, filePath);
+	}
+	if (snapshot.projectRulesScan) {
+		runtime.projectRulesScan = snapshot.projectRulesScan;
+	}
+	runtime.wordIndex = deserializeWordIndex(snapshot.wordIndex);
+}
+
+/**
+ * #1785 F2/F3: additive counterpart to `hydrateRuntimeFromProjectSnapshot`
+ * for a LATE/retroactive hydration attempt — one that runs after other work
+ * may already have populated the runtime for real (e.g. quick mode's
+ * background warmup building a genuine `wordIndex`, docCount > 0). The
+ * unconditional version above is only safe for the FIRST hydration attempt,
+ * made before anything else has run: clearing `cachedExports` is correct
+ * there because there is nothing yet to destroy.
+ *
+ * A late call cannot make that assumption, and `cachedExports` and
+ * `projectRulesScan` are populated by INDEPENDENT tasks from whatever else is
+ * running (nothing else in quick mode touches either), so this guards each
+ * field on its OWN "nothing computed since" check rather than one
+ * all-or-nothing bail-out — the field a concurrent task actually populated is
+ * protected without needlessly withholding the other, still-idle field the
+ * snapshot could still supply. Returns whether it hydrated ANY field, so the
+ * caller can log honestly instead of claiming success when nothing changed.
+ *
+ * #1785 F5: takes ONLY the narrow `{ cachedExports, projectRulesScan }`
+ * shape (see `ProjectSnapshotExportsAndRules`) — deliberately no `wordIndex`
+ * parameter at all, not even an optional one. The retroactive path's
+ * captured/reloaded snapshot always comes from
+ * `loadProjectSnapshotExportsAndRules`, which never parses `wordIndex` in
+ * the first place (avoiding its dominant share of a full body parse's cost —
+ * see that function's doc comment for the measured numbers). This is also
+ * the right behavior, not just a performance shortcut: quick mode's warmup
+ * is the only thing that ever builds a `wordIndex` in this window, and F2's
+ * hazard was this exact late-hydration path nulling that live index from a
+ * disk copy that predated it — removing the parameter removes the hazard by
+ * construction instead of merely guarding against it at runtime.
+ */
+export function hydrateRuntimeFromProjectSnapshotIfIdle(
+	runtime: RuntimeCoordinator,
+	snapshot: Pick<ProjectSnapshot, "cachedExports" | "projectRulesScan">,
+): boolean {
+	let hydratedAnything = false;
+
+	if (runtime.cachedExports.size === 0 && snapshot.cachedExports.length > 0) {
+		runtime.cachedExports.clear();
+		for (const [name, filePath] of snapshot.cachedExports) {
+			runtime.cachedExports.set(name, filePath);
+		}
+		hydratedAnything = true;
+	}
+
+	if (
+		!runtime.projectRulesScan.hasCustomRules &&
+		runtime.projectRulesScan.rules.length === 0 &&
+		snapshot.projectRulesScan
+	) {
+		runtime.projectRulesScan = snapshot.projectRulesScan;
+		hydratedAnything = true;
+	}
+
+	return hydratedAnything;
+}
+
+export function saveRuntimeProjectSnapshot(args: {
+	cwd: string;
+	runtime: RuntimeCoordinator;
+	startupScan?: StartupScanContext;
+	languageProfile?: ProjectLanguageProfile;
+	conventions?: ProjectConventions;
+	dbg?: (msg: string) => void;
+}): void {
+	try {
+		if (typeof args.runtime.projectSeq !== "number") return;
+		const existing = loadProjectSnapshot(args.cwd);
+		let conventions = args.conventions ?? existing?.conventions;
+		if (!conventions) {
+			try {
+				conventions = detectProjectConventions(args.cwd);
+			} catch (err) {
+				args.dbg?.(`project_snapshot: convention detection failed: ${err}`);
+			}
+		}
+		const snapshot = buildProjectSnapshotFromRuntime({
+			...args,
+			startupScan: args.startupScan ?? existing?.startupScan,
+			languageProfile: args.languageProfile ?? existing?.languageProfile,
+			conventions,
+		});
+		if (existing) {
+			snapshot.files = existing.files ?? {};
+			snapshot.symbols = existing.symbols ?? {};
+			snapshot.reverseDeps = existing.reverseDeps ?? {};
+			// The word index is built by its own session task, which may not have
+			// finished when another task triggers a save — keep the prior index
+			// rather than clobbering it with undefined. #348: only carry it forward
+			// when `existing` was built AT THIS SAME seq — otherwise a stale
+			// snapshot's leftover index (already correctly rejected as stale by
+			// isProjectSnapshotFresh on load, seq mismatch) would get silently
+			// re-stamped with the CURRENT seq by this save, "laundering" a stale
+			// index into looking fresh before the word-index task even runs.
+			// #3511: an index from an incomplete view at the same seq would be
+			// laundered the same way into a complete snapshot.
+			if (
+				!snapshot.wordIndex &&
+				existing.wordIndex &&
+				existing.seq === snapshot.seq &&
+				(snapshot.incomplete || !existing.incomplete)
+			) {
+				snapshot.wordIndex = existing.wordIndex;
+			}
+		}
+		saveProjectSnapshot(args.cwd, snapshot);
+		args.dbg?.(
+			`project_snapshot: saved seq=${snapshot.seq} exports=${snapshot.cachedExports.length}`,
+		);
+	} catch (err) {
+		args.dbg?.(`project_snapshot: save failed: ${err}`);
+	}
+}

@@ -1,0 +1,853 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import semver from "semver";
+import { describe, expect, it } from "vitest";
+import {
+	HOST_PROVIDED_PACKAGES,
+	HOST_PROVIDED_RUNTIME_PACKAGES,
+	HOST_PROVIDED_TYPE_ONLY_PACKAGES,
+	LAZY_NATIVE_PACKAGES,
+} from "../scripts/lib/host-provided-deps.mjs";
+import { readLockedToolVersion } from "../scripts/lib/exec-isolation.mjs";
+// The baseline doc's verified-host table has ONE reader (#4632 acceptance 9):
+// the certified-host spread (scripts/probe-pi-host-tiers.mjs) reads the same
+// table, so a second parser here is how the spread and this ratchet would
+// start disagreeing about which rows count.
+import { parseVerifiedHostRows } from "../scripts/lib/pi-host-spread.mjs";
+import yaml from "../clients/deps/js-yaml.js";
+import { USER_PROFILE_PATH_RE } from "./support/user-profile-path-pattern.js";
+
+// These tests pin the published-package contract: pi-lens ships a precompiled
+// dist/ and points its entry at compiled JS, so pi does NOT jiti-transpile ~200
+// TypeScript files on every startup (issue #182). A regression here silently
+// reintroduces the ~3.5s cold-start cost, so guard it statically.
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const pkg = JSON.parse(
+	fs.readFileSync(path.join(root, "package.json"), "utf8"),
+) as {
+	main?: string;
+	files?: string[];
+	scripts?: Record<string, string>;
+	pi?: { extensions?: string[]; skills?: string[] };
+	dependencies?: Record<string, string>;
+	devDependencies?: Record<string, string>;
+	peerDependencies?: Record<string, string>;
+	peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+	allowScripts?: Record<string, boolean>;
+};
+
+const lock = JSON.parse(
+	fs.readFileSync(path.join(root, "package-lock.json"), "utf8"),
+) as {
+	packages?: {
+		"node_modules/@ast-grep/cli"?: {
+			version?: string;
+			hasInstallScript?: boolean;
+		};
+		"node_modules/@earendil-works/pi-tui"?: {
+			version?: string;
+		};
+	};
+};
+
+describe("published package entry points (dist mode, #182)", () => {
+	it("allows the exact ast-grep CLI version with an install script (#2401)", () => {
+		const cli = lock.packages?.["node_modules/@ast-grep/cli"];
+		const version = cli?.version;
+		expect(version, "lockfile must pin @ast-grep/cli").toBeTruthy();
+		expect(cli?.hasInstallScript).toBe(true);
+		expect(pkg.allowScripts?.[`@ast-grep/cli@${version}`]).toBe(true);
+	});
+
+	it("main points at the compiled dist entry", () => {
+		expect(pkg.main).toBe("./dist/index.js");
+	});
+
+	it("every pi.extensions entry is a compiled dist .js file", () => {
+		const exts = pkg.pi?.extensions ?? [];
+		expect(exts.length).toBeGreaterThan(0);
+		for (const e of exts) {
+			expect(e, e).toMatch(/^\.\/dist\/.+\.js$/);
+		}
+	});
+
+	it("ships the bundled dist entries and never TypeScript source in the npm tarball", () => {
+		const files = pkg.files ?? [];
+		// #3219: the bundled entries, never the whole dist/ tree.
+		expect(files).toContain("dist/index.js");
+		for (const f of files) {
+			// A .ts entry (or a clients/commands/tools source glob) would put pi
+			// back on the jiti transpile-on-startup path.
+			expect(f.endsWith(".ts"), `files must not ship TS source: ${f}`).toBe(
+				false,
+			);
+		}
+	});
+
+	it("prepare builds dist on install (incl. git) and before publish", () => {
+		// `prepare` (not `prepack`) is required so a `git:` install — which runs
+		// `npm install`, not `npm pack` — also gets the compiled dist (#182).
+		expect(pkg.scripts?.prepare ?? "").toContain("build:dist");
+		expect(pkg.scripts?.["build:dist"] ?? "").toContain("tsconfig.dist.json");
+	});
+
+	it("pi.skills resolves PACKAGE-ROOT-relative and never escapes the package (#2587)", () => {
+		// Guards the recurrence of #2587: a `pi.skills` entry that leaves the
+		// package, so none of the shipped skills register on any install.
+		//
+		// pi's real resolver — `PackageManager#collectFilesFromManifestEntries` in
+		// `@earendil-works/pi-coding-agent` `dist/core/package-manager.js`
+		// (this non-glob branch is identical in 0.78.1, 0.84.1 and 0.85.1; the
+		// glob branch was refactored into `expandPackageGlob` in 0.85.1):
+		//
+		//     if (!hasGlobPattern(entry)) return [resolve(root, entry)];
+		//
+		// where `root` is the PACKAGE ROOT (the dir holding package.json), passed
+		// down from `addManifestEntries(entries, packageRoot, …)`. It is NOT the
+		// extension entry file and NOT `dist/`. #199 assumed entry-file-relative
+		// resolution and set `["../../skills"]`; from any real install root
+		// (`…/node_modules/pi-lens`) that lands two levels OUTSIDE the package, so
+		// pi loaded zero skills everywhere — and the #199 test replicated the
+		// guessed resolver instead of pi's, so CI stayed green for four releases.
+		const resolveLikePi = (packageRoot: string, entry: string) =>
+			path.resolve(packageRoot, entry);
+		const inside = (packageRoot: string, resolved: string) =>
+			resolved === packageRoot || resolved.startsWith(packageRoot + path.sep);
+
+		const skills = pkg.pi?.skills ?? [];
+		expect(
+			skills.length,
+			"pi.skills must declare the shipped dir",
+		).toBeGreaterThan(0);
+		expect(pkg.files ?? [], "skills/ must ship in the tarball").toContain(
+			"skills/",
+		);
+		// One skills tree only: a second copy under dist/ would ship dead weight.
+		expect(pkg.scripts?.["build:dist"] ?? "").not.toContain("dist/skills");
+
+		// The published package root is wherever the installer puts it, so assert
+		// containment against a SYNTHETIC root too — the property belongs to the
+		// entry string, not to this checkout's location on disk.
+		const installRoot = path.resolve(
+			path.sep,
+			"pi",
+			"agent",
+			"npm",
+			"node_modules",
+			"pi-lens",
+		);
+		const rootSkills = path.resolve(root, "skills");
+		for (const entry of skills) {
+			// The replication above only covers pi's non-glob branch.
+			expect(
+				/[*?]/.test(entry),
+				`pi.skills "${entry}" must not be a glob (pi takes a different branch)`,
+			).toBe(false);
+			expect(
+				resolveLikePi(root, entry),
+				`pi.skills "${entry}" must resolve (package-root-relative) to the root skills/ dir`,
+			).toBe(rootSkills);
+			expect(
+				inside(installRoot, resolveLikePi(installRoot, entry)),
+				`pi.skills "${entry}" escapes the installed package: ${resolveLikePi(installRoot, entry)}`,
+			).toBe(true);
+		}
+		expect(
+			fs.existsSync(path.join(rootSkills, "pi-lens-ast-grep", "SKILL.md")),
+			"the resolved skills dir must actually hold SKILL.md files",
+		).toBe(true);
+	});
+
+	it("bundles core grammars via prepare and ships them in the tarball", () => {
+		// Core grammars are downloaded at `prepare` time into grammars/ (shipped in
+		// files[]); the tail lazy-fetches at runtime. There is intentionally NO
+		// postinstall (it was npm-only and pnpm/bun blocked it) — see the grammar
+		// distribution note in AGENTS.md.
+		expect(pkg.scripts?.prepare ?? "").toContain("download-grammars");
+		expect(pkg.files ?? []).toContain("grammars/");
+		expect(pkg.files ?? []).toContain("scripts/download-grammars.js");
+		expect(
+			pkg.scripts?.postinstall,
+			"postinstall was removed — grammars ship bundled + lazy-fetch",
+		).toBeUndefined();
+	});
+
+	it("wires the bundle step into build:dist after tsc (#335, #2593)", () => {
+		const bd = pkg.scripts?.["build:dist"] ?? "";
+		// tsc (isolated via scripts/build-dist-tsc.mjs, #2593) must run before
+		// the bundle (bundle collapses the tsc emit).
+		expect(bd).toContain("bundle:dist");
+		expect(bd).toContain("build-dist-tsc.mjs");
+		expect(bd.indexOf("tsconfig.dist.json")).toBeLessThan(
+			bd.indexOf("bundle:dist"),
+		);
+		expect(bd.indexOf("build-dist-tsc.mjs")).toBeLessThan(
+			bd.indexOf("bundle:dist"),
+		);
+		expect(pkg.scripts?.["bundle:dist"] ?? "").toContain("bundle-dist.mjs");
+	});
+});
+
+// #1926: pi provides these packages from its own runtime. Declaring one in
+// `dependencies` makes `npm install --omit=dev` — the command pi runs for a
+// `git:` install — vendor a private second copy, which Node then evaluates at
+// import. That cost the git install 720ms of an 838ms module import, while the
+// npm path (where the copies are absent) stayed cheap. The declaration shape is
+// the fix, so pin it: optional peer for the runtime contract, devDependency so
+// local builds and CI still type-check, and never a runtime dependency.
+describe("host-provided packages are not vendored (#1926)", () => {
+	const deps = pkg.dependencies ?? {};
+	const devDeps = pkg.devDependencies ?? {};
+	const peers = pkg.peerDependencies ?? {};
+	const peerMeta = pkg.peerDependenciesMeta ?? {};
+
+	it("lists at least one host-provided package to guard", () => {
+		// Guards the guard: an emptied HOST_PROVIDED_PACKAGES would make every
+		// per-package assertion below vacuously pass.
+		expect(HOST_PROVIDED_PACKAGES.length).toBeGreaterThan(0);
+	});
+
+	// #5365: the "ships <file> because a packed file imports it" pins that used
+	// to live here (#1926 host-provided-deps, #4789 scratch-home-env, #2626
+	// skills-predicate, #3409 web-tree-sitter-dir) are gone. Each guarded one
+	// edge: a packed script importing a `scripts/lib/*.mjs` that `files[]` had
+	// dropped, so the import threw in the tarball. Every such edge is now one
+	// finding from `packedImportResolutionViolations`, which
+	// tests/packaging-pack-manifest.test.ts runs over the real `npm pack`
+	// tarball, so the next import of an unpacked file is caught without a new
+	// pin.
+
+	it("splits host-provided packages into runtime and type-only, with no overlap", () => {
+		// CI installs the RUNTIME half before a bare `node dist/index.js` smoke
+		// check, because bare node is not pi. It must never install the type-only
+		// half: that tree's nested paths exceed Windows MAX_PATH (#1334 S6). A
+		// package landing in both halves, or in neither, breaks that split.
+		expect(HOST_PROVIDED_RUNTIME_PACKAGES.length).toBeGreaterThan(0);
+		expect(HOST_PROVIDED_TYPE_ONLY_PACKAGES.length).toBeGreaterThan(0);
+		const overlap = HOST_PROVIDED_RUNTIME_PACKAGES.filter((name) =>
+			HOST_PROVIDED_TYPE_ONLY_PACKAGES.includes(name),
+		);
+		expect(overlap, "a package cannot be both runtime and type-only").toEqual(
+			[],
+		);
+		expect([...HOST_PROVIDED_PACKAGES].sort()).toEqual(
+			[
+				...HOST_PROVIDED_RUNTIME_PACKAGES,
+				...HOST_PROVIDED_TYPE_ONLY_PACKAGES,
+			].sort(),
+		);
+	});
+
+	it("value-imported host packages are the runtime half, not the type-only half", () => {
+		// Derived from source. A `clients/deps/*.ts` seam that value-imports a
+		// host package proves that package must exist at runtime, so CI has to
+		// supply it. Listing it as type-only instead would make the smoke check
+		// allow a real load failure.
+		const seamDir = path.join(root, "clients", "deps");
+		for (const file of fs.readdirSync(seamDir)) {
+			if (!file.endsWith(".ts")) continue;
+			const text = fs.readFileSync(path.join(seamDir, file), "utf8");
+			for (const line of text.split("\n")) {
+				if (/^\s*(?:import|export)\s+type\b/.test(line)) continue;
+				const m = line.match(
+					/^\s*(?:import|export)\b[^;"']*\bfrom\s*["']([^"'.][^"']*)["']/,
+				);
+				const name = m?.[1];
+				if (!name || !HOST_PROVIDED_PACKAGES.includes(name)) continue;
+				expect(
+					HOST_PROVIDED_TYPE_ONLY_PACKAGES.includes(name),
+					`${name} is value-imported by ${file}, so it cannot be type-only`,
+				).toBe(false);
+				expect(
+					HOST_PROVIDED_RUNTIME_PACKAGES.includes(name),
+					`${name} is value-imported by ${file}, so it belongs in the runtime half`,
+				).toBe(true);
+			}
+		}
+	});
+
+	it("lists every dep seam package that nothing installs", () => {
+		// Derived from source, so dropping an entry from HOST_PROVIDED_PACKAGES
+		// does not quietly drop its guard. Every package a `clients/deps/*.ts`
+		// seam VALUE-imports must be installed by something — a runtime
+		// dependency, an optional dependency — or else supplied by pi. If it is
+		// in neither install list, it can only come from the host, so it belongs
+		// on the host-provided list.
+		const optionalDeps =
+			(pkg as { optionalDependencies?: Record<string, string> })
+				.optionalDependencies ?? {};
+		const seamDir = path.join(root, "clients", "deps");
+		const valueImported = new Set<string>();
+		for (const file of fs.readdirSync(seamDir)) {
+			if (!file.endsWith(".ts")) continue;
+			const text = fs.readFileSync(path.join(seamDir, file), "utf8");
+			for (const line of text.split("\n")) {
+				// `import type` / `export type` are erased at compile time and never
+				// need the package to exist at runtime.
+				if (/^\s*(?:import|export)\s+type\b/.test(line)) continue;
+				const m = line.match(
+					/^\s*(?:import|export)\b[^;"']*\bfrom\s*["']([^"'.][^"']*)["']/,
+				);
+				if (m && !m[1].startsWith("node:")) valueImported.add(m[1]);
+			}
+		}
+		expect(valueImported.size).toBeGreaterThan(0);
+
+		const uninstalled = [...valueImported].filter(
+			(name) =>
+				!Object.hasOwn(deps, name) && !Object.hasOwn(optionalDeps, name),
+		);
+		expect(uninstalled.length).toBeGreaterThan(0);
+		for (const name of uninstalled) {
+			expect(
+				HOST_PROVIDED_PACKAGES.includes(name),
+				`${name} is value-imported by a clients/deps seam but no install ` +
+					"list provides it — declare it host-provided or make it a dependency",
+			).toBe(true);
+		}
+	});
+
+	for (const name of HOST_PROVIDED_PACKAGES) {
+		it(`${name} is never a runtime dependency`, () => {
+			expect(
+				Object.hasOwn(deps, name),
+				`${name} is host-provided: a runtime dependency vendors a second ` +
+					"copy into the git install and re-evaluates it at import (#1926)",
+			).toBe(false);
+		});
+
+		it(`${name} is an optional peer dependency`, () => {
+			expect(
+				Object.hasOwn(peers, name),
+				`${name} missing from peerDependencies`,
+			).toBe(true);
+			// Without `optional: true`, npm 7+ installs the peer anyway and the
+			// second copy comes back.
+			expect(
+				peerMeta[name]?.optional,
+				`${name} must be peerDependenciesMeta.optional`,
+			).toBe(true);
+		});
+
+		it(`${name} is a devDependency so builds and tests resolve it`, () => {
+			expect(
+				Object.hasOwn(devDeps, name),
+				`${name} must be a devDependency (types + local test resolution)`,
+			).toBe(true);
+		});
+	}
+
+	it("native/wasm packages keep shipping with the extension", () => {
+		// The other half of the external list is NOT host-provided: pi does not
+		// ship @ast-grep/napi or web-tree-sitter, so those must keep installing
+		// with the extension, as a runtime or optional dependency. Demoting one to
+		// a host-provided peer would break analysis at runtime.
+		const optionalDeps =
+			(pkg as { optionalDependencies?: Record<string, string> })
+				.optionalDependencies ?? {};
+		for (const name of LAZY_NATIVE_PACKAGES) {
+			expect(
+				Object.hasOwn(deps, name) || Object.hasOwn(optionalDeps, name),
+				`${name} must stay a runtime or optional dependency`,
+			).toBe(true);
+			expect(
+				HOST_PROVIDED_PACKAGES.includes(name),
+				`${name} is not host-provided`,
+			).toBe(false);
+		}
+	});
+});
+
+// #2682 / #3805: pi-coding-agent and pi-tui are HOST-PROVIDED peers, so both
+// declare `"*"` -- pi's own rule (its resource loader warns when an extension
+// lists a host package anywhere but `peerDependencies` with a `*` range). The
+// recurrence: #2586 narrowed pi-tui to `^0.84.1 || ^0.85.0`, and on pi 0.99 a
+// raw `npm i` with pi-tui at the top level is a hard ERESOLVE (npm 9.2.0
+// treats even an optional peer conflict as fatal), while `pi install` runs
+// `--legacy-peer-deps` and shows the user nothing -- the range only ever cost
+// developers and CI. The window pi-lens actually supports is enforced where it
+// is measured: `PI_HOST_SUPPORTED_RANGE` in install-smoke.yml, below.
+describe("host-provided peers are open; the supported window lives in install-smoke (#2682, #3805)", () => {
+	for (const name of [
+		"@earendil-works/pi-coding-agent",
+		"@earendil-works/pi-tui",
+	]) {
+		it(`declares ${name} as the open peer "*"`, () => {
+			expect(pkg.peerDependencies?.[name]).toBe("*");
+		});
+	}
+
+	const workflow = yaml.load(
+		fs.readFileSync(
+			path.join(root, ".github", "workflows", "install-smoke.yml"),
+			"utf8",
+		),
+	) as { env?: Record<string, string> };
+	const window = workflow.env?.PI_HOST_SUPPORTED_RANGE ?? "";
+	const floor = workflow.env?.PI_HOST_FLOOR_VERSION ?? "";
+
+	// Certified hosts (release-QA witness, or maintainer certification recorded
+	// in the row). NOT derived from the lockfile: its pi version is only a
+	// test host, not a promise. #4688 removed the
+	// 0.80, 0.84 and 0.85 rows with the certified floor, because a pi below
+	// 0.86 emits no `context_with_system` and receives no findings at all.
+	const RELEASE_QA_VERIFIED_HOSTS = [
+		"0.86.1",
+		"0.87.1",
+		"0.99.2",
+		"1.0.4",
+		"1.1.0",
+		"1.2.0",
+		"1.3.0",
+		"1.4.0",
+		"1.5.0",
+	];
+	const VERIFIED_MINOR_LINES = [
+		"0.86",
+		"0.87",
+		"0.99",
+		"1.0",
+		"1.1",
+		"1.2",
+		"1.3",
+		"1.4",
+		"1.5",
+	];
+
+	it("declares a window at all", () => {
+		expect(
+			semver.validRange(window),
+			`window ${JSON.stringify(window)}`,
+		).not.toBe(null);
+		expect(semver.valid(floor), `floor ${JSON.stringify(floor)}`).not.toBe(
+			null,
+		);
+	});
+
+	for (const version of RELEASE_QA_VERIFIED_HOSTS) {
+		it(`admits the release-qa verified host ${version}`, () => {
+			expect(
+				semver.satisfies(version, window),
+				`PI_HOST_SUPPORTED_RANGE (${window}) must admit ${version}`,
+			).toBe(true);
+		});
+	}
+
+	it("starts exactly at the promised floor", () => {
+		expect(semver.satisfies(floor, window)).toBe(true);
+		expect(semver.satisfies(semver.inc(floor, "patch") ?? "", window)).toBe(
+			true,
+		);
+		expect(
+			semver.satisfies(
+				`0.${semver.minor(floor)}.${semver.patch(floor) - 1}`,
+				window,
+			),
+		).toBe(false);
+	});
+
+	it("keeps the next unverified host out (1.6.0 stays out)", () => {
+		expect(semver.satisfies("1.6.0", window)).toBe(false);
+	});
+
+	// Recurrence prevented (#4513): the ceiling moved from <1.2.0 to <1.4.0 while
+	// the real-pi compat smoke stayed on the oldest supported floor, so nothing
+	// exercised the new top of the window. The floor is install-smoke's job;
+	// compat-smoke carries the newest verified host.
+	it("pins compat-smoke to the newest release-qa verified host", () => {
+		const compat = yaml.load(
+			fs.readFileSync(
+				path.join(root, ".github", "workflows", "compat-smoke.yml"),
+				"utf8",
+			),
+		) as {
+			jobs: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+		};
+		const runs = Object.values(compat.jobs)
+			.flatMap((job) => job.steps ?? [])
+			.filter((step) => step.name === "Install pi")
+			.map((step) => step.run ?? "");
+		expect(runs).toHaveLength(1);
+		// Shell comment lines are prose, not the install command.
+		const command = (runs[0] as string)
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("#"))
+			.join("\n");
+		const pinned = command.match(
+			/@earendil-works\/pi-coding-agent@(\d+\.\d+\.\d+)/,
+		)?.[1];
+		const newest = [...RELEASE_QA_VERIFIED_HOSTS].sort(semver.compare).at(-1);
+		expect(pinned).toBe(newest);
+	});
+
+	// Recurrence prevented (#4513): a dependency bump to pi 1.4 would put the
+	// test host past the window before release-qa has run on it.
+	it("keeps the locked dev host inside the supported window", () => {
+		const lock = JSON.parse(
+			fs.readFileSync(path.join(root, "package-lock.json"), "utf8"),
+		) as { packages: Record<string, { version?: string }> };
+		const locked =
+			lock.packages["node_modules/@earendil-works/pi-coding-agent"]?.version ??
+			"";
+		expect(
+			semver.satisfies(locked, window),
+			`locked pi-coding-agent ${locked} vs PI_HOST_SUPPORTED_RANGE (${window})`,
+		).toBe(true);
+	});
+
+	it("has a release-qa verified host on every certified minor line", () => {
+		for (const minorLine of VERIFIED_MINOR_LINES) {
+			expect(
+				RELEASE_QA_VERIFIED_HOSTS.some((version) =>
+					version.startsWith(`${minorLine}.`),
+				),
+				`${minorLine} has no release-qa verified host`,
+			).toBe(true);
+		}
+	});
+
+	// #4688: the floor is declared twice on purpose -- once as the window a
+	// workflow measures, once as the policy sentence a human reads before
+	// running the matrix -- and nothing compared them. The doc kept
+	// `>=0.80.10 <1.4.0` and a host list carrying three hosts below the
+	// certified floor after the floor moved, so the two declarations could
+	// disagree with every case above still green.
+	const baselineDoc = fs.readFileSync(
+		path.join(root, "docs", "release-qa-baseline.md"),
+		"utf8",
+	);
+
+	it("states in the baseline doc the same certified policy the workflow enforces", () => {
+		const cited = baselineDoc.match(/The certified policy is `([^`]+)`/)?.[1];
+		expect(cited, "docs/release-qa-baseline.md 'Verified hosts' policy").toBe(
+			window,
+		);
+	});
+
+	// #4688 R2 (F1): the paragraph said `0.81–0.83 are in-window` after the floor
+	// moved past them. #4688's own sweep enumerated the three removed host
+	// versions (`0\.80\.10|>=0\.80|0\.84\.1|0\.85\.1`), so the class -- any minor
+	// below the new floor -- survived it (AGENTS.md shape 69). The paragraph now
+	// names the certified minor range, and this case reads that sentence against
+	// the workflow's own values: a rewording reds, which is the fail-closed
+	// behaviour the policy case above already has.
+	it("states in the baseline doc the certified minor range the workflow enforces", () => {
+		const clause = baselineDoc.match(
+			/one verified host per minor line from (\d+\.\d+) onward;\s+(\d+\.\d+)[–-](\d+\.\d+)\s+are\s+in-window/,
+		);
+		expect(
+			clause,
+			"docs/release-qa-baseline.md 'P1 is one verified host per minor line …' clause",
+		).toBeTruthy();
+		const [from, low, high] = (clause as RegExpMatchArray).slice(1) as [
+			string,
+			string,
+			string,
+		];
+		// The range must start on the floor's own minor line, derived from
+		// PI_HOST_FLOOR_VERSION, and end on the newest verified host's minor line,
+		// derived from this ratchet. Both ends are independent of the clause.
+		const floorMinorLine = `${semver.major(floor)}.${semver.minor(floor)}`;
+		const newest =
+			[...RELEASE_QA_VERIFIED_HOSTS].sort(semver.compare).at(-1) ?? "";
+		const newestMinorLine = `${semver.major(newest)}.${semver.minor(newest)}`;
+		expect(from, "docs/release-qa-baseline.md in-window start").toBe(
+			floorMinorLine,
+		);
+		expect(low, "docs/release-qa-baseline.md in-window range start").toBe(
+			floorMinorLine,
+		);
+		expect(high, "docs/release-qa-baseline.md in-window range end").toBe(
+			newestMinorLine,
+		);
+	});
+
+	// #4688 R2 (F1), the class sweep: the defect was an enumeration of three
+	// removed versions, so a claim naming any other pre-floor minor slipped by.
+	// Every `<x.y>[–<x.y>] are in-window` claim in the two files that declare the
+	// window is read here, and the claim's low end must not sit below the floor.
+	it("claims no minor line below the floor is in-window", () => {
+		const files = [
+			[
+				"docs/release-qa-baseline.md",
+				fs.readFileSync(
+					path.join(root, "docs", "release-qa-baseline.md"),
+					"utf8",
+				),
+			],
+			[
+				".github/workflows/install-smoke.yml",
+				fs.readFileSync(
+					path.join(root, ".github", "workflows", "install-smoke.yml"),
+					"utf8",
+				),
+			],
+		] as const;
+		const claims = files.flatMap(([file, text]) =>
+			[
+				...text.matchAll(/(?<![\w.])(\d+\.\d+)[–-](\d+\.\d+) are in-window/g),
+			].map((match) => ({
+				file,
+				claim: match[0],
+				low: match[1] as string,
+			})),
+		);
+		// A sweep that reads no claim is not a passing sweep: both files must keep
+		// stating the in-window range, which is what gives the check below a
+		// population to refuse.
+		for (const [file, text] of files) {
+			expect(
+				claims.filter((entry) => entry.file === file),
+				`${file} must keep an in-window claim`,
+			).not.toEqual([]);
+			// Fail closed: every "in-window" mention must be a form the regex reads,
+			// so a wording it cannot parse ("0.85 through 1.3") reds, not passes.
+			expect(
+				text.match(/in-window/g)?.length,
+				`${file}: every "in-window" mention must read "<x.y>-<x.y> are in-window"`,
+			).toBe(claims.filter((entry) => entry.file === file).length);
+		}
+		const floorMinorLine = `${semver.major(floor)}.${semver.minor(floor)}.0`;
+		const belowFloor = claims.filter((entry) =>
+			semver.lt(`${entry.low}.0`, floorMinorLine),
+		);
+		expect(
+			belowFloor.map((entry) => `${entry.file}: ${entry.claim}`),
+			`in-window claim(s) naming a minor below the floor ${floor}: ${belowFloor.map((entry) => `${entry.file}: ${entry.claim}`).join("; ")}`,
+		).toEqual([]);
+	});
+
+	// #4688 R2 (F3): the two prose floors a human reads before running the
+	// matrix were graded by nothing, so a later floor move could leave either
+	// behind while every case here stayed green.
+	it("states the same floor in the baseline doc's floor sentence", () => {
+		const cited = baselineDoc.match(/The floor is (\d+\.\d+\.\d+)/)?.[1];
+		expect(cited, "docs/release-qa-baseline.md 'The floor is …'").toBe(floor);
+	});
+
+	it("states the same floor in the README's requirement line", () => {
+		const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+		const cited = readme.match(/a pi host of (\d+\.\d+\.\d+) or newer/)?.[1];
+		expect(cited, "README.md 'a pi host of … or newer'").toBe(floor);
+	});
+
+	it("keeps the baseline doc's verified-host table and this ratchet one list", () => {
+		const { rows, hasHeader } = parseVerifiedHostRows(baselineDoc);
+		// The header is part of the table's structure, not of its content: a
+		// table that lost its header is not a shorter list of hosts, it is a
+		// list this ratchet cannot read (#4719 F4).
+		expect(
+			hasHeader,
+			"docs/release-qa-baseline.md 'Verified hosts' has its header row",
+		).toBe(true);
+		const unreadable = rows.filter((row) => row.version === null);
+		// Fail closed on a row this reader cannot parse (#4688 R2 F2): a row
+		// spelled `| 1.4 |` is a host the ratchet does not carry and the window
+		// excludes, and dropping it silently let it ship.
+		expect(
+			unreadable.map((row) => row.line),
+			`docs/release-qa-baseline.md verified-host row(s) with no \`| x.y.z |\` version: ${unreadable.map((row) => row.line).join("; ")}`,
+		).toEqual([]);
+		// A set comparison (#4688 R2 F4): a certified host back-filled in the
+		// middle of the range is the doc's own update habit, not a disagreement
+		// about membership.
+		expect(
+			rows.map((row) => row.version as string).sort(semver.compare),
+		).toEqual([...RELEASE_QA_VERIFIED_HOSTS].sort(semver.compare));
+	});
+
+	it("lists no verified host the certified window excludes", () => {
+		const excluded = parseVerifiedHostRows(baselineDoc)
+			.rows.map((row) => row.version)
+			.filter((version): version is string => version !== null)
+			.filter((version) => !semver.satisfies(version, window));
+		expect(
+			excluded,
+			`PI_HOST_SUPPORTED_RANGE (${window}) excludes listed host(s) ${excluded.join(", ")}`,
+		).toEqual([]);
+	});
+});
+
+// Recurrence prevented (#4513): `build:dist` reads the esbuild and tsc versions
+// out of package-lock.json. esbuild was in the lock only because pi 1.1's
+// `@earendil-works/chord` pulled it in; pi 1.2 dropped chord, the regenerated
+// lock lost esbuild, and bundle-dist threw "needs an exact locked version".
+// A tool whose version a build script reads from the lock is a direct
+// devDependency, so no host release can remove it by accident.
+describe("build tools read from the lock are direct dev dependencies (#4513)", () => {
+	for (const tool of ["esbuild", "typescript"]) {
+		it(`declares ${tool} and locks an exact version`, () => {
+			expect(pkg.devDependencies?.[tool]).toBeDefined();
+			expect(() =>
+				readLockedToolVersion({ root, packageName: tool }),
+			).not.toThrow();
+		});
+	}
+});
+
+// Guards the #335 bundle CONTRACT against the built entry: pi's Bun-compiled
+// host cannot resolve a bare specifier from the extension's node_modules, so the
+// bundle must inline the pure-JS deps and keep only host-provided + native/wasm
+// packages external. dist/ is gitignored, so this only runs post-build (CI runs
+// build:dist before the suite); a source-only checkout skips it.
+describe("bundled dist entry shape (#335)", () => {
+	const distEntry = path.join(root, "dist", "index.js");
+	const built = fs.existsSync(distEntry);
+	const src = built ? fs.readFileSync(distEntry, "utf8") : "";
+
+	it.runIf(built)("inlines the pure-JS deps (no bare import at load)", () => {
+		for (const dep of ["minimatch", "js-yaml", "vscode-jsonrpc"]) {
+			const bareImport = src.includes(`from "${dep}"`);
+			const bareRequire =
+				src.includes(`require("${dep}")`) || src.includes(`require('${dep}')`);
+			expect(
+				bareImport || bareRequire,
+				`${dep} must be inlined, not bare-imported`,
+			).toBe(false);
+		}
+	});
+
+	it.runIf(built)(
+		"carries exactly ONE require banner (bundle is idempotent)",
+		() => {
+			// The banner line mentions __pilensCreateRequire twice (import alias +
+			// call). A doubled banner — the pre-guard artifact of running
+			// `bundle:dist` standalone on an already-bundled entry — would show 4 and
+			// fail to load ("Identifier ... has already been declared").
+			const count = src.match(/__pilensCreateRequire/g)?.length ?? 0;
+			expect(count).toBe(2);
+		},
+	);
+
+	it.runIf(built)("keeps host-provided packages external", () => {
+		// Derived from the same list bundle-dist.mjs uses (#1926), so the bundle
+		// contract and the dependency contract cannot drift apart. Only the ones
+		// the entry actually imports are asserted; pi-coding-agent is types-only
+		// apart from the one lazy lookup `tests/host-sdk-type-only.test.ts`
+		// admits in `index.ts` (#3506), admitted here by the same exact count.
+		const count = (needle: string) => src.split(needle).length - 1;
+		const lazyImports: Readonly<Record<string, number>> = {
+			"@earendil-works/pi-coding-agent": 1,
+		};
+		const imported = HOST_PROVIDED_PACKAGES.filter(
+			(dep) => count(`"${dep}"`) > count(`import("${dep}")`),
+		);
+		expect(imported.length).toBeGreaterThan(0);
+		for (const dep of HOST_PROVIDED_PACKAGES) {
+			expect(
+				count(`import("${dep}")`),
+				`${dep}: lazy dynamic imports in dist/index.js`,
+			).toBe(lazyImports[dep] ?? 0);
+		}
+		for (const dep of imported) {
+			expect(
+				src.includes(`from "${dep}"`),
+				`${dep} must stay an external import`,
+			).toBe(true);
+		}
+	});
+
+	it.runIf(built)(
+		"resolves native/wasm via file:// URL, not a bare specifier",
+		() => {
+			// A raw absolute path is not a valid Windows import specifier; both lazy
+			// accessors must convert the createRequire-resolved path via
+			// pathToFileURL before dynamic-importing. web-tree-sitter's exports map
+			// has only the `.` entry, so the bare package name is resolved (never a
+			// custom subpath). esbuild suffixes the require var (_require2 etc.), so
+			// match the .resolve(<pkg>) call shape rather than the exact var name.
+			expect(src).toMatch(/\.resolve\("@ast-grep\/napi"\)/);
+			expect(src).toMatch(/\.resolve\("web-tree-sitter"\)/);
+			expect(src).not.toContain('.resolve("web-tree-sitter/tree-sitter');
+			expect(src).toContain("pathToFileURL");
+		},
+	);
+
+	// #2594 review F1/F2: scripts/bundle-dist.mjs's `npm exec --package
+	// esbuild@…` spawn originally ran with `cwd: root`, but esbuild bakes its
+	// bundled-module-path banner COMMENTS relative to esbuild's own cwd. A
+	// since-reverted fix moved that cwd to a temp directory to dodge a
+	// project-tree dependency collision (#2590) and, as a side effect, baked
+	// the temp path (and this machine's home directory, via the temp dir's
+	// full path) into every one of those comments in the shipped
+	// dist/index.js — the exact #1718/#1728 hardcoded-machine-path shape,
+	// just introduced by the bundler instead of a hand-typed literal. The fix
+	// keeps `cwd: root` (so esbuild's own relative paths stay correct) and
+	// isolates npm's tree lookup via `--prefix` instead. Reuses the same
+	// regex `tests/scripts/no-hardcoded-machine-paths.test.ts` scans source
+	// with, so the two guards cannot drift onto different patterns.
+	it.runIf(built)("bakes no user-profile absolute path into the bundle", () => {
+		// Reviewed, named exception — never a blanket skip (same policy as
+		// no-hardcoded-machine-paths.test.ts's own ALLOWLIST). This is a real,
+		// pre-existing, unrelated match: clients/knip-client.ts's own doc
+		// comment discusses a historical incident with the literal example path
+		// "/home/v" (a one-letter example username), which the regex's
+		// `[A-Za-z0-9_.-]+` (1-or-more) legitimately matches. It has nothing to
+		// do with this bundle's build tooling and is present in every build,
+		// buggy or not — excluding it by exact value leaves the check exactly as
+		// strict against the actual defect shape (hundreds of distinct
+		// `/home/<real-user>` occurrences from esbuild's own banner comments).
+		const KNOWN_BENIGN_MATCHES = new Set(["/home/v"]);
+		const matches = (src.match(USER_PROFILE_PATH_RE) ?? []).filter(
+			(m) => !KNOWN_BENIGN_MATCHES.has(m),
+		);
+		expect(matches).toEqual([]);
+	});
+
+	// #5365: the #4314 pin ("every dynamic import in a shipped file resolves
+	// inside the tarball") is gone. `packedImportResolutionViolations` covers the
+	// same contract over the whole pack list instead of dist/ alone: a literal
+	// dynamic import of a file the pack does not carry, and a computed specifier
+	// that names a `./`-shaped path (`import(["./lsp", "capabilities.js"].join("/"))`,
+	// the 4.4.2 failure #4314 records), are each a finding there, with the
+	// pathToFileURL runtime loads admitted by shape.
+});
+
+describe("tsconfig.dist.json", () => {
+	const dist = JSON.parse(
+		fs.readFileSync(path.join(root, "tsconfig.dist.json"), "utf8"),
+	) as {
+		compilerOptions?: { outDir?: string; types?: string[]; allowJs?: boolean };
+		exclude?: string[];
+		include?: string[];
+	};
+
+	it("emits to ./dist", () => {
+		expect(dist.compilerOptions?.outDir).toBe("./dist");
+	});
+
+	it("excludes tests from the published build", () => {
+		const ex = dist.exclude ?? [];
+		expect(ex.some((e) => e.includes("test"))).toBe(true);
+	});
+
+	it("does not require @types/node during production install-time dist builds", () => {
+		// pi installs git extensions with `npm install --omit=dev`, then npm runs
+		// `prepare`. In that environment dev-only @types/node is absent, so the
+		// dist config must not inherit the base config's `types: ["node"]` entry.
+		expect(dist.compilerOptions?.types).toEqual([]);
+	});
+
+	it("compiles the shared process-table seam into dist so esbuild can inline it", () => {
+		// #2443: `clients/process-snapshot.ts` imports
+		// `../scripts/lib/process-scan.mjs` (the seam lives in scripts/ because
+		// the worktree-hygiene hooks run before anything is built — see that
+		// file's header). tsc resolves its TYPES from the sibling `.d.mts` and
+		// would emit no JS at all, leaving `dist/clients/process-snapshot.js`
+		// importing a file that is not there — and `bundle:dist` then dies with
+		// "Could not resolve". Naming the .mjs in `include` (with `allowJs`)
+		// puts it at `dist/scripts/lib/process-scan.mjs`, exactly where that
+		// relative specifier lands.
+		expect(dist.compilerOptions?.allowJs).toBe(true);
+		expect(dist.include ?? []).toContain("scripts/lib/process-scan.mjs");
+	});
+
+	it("compiles the shared skills predicate into dist so esbuild can inline it (#2626)", () => {
+		// Same failure mode as process-scan.mjs above: `clients/skills-resolver.ts`
+		// imports `../scripts/lib/skills-predicate.mjs`, and without this entry
+		// `bundle:dist` dies trying to resolve it from `dist/clients/`.
+		expect(dist.include ?? []).toContain("scripts/lib/skills-predicate.mjs");
+	});
+});

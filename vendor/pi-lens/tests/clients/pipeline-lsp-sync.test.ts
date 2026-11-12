@@ -1,0 +1,484 @@
+// flake-shape: raw-timer-wait — "records NOTHING when Escape aborts mid-flight" (#2523 slice 2) schedules `setTimeout(() => controller.abort(), 20)` to fire the caller's abort DURING an in-flight, never-resolving `resyncLspFile` call; the subject is the ordering (abort arrives mid-await, not before or after), which a fake clock cannot exercise against a real never-settling mock without a manual `vi.advanceTimersByTimeAsync` that would just re-encode the same real ordering (#2557 review round 3).
+/**
+ * The pre-dispatch LSP sync (`resyncLspFile`) must never let a wedged language
+ * server hang the edit. Its didChange/didOpen write can backpressure forever
+ * when the server's stdin isn't drained, so the sync is bounded by a hard budget
+ * (PI_LENS_LSP_SYNC_BUDGET_MS) and the turn's abort signal (Escape) — whichever
+ * wins, resyncLspFile returns and the edit proceeds. Regression guard for the
+ * "8h invisible edit hang" class.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { gatedPromise, starveBudget } from "../support/fault-injection.js";
+import { useGlobalConfig } from "../support/global-config.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
+
+const logLatencyMock = vi.fn();
+
+vi.mock("../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<typeof import("../../clients/latency-logger.js")>()),
+	logLatency: (entry: unknown) => logLatencyMock(entry),
+}));
+
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import { resyncLspFile } from "../../clients/pipeline.js";
+import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
+
+const getFlag = () => undefined;
+const dbg = () => {};
+
+function mockService(
+	touchFile: () => Promise<unknown>,
+	isSpawnInFlight: () => boolean = () => false,
+) {
+	const touch = vi.fn(touchFile);
+	const spawn = vi.fn(isSpawnInFlight);
+	installLspService(
+		makeLspServiceDouble({
+			supportsLSP: () => true,
+			touchFile: touch,
+			isSpawnInFlight: spawn,
+		}),
+	);
+}
+
+beforeEach(async () => {
+	// No service until a case installs one (`getLSPService: vi.fn()` answered
+	// undefined): the cases below that never call `mockService` reach nothing.
+	await installLspServiceDouble(null);
+	starveBudget("PI_LENS_LSP_SYNC_BUDGET_MS", 50);
+	setAmbientAbortSignal(undefined);
+	logLatencyMock.mockClear();
+	resetDegradationLedger();
+});
+afterEach(() => {
+	delete process.env.PI_LENS_LSP_SYNC_BUDGET_MS;
+	setAmbientAbortSignal(undefined);
+	vi.restoreAllMocks();
+});
+
+describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
+	// #3405: this is the ONE touch in the tree that knows pi-lens just wrote the
+	// file, so it is the one that declares a save. Recurrence it prevents: the
+	// client advertised `didSave` for months with no caller emitting one, so a
+	// save-triggered server (Expert recompiles the project on didSave and on
+	// nothing else) published nothing for an edit made through pi-lens.
+	it("declares the post-write touch a save so didSave is sent", async () => {
+		const touch = vi.fn(async () => ({ diags: [] }));
+		mockService(touch);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		expect(touch).toHaveBeenCalledWith(
+			"/proj/a.ts",
+			"content",
+			expect.objectContaining({ source: "lsp_sync", saved: true }),
+		);
+	});
+
+	// #3405 r2: the byte/line bound moved to `clients/lsp/content-limits.ts`, so
+	// the pipeline now CALLS a shared predicate instead of owning a private copy.
+	// Recurrence this prevents: deleting that call along with the copy — which is
+	// what "delete the pipeline-local check" reads as — would start handing the
+	// server whole-file didOpen frames for documents this pipeline has always
+	// refused to sync. The save seam's policy (drop the redundant text, still
+	// send the save) is deliberately NOT this one.
+	// #3481: the read stamp reaches touchFile, where the notify queue orders
+	// the sync against other reads of the file.
+	it("passes the caller's read stamp to the touch", async () => {
+		const touch = vi.fn(async () => ({ diags: [] }));
+		mockService(touch);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg, 42);
+		expect(touch).toHaveBeenCalledWith(
+			"/proj/a.ts",
+			"content",
+			expect.objectContaining({ readStamp: 42 }),
+		);
+	});
+
+	it("does not sync a document past the shared content bound", async () => {
+		const touch = vi.fn(async () => ({ diags: [] }));
+		mockService(touch);
+		// Few lines, past the BYTE bound only — so neutering the shared byte
+		// branch reds this writer too, not just the save writer.
+		const oversized = `${"x".repeat(3 * 1024 * 1024)}\n`;
+		await resyncLspFile("/proj/huge.ts", oversized, true, false, getFlag, dbg);
+		expect(touch).not.toHaveBeenCalled();
+	});
+
+	it("abandons a wedged touch after the budget instead of hanging", async () => {
+		// touchFile that never resolves = a server whose didChange write backpressures.
+		// Kit-gated (#1838): the wedge is an explicit gatedPromise, so "the budget
+		// fired before the work completed" holds on any scheduler, any load.
+		const gate = gatedPromise<unknown>();
+		mockService(() => gate.promise);
+		const started = Date.now();
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		const elapsed = Date.now() - started;
+		expect(elapsed).toBeGreaterThanOrEqual(45);
+		expect(elapsed).toBeLessThan(2000); // returned, did not hang
+		gate.resolve(null); // release the gate so nothing dangles into teardown
+	});
+
+	// #2523 slice 2. The bound above used to be `combineAbortSignals(abort,
+	// AbortSignal.timeout(budgetMs))` fed into a hand-rolled `Promise.race` —
+	// a private fifth copy of "deadline AND signal" that recorded nothing.
+	// It is `bounded()` now, and the ledger row is the only difference an
+	// elapsed-time assertion cannot see: revert the fold and this reds on a
+	// missing `hook-await-exceeded`, while every case around it stays green.
+	it("records the abandonment under hook-await-exceeded, naming the seam", async () => {
+		const gate = gatedPromise<unknown>();
+		mockService(() => gate.promise);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "hook-await-exceeded",
+		);
+		expect(group?.latestReasons.at(-1)?.subject).toBe(
+			"tool_result_edit:resyncLspFile",
+		);
+		// The pre-existing latency record is NOT replaced by the ledger row —
+		// the two answer different questions (which server stalled, versus
+		// which hook budget was spent).
+		expect(
+			logLatencyMock.mock.calls
+				.map((call) => call[0])
+				.some((entry: any) => entry.phase === "lsp_sync_abandoned"),
+		).toBe(true);
+		gate.resolve(null);
+	});
+
+	it("records NOTHING when Escape aborts mid-flight — a cancel is not a degradation", async () => {
+		// `bounded()`'s cause precedence, at this call site: a caller abort
+		// must not surface in `pilens_health` next to a wedged server. Fold the
+		// signal back out of the race and this case reds, because the deadline
+		// would then be the only way out.
+		mockService(() => new Promise(() => {}));
+		const controller = new AbortController();
+		setAmbientAbortSignal(controller.signal);
+		process.env.PI_LENS_LSP_SYNC_BUDGET_MS = "10000";
+		const pending = resyncLspFile(
+			"/proj/a.ts",
+			"content",
+			true,
+			false,
+			getFlag,
+			dbg,
+		);
+		setTimeout(() => controller.abort(), 20);
+		await pending;
+		// The WHOLE summary, not just `hook-await-exceeded`: recording a cancel
+		// under the informational `hook-await-abandoned` kind instead would be
+		// the same inversion in a quieter tier, and a kind-specific assertion
+		// would wave it through (measured — that mutation left this green).
+		expect(getDegradationSummary()).toEqual([]);
+	});
+
+	it("returns immediately when the turn is already aborted, without touching", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		setAmbientAbortSignal(controller.signal);
+		const touch = vi.fn(() => new Promise(() => {}));
+		mockService(touch);
+		const started = Date.now();
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		expect(Date.now() - started).toBeLessThan(30);
+		expect(touch).not.toHaveBeenCalled();
+	});
+
+	it("bails as soon as Escape aborts mid-flight (before the budget)", async () => {
+		mockService(() => new Promise(() => {}));
+		const controller = new AbortController();
+		setAmbientAbortSignal(controller.signal);
+		process.env.PI_LENS_LSP_SYNC_BUDGET_MS = "10000"; // long, so abort wins the race
+		const started = Date.now();
+		const p = resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		setTimeout(() => controller.abort(), 30);
+		await p;
+		expect(Date.now() - started).toBeLessThan(2000);
+	});
+
+	it("completes normally (fast) when the server is healthy", async () => {
+		const touch = vi.fn(() => Promise.resolve([]));
+		mockService(touch);
+		const started = Date.now();
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		expect(Date.now() - started).toBeLessThan(45); // resolved well before the budget
+		expect(touch).toHaveBeenCalledTimes(1);
+	});
+
+	// #1766: the resync deadline can expire while the target server's FIRST
+	// spawn is still in flight (a cold spawn slower than the budget). The old
+	// wording blamed that server as "slow/wedged" — a verdict about a running
+	// server — even though it did not exist yet. Synthesize the race
+	// deterministically via isSpawnInFlight rather than real spawn timing.
+	it("reports spawn-in-flight, not slow/wedged, when the deadline fires during the server's first spawn", async () => {
+		const dbgCalls: string[] = [];
+		const dbgSpy = (msg: string) => dbgCalls.push(msg);
+		mockService(
+			() => new Promise(() => {}), // touch never resolves within the test
+			() => true, // the target server's spawn is still unresolved
+		);
+		await resyncLspFile(
+			"/proj/new.json",
+			"content",
+			true,
+			false,
+			getFlag,
+			dbgSpy,
+		);
+
+		const joined = dbgCalls.join("\n");
+		expect(joined).toContain("spawn-in-flight");
+		expect(joined).not.toContain("slow/wedged");
+
+		const abandoned = logLatencyMock.mock.calls
+			.map((call) => call[0])
+			.find((entry: any) => entry.phase === "lsp_sync_abandoned");
+		expect(abandoned?.metadata?.reason).toBe("spawn-in-flight");
+		expect(abandoned?.filePath).toBe("/proj/new.json");
+	});
+
+	it("still reports slow/wedged when no spawn is in flight (a genuinely stalled running server)", async () => {
+		const dbgCalls: string[] = [];
+		const dbgSpy = (msg: string) => dbgCalls.push(msg);
+		mockService(
+			() => new Promise(() => {}),
+			() => false, // no spawn pending — this server is already running
+		);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbgSpy);
+
+		const joined = dbgCalls.join("\n");
+		expect(joined).toContain("slow/wedged");
+		expect(joined).not.toContain("spawn-in-flight");
+
+		const abandoned = logLatencyMock.mock.calls
+			.map((call) => call[0])
+			.find((entry: any) => entry.phase === "lsp_sync_abandoned");
+		expect(abandoned?.metadata?.reason).toBe("timeout");
+	});
+
+	// #1766 review F3, restated for the #2592 contract. The invariant is
+	// unchanged: a stall must never go UNRECORDED because the spawn-state
+	// discriminator misbehaved — an unguarded call that throws lands in
+	// resyncLspFile's swallow-all catch and takes the lsp_sync_abandoned
+	// record with it.
+	//
+	// What changed is where the invariant is enforced. Production used to
+	// hedge with `typeof lspService.isSpawnInFlight === "function"`, for the
+	// 19 hand-rolled doubles that lacked the method; #2592 migrated all of
+	// them onto `makeLspServiceDouble` and deleted the hedge, so the contract
+	// is now "every double carries the whole surface". This case pins THAT:
+	// a bare factory double — no isSpawnInFlight override, exactly what a
+	// test that does not care about spawn state writes today — still reaches
+	// the discriminator and still records the stall.
+	//
+	// It is the only case here that leans on the factory DEFAULT rather than
+	// an override, so dropping `isSpawnInFlight` from the factory's surface
+	// reds this and leaves the two cases above (which override it) green.
+	it("records the stall through the factory's default isSpawnInFlight, without falling into the catch", async () => {
+		const dbgCalls: string[] = [];
+		const dbgSpy = (msg: string) => dbgCalls.push(msg);
+		const hangingTouch = vi.fn(() => new Promise(() => {}));
+		const service = makeLspServiceDouble({
+			supportsLSP: () => true,
+			touchFile: hangingTouch,
+		});
+		expect(typeof service.isSpawnInFlight).toBe("function");
+		installLspService(service);
+
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbgSpy);
+
+		const joined = dbgCalls.join("\n");
+		expect(joined).toContain("slow/wedged");
+		expect(joined).not.toContain("after autofix error"); // did not fall into the catch
+
+		const abandoned = logLatencyMock.mock.calls
+			.map((call) => call[0])
+			.find((entry: any) => entry.phase === "lsp_sync_abandoned");
+		expect(abandoned).toBeDefined();
+		expect(abandoned?.metadata?.reason).toBe("timeout");
+	});
+
+	// #2582 F3 — the #1766 F3 invariant, re-opened for a DIFFERENT method.
+	// #2540 put the auxiliary kick-off ahead of the primary `touchFile` inside
+	// resyncLspFile's swallow-all catch, so anything that threw out of
+	// auxiliary acquisition (here: a double whose `getAuxiliaryClientsForFile`
+	// returns undefined, so `.catch` is read off undefined) aborted the WHOLE
+	// resync before the primary sync ever started — no touch, and no
+	// lsp_sync_abandoned record for the stall. Auxiliary warmup is a
+	// best-effort overlap; it must never pre-empt the primary sync.
+	it("starts the primary touch and still records the stall when auxiliary acquisition throws", async () => {
+		const dbgCalls: string[] = [];
+		const dbgSpy = (msg: string) => dbgCalls.push(msg);
+		const order: string[] = [];
+		const hangingTouch = vi.fn(() => {
+			order.push("touchFile");
+			return new Promise(() => {});
+		});
+		// The reviewer's probe verbatim: a bare `vi.fn()` returns undefined, so
+		// the production `.catch(...)` reads `catch` off undefined and throws
+		// SYNCHRONOUSLY — the failure direction a plain `.catch` cannot cover.
+		const bareAux = vi.fn(() => {
+			order.push("getAuxiliaryClientsForFile");
+		});
+		installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				touchFile: hangingTouch,
+				getAuxiliaryClientsForFile: bareAux,
+			}) as any,
+		);
+
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbgSpy);
+
+		expect(hangingTouch).toHaveBeenCalledTimes(1);
+		// Ordering is half the invariant: the primary didChange write goes out
+		// before any best-effort auxiliary work, so nothing the auxiliary path
+		// does synchronously can delay (or pre-empt) the edit's own sync.
+		expect(order).toEqual(["touchFile", "getAuxiliaryClientsForFile"]);
+		const joined = dbgCalls.join("\n");
+		expect(joined).not.toContain("after autofix error"); // did not fall into the catch
+		const abandoned = logLatencyMock.mock.calls
+			.map((call) => call[0])
+			.find((entry: any) => entry.phase === "lsp_sync_abandoned");
+		expect(abandoned).toBeDefined();
+		expect(abandoned?.metadata?.reason).toBe("timeout");
+	});
+
+	it("kicks off auxiliary server acquisition concurrently and unawaited (#2540)", async () => {
+		const neverResolvingAux = new Promise<never>(() => {});
+		const getAuxSpy = vi.fn().mockImplementation(() => neverResolvingAux);
+		const completedTouch = vi.fn().mockResolvedValue("done");
+		installLspService(
+			makeLspServiceDouble({
+				supportsLSP: () => true,
+				touchFile: completedTouch,
+				getAuxiliaryClientsForFile: getAuxSpy,
+			}) as any,
+		);
+
+		const resyncPromise = resyncLspFile(
+			"/proj/a.ts",
+			"content",
+			true,
+			false,
+			() => undefined,
+			dbg,
+		);
+
+		// resyncLspFile resolves immediately without waiting on auxiliary warmup
+		await expect(resyncPromise).resolves.toBe("synced");
+		expect(getAuxSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+// #3528 r1 F1: the deferred drain's post-exit row reported `synced` for a
+// resync that returned before touching anything. Each return path names what
+// it did, so a caller can record `synced` only when a touch went out.
+describe("resyncLspFile — its outcome names what it did (#3528 r1 F1)", () => {
+	const setGlobalConfig = useGlobalConfig();
+	const resync = (
+		content = "content",
+		flag: (name: string) => boolean | undefined = () => undefined,
+		needsContentRefresh = true,
+		lspSyncCompleted = false,
+	) =>
+		resyncLspFile(
+			"/proj/a.ts",
+			content,
+			needsContentRefresh,
+			lspSyncCompleted,
+			flag,
+			dbg,
+		);
+
+	it("synced: the touch completed", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync()).resolves.toBe("synced");
+	});
+
+	it("no-lsp: the flag turned the LSP off", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync("content", (name) => name === "no-lsp")).resolves.toBe(
+			"no-lsp",
+		);
+	});
+
+	it("up-to-date: no refresh needed and the sync already ran", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync("content", () => undefined, false, true)).resolves.toBe(
+			"up-to-date",
+		);
+	});
+
+	it("too-large: past the shared content bound", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync(`${"x".repeat(3 * 1024 * 1024)}\n`)).resolves.toBe(
+			"too-large",
+		);
+	});
+
+	// #5306: the global `lsp.queryMaxFileLines` key lifts only the explicit
+	// single-file query's limit. Recurrence it prevents: reading the key inside
+	// the shared predicate would feed a 20k-line document to the server on every
+	// edit (clangd re-parses it whole each time: 10 CPU-s at 20k lines).
+	it("too-large: the explicit-query line key does not lift the per-edit bound", async () => {
+		setGlobalConfig({ lsp: { queryMaxFileLines: 20_000 } });
+		const touchFile = vi.fn(async () => ({ diags: [] }));
+		mockService(touchFile);
+		await expect(resync("a\n".repeat(8000))).resolves.toBe("too-large");
+		expect(touchFile).not.toHaveBeenCalled();
+	});
+
+	it("unsupported: no server serves the file", async () => {
+		installLspService(
+			makeLspServiceDouble({ supportsLSP: () => false }) as any,
+		);
+		await expect(resync()).resolves.toBe("unsupported");
+	});
+
+	it("aborted: the turn was already aborted", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		setAmbientAbortSignal(controller.signal);
+		mockService(async () => ({ diags: [] }));
+		await expect(resync()).resolves.toBe("aborted");
+	});
+
+	it("abandoned: the bound gave up on a wedged touch", async () => {
+		const gate = gatedPromise<unknown>();
+		mockService(() => gate.promise);
+		await expect(resync()).resolves.toBe("abandoned");
+		gate.resolve(null);
+	});
+
+	it("failed: the service lookup threw", async () => {
+		await installLspServiceDouble(null);
+		await expect(resync()).resolves.toBe("failed");
+	});
+
+	it("not-sent: the touch reached no client", async () => {
+		mockService(async () => undefined);
+		await expect(resync()).resolves.toBe("not-sent");
+	});
+
+	it("superseded: the notify queue dropped this read as older than one it sent", async () => {
+		mockService(async () => ({
+			diags: [],
+			supersededServerIds: ["typescript"],
+		}));
+		await expect(resync()).resolves.toBe("superseded");
+	});
+
+	it("failed: the touch rejected", async () => {
+		mockService(async () => {
+			throw new Error("server gone");
+		});
+		await expect(resync()).resolves.toBe("failed");
+	});
+});

@@ -1,0 +1,591 @@
+/**
+ * Trivy client for pi-lens — dependency CVE detection (Phase 1 of #131).
+ *
+ * Surfaces known vulnerabilities (CVE / GHSA) in a project's declared
+ * dependencies, across every ecosystem Trivy understands (npm, PyPI, Maven,
+ * Gradle, Go modules, Cargo, Composer, RubyGems, NuGet, …) from a single
+ * filesystem walk. pi-lens has zero dependency-CVE coverage otherwise.
+ *
+ * Lifecycle (mirrors the gitleaks / govulncheck session-scan clients):
+ *   - session_start scan (via the `runTask(setImmediate)` background wrapper)
+ *   - turn_end advisory reads the cached result and surfaces top-N findings;
+ *     CRITICAL is treated as a blocker, the rest as advisory
+ *   - per-edit scope: skipped — CVE data is daily-ish and the scan is whole-tree;
+ *     re-running per keystroke is wasteful. Re-scan is driven by the cache layer
+ *     (keyed on lockfile mtimes by the caller).
+ *
+ * Detection gate (explicit opt-in per #131): the project must opt in via
+ * `trivy.enabled: true` in `.pi-lens.json` AND declare a scannable dependency
+ * surface (any manifest at the analysis root). The opt-in is required because a
+ * first scan auto-installs the binary and pulls a 30-200 MB vuln DB — too heavy
+ * to enable for every project that merely has a `package.json`. Set
+ * `trivy.minSeverity` to widen what surfaces (default HIGH; never hides
+ * HIGH/CRITICAL).
+ *
+ * When the gate trips, the client auto-installs trivy from GitHub releases
+ * (installer entry registered in clients/installer/index.ts) and runs
+ * `trivy fs --scanners vuln`. The first run downloads Trivy's vuln DB
+ * (~30-200 MB); because the scan runs in the background session_start task it
+ * never blocks an edit.
+ *
+ * Scope note: this slice is dependency CVEs only. IaC misconfig (per-edit),
+ * secrets (pending dedup vs gitleaks), and license compliance are follow-ups
+ * tracked on #131.
+ *
+ * Scope note (#1562 class fix): `fs`'s own tree walk is handed
+ * `--skip-dirs` per shared scratch/cache tree (`scratch-tree-policy.ts`,
+ * derived from the same `EXCLUDED_DIRS` gitleaks/opengrep use) so its
+ * `secret` scanner doesn't repeat gitleaks's `.pi/greedysearch-sources/`
+ * false-positive shape.
+ *
+ * Refs: #131, #1562
+ */
+
+import type { AnalysedRootSignal } from "./analysed-root.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { loadPiLensProjectConfig } from "./project-lens-config.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
+import { isUnderDir, normalizeMapKey, toPosix } from "./path-utils.js";
+import {
+	getScratchTreeGlobPatterns,
+	nestedWorktreeOffsets,
+} from "./scratch-tree-policy.js";
+import { parseReportJson } from "./report-scan.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
+import { SecurityScanClient } from "./security-scan-client.js";
+import type { TrivySecretFinding } from "./secret-findings.js";
+
+// --- Types ---
+
+/** Subset of Trivy's per-vulnerability JSON fields that we surface. */
+export interface TrivyFinding {
+	vulnerabilityId: string;
+	pkgName: string;
+	installedVersion?: string;
+	fixedVersion?: string;
+	severity: TrivySeverity;
+	title?: string;
+	primaryUrl?: string;
+	/** The manifest/lockfile the vulnerable package was found in. */
+	target?: string;
+}
+
+/** Subset of Trivy's `Results[].Licenses[]` fields (#131 Mode 4). */
+export interface TrivyLicenseFinding {
+	/** License identifier, e.g. "GPL-3.0", "AGPL-3.0". */
+	license: string;
+	/** Package the license applies to (or the file, for license-file findings). */
+	pkgName: string;
+	severity: TrivySeverity;
+	/** Trivy's classification, e.g. "restricted", "reciprocal", "forbidden". */
+	category?: string;
+	/** Where it was found — the result Target or the license file path. */
+	filePath?: string;
+}
+
+export interface TrivyResult extends AnalysedRootSignal {
+	success: boolean;
+	findings: TrivyFinding[];
+	/** Hardcoded-secret findings from the same `trivy fs` pass (#131 Mode 3). */
+	secrets: TrivySecretFinding[];
+	/** Dependency license-risk findings from the same pass (#131 Mode 4). */
+	licenses: TrivyLicenseFinding[];
+	scannedAt: string;
+	summary?: string;
+}
+
+export type TrivySeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+
+const EMPTY_RESULT: Omit<TrivyResult, "scannedAt"> = {
+	success: false,
+	findings: [],
+	secrets: [],
+	licenses: [],
+};
+
+// Generous: the FIRST run downloads the vuln DB (~30-200 MB). This runs in the
+// background session_start task, so a slow cold start never blocks an edit.
+const SCAN_TIMEOUT_MS = 180_000;
+
+// --- Detection ---
+
+/**
+ * Dependency manifests / lockfiles whose presence at the analysis root opts the
+ * project in to CVE scanning. Mirrors the ecosystem coverage Trivy's SCA walk
+ * understands (#131).
+ */
+const DEPENDENCY_MANIFESTS = [
+	// JS / TS
+	"package.json",
+	"package-lock.json",
+	"pnpm-lock.yaml",
+	"yarn.lock",
+	"bun.lockb",
+	// Python
+	"pyproject.toml",
+	"requirements.txt",
+	"poetry.lock",
+	"Pipfile.lock",
+	// Java / JVM
+	"pom.xml",
+	"build.gradle",
+	"build.gradle.kts",
+	"gradle.lockfile",
+	// Go
+	"go.mod",
+	"go.sum",
+	// Rust
+	"Cargo.toml",
+	"Cargo.lock",
+	// .NET
+	"packages.lock.json",
+	// PHP
+	"composer.json",
+	"composer.lock",
+	// Ruby
+	"Gemfile",
+	"Gemfile.lock",
+] as const;
+
+/**
+ * Detect whether the analysis root declares any dependencies Trivy can scan.
+ * Root-level check (fast, synchronous) — the same shape as `hasGitleaksSignal`.
+ * Nested-only manifests in deep monorepo packages are a known follow-up; the
+ * gate intentionally errs toward not auto-pulling a 100 MB DB for a project that
+ * shows no dependency surface at its root.
+ *
+ * Exported for tests and gate-before-construct callers.
+ */
+export function hasAnyDependencyManifest(cwd: string): boolean {
+	return existingDependencyManifests(cwd).length > 0;
+}
+
+/**
+ * #4617: the manifests a `trivy fs` pass at `cwd` reads, as absolute paths —
+ * the DEPENDENCY SURFACE probe (`hasAnyDependencyManifest`) and, at turn end,
+ * the citation fallback for a report whose rows name no target.
+ *
+ * These are the manifests at `cwd` only, which is narrower than the scan: the
+ * walk reads nested manifests too, so a rendered row cites its own `Target`
+ * through `trivyEvidenceFiles` (below) and this list answers only when no
+ * shown row cites one. The one place the manifest list is turned into paths, so
+ * the detection gate and the fallback cannot disagree about which files sit at
+ * the root.
+ */
+export function existingDependencyManifests(cwd: string): string[] {
+	const found: string[] = [];
+	for (const manifest of DEPENDENCY_MANIFESTS) {
+		try {
+			const candidate = path.join(cwd, manifest);
+			if (fs.existsSync(candidate)) found.push(candidate);
+		} catch {
+			// non-fatal — keep probing the remaining manifests
+		}
+	}
+	return found;
+}
+
+/**
+ * #4617 review F1: the declarations one rendered trivy report was read from, as
+ * absolute paths — each row's target (a result's `Target`, or a license row's
+ * `FilePath`, which falls back to its result's `Target`) resolved against the
+ * scan root, deduped.
+ *
+ * `trivy fs` walks the whole tree, so the root manifests alone under-covered
+ * the scan: a monorepo package's own lockfile could move on and the CVE row
+ * still read current. A row that names no target, or one the scan root does
+ * not contain (a `..` or an absolute path outside it, review V3), contributes
+ * nothing, and a report whose rows all contribute nothing falls back to
+ * `existingDependencyManifests`
+ * (the same list the opt-in gate probes) so the tier keeps a subject — an
+ * uncited part fails the provenance stamp closed, which would label a live
+ * report historical.
+ *
+ * Bounded by the caller: it is handed the rows the report SHOWS, so a scan with
+ * hundreds of CVE rows never pushes the stamp past its file cap.
+ */
+export function trivyEvidenceFiles(
+	scanRoot: string,
+	targets: readonly (string | undefined)[],
+): string[] {
+	const files = new Set<string>();
+	for (const target of targets) {
+		if (target === undefined || target.trim() === "") continue;
+		const resolved = path.resolve(scanRoot, target);
+		// #4617 review V3: a declaration outside the scan root is not one this
+		// scan read, so it never decides the label.
+		if (!isUnderDir(resolved, scanRoot)) continue;
+		// The set is a map key: two spellings of one lockfile must collapse to one
+		// subject, and the stamp keys by the same derivation (`advisoryPathKey`).
+		files.add(normalizeMapKey(resolved));
+	}
+	return files.size > 0 ? [...files] : existingDependencyManifests(scanRoot);
+}
+
+/**
+ * Explicit opt-in: trivy runs only when the project sets `trivy.enabled: true`
+ * in `.pi-lens.json` (the loader walks up, so a `~/.pi-lens.json` enables it
+ * globally). Required because the first scan auto-installs the binary and pulls
+ * a 30-200 MB vuln DB — too costly to enable implicitly. Default OFF.
+ *
+ * Exported for tests and gate-before-construct callers.
+ */
+export function isTrivyEnabled(cwd: string): boolean {
+	try {
+		const config = loadPiLensProjectConfig(cwd);
+		const trivy = (config.raw as { trivy?: { enabled?: unknown } } | undefined)
+			?.trivy;
+		return trivy?.enabled === true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Full session-scan gate: explicit opt-in AND a scannable dependency surface.
+ * Both must hold before we auto-install trivy / pull its DB.
+ */
+export function shouldScanTrivy(cwd: string): boolean {
+	return isTrivyEnabled(cwd) && hasAnyDependencyManifest(cwd);
+}
+
+// --- Severity floor ---
+
+const SEVERITY_RANK: Record<string, number> = {
+	LOW: 0,
+	MEDIUM: 1,
+	HIGH: 2,
+	CRITICAL: 3,
+};
+
+/**
+ * Resolve the `--severity` list from the project's `pi-lens.trivy.minSeverity`
+ * (default HIGH). The floor can be LOWERED (MEDIUM / LOW = see more) but is
+ * clamped so it can never be raised above HIGH — a CRITICAL or HIGH CVE must
+ * always surface regardless of config (#131 non-goal: no bypassing criticals).
+ */
+export function resolveSeverityFloor(cwd: string): TrivySeverity[] {
+	let raw: unknown;
+	try {
+		const config = loadPiLensProjectConfig(cwd);
+		raw = (config.raw as { trivy?: { minSeverity?: unknown } } | undefined)
+			?.trivy?.minSeverity;
+	} catch {
+		raw = undefined;
+	}
+	const requested =
+		typeof raw === "string" ? SEVERITY_RANK[raw.toUpperCase()] : undefined;
+	// Default HIGH; never stricter than HIGH so HIGH/CRITICAL are never hidden.
+	const floor = Math.min(requested ?? SEVERITY_RANK.HIGH, SEVERITY_RANK.HIGH);
+	return (["LOW", "MEDIUM", "HIGH", "CRITICAL"] as TrivySeverity[]).filter(
+		(s) => SEVERITY_RANK[s] >= floor,
+	);
+}
+
+/**
+ * `--skip-dirs` values for the linked worktrees under `cwd` (#4132): the path
+ * relative to `cwd`, which trivy matches against each directory's path relative
+ * to the scan root (v0.75.0 `BuildSkipPaths`, an absolute path is re-based
+ * onto the unresolved root and misses through a symlinked `cwd`). The flag is
+ * a comma-split slice and the value a doublestar glob, so a path holding a
+ * comma, a quote or a glob character is counted, not passed.
+ */
+export function worktreeSkipDirs(
+	cwd: string,
+	separator = path.sep,
+	maxArgumentChars = separator === "\\" ? 30_000 : Number.POSITIVE_INFINITY,
+): string[] {
+	const unsafe = separator === "\\" ? /[,"*?[\]{}]/ : /[,"*?[\]{}\\]/;
+	const skips: string[] = [];
+	let argumentChars = 0;
+	for (const offset of nestedWorktreeOffsets(cwd)) {
+		if (unsafe.test(offset)) {
+			incrementDegradationCount({
+				kind: "scan-worktree-exclusion-skipped",
+				subject: "trivy",
+				reason: `csv-or-glob-char-in-path: ${offset} not skipped under ${cwd}`,
+			});
+			continue;
+		}
+		const value = toPosix(offset);
+		const addedChars = "--skip-dirs".length + value.length + 2;
+		if (argumentChars + addedChars > maxArgumentChars) {
+			incrementDegradationCount({
+				kind: "scan-worktree-exclusion-skipped",
+				subject: "trivy",
+				reason: `windows-command-line-cap: ${offset} not skipped under ${cwd}`,
+			});
+			continue;
+		}
+		skips.push(value);
+		argumentChars += addedChars;
+	}
+	return skips;
+}
+
+// --- Client ---
+
+export class TrivyClient extends SecurityScanClient<TrivyResult> {
+	constructor(verbose = false) {
+		super("trivy", verbose);
+	}
+
+	/** Static gates so callers can skip before constructing. */
+	static hasAnyDependencyManifest(cwd: string): boolean {
+		return hasAnyDependencyManifest(cwd);
+	}
+
+	/** Full opt-in gate (config opt-in AND a dependency manifest). */
+	static shouldScan(cwd: string): boolean {
+		return shouldScanTrivy(cwd);
+	}
+
+	/**
+	 * Auto-install via the GitHub-release path (registered in
+	 * `clients/installer/index.ts`) when trivy isn't already on PATH.
+	 */
+	protected doEnsureAvailable(): Promise<boolean> {
+		return this.ensureViaInstaller(["--version"]);
+	}
+
+	/**
+	 * Scan a directory tree for dependency CVEs.
+	 *
+	 * Skips early when the opt-in gate isn't satisfied. When trivy is
+	 * unavailable, returns an empty (but successful) result rather than failing
+	 * the session_start task. Re-entrancy safe: concurrent calls against the
+	 * same root share a single process.
+	 */
+	async scan(cwd: string): Promise<TrivyResult> {
+		const targetDir = path.resolve(cwd);
+		const scannedAt = new Date().toISOString();
+
+		if (!shouldScanTrivy(targetDir)) {
+			return {
+				...EMPTY_RESULT,
+				success: true,
+				scannedAt,
+				summary: hasAnyDependencyManifest(targetDir)
+					? "trivy not enabled (set trivy.enabled in .pi-lens.json)"
+					: "no dependency manifest at analysis root",
+			};
+		}
+
+		if (!(await this.ensureAvailable())) {
+			return { ...EMPTY_RESULT, scannedAt, summary: "trivy not installed" };
+		}
+
+		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
+	}
+
+	private runScan(cwd: string): Promise<TrivyResult> {
+		const bin = this.binaryPath ?? "trivy";
+		const severities = resolveSeverityFloor(cwd);
+		return this.runReportScan({
+			spawn: ({ reportPath }) => {
+				// One filesystem walk covers all three scanners. `--severity` filters
+				// both the vuln and the license results; secret findings are
+				// severity-independent (trivy always emits them) and collapsed
+				// downstream against gitleaks / ast-grep.
+				//
+				// `--skip-dirs` (#1562 class fix): trivy's `fs` scan walks `cwd`
+				// ITSELF (unlike knip/jscpd, which pi-lens's own `EXCLUDED_DIRS`-aware
+				// walker feeds a pre-filtered file list). Without this, its `secret`
+				// scanner is exactly as exposed to `.pi/greedysearch-sources/`-style
+				// scratch trees as gitleaks was — same doublestar-glob patterns
+				// `scratch-tree-policy.ts` derives from the SAME `EXCLUDED_DIRS` list.
+				return safeSpawnAsync(
+					bin,
+					[
+						"fs",
+						"--scanners",
+						"vuln,secret,license",
+						"--severity",
+						severities.join(","),
+						"--format",
+						"json",
+						"--output",
+						reportPath,
+						"--quiet",
+						"--no-progress",
+						...[
+							...getScratchTreeGlobPatterns(),
+							...worktreeSkipDirs(cwd),
+						].flatMap((glob) => ["--skip-dirs", glob]),
+						cwd,
+					],
+					{ cwd, timeout: SCAN_TIMEOUT_MS },
+				);
+			},
+			parse: (raw, scannedAt) => {
+				const findings = parseTrivyReport(raw);
+				const secrets = parseTrivySecrets(raw);
+				const licenses = parseTrivyLicenses(raw);
+				// #2154: the one trivy site that parsed a scan of this root.
+				return {
+					success: true,
+					analyzed: true,
+					findings,
+					secrets,
+					licenses,
+					scannedAt,
+				};
+			},
+			// Only master's three fields: the failure's raw parts (stderr, status,
+			// outcome) stay in the ledger lane, never in a result that is cached
+			// on success (round-1 review of #5440, F1).
+			fail: ({ success, scannedAt, summary }) => ({
+				...EMPTY_RESULT,
+				success: success === true,
+				scannedAt,
+				summary,
+			}),
+		});
+	}
+}
+
+// --- Parser ---
+
+function normalizeSeverity(raw: unknown): TrivySeverity {
+	const s = typeof raw === "string" ? raw.toUpperCase() : "";
+	if (s === "CRITICAL" || s === "HIGH" || s === "MEDIUM" || s === "LOW") {
+		return s;
+	}
+	return "UNKNOWN";
+}
+
+/**
+ * Map Trivy's `fs --format json` report to our `TrivyFinding[]`. The report is
+ * `{ Results: [{ Target, Vulnerabilities: [{ VulnerabilityID, PkgName, … }] }] }`;
+ * `Results` / `Vulnerabilities` are often `null` when nothing is found.
+ *
+ * Input that is not JSON throws (`parseReportJson`): a truncated report is not
+ * a clean scan, and `runReportScan` records the throw as a failed scan, so the
+ * session_start task still cannot crash (#5447). Exported for unit tests.
+ */
+export function parseTrivyReport(raw: string): TrivyFinding[] {
+	if (!raw.trim()) return [];
+	const parsed = parseReportJson("trivy", raw);
+	const results = (parsed as { Results?: unknown })?.Results;
+	if (!Array.isArray(results)) return [];
+
+	const findings: TrivyFinding[] = [];
+	for (const resultEntry of results) {
+		if (!resultEntry || typeof resultEntry !== "object") continue;
+		const r = resultEntry as Record<string, unknown>;
+		const target = typeof r.Target === "string" ? r.Target : undefined;
+		const vulns = r.Vulnerabilities;
+		if (!Array.isArray(vulns)) continue;
+		for (const vulnEntry of vulns) {
+			if (!vulnEntry || typeof vulnEntry !== "object") continue;
+			const v = vulnEntry as Record<string, unknown>;
+			const vulnerabilityId =
+				typeof v.VulnerabilityID === "string" ? v.VulnerabilityID : undefined;
+			const pkgName = typeof v.PkgName === "string" ? v.PkgName : undefined;
+			if (!vulnerabilityId || !pkgName) continue;
+			findings.push({
+				vulnerabilityId,
+				pkgName,
+				installedVersion:
+					typeof v.InstalledVersion === "string"
+						? v.InstalledVersion
+						: undefined,
+				fixedVersion:
+					typeof v.FixedVersion === "string" && v.FixedVersion.trim()
+						? v.FixedVersion
+						: undefined,
+				severity: normalizeSeverity(v.Severity),
+				title: typeof v.Title === "string" ? v.Title : undefined,
+				primaryUrl: typeof v.PrimaryURL === "string" ? v.PrimaryURL : undefined,
+				target,
+			});
+		}
+	}
+	return findings;
+}
+
+/**
+ * Map Trivy's `Results[].Secrets[]` rows to normalized secret findings. The
+ * file is the result's `Target`; each secret carries a `RuleID`, `StartLine`,
+ * and `Title`. Same contract as `parseTrivyReport` — input that is not JSON
+ * throws. These are collapsed against gitleaks / ast-grep downstream
+ * (`clients/secret-findings.ts`) so the same secret surfaces once. Exported for
+ * unit tests.
+ */
+export function parseTrivySecrets(raw: string): TrivySecretFinding[] {
+	if (!raw.trim()) return [];
+	const parsed = parseReportJson("trivy", raw);
+	const results = (parsed as { Results?: unknown })?.Results;
+	if (!Array.isArray(results)) return [];
+
+	const secrets: TrivySecretFinding[] = [];
+	for (const resultEntry of results) {
+		if (!resultEntry || typeof resultEntry !== "object") continue;
+		const r = resultEntry as Record<string, unknown>;
+		const target = typeof r.Target === "string" ? r.Target : undefined;
+		const rows = r.Secrets;
+		if (!target || !Array.isArray(rows)) continue;
+		for (const row of rows) {
+			if (!row || typeof row !== "object") continue;
+			const s = row as Record<string, unknown>;
+			const ruleId = typeof s.RuleID === "string" ? s.RuleID : undefined;
+			const line = typeof s.StartLine === "number" ? s.StartLine : undefined;
+			if (!ruleId || line == null) continue;
+			secrets.push({
+				ruleId,
+				file: target,
+				line,
+				title: typeof s.Title === "string" ? s.Title : undefined,
+			});
+		}
+	}
+	return secrets;
+}
+
+/**
+ * Map Trivy's `Results[].Licenses[]` rows to normalized license-risk findings
+ * (#131 Mode 4). Each row carries `Name` (the license id, e.g. "GPL-3.0"),
+ * `PkgName`, `Severity`, `Category` (trivy's classification: restricted /
+ * reciprocal / forbidden / …), and a `FilePath` for license-file findings.
+ * `Severity` is already filtered by the scan's `--severity` floor. Same
+ * contract as the sibling parsers (non-JSON input throws). Exported for unit
+ * tests.
+ */
+export function parseTrivyLicenses(raw: string): TrivyLicenseFinding[] {
+	if (!raw.trim()) return [];
+	const parsed = parseReportJson("trivy", raw);
+	const results = (parsed as { Results?: unknown })?.Results;
+	if (!Array.isArray(results)) return [];
+
+	const licenses: TrivyLicenseFinding[] = [];
+	for (const resultEntry of results) {
+		if (!resultEntry || typeof resultEntry !== "object") continue;
+		const r = resultEntry as Record<string, unknown>;
+		const target = typeof r.Target === "string" ? r.Target : undefined;
+		const rows = r.Licenses;
+		if (!Array.isArray(rows)) continue;
+		for (const row of rows) {
+			if (!row || typeof row !== "object") continue;
+			const l = row as Record<string, unknown>;
+			const license = typeof l.Name === "string" ? l.Name : undefined;
+			if (!license) continue;
+			const filePath =
+				typeof l.FilePath === "string" && l.FilePath ? l.FilePath : target;
+			// Package licenses carry PkgName; license-file findings fall back to
+			// the file they were found in.
+			const pkgName =
+				typeof l.PkgName === "string" && l.PkgName
+					? l.PkgName
+					: (filePath ?? "unknown");
+			licenses.push({
+				license,
+				pkgName,
+				severity: normalizeSeverity(l.Severity),
+				category: typeof l.Category === "string" ? l.Category : undefined,
+				filePath,
+			});
+		}
+	}
+	return licenses;
+}

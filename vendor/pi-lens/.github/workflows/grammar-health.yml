@@ -1,0 +1,126 @@
+name: Grammar health (nightly)
+
+# A bad tree-sitter grammar WASM can crash the whole host runtime instead of
+# failing gracefully (e.g. tree-sitter-swift @ tree-sitter-wasms 0.1.13 triggers a
+# fatal V8 Turboshaft-WASM crash on Node 24 — #423). Such a crash can't be caught
+# in-process and is Node/platform/arch-specific, so this nightly:
+#   1. loads + exercises EVERY grammar in an isolated child process on each OS, so
+#      a crasher is caught here — across platforms — before it reaches a user; and
+#   2. force-loads the currently-blocked Swift grammar (BLOCKED_GRAMMARS, #432) to
+#      watch whether it STILL crashes on the current runtime — the signal that the
+#      block can eventually be lifted. Informational (never fails the nightly).
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC nightly
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# #5420: one transient registry 5xx must not red npm ci or npx; npm's default
+# is 2 retries. The gate (workflow-level, literal, floored) is
+# tests/config/release-download-helper-workflow.test.ts.
+env:
+  npm_config_fetch_retries: 5
+  npm_config_fetch_retry_maxtimeout: 120000
+
+jobs:
+  # 1. Run the guard against the currently-shipped/downloaded grammars on every OS.
+  guard:
+    name: Grammar-load guard (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (30 matrix legs,
+    # macos-latest slowest): 452s (7m32s); sized at ~2x + margin.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24" # the version where #423 reproduces
+      - name: Install dependencies (downloads core grammars via prepare)
+        run: npm install --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: Load + exercise every grammar in an isolated child process
+        run: node scripts/check-grammar-load.mjs
+      # Runs after a red load step too, so one night records both failures.
+      - name: Parse committed real-file corpus through pi-lens
+        if: ${{ !cancelled() }}
+        run: node scripts/check-grammar-corpus.mjs
+
+  # 2. Watch whether the blocked Swift grammar still crashes on the current Node.
+  #    The runtime refuses to load it (BLOCKED_GRAMMARS, #432); this force-loads it
+  #    anyway (PILENS_UNSAFE_FORCE_GRAMMAR_LOAD) to see if a newer Node/V8 has fixed
+  #    the underlying V8 Turboshaft-WASM crash — the trigger to LIFT the block.
+  #    Informational: the crash itself never fails the nightly, but a run that
+  #    could not evaluate swift at all does (#4518, the floor step).
+  swift-crash-watch:
+    name: Swift crash-watch (lift signal, #432)
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 49s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24" # the version where #423 reproduces
+      - name: Install dependencies (downloads the prebuilt swift grammar)
+        run: npm install --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      # Informational in both outcomes, but never silent (#4518). The child exits
+      # 0 when swift loads and parses (the lift signal: BLOCKED_GRAMMARS can
+      # drop it), 2 when the tree-sitter runtime is unavailable and 3 when the
+      # grammar did not load (a download or env failure); any other status is the
+      # runtime going down, which is the known #423 crash. Only 2 and 3 evaluated
+      # nothing, and the floor step below turns exactly those into a red job. The
+      # lift signal is an annotation plus a step-summary line.
+      - name: Force-load swift and see whether it still crashes
+        id: swift
+        env:
+          PILENS_UNSAFE_FORCE_GRAMMAR_LOAD: "1"
+        run: |
+          set +e
+          node scripts/check-grammar-load.mjs swift
+          code=$?
+          set -e
+          node_version="$(node --version)"
+          case "$code" in
+            0)
+              evaluated=1
+              msg="swift loads and parses on Node ${node_version}: the block (BLOCKED_GRAMMARS, #432) can be lifted"
+              echo "::notice title=Swift crash-watch::${msg}"
+              ;;
+            2|3)
+              evaluated=0
+              msg="swift was not evaluated on Node ${node_version} (exit ${code}: runtime or grammar unavailable)"
+              ;;
+            *)
+              evaluated=1
+              msg="swift still crashes on Node ${node_version} (exit ${code}): the block stays"
+              ;;
+          esac
+          echo "$msg"
+          # The log states the count, not only the step output: a night read from
+          # the job log alone (the #4518 remainder) must show whether swift was
+          # evaluated, and `evaluated=` is the greppable spelling.
+          echo "evaluated=${evaluated}"
+          echo "- ${msg}" >> "$GITHUB_STEP_SUMMARY"
+          echo "evaluated=${evaluated}" >> "$GITHUB_OUTPUT"
+
+      - name: Swift crash-watch evaluated floor
+        env:
+          EVALUATED: ${{ steps.swift.outputs.evaluated }}
+        run: node scripts/assert-evaluated.mjs --count "swift-crash-watch=${EVALUATED}" --floor 1

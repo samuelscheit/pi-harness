@@ -1,0 +1,727 @@
+// flake-shape: real-process-spawn — textDocument/didSave is gated by the server's save capability and observed on its real JSON-RPC stream; a stub cannot show what the client sent
+/**
+ * #3405: `textDocument/didSave` is sent on the post-write sync, capability-gated.
+ *
+ * Recurrence this file prevents: the client advertised
+ * `synchronization.didSave` in `CLIENT_CAPABILITIES` (since #278, for the
+ * OmniSharp null-deref class) and NO caller ever emitted the notification, so a
+ * server whose diagnose pass is save-triggered could not answer through pi-lens
+ * at all. Expert is the measured member — `expert-lsp/expert@6bbad8c`
+ * `apps/expert/lib/expert/state.ex:385-389` declares `save: true`, and `:243-257`
+ * makes didSave its only whole-project `schedule_compile` trigger — which is why
+ * #3402's lane-B expert row collected 0 diagnostics at both 1500 and 8000 ms
+ * after a successful `mix compile`.
+ *
+ * The contract is upstream's, not the issue's paraphrase:
+ * `microsoft/vscode-languageserver-node@4f782ceac1b4444d335a32561bda0ded305c401e`
+ * `protocol/src/common/protocol.ts:1751-1755` — "If present save notifications
+ * are sent to the server. If omitted the notification should not be sent." —
+ * `:1038-1043` for `SaveOptions.includeText`, and `:1909-1920` for
+ * `DidSaveTextDocumentParams` (`textDocument` plus an OPTIONAL `text`).
+ *
+ * Screens (AGENTS.md's ten): **all-mocks** — the only double is
+ * `state.connection`, the JSON-RPC transport, which is the true process
+ * boundary; the negotiation, the notify queue and the send gates are the real
+ * production functions, and the last describe re-proves the same behaviour over
+ * a real stdio server process with no double at all. **implementation mirror** —
+ * the assertions read the wire frames a server receives (method order, params),
+ * never the client's own state. **invisible skip** — no `skipIf` anywhere.
+ * **loose bound** — every case pins the exact method sequence, not "didSave was
+ * called at least once".
+ */
+
+import * as os from "node:os";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+	createLSPClient,
+	handleNotifyChange,
+	handleNotifyOpen,
+	handleNotifySave,
+	sentContentFor,
+	type LSPClientState,
+} from "../../../clients/lsp/client.js";
+import { stopLSP } from "../../../clients/lsp/launch.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
+import {
+	negotiateSaveOptions,
+	TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL,
+} from "../../../clients/lsp/sync-kind.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
+import { createMockState } from "./mock-client-state.js";
+
+const TEST_FILE = path.join(os.tmpdir(), "pi-lens-did-save.ts");
+const TEST_URI = pathToFileURL(TEST_FILE).href;
+
+/** The notification methods the transport was handed, in order. */
+function sentMethods(state: LSPClientState): string[] {
+	return vi
+		.mocked(state.connection.sendNotification)
+		.mock.calls.map((call) => String(call[0]));
+}
+
+function sentParams(state: LSPClientState, method: string): unknown {
+	const call = vi
+		.mocked(state.connection.sendNotification)
+		.mock.calls.find((entry) => String(entry[0]) === method);
+	return call?.[1];
+}
+
+describe("negotiateSaveOptions — the `save` half of textDocumentSync (#3405)", () => {
+	it("reads a bare `save: true` as save-declaring with no text", () => {
+		expect(
+			negotiateSaveOptions({
+				textDocumentSync: { openClose: true, save: true },
+			}),
+		).toEqual({ includeText: false });
+	});
+
+	it("reads `save: { includeText: true }` as asking for the document text", () => {
+		expect(
+			negotiateSaveOptions({
+				textDocumentSync: { save: { includeText: true } },
+			}),
+		).toEqual({ includeText: true });
+	});
+
+	it("reads `save: {}` as declaring save without the text", () => {
+		expect(negotiateSaveOptions({ textDocumentSync: { save: {} } })).toEqual({
+			includeText: false,
+		});
+	});
+
+	it("treats an omitted `save` as a server that must not receive didSave", () => {
+		expect(
+			negotiateSaveOptions({
+				textDocumentSync: {
+					openClose: true,
+					change: TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL,
+				},
+			}),
+		).toBeUndefined();
+	});
+
+	it("treats an explicit `save: false` as a refusal", () => {
+		expect(
+			negotiateSaveOptions({ textDocumentSync: { save: false } }),
+		).toBeUndefined();
+	});
+
+	it("treats the legacy numeric textDocumentSync shape as declaring no save", () => {
+		// Pre-3.0 servers answer with the bare change kind; it carries no save
+		// field, so per upstream the notification must not be sent.
+		expect(negotiateSaveOptions({ textDocumentSync: 2 })).toBeUndefined();
+		expect(negotiateSaveOptions({})).toBeUndefined();
+		expect(negotiateSaveOptions(undefined)).toBeUndefined();
+	});
+});
+
+describe("textDocument/didSave on a declared save (#3405)", () => {
+	let state: LSPClientState;
+
+	beforeEach(() => {
+		state = createMockState();
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("follows the first didOpen with didSave when the server declared save", async () => {
+		state.saveOptions = { includeText: false };
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didOpen",
+			"textDocument/didSave",
+		]);
+		// Upstream's DidSaveTextDocumentParams: the identifier, and `text` only
+		// when includeText was asked for.
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+		});
+	});
+
+	it("carries the document text when the server asked for includeText", async () => {
+		state.saveOptions = { includeText: true };
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+			text: "const x = 1;\n",
+		});
+	});
+
+	it("follows a didChange with didSave when the document is already open", async () => {
+		state.saveOptions = { includeText: false };
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 2;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didChange",
+			"textDocument/didSave",
+		]);
+	});
+
+	it("sends no didSave to a server that declared no save", async () => {
+		// The gate that makes this spec-correct rather than merely cautious.
+		expect(state.saveOptions).toBeUndefined();
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		expect(sentMethods(state)).toEqual(["textDocument/didOpen"]);
+	});
+
+	it("sends no didSave when the caller did not declare the touch a save", async () => {
+		// Warm reads, cascade neighbours and the workspace sweep all land here.
+		state.saveOptions = { includeText: false };
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+		);
+		expect(sentMethods(state)).toEqual(["textDocument/didOpen"]);
+	});
+
+	it("sends no didSave for content whose own notification never left the process", async () => {
+		// safeSendNotification swallows a destroyed stream and returns false; a
+		// save claimed then would tell the server to diagnose bytes it never got.
+		state.saveOptions = { includeText: false };
+		const streamError = Object.assign(new Error("write after end"), {
+			code: "ERR_STREAM_WRITE_AFTER_END",
+		});
+		vi.mocked(state.connection.sendNotification).mockRejectedValueOnce(
+			streamError,
+		);
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		expect(sentMethods(state)).toEqual(["textDocument/didOpen"]);
+	});
+
+	it("keeps the save when an unsaved notify coalesces over a saved one", async () => {
+		// The pipeline's post-write touch and the dispatch runner's read touch
+		// land on the same path within one turn. The runner's entry replaces the
+		// pipeline's before it starts writing whenever the pipeline's write has
+		// not landed yet — so the save intent has to survive the replacement, and
+		// describe the newer bytes.
+		state.saveOptions = { includeText: true };
+		const saved = handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		const superseding = handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 2;\n",
+			"typescript",
+			false,
+			true,
+			false,
+		);
+		await Promise.all([saved, superseding]);
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didOpen",
+			"textDocument/didSave",
+		]);
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+			text: "const x = 2;\n",
+		});
+	});
+
+	// #3545: the change runner dropped the save it inherited. A saved touch
+	// replaced by a change, or kept out behind one as the older read, then
+	// produced no didSave at all, unlike the open-over-open case above.
+	it("keeps the save when a change coalesces over a saved open", async () => {
+		state.saveOptions = { includeText: true };
+		const saved = handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		const superseding = handleNotifyChange(state, TEST_FILE, "const x = 2;\n");
+		await Promise.all([saved, superseding]);
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didOpen",
+			"textDocument/didSave",
+		]);
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+			text: "const x = 2;\n",
+		});
+	});
+
+	it.each([
+		["fallback didOpen", false, ["textDocument/didOpen"]],
+		["didChange", true, ["textDocument/didOpen", "textDocument/didChange"]],
+	] as const)(
+		"sends no didSave for a save a change carries when its %s never left the process",
+		async (_branch, openFirst, expected) => {
+			state.saveOptions = { includeText: false };
+			if (openFirst)
+				await handleNotifyOpen(
+					state,
+					TEST_FILE,
+					"const x = 0;\n",
+					"typescript",
+					false,
+					true,
+				);
+			vi.mocked(state.connection.sendNotification).mockRejectedValueOnce(
+				Object.assign(new Error("write after end"), {
+					code: "ERR_STREAM_WRITE_AFTER_END",
+				}),
+			);
+			const saved = handleNotifyOpen(
+				state,
+				TEST_FILE,
+				"const x = 1;\n",
+				"typescript",
+				false,
+				true,
+				true,
+			);
+			const superseding = handleNotifyChange(
+				state,
+				TEST_FILE,
+				"const x = 2;\n",
+			);
+			await Promise.all([saved, superseding]);
+			expect(sentMethods(state)).toEqual(expected);
+		},
+	);
+
+	it("sends no didSave after a change that carries no save", async () => {
+		state.saveOptions = { includeText: false };
+		await handleNotifyChange(state, TEST_FILE, "const x = 1;\n");
+		await handleNotifyChange(state, TEST_FILE, "const x = 2;\n");
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didOpen",
+			"textDocument/didChange",
+		]);
+	});
+
+	it("sends no didSave when the client dies between the two notifications", async () => {
+		// The one window the caller's own entry guard cannot cover: the client is
+		// alive when the notify starts and destroyed by the time the content
+		// notification has been awaited. A send on a disposed connection throws a
+		// non-stream error, which `safeSendNotification` re-raises out of the
+		// notify queue — so the save re-checks liveness the same way the
+		// reopen-on-resync branch above it does.
+		state.saveOptions = { includeText: false };
+		vi.mocked(state.connection.sendNotification).mockImplementation(
+			async () => {
+				state.isDestroyed = true;
+				return undefined;
+			},
+		);
+		await handleNotifyOpen(
+			state,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+			true,
+		);
+		expect(sentMethods(state)).toEqual(["textDocument/didOpen"]);
+	});
+});
+
+/**
+ * Records every notification the fake server reports receiving, and hands back
+ * a promise that settles when a named one arrives — a deterministic wait on the
+ * event itself, not a polled `vi.waitFor` (flake-shape `ungoverned-wait-for`).
+ */
+function notifyRecorder(client: Awaited<ReturnType<typeof createLSPClient>>) {
+	const methods: string[] = [];
+	const saves: Array<{ uri: string; hasText: boolean }> = [];
+	const waiters = new Map<string, () => void>();
+	let saveWaiter: (() => void) | undefined;
+	client.connection.onNotification("$/test/notifyReceived", ((params: {
+		method: string;
+	}) => {
+		methods.push(params.method);
+		waiters.get(params.method)?.();
+		waiters.delete(params.method);
+	}) as never);
+	client.connection.onNotification("$/test/didSaveReceived", ((params: {
+		uri: string;
+		hasText: boolean;
+	}) => {
+		saves.push(params);
+		saveWaiter?.();
+		saveWaiter = undefined;
+	}) as never);
+	return {
+		methods,
+		saves,
+		until(method: string): Promise<void> {
+			if (methods.includes(method)) return Promise.resolve();
+			return new Promise<void>((resolve) => waiters.set(method, resolve));
+		},
+		/** The echo the fixture sends from its didSave branch, which lands AFTER
+		 *  the generic method echo — so the save's own params need their own
+		 *  event to wait on. */
+		untilSave(): Promise<void> {
+			if (saves.length > 0) return Promise.resolve();
+			return new Promise<void>((resolve) => {
+				saveWaiter = resolve;
+			});
+		},
+	};
+}
+
+/**
+ * #3405 r1: `notify.save` is the save for bytes the server already holds — the
+ * service sends it when it debounced a saved touch's push (an unsaved push of
+ * the same bytes landed just before). Recurrence: a cold `lsp_diagnostics`
+ * query lost its save that way (clangd 22.1.0 received didOpen, never didSave).
+ */
+describe("a save with no content push (#3405 r1)", () => {
+	let state: LSPClientState;
+
+	beforeEach(() => {
+		state = createMockState();
+		state.saveOptions = { includeText: true };
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const openUnsaved = (content = "const x = 1;\n") =>
+		handleNotifyOpen(state, TEST_FILE, content, "typescript", false, true);
+
+	it("sends only didSave, without text, for a document the server holds", async () => {
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(true);
+		// No re-push: clangd does not republish identical bytes, and a re-push
+		// clears the cached answer the touch then waits on.
+		expect(sentMethods(state)).toEqual(["textDocument/didSave"]);
+		// No text even under includeText: a push queued before this entry may
+		// have replaced the bytes its caller read.
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+		});
+	});
+
+	// R7: an unsuccessful open leaves no landed-content record to mark. A
+	// later explicit save retains its boolean outcome without inventing content.
+	it("does not forge content evidence after an unsuccessful open", async () => {
+		vi.mocked(state.connection.sendNotification).mockRejectedValueOnce(
+			new Error("stream write failed"),
+		);
+		await expect(openUnsaved()).resolves.toBe(false);
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(true);
+		expect(sentContentFor(state, TEST_FILE)).toBeUndefined();
+	});
+
+	// R7: debt-only duplicate suppression must never consume an explicit save.
+	it.each(["owed-first", "explicit-first"])(
+		"keeps an explicit save when coalescing %s",
+		async (order) => {
+			await openUnsaved();
+			await handleNotifySave(state, TEST_FILE);
+			vi.mocked(state.connection.sendNotification).mockClear();
+			const debt = order === "owed-first";
+			await Promise.all([
+				handleNotifySave(state, TEST_FILE, debt),
+				handleNotifySave(state, TEST_FILE, !debt),
+			]);
+			expect(sentMethods(state)).toEqual(["textDocument/didSave"]);
+		},
+	);
+
+	it("hands its save to an unsent push instead of replacing it", async () => {
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		const push = openUnsaved("const x = 2;\n");
+		const save = handleNotifySave(state, TEST_FILE);
+		await Promise.all([push, save]);
+		// The newer bytes still go, and they carry the save: one didChange, one
+		// didSave, in that order.
+		expect(sentMethods(state)).toEqual([
+			"textDocument/didChange",
+			"textDocument/didSave",
+		]);
+		expect(sentParams(state, "textDocument/didSave")).toEqual({
+			textDocument: { uri: TEST_URI },
+			text: "const x = 2;\n",
+		});
+		await expect(push).resolves.toBe(true);
+	});
+
+	it("sends nothing to a server that declared no save", async () => {
+		state.saveOptions = undefined;
+		await openUnsaved();
+		vi.mocked(state.connection.sendNotification).mockClear();
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(false);
+		expect(sentMethods(state)).toEqual([]);
+	});
+
+	it("sends nothing for a document the server does not hold", async () => {
+		await expect(handleNotifySave(state, TEST_FILE)).resolves.toBe(false);
+		expect(sentMethods(state)).toEqual([]);
+	});
+
+	// #4532 gap 9 round 5: a save that never left gives its rescan expectation
+	// back. The client now retries such a save (`saveDebouncedPush`), and the
+	// retry raises its OWN expectation, so keeping the failed attempt's binds the
+	// path to one more publication than arrives — the #3482 surplus, which
+	// withholds the rescan the retry does produce. Only a `rescansOnSave` server
+	// raises one at all, so the case is an opengrep-shaped state.
+	it("gives back the rescan expectation of a save that failed to leave", async () => {
+		const rescanner = createMockState({ serverId: "opengrep" });
+		rescanner.saveOptions = { includeText: false };
+		await handleNotifyOpen(
+			rescanner,
+			TEST_FILE,
+			"const x = 1;\n",
+			"typescript",
+			false,
+			true,
+		);
+		const key = normalizeMapKey(TEST_FILE);
+		expect(rescanner.expectedPublicationsBeyondSends.get(key) ?? 0).toBe(0);
+
+		vi.mocked(rescanner.connection.sendNotification).mockRejectedValue(
+			new Error("stream write failed"),
+		);
+		await expect(handleNotifySave(rescanner, TEST_FILE)).resolves.toBe(false);
+		expect(rescanner.expectedPublicationsBeyondSends.get(key) ?? 0).toBe(0);
+	});
+});
+
+describe("didSave through the real createLSPClient init path (#3405)", () => {
+	it("a server advertising save: true receives didSave after didOpen", async () => {
+		const proc = await spawnFakeLspServer({
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_SAVE: "true",
+				FAKE_LSP_ECHO_DID_SAVE: "1",
+				FAKE_LSP_ECHO_NOTIFY_METHODS: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-save",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const recorder = notifyRecorder(client);
+			const filePath = path.join(os.tmpdir(), "pi-lens-did-save-real.ts");
+			await client.notify.open(
+				filePath,
+				"const x = 1;\n",
+				"typescript",
+				undefined,
+				true,
+				true,
+			);
+			await recorder.untilSave();
+			// #3407: the inventory reads the same negotiated value.
+			expect(client.getSaveOptions?.()).toEqual({ includeText: false });
+
+			// The real `initialize` reply drove the send: the fixture advertises
+			// `save: true` and nothing else about saving, so no text rides along.
+			expect(recorder.saves[0]?.uri).toBe(pathToFileURL(filePath).href);
+			expect(recorder.saves[0]?.hasText).toBe(false);
+			expect(recorder.methods.indexOf("textDocument/didSave")).toBeGreaterThan(
+				recorder.methods.indexOf("textDocument/didOpen"),
+			);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
+
+	it("a server advertising no save receives no didSave at all", async () => {
+		const proc = await spawnFakeLspServer({
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_ECHO_DID_SAVE: "1",
+				FAKE_LSP_ECHO_NOTIFY_METHODS: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-no-save",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const recorder = notifyRecorder(client);
+			const filePath = path.join(os.tmpdir(), "pi-lens-did-save-none.ts");
+			await client.notify.open(
+				filePath,
+				"const x = 1;\n",
+				"typescript",
+				undefined,
+				true,
+				true,
+			);
+			await recorder.until("textDocument/didOpen");
+			// #3407: declared no save → the inventory reports none.
+			expect(client.getSaveOptions?.()).toBeUndefined();
+			// A stdio JSON-RPC stream is FIFO, so a reply to a request issued AFTER
+			// the notify proves the server has already drained everything the notify
+			// wrote. That is what makes the absence below evidence and not a race —
+			// and it is a settled round trip, not a polled wait.
+			await client.pingLiveness?.(5000);
+
+			expect(recorder.methods).toContain("textDocument/didOpen");
+			expect(recorder.methods).not.toContain("textDocument/didSave");
+			expect(recorder.saves).toEqual([]);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
+
+	// The production consequence the issue is about, not the notification alone:
+	// a server whose WHOLE diagnose pass is save-triggered publishes ONLY from
+	// its didSave branch (`FAKE_LSP_PUBLISH_ON_SAVE`), so the diagnostics pi-lens
+	// reads are reachable exactly when the save is. Expert is that member; the
+	// fixture stands in for it because the local box has no Elixir (#3405).
+	it("reads the save-only server's diagnostics after a save touch", async () => {
+		const proc = await spawnFakeLspServer({
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_SAVE: "true",
+				FAKE_LSP_PUBLISH_ON_SAVE: "1",
+				FAKE_LSP_ECHO_DID_SAVE: "1",
+				FAKE_LSP_NO_DIAGNOSTIC_PROVIDER: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-save-publish",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const recorder = notifyRecorder(client);
+			const filePath = path.join(os.tmpdir(), "pi-lens-did-save-publish.ts");
+			// 6th argument `saved: true` is the post-write sync's declaration.
+			await client.notify.open(
+				filePath,
+				"const x = 1;\n",
+				"typescript",
+				undefined,
+				true,
+				true,
+			);
+			// The fixture sends the publish BEFORE this echo, and a stdio stream is
+			// FIFO, so a settled echo proves the client has already stored it.
+			await recorder.untilSave();
+			await client.waitForDiagnostics(filePath, 5000);
+			expect(client.getDiagnostics(filePath).map((d) => d.code)).toEqual([
+				"P3405",
+			]);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
+
+	it("reads no diagnostics from the same server when the touch is not a save", async () => {
+		const proc = await spawnFakeLspServer({
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_SAVE: "true",
+				FAKE_LSP_PUBLISH_ON_SAVE: "1",
+				FAKE_LSP_ECHO_DID_SAVE: "1",
+				FAKE_LSP_ECHO_NOTIFY_METHODS: "1",
+				FAKE_LSP_NO_DIAGNOSTIC_PROVIDER: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-save-publish-none",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const recorder = notifyRecorder(client);
+			const filePath = path.join(
+				os.tmpdir(),
+				"pi-lens-did-save-publish-none.ts",
+			);
+			await client.notify.open(
+				filePath,
+				"const x = 1;\n",
+				"typescript",
+				undefined,
+				true,
+				false,
+			);
+			await recorder.until("textDocument/didOpen");
+			// A reply issued after the notify proves the server drained it, so the
+			// absent publish below is evidence, not a race.
+			await client.pingLiveness?.(5000);
+			expect(recorder.methods).not.toContain("textDocument/didSave");
+			expect(client.getDiagnostics(filePath)).toEqual([]);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
+});

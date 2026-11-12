@@ -1,0 +1,281 @@
+/**
+ * scripts/lib/ci-checks.mjs (#2539 round 2, F2): the ONE required-checks name
+ * list and the ONE fail-closed "latest check-run per name" resolver, shared
+ * by every consumer that reads GitHub check-runs for this repo's two gating
+ * checks -- ci-verdict.mjs (REST `commits/<sha>/check-runs`: `started_at`,
+ * lowercase `status`/`conclusion`). The retired merge lane and the retired
+ * merge-train warden (#4105) no longer consume this module.
+ *
+ * Before this round, ci-verdict.mjs hand-rolled its own `latestRunNamed`
+ * with an `id`-as-tiebreak policy that is NOT fail-closed (a superseded
+ * SUCCESS with the higher id could win a tie over an unresolved duplicate).
+ * Two required-check name lists and two different tie policies for the same
+ * real-world duplicate-check-run shape (a rerun, or the classify-ci-failure
+ * auto-rerun, #2103) is the single-source-of-truth defect this module fixes.
+ */
+
+export const REQUIRED_CHECKS = ["Unit tests", "Lint & type-check"];
+
+// The required contexts on master, read 2026-11-01 with `gh api
+// repos/apmantza/pi-lens/branches/master --jq
+// .protection.required_status_checks.contexts`. GitHub is the source of truth
+// and ci-verdict reads it live; workflow tests read this one mirror.
+export const BRANCH_PROTECTION_CONTEXTS = Object.freeze([
+	"Lint & type-check",
+	"Unit tests",
+	"Install test (ubuntu-latest)",
+	"Install test (windows-latest)",
+	"Install test (macos-latest)",
+	"knip",
+	"oxfmt format check",
+	"TLA+ models",
+	"Unit tests Windows",
+	"Hot-path latency (advisory)",
+]);
+
+export const CI_JOB_NAMES = Object.freeze({
+	CHANGELOG_FRAGMENT: "Changelog fragment (fast-fail)",
+	LINT_AND_TYPECHECK: "Lint & type-check",
+	KNIP: "knip",
+	UNIT_TESTS: "Unit tests",
+});
+
+// #3753: the suite runs as `Unit tests (shard k/N)` matrix jobs (ci.yml job
+// `test`) behind ONE aggregate check-run named exactly `Unit tests`. The
+// aggregate is what the ruleset requires; a consumer that keys on "the Unit
+// tests job" (ci-verdict's infra-rerun hold, the failure classifier's log
+// read) must also recognize the shard rows, because the failing test output
+// and any kill signature live in the shard's log, not the aggregate's.
+const UNIT_TESTS_SHARD_PREFIX = `${CI_JOB_NAMES.UNIT_TESTS} (shard `;
+
+export function isUnitTestsJobName(name) {
+	const text = String(name ?? "");
+	return (
+		text === CI_JOB_NAMES.UNIT_TESTS || text.startsWith(UNIT_TESTS_SHARD_PREFIX)
+	);
+}
+
+export function isUnitTestsShardJobName(name) {
+	return String(name ?? "").startsWith(UNIT_TESTS_SHARD_PREFIX);
+}
+
+// How this repository ACTUALLY marks a check advisory: the workflow job name
+// ends in "(advisory)". Probed 2026-08-26 against the live rollups of every
+// open PR -- `PR body (advisory)`, `Vale prose lint (advisory)` (a step of
+// `Lint (advisory)` since #5164), `OSV scan (advisory)`. Originally lived only
+// in the former merge lane; moved here in #2609 so ci-verdict.mjs (a second
+// consumer of the exact same policy) imports the ONE list instead of
+// hand-rolling its own -- AGENTS.md shape 38's own warning ("the cheapest
+// evasion is adding a real gate to the advisory list") is a defect risk
+// multiplied by every duplicate copy of this set, not just the original.
+const ADVISORY_SUFFIX = "(advisory)";
+export const ADVISORY_CHECKS = new Set([
+	// Third-party SonarCloud GitHub App check-run (posted via the SonarCloud
+	// integration, not a workflow job in .github/workflows) -- has no
+	// "(advisory)" suffix to self-identify by, so it needs an explicit entry.
+	"SonarCloud Code Analysis",
+	// GitHub's own code-scanning summary check. Since #3801 CodeQL runs as a
+	// committed advanced setup, and since #5275 only as codeql.yml's daily
+	// schedule: its `CodeQL baseline (<lang>) (advisory)` rows are classified by
+	// the suffix, not by an entry here. An open PR head older than #5275 still
+	// carries ci.yml's PR-time `CodeQL (<lang>) (advisory)` rows, classified the
+	// same way. The legacy default-setup `Analyze (<lang>)` rows, which a PR
+	// head older than the #3801 switch still carries, are a DIFFERENT set of
+	// names this list does NOT cover; they keep gating because an alert on such
+	// a head is a real result.
+	"CodeQL",
+	"Changed tests shuffled (advisory)",
+	// Stale verdict labels are bookkeeping only. Their cleanup asserts no
+	// property of the change, so API or token failures must never block a merge
+	// (#2993, including read-only fork pull_request tokens).
+	"Clear stale CI verdict labels",
+	// .github/workflows/greetings.yml's `greeting` job (the job KEY -- no
+	// `name:` override), posted by `actions/first-interaction` on
+	// `pull_request_target: types: [opened]` only. A cosmetic
+	// first-time-contributor welcome bot; a token or action-version failure
+	// in it must never block the train (#2618 fix-round-2 F3).
+	"greeting",
+]);
+
+// #3801: ci.yml's `Heavy advisory gate (advisory)` job and its deferred-row
+// list are retired. An older PR head can still carry that check-run (red,
+// skipped or running); the suffix above classifies it as advisory, so it never
+// gates (tests/scripts/ci-verdict-retired-heavy-gate.test.ts).
+
+// #4090: the events whose workflow runs are NOT a commit's PR/push CI. A
+// scheduled run attaches its check-runs to master's head and a dispatched run
+// to the dispatched branch's head, so without this a nightly lane or a
+// label-triage job turns a PR or master red. A run of any other (or unknown)
+// event keeps today's gating.
+const NON_PR_CI_EVENTS = new Set([
+	"schedule",
+	"workflow_dispatch",
+	"repository_dispatch",
+	"workflow_run",
+]);
+
+export function isNonPrCiEvent(event) {
+	return NON_PR_CI_EVENTS.has(String(event ?? ""));
+}
+
+export function isAdvisoryCheck(name) {
+	return (
+		ADVISORY_CHECKS.has(name) || String(name ?? "").endsWith(ADVISORY_SUFFIX)
+	);
+}
+
+// A non-advisory check in any of these states blocks a merge (#2185's real
+// merge gate; moved here from the former merge lane in #2609 for the
+// same single-source reason as ADVISORY_CHECKS above). GraphQL's rollup
+// reports these UPPERCASE; REST's check-runs API reports them lowercase --
+// `isBlockingConclusion` below normalizes case so both payload shapes share
+// this ONE list. Deliberately NOT exhaustive over every enum value GitHub
+// documents: "success", "skipped", and "neutral" are exactly the completed
+// conclusions that are NOT failures, and every one of them is a real,
+// observed shape in this repo -- "skipped" is not hypothetical, it is what
+// a conditionally skipped workflow job reports on an ordinary pull_request
+// run. Treating a job's own conditional skip as a failure would red every PR
+// forever (#2609).
+const BLOCKING_CONCLUSIONS = new Set([
+	"FAILURE",
+	"TIMED_OUT",
+	"CANCELLED",
+	"ACTION_REQUIRED",
+	"STARTUP_FAILURE",
+	"STALE",
+]);
+
+export function isBlockingConclusion(conclusion) {
+	return BLOCKING_CONCLUSIONS.has(String(conclusion ?? "").toUpperCase());
+}
+
+// #2618 fix-round-2, F2: `CANCELLED` sits in `BLOCKING_CONCLUSIONS` above
+// because a check a HUMAN cancelled genuinely is not passing -- but
+// Event-scoped `cancel-in-progress` cancels the PREVIOUS in-flight run of a
+// concurrency group when a cancelling event targets the SAME ref, and
+// that cancelled check-run can be the ONLY row present for its name for
+// several minutes before its replacement posts (live-probed 2026-09-06 on
+// PR #2607's head: three check-suites for one discovered job on ONE
+// commit -- 17:21:06 cancelled, 17:25:29 skipped, 17:32:15 skipped --
+// `resolveLatestByName` correctly drops the cancelled one once a newer row
+// exists, but at 17:21-17:25 it was the newest, and only, row). Reading that
+// window as a hard FAILURE (as `isBlockingConclusion` alone would) is a
+// false positive on a check that is not done reporting, not a check that
+// failed -- callers gate a DISCOVERED (non-required) row's "cancelled"
+// conclusion through this predicate instead, to PEND rather than fail. A
+// REQUIRED row gets no such grace: it must reach a literal "success" as
+// ANY other terminal state means it, or a run superseding it, was
+// interrupted or is stale evidence -- see ci-verdict.mjs's `computeVerdict`.
+export function isUncertainConclusion(conclusion) {
+	return String(conclusion ?? "").toUpperCase() === "CANCELLED";
+}
+
+function startedAtOf(run) {
+	return run?.startedAt ?? run?.started_at ?? null;
+}
+
+// Case-insensitive: GraphQL reports "COMPLETED"/"SUCCESS", REST reports
+// "completed"/"success". Comparing case-insensitively here is what lets ONE
+// tie policy serve both payload shapes without either caller normalizing
+// its check-run records first.
+function isConcludedSuccess(run) {
+	const status = String(run?.status ?? "").toUpperCase();
+	const conclusion = String(run?.conclusion ?? "").toUpperCase();
+	return status === "COMPLETED" && conclusion === "SUCCESS";
+}
+
+/**
+ * The aggregate check a SHARDED job row belongs to, or `null` for any other
+ * name: `"Unit tests (shard 3/5)"` -> `"Unit tests"`. The aggregate is the ONE
+ * required context (#3753, #4672), and it is the job that reads every shard's
+ * row and decides whether a cancellation was a teardown race.
+ *
+ * @param {unknown} name
+ * @returns {string | null}
+ */
+export function shardAggregateName(name) {
+	const match = /^(.+?) \(shard [0-9]+\/[0-9]+\)$/.exec(String(name ?? ""));
+	return match ? match[1] : null;
+}
+
+/**
+ * The names every one of whose runs came from a schedule/dispatch/
+ * workflow_run workflow (#4090). Those runs are not part of a commit's PR/push
+ * CI, so the name is advisory for this head. One run of the name from any other
+ * (or an unknown) event keeps it out of the set.
+ *
+ * @param {CheckRunRecord[]} checkRuns
+ * @returns {Set<string>}
+ */
+export function resolveTriggerAdvisoryNames(checkRuns) {
+	const events = new Map();
+	for (const run of checkRuns ?? []) {
+		const seen = events.get(run.name) ?? [];
+		// #5062: a dispatch run on a bot-opened PR is that PR's CI, so it is
+		// never a non-PR event (`dispatch_is_pr_ci`, stamped by ci-verdict).
+		seen.push(run.dispatch_is_pr_ci === true ? undefined : run.workflow_event);
+		events.set(run.name, seen);
+	}
+	return new Set(
+		[...events]
+			.filter(([, seen]) => seen.every((event) => isNonPrCiEvent(event)))
+			.map(([name]) => name),
+	);
+}
+
+/**
+ * Whether a check NAME gates this head: branch protection requires it, or it
+ * is not on the advisory allowlist and not a schedule-only lane.
+ *
+ * ONE owner for the rule, because two readers of the same payload answer it --
+ * `computeVerdict`'s rows and `runtimeCapLines`' printed `(gating)` marker --
+ * and they disagreed: the marker labelled seven schedule-only nightly jobs
+ * `(gating)` while the verdict scored them `gating: false` (V5a). The shape-38
+ * override still wins: a name branch protection requires always gates.
+ *
+ * @param {string} name
+ * @param {{ required?: Iterable<string>, triggerAdvisoryNames?: Set<string> }} [context]
+ * @returns {boolean}
+ */
+export function isGatingCheckName(
+	name,
+	{ required = REQUIRED_CHECKS, triggerAdvisoryNames = new Set() } = {},
+) {
+	const requiredSet = required instanceof Set ? required : new Set(required);
+	return (
+		requiredSet.has(name) ||
+		(!isAdvisoryCheck(name) && !triggerAdvisoryNames.has(name))
+	);
+}
+
+/**
+ * Fail-closed tie policy (#2190 incident): when two check-runs share a name
+ * and neither `startedAt`/`started_at` orders them (missing, unparsable, or
+ * exactly equal), the run that is NOT a concluded success wins. An
+ * unorderable tie can only ever withhold a pass, never grant one.
+ */
+function preferCheckRun(a, b) {
+	const ta = Date.parse(startedAtOf(a) ?? "");
+	const tb = Date.parse(startedAtOf(b) ?? "");
+	if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb)
+		return ta > tb ? a : b;
+	if (isConcludedSuccess(a) && !isConcludedSuccess(b)) return b;
+	if (isConcludedSuccess(b) && !isConcludedSuccess(a)) return a;
+	return a;
+}
+
+/**
+ * One check-run per NAME, newest wins via `preferCheckRun`. GitHub's own
+ * rollup really does carry duplicate names on one head (a PR head listed six
+ * names twice; another listed `Unit tests` as both IN_PROGRESS and
+ * COMPLETED/SUCCESS at once) and the API documents no ordering guarantee
+ * across reruns, so array order/position is never trusted here.
+ */
+export function resolveLatestByName(checkRuns) {
+	const byName = new Map();
+	for (const run of checkRuns ?? []) {
+		const incumbent = byName.get(run.name);
+		byName.set(run.name, incumbent ? preferCheckRun(incumbent, run) : run);
+	}
+	return byName;
+}
