@@ -224,6 +224,8 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 	  }
 	| { type: "agent_settled"; aborted: boolean }
+	/** Cache warming changed state: a host keeping sessions loaded can keep this one while a refresh is pending. */
+	| { type: "cache_warming"; state: CacheWarmingStatus["state"]; nextWarmAt?: number; reason?: string }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -510,7 +512,9 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 
 	private _modelRuntime: ModelRuntime;
-	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
+	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "onStatusChanged">;
+	/** The last cache warming state emitted, to emit changes only. */
+	private _cacheWarmingEmitted?: string;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -538,6 +542,7 @@ export class AgentSession {
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
 			this._cacheWarmer.onWarmed = (entry) => this._emit({ type: "entry_appended", entry });
+			this._cacheWarmer.onStatusChanged = () => this._emitCacheWarmingStatus();
 		}
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -1540,6 +1545,7 @@ export class AgentSession {
 		this._eventListeners = [];
 		if (this._cacheWarmer) {
 			this._cacheWarmer.onWarmed = undefined;
+			this._cacheWarmer.onStatusChanged = undefined;
 			this._cacheWarmer.cancel();
 		}
 		cleanupSessionResources(this.sessionId);
@@ -1560,6 +1566,21 @@ export class AgentSession {
 	}
 
 	/** Current cache-warming state and the policy inputs that produced it. */
+	private _emitCacheWarmingStatus(): void {
+		const status = this._cacheWarmer?.status;
+		if (!status) return;
+		const event = {
+			type: "cache_warming" as const,
+			state: status.state,
+			...(status.nextWarmAt === undefined ? {} : { nextWarmAt: status.nextWarmAt }),
+			...(status.reason === undefined ? {} : { reason: status.reason }),
+		};
+		const key = JSON.stringify(event);
+		if (key === this._cacheWarmingEmitted) return;
+		this._cacheWarmingEmitted = key;
+		this._emit(event);
+	}
+
 	get cacheWarmingStatus(): CacheWarmingStatus | undefined {
 		return this._cacheWarmer?.status;
 	}
