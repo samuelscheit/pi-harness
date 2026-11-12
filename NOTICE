@@ -1,0 +1,4 @@
+prompt/base.md is adapted from the base instructions of OpenAI Codex CLI
+(https://github.com/openai/codex), licensed under the Apache License 2.0.
+The upstream commit and source are recorded in prompt/SOURCE.json; the
+adaptations are listed in scripts/import-codex-prompt.mjs.
