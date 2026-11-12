@@ -428,6 +428,14 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	/** A reload was requested and has not happened yet (see requestReload()). */
+	private _reloadRequested = false;
+	/** A requested reload waits for the run to settle (queued once in _deferredSettledActions). */
+	private _reloadDeferredToSettle = false;
+	/** Set while a requested reload runs at a turn boundary of the active run, where reload() is safe. */
+	private _reloadingAtTurnBoundary = false;
+	/** What started the active run, to emit before_agent_start again after a reload at a turn boundary. */
+	private _runTrigger: BeforeAgentStartTrigger | undefined;
 	private _promptPreflightCount = 0;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
@@ -1020,6 +1028,7 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
+			await this._reloadAtTurnBoundary();
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
 			const nextContext = previousSnapshot?.context ?? context;
@@ -2067,6 +2076,7 @@ export class AgentSession {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
 			this._runSystemPromptOptions = undefined;
+			this._runTrigger = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			await this._emitAgentSettled();
@@ -2088,15 +2098,8 @@ export class AgentSession {
 			await this._compactIfCheaper();
 		}
 
-		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
-		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-		// which updates the live loadout instead. An explicit edit wins; otherwise the live
-		// loadout is authoritative, so a setActiveTools() call is not undone here.
-		const handlerEditedTools =
-			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+		this._runTrigger = trigger;
+		const result = await this._emitBeforeAgentStart(trigger);
 
 		const messages: AgentMessage[] = [];
 		if (trigger.messageType === "custom") {
@@ -2131,6 +2134,22 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 		return messages;
+	}
+
+	/**
+	 * Emit before_agent_start on the base prompt options. Handlers may edit
+	 * event.systemPromptOptions.selectedTools or call setActiveTools(), which updates the live
+	 * loadout instead. An explicit edit wins; otherwise the live loadout is authoritative, so a
+	 * setActiveTools() call is not undone here.
+	 */
+	private async _emitBeforeAgentStart(trigger: BeforeAgentStartTrigger) {
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+		const handlerEditedTools =
+			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
+			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
+		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+		return result;
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -3655,6 +3674,7 @@ export class AgentSession {
 				getAllTools: () => this.getAllTools(),
 				getSettings: () => this.settingsManager.getSettings(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
+				requestReload: () => this.requestReload(),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {
@@ -3889,13 +3909,76 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Reload at the next safe point (see ExtensionAPI.requestReload): at once when idle, else at the
+	 * next turn boundary of the running run, else once it settles. The reload goes through the mode's
+	 * reload action when bound (the TUI rebuilds its chat and shortcuts), else reload().
+	 */
+	requestReload(): void {
+		if (this._reloadRequested) return;
+		this._reloadRequested = true;
+		if (this.isStreaming || this._isEmittingAgentSettled) {
+			if (this._reloadDeferredToSettle) return;
+			this._reloadDeferredToSettle = true;
+			this._deferredSettledActions.push(async () => {
+				this._reloadDeferredToSettle = false;
+				await this._runRequestedReload();
+			});
+			return;
+		}
+		void this._runRequestedReload();
+	}
+
+	/** Run a requested reload unless one ran since it was requested; errors go to the extension error listeners. */
+	private async _runRequestedReload(): Promise<void> {
+		if (!this._reloadRequested) return;
+		// An idle compaction (manual or cold-cache) cannot be interrupted: try again once it is done.
+		if (this.isCompacting) {
+			setTimeout(() => void this._runRequestedReload(), 250).unref?.();
+			return;
+		}
+		try {
+			const reload = this._extensionCommandContextActions?.reload;
+			if (reload && !this._reloadingAtTurnBoundary) await reload();
+			else await this.reload();
+		} catch (error) {
+			this._reloadRequested = false;
+			this._extensionRunner.emitError({
+				extensionPath: "<reload>",
+				event: "reload",
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+		}
+	}
+
+	/**
+	 * At a turn boundary of the active run: reload when one was requested, then let the reloaded
+	 * extensions rebuild the run's prompt options and tools (before_agent_start with `reloaded`), so
+	 * the run's remaining turns use them.
+	 */
+	private async _reloadAtTurnBoundary(): Promise<void> {
+		if (!this._reloadRequested || !this._runTrigger) return;
+		this._reloadingAtTurnBoundary = true;
+		try {
+			await this._runRequestedReload();
+		} finally {
+			this._reloadingAtTurnBoundary = false;
+		}
+		if (this._reloadRequested) return;
+		const result = await this._emitBeforeAgentStart({ ...this._runTrigger, reloaded: true });
+		this._setActiveTools(result.systemPromptOptions.selectedTools);
+		this._runSystemPromptOptions = result.systemPromptOptions;
+	}
+
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
-		if (this.isStreaming) {
+		if (this.isStreaming && !this._reloadingAtTurnBoundary) {
 			throw new Error("Wait for the current response to finish before reloading.");
 		}
 		if (this.isCompacting) {
 			throw new Error("Wait for compaction to finish before reloading.");
 		}
+		this._reloadRequested = false;
 
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();

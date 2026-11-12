@@ -1535,34 +1535,28 @@ Important behavior:
 
 For predictable behavior, treat reload as terminal for that handler (`await ctx.reload(); return;`).
 
-Tools run with `ExtensionToolContext`, not `ExtensionCommandContext`, so they cannot call `ctx.reload()`, and Pi cannot reload while the agent is running. To let the LLM trigger a reload, have the tool record the request and run the command from `agent_settled`, where messages sent by handlers are processed after all settled handlers finish:
+Tools and event handlers run with `ExtensionContext`, not `ExtensionCommandContext`, so they cannot call `ctx.reload()`. They call `pi.requestReload()` instead, which reloads at the next safe point:
+
+- idle: at once;
+- during an agent run: at the next turn boundary, after the turn's tool results and before the next model request. Handlers see `before_agent_start` again with `reloaded: true` and rebuild the run's prompt options and tools; the run's remaining turns use them. A tool call still executing then finishes on the old code;
+- a run without a later turn boundary: once it settles.
+
+Repeated requests before the reload are one. Like after `ctx.reload()`, the requesting extension instance is stale once the reload ran.
 
 ```typescript
-let reloadRequested = false;
-
 pi.registerTool({
   name: "reload_runtime",
   label: "Reload Runtime",
   description: "Reload extensions, skills, prompts, themes, and context files",
   parameters: Type.Object({}),
   async execute() {
-    reloadRequested = true;
-    return {
-      content: [{ type: "text", text: "Reload requested. Pi reloads after this response." }],
-      details: {},
-      terminate: true,
-    };
+    pi.requestReload();
+    return { content: [{ type: "text", text: "Reload requested; the next turn runs on the reloaded extensions." }], details: {} };
   },
-});
-
-pi.on("agent_settled", () => {
-  if (!reloadRequested) return;
-  reloadRequested = false;
-  pi.sendUserMessage("/reload-runtime", { expandPromptTemplates: true });
 });
 ```
 
-`expandPromptTemplates: true` dispatches the text as a command. Without it, or when queued with `deliverAs`, the text reaches the model as a plain user message. See [reload-runtime.ts](../examples/extensions/reload-runtime.ts).
+See [reload-runtime.ts](../examples/extensions/reload-runtime.ts).
 
 ## ExtensionAPI Methods
 
@@ -3294,7 +3288,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `handoff.ts` | Cross-provider model handoff | `registerCommand`, `ui.editor`, `ui.custom` |
 | `qna.ts` | Q&A with custom UI | `registerCommand`, `ui.custom`, `setEditorText` |
 | `send-user-message.ts` | Inject user messages | `registerCommand`, `sendUserMessage` |
-| `reload-runtime.ts` | Reload command and LLM tool handoff | `registerCommand`, `ctx.reload()`, `on("agent_settled")`, `sendUserMessage` |
+| `reload-runtime.ts` | Reload command and an LLM tool that reloads mid-run | `registerCommand`, `ctx.reload()`, `requestReload` |
 | `shutdown-command.ts` | Graceful shutdown command | `registerCommand`, `shutdown()` |
 | **Events & Gates** |||
 | `permission-gate.ts` | Block dangerous commands | `on("tool_call")`, `ui.select` |

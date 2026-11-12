@@ -166,9 +166,10 @@ function isUserBashEventResult(value: unknown): value is UserBashEventResult {
 }
 
 /** The message that starts a run: the before_agent_start event without its prompt fields. */
-export type BeforeAgentStartTrigger =
+export type BeforeAgentStartTrigger = (
 	| Pick<BeforeAgentStartUserEvent, "messageType" | "prompt" | "images">
-	| Pick<BeforeAgentStartCustomEvent, "messageType" | "message">;
+	| Pick<BeforeAgentStartCustomEvent, "messageType" | "message">
+) & { reloaded?: boolean };
 
 /** Combined result from all before_agent_start handlers. */
 interface BeforeAgentStartCombinedResult {
@@ -436,6 +437,7 @@ export class ExtensionRunner {
 		this.runtime.getAllTools = actions.getAllTools;
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
+		this.runtime.requestReload = actions.requestReload;
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
