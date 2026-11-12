@@ -16,6 +16,7 @@ import { Worker } from "node:worker_threads";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { SOURCES, type Source } from "../../extensions/metrics/queries/index.ts";
 import { CLAUDE_PROJECTS, metricsPath, needsClaude } from "../../extensions/metrics/stats.ts";
+import { RELEASE } from "../../extensions/lib/repository.ts";
 import { openStore } from "../../extensions/metrics/store.ts";
 import { ApiError, route } from "./api.ts";
 
@@ -56,11 +57,14 @@ export interface IndexStatus {
 	error: string | null;
 	/** Bumped by every completed index; clients refetch when it changes. */
 	generation: number;
+	/** The harness release the server runs (null from a repository checkout), and its process, so a newer release can replace it. */
+	release: string | null;
+	pid: number;
 }
 
 /** Runs index passes one at a time in a worker; a request during a pass queues one more. */
 export class Indexer {
-	readonly status: IndexStatus = { app: APP, indexing: false, claudeIndexed: false, lastIndexed: null, indexed: 0, failed: [], error: null, generation: 0 };
+	readonly status: IndexStatus = { app: APP, indexing: false, claudeIndexed: false, lastIndexed: null, indexed: 0, failed: [], error: null, generation: 0, release: RELEASE?.commit ?? null, pid: process.pid };
 	private running: Promise<void> | undefined;
 	private queued: { claude: boolean } | undefined;
 	private readonly options: { path: string; agentDir: string; claudeDir: string; onDone: () => void };

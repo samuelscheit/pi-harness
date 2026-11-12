@@ -3,30 +3,38 @@
 // sources changed.
 //
 // The detached server logs to <agent dir>/dashboard.log. A running server is recognised by its
-// /api/status answer and reused.
+// /api/status answer and reused. When the harness runs from releases (extensions/lib/release.ts),
+// the server starts from the deployed release, whatever release the caller runs, and
+// `restartOutdated` replaces a server that still runs an older one.
 
 import { execFile, spawn } from "node:child_process";
-import { existsSync, openSync, readdirSync, statSync } from "node:fs";
+import { existsSync, openSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { APP, DEFAULT_PORT, HOST } from "./server.ts";
+import { currentLink } from "../../extensions/lib/release.ts";
+import { RELEASE } from "../../extensions/lib/repository.ts";
+import { APP, DEFAULT_PORT, HOST, type IndexStatus } from "./server.ts";
 
-const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const MAIN = fileURLToPath(new URL("./main.ts", import.meta.url));
+/** The dashboard directory to run: the deployed release's when running from releases, else this one. */
+const dashboardRoot = (agentDir = getAgentDir()) => (RELEASE ? join(realpathSync(currentLink(agentDir)), "dashboard") : fileURLToPath(new URL("..", import.meta.url)));
 const START_TIMEOUT_MS = 15_000;
 const STATUS_TIMEOUT_MS = 1_000;
 
-/** Whether a dashboard answers on `port`. */
-export async function running(port: number): Promise<boolean> {
+/** The status of the dashboard answering on `port`, if one does. */
+async function status(port: number): Promise<IndexStatus | undefined> {
 	try {
 		const response = await fetch(`http://${HOST}:${port}/api/status`, { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) });
-		return response.ok && ((await response.json()) as { app?: string }).app === APP;
+		const body = response.ok ? ((await response.json()) as IndexStatus) : undefined;
+		return body?.app === APP ? body : undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
+
+/** Whether a dashboard answers on `port`. */
+export const running = async (port: number) => (await status(port)) !== undefined;
 
 function newest(path: string): number {
 	const stat = statSync(path);
@@ -38,7 +46,7 @@ function newest(path: string): number {
 const BUILD_INPUTS = ["src", "index.html", "package.json", "vite.config.ts", "tailwind.config.ts", "postcss.config.js", "tsconfig.json"];
 
 /** Whether dist is missing or older than a build input (the server's own types included). */
-export function stale(root = ROOT): boolean {
+export function stale(root = dashboardRoot()): boolean {
 	const built = join(root, "dist", "index.html");
 	if (!existsSync(built)) return true;
 	const inputs = [...BUILD_INPUTS.map((name) => join(root, name)), join(root, "..", "extensions", "metrics", "queries")].filter((path) => existsSync(path));
@@ -52,10 +60,10 @@ const npm = () => {
 };
 
 /** Install the frontend's dependencies when missing and build it when stale. */
-export async function build(log: (line: string) => void = () => {}): Promise<void> {
-	if (!stale()) return;
-	const run = (args: string[]) => promisify(execFile)(npm(), args, { cwd: ROOT, maxBuffer: 64 * 1024 * 1024 });
-	if (!existsSync(join(ROOT, "node_modules"))) {
+export async function build(log: (line: string) => void = () => {}, root = dashboardRoot()): Promise<void> {
+	if (!stale(root)) return;
+	const run = (args: string[]) => promisify(execFile)(npm(), args, { cwd: root, maxBuffer: 64 * 1024 * 1024 });
+	if (!existsSync(join(root, "node_modules"))) {
 		log("Installing the dashboard's dependencies…");
 		await run(["ci", "--no-audit", "--no-fund"]);
 	}
@@ -67,10 +75,11 @@ export async function build(log: (line: string) => void = () => {}): Promise<voi
 export async function launch({ port = DEFAULT_PORT, agentDir = getAgentDir() } = {}): Promise<{ url: string; started: boolean }> {
 	const url = `http://${HOST}:${port}`;
 	if (await running(port)) return { url, started: false };
-	await build();
+	const root = dashboardRoot(agentDir);
+	await build(undefined, root);
 	const log = openSync(join(agentDir, "dashboard.log"), "a");
-	const child = spawn(process.execPath, [MAIN, "--port", String(port)], {
-		cwd: resolve(ROOT, ".."),
+	const child = spawn(process.execPath, [join(root, "server", "main.ts"), "--port", String(port)], {
+		cwd: resolve(root, ".."),
 		detached: true,
 		stdio: ["ignore", log, log],
 		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
@@ -83,4 +92,24 @@ export async function launch({ port = DEFAULT_PORT, agentDir = getAgentDir() } =
 		await new Promise((wait) => setTimeout(wait, 200));
 	}
 	throw new Error(`the dashboard did not start; see ${join(agentDir, "dashboard.log")}`);
+}
+
+/**
+ * Replace a running dashboard that runs another release than the deployed one: stop it, then
+ * start the deployed release's. Does nothing when none runs or it is current. Returns whether it
+ * restarted one.
+ */
+export async function restartOutdated({ port = DEFAULT_PORT, agentDir = getAgentDir(), deployed }: { port?: number; agentDir?: string; deployed: string }): Promise<boolean> {
+	const current = await status(port);
+	// A server from before status carried its pid cannot be replaced from here.
+	if (!current || current.release === deployed || typeof current.pid !== "number") return false;
+	try {
+		process.kill(current.pid, "SIGTERM");
+	} catch {
+		// Gone already.
+	}
+	const deadline = Date.now() + START_TIMEOUT_MS;
+	while ((await running(port)) && Date.now() < deadline) await new Promise((wait) => setTimeout(wait, 200));
+	await launch({ port, agentDir });
+	return true;
 }

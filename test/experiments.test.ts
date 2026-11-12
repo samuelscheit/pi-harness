@@ -610,6 +610,12 @@ describe("/harness experiment", () => {
 		assert.match(log, /^## 2026-11-20 — experiment stopped: x$/m);
 		assert.match(log, /```\nx: A 0 sessions/);
 		assert.match(experimentCommand(["x", "stop"], ctx).text, /already stopped/);
+		// Running a release, the written files are committed to the harness repository to take effect.
+		experimentFile("y", "Variant.", at);
+		const published: [string[], string][] = [];
+		const text = experimentCommand(["y", "stop"], { ...ctx, publish: (paths, message) => (published.push([paths, message]), "Committed abc.") }).text;
+		assert.deepEqual(published, [[[join(at, "y.md"), changelog], "chore(experiments): stop y"]]);
+		assert.match(text, /^Stopped y; result logged in the changelog\.\nCommitted abc\./);
 		assert.match(experimentCommand(["x", "on"], ctx).text, /already stopped/);
 	});
 

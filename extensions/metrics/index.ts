@@ -9,6 +9,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { launch } from "../../dashboard/server/launch.ts";
 import { DEFAULT_PORT, lanUrls } from "../../dashboard/server/server.ts";
 import { ARM_ENTRY, listExperiments, recordedArms } from "../lib/experiments.ts";
+import { commitToSource } from "../lib/release.ts";
+import { RELEASE, SOURCE_ROOT } from "../lib/repository.ts";
 import { EXPERIMENT_USAGE, experimentCommand } from "./experiment.ts";
 import { stats } from "./stats.ts";
 
@@ -46,6 +48,8 @@ export default function metrics(pi: ExtensionAPI) {
 					sessionId: ctx.sessionManager.getSessionId(),
 					recorded: recordedArms(ctx.sessionManager.getEntries()),
 					appendEntry: (data) => pi.appendEntry(ARM_ENTRY, data),
+					// Running a release, the stop takes effect once committed to the harness repository.
+					...(RELEASE ? { publish: (paths: string[], message: string) => commitToSource(SOURCE_ROOT, paths, message) } : {}),
 				});
 				ctx.ui.notify(text, level);
 			} else {

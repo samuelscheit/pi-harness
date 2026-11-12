@@ -8,7 +8,7 @@ import { bucketLabel, delta, projectName, tokens, usd } from "./format";
 import { compressedScale } from "./timeline";
 import { foldDiff } from "./versions";
 
-const status: IndexStatus = { app: "pi-harness-dashboard", indexing: false, claudeIndexed: false, lastIndexed: Date.now(), indexed: 0, failed: [], error: null, generation: 1 };
+const status: IndexStatus = { app: "pi-harness-dashboard", indexing: false, claudeIndexed: false, lastIndexed: Date.now(), indexed: 0, failed: [], error: null, generation: 1, release: null, pid: 1 };
 
 let calls: { view: string; params: Params }[] = [];
 let posts: { view: string; params: Params }[] = [];

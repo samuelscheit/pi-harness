@@ -5,14 +5,14 @@
 // Backlogs are plain Markdown in the harness-neutral `.agents/` layout:
 // - project: <repository root>/.agents/improvements.md, for the project's AGENTS.md, skills
 //   and conventions;
-// - harness: this repository's .agents/improvements.md, for the base prompt, global rules,
-//   extensions, tools and models.
+// - harness: the harness repository's .agents/improvements.md (its source, also when Pi runs a
+//   release of it), for the base prompt, global rules, extensions, tools and models.
 
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { HARNESS_ROOT, repositoryRoot } from "../lib/repository.ts";
+import { repositoryRoot, SOURCE_ROOT } from "../lib/repository.ts";
 const BACKLOG = join(".agents", "improvements.md");
 const HEADER = "# Improvement backlog\n\nNoted by agents with note_improvement; consumed by dreaming and /improve.\n";
 
@@ -37,7 +37,7 @@ export interface Note {
 	proposal: string;
 }
 
-export function backlogPath(scope: Note["scope"], cwd: string, harnessRoot = HARNESS_ROOT): string {
+export function backlogPath(scope: Note["scope"], cwd: string, harnessRoot = SOURCE_ROOT): string {
 	return join(scope === "harness" ? harnessRoot : repositoryRoot(cwd), BACKLOG);
 }
 
