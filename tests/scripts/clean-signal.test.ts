@@ -1,0 +1,1270 @@
+/**
+ * Tests for the pure helpers behind scripts/probe-clean-signal.mjs (#460):
+ *   - scripts/lib/clean-signal.mjs  — classifyCleanBehavior, the PHASE-AWARE
+ *     4-way classifier (2 publishes-versioned / 2* publishes-unversioned /
+ *     3 silent / unknown). The phase dimension matters: a server that published
+ *     only on the dirty touch and went silent on clean transitions (typescript —
+ *     the true budget-wait case) must NOT be conflated with one that actively
+ *     re-publishes version-lessly on clean transitions (opengrep — early-returns
+ *     the wait at runtime).
+ *   - scripts/lib/md-matrix.mjs     — the partial-doc MERGE guard (#390): a run
+ *     that couldn't measure a server must NOT drop or blank its row.
+ *
+ * These are the classifier + merge logic the nightly relies on; spawning a server
+ * is out of scope for a unit test (mirrors the repo pattern of testing script
+ * helpers, not the scripts, per tests/scripts/changelog.test.ts).
+ */
+
+import { describe, expect, it } from "vitest";
+import {
+	aggregateDriftRows,
+	buildMatrixObservations,
+	checkCleanSignalDrift,
+	classifyCleanBehavior,
+	classifyFirstPublish,
+	COMPARABLE_FIRST_PUBLISH,
+	createPublishTraceDrainer,
+	describeFirstPublishAuthors,
+	findCleanSignalDrift,
+	resolveProbeServerId,
+	resolveTargetLangRows,
+	strategyKeyForLang,
+	targetLangForFixture,
+} from "../../scripts/lib/clean-signal.mjs";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	createProbeFixture,
+	type ProbeRow,
+} from "../../scripts/lib/probe-fixture.mjs";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import {
+	mergeRows,
+	mergeSrc,
+	parseTable,
+	replaceTable,
+} from "../../scripts/lib/md-matrix.mjs";
+
+/** One parsed `[lsp-pub]` record as the drainer pushes it into a phase sink. */
+interface DrainedPublish {
+	server: string;
+	/** #4615: the document the row is about, absent on an unattributable row. */
+	path?: string;
+	pubVersion: string;
+	diags: number;
+	versioned: boolean;
+}
+
+const INTERLEAVED_FIXTURE = path.join(
+	process.cwd(),
+	"tests/fixtures/extension-logs/probe-clean-signal-interleaved.log",
+);
+
+/**
+ * Drain one NDJSON sink window for one (server, document) through the real
+ * drainer — the production offset/parse/filter path, fed from a buffer instead
+ * of extension.log.
+ */
+function drainRows(
+	logText: string,
+	serverId: string,
+	fixturePath: string,
+): DrainedPublish[] {
+	const bytes = Buffer.from(logText);
+	const drain = createPublishTraceDrainer({
+		readLog() {
+			return {
+				size: bytes.length,
+				read(start) {
+					const chunk = bytes.subarray(start).toString("utf8");
+					return { chunk, bytesRead: bytes.length - start };
+				},
+			};
+		},
+	});
+	const sink: DrainedPublish[] = [];
+	drain(sink, serverId, fixturePath);
+	return sink;
+}
+
+/** The saved interleaved sink window, drained for one (server, document). */
+function drainFixtureLog(
+	serverId: string,
+	fixturePath: string,
+): DrainedPublish[] {
+	return drainRows(
+		fs.readFileSync(INTERLEAVED_FIXTURE, "utf8"),
+		serverId,
+		fixturePath,
+	);
+}
+
+/** One `[lsp-pub]` sink line, as the client's `logExtension` writes it. */
+function pubLine(server: string, diags: number, documentPath?: string): string {
+	return `${JSON.stringify({
+		subsystem: "lsp-pub",
+		level: "debug",
+		message: `server=${server} pubVersion=undefined docVersion=1 diags=${diags}`,
+		...(documentPath === undefined ? {} : { metadata: { path: documentPath } }),
+	})}\n`;
+}
+
+describe("classifyCleanBehavior (phase-aware 4-way)", () => {
+	it("scopes an interleaved extension.log trace to the row's server and document", () => {
+		// #3390 recurrence: a shared extension.log lets another live server's
+		// publish become this row's first-publish and clean-signal evidence.
+		// #4615: the same log also holds other DOCUMENTS of the same server id
+		// (five typescript fixtures), so the drain is scoped to both.
+		const drainA = drainFixtureLog("server-a", "/proj/a.ts");
+		const own = drainA;
+		expect(own).toHaveLength(2);
+		expect(own.map((publish) => publish.diags)).toEqual([1, 0]);
+		expect(
+			classifyCleanBehavior({
+				dirtyPublishes: own.slice(0, 1).length,
+				dirtyVersioned: 1,
+				cleanTransitionPublishes: own.slice(1).length,
+				cleanTransitionVersioned: 1,
+			}).behavior,
+		).toBe("publishes-versioned");
+		// The other server's rows are in the same window, interleaved, and do not
+		// leak into A's phase; the same server on another document neither.
+		expect(
+			drainFixtureLog("server-b", "/proj/b.ts").map((p) => p.diags),
+		).toEqual([7, 6]);
+		expect(drainFixtureLog("server-a", "/proj/b.ts")).toEqual([]);
+	});
+	it("scopes an auxiliary fixture's trace to the auxiliary, not the file's primary (#3665)", () => {
+		// #3665 recurrence (the inverse of #3390): the probe resolved serverId by
+		// `role !== "auxiliary"`, so the ast-grep row read typescript's two
+		// unversioned publishes instead of ast-grep's three versioned ones.
+		const drainFor = (serverId: string | undefined) =>
+			drainFixtureLog(serverId as string, "/proj/sample.ts");
+		// `getServersForFileWithConfig` order for a .ts file with the ast-grep aux.
+		const servers = [
+			{ id: "typescript" },
+			{ id: "ast-grep", role: "auxiliary" },
+		];
+		const auxFixture = { lang: "ast-grep", auxiliaryServerIds: ["ast-grep"] };
+		const primaryFixture = { lang: "typescript" };
+
+		const auxId = resolveProbeServerId(auxFixture, servers);
+		expect(auxId).toBe("ast-grep");
+		const auxTrace = drainFor(auxId);
+		expect(auxTrace.map((p) => p.versioned)).toEqual([true, true, true]);
+		expect(auxTrace.every((p) => p.server === "ast-grep")).toBe(true);
+
+		// #3390 behaviour kept: a non-auxiliary fixture still resolves the primary.
+		const primaryId = resolveProbeServerId(primaryFixture, servers);
+		expect(primaryId).toBe("typescript");
+		expect(drainFor(primaryId).map((p) => p.versioned)).toEqual([false, false]);
+	});
+	it("probeFixture attributes an auxiliary row to the auxiliary's own publishes (#3665 call site)", async () => {
+		// #3665 recurrence: the unit test above pinned the helper, while a revert
+		// of the CALL SITE to the primary-by-role expression stayed green. This
+		// drives the production row construction (`createProbeFixture`, the step
+		// scripts/probe-clean-signal.mjs runs per fixture) with a fake LSP whose
+		// touches append the saved interleaved typescript/ast-grep window to the
+		// log the real drainer reads: dirty touch = ts(unversioned), ast-grep v1,
+		// ast-grep v2; clean touch = ts(unversioned), ast-grep v3.
+		const lines = fs
+			.readFileSync(INTERLEAVED_FIXTURE, "utf8")
+			.trimEnd()
+			.split("\n")
+			.slice(4);
+		let log = Buffer.alloc(0);
+		const drain = createPublishTraceDrainer({
+			readLog() {
+				return {
+					size: log.length,
+					read(start) {
+						const chunk = log.subarray(start).toString("utf8");
+						return { chunk, bytesRead: log.length - start };
+					},
+				};
+			},
+		});
+		const dst = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-probe-fixture-"),
+		);
+		try {
+			const absFile = path.join(dst, "sample.ts");
+			fs.writeFileSync(absFile, "export const x = 1;\n");
+			// #4615: the saved window names its own document; re-stamp it to THIS
+			// fixture's file so the rows are the ones its phase may claim.
+			const stamped = lines.map((line) => {
+				const row = JSON.parse(line) as { metadata?: { path: string } };
+				row.metadata = { path: absFile };
+				return JSON.stringify(row);
+			});
+			const phases = [stamped.slice(0, 3), stamped.slice(3)];
+			let touches = 0;
+			const probeFixture = createProbeFixture({
+				lsp: {
+					supportsLSP: () => true,
+					// The wrapper `touchFile` has returned since #1179: the dirty touch
+					// answers with one finding, the clean touch with none. A bare array
+					// here kept the probe's own `Array.isArray` reading green while it
+					// printed `dirtyDiags=0` for every real row (#4466 review F3).
+					async touchFile() {
+						const next = phases[touches++] ?? [];
+						log = Buffer.concat([log, Buffer.from(`${next.join("\n")}\n`)]);
+						return {
+							diags:
+								touches === 1
+									? [{ message: "ast-grep finding", source: "ast-grep" }]
+									: [],
+							inconclusive: false,
+						};
+					},
+					getWorkspaceDiagnosticsSupport: async () => ({ mode: "push-only" }),
+				},
+				repoRoot: process.cwd(),
+				install: false,
+				initLSPConfig: undefined,
+				getServersForFileWithConfig: () => [
+					{ id: "typescript" },
+					{ id: "ast-grep", role: "auxiliary" },
+				],
+				bootstrapFixtureWorkspace: async () => ({ absFile }),
+				drainPublishTrace: drain,
+				pubLogSize: () => log.length,
+				sleep: async () => undefined,
+			});
+			const row = {
+				lang: "ast-grep",
+				serverId: undefined as string | undefined,
+				behavior: "unknown",
+				tier: 0,
+				tierLabel: "",
+				mode: "?",
+				detail: "",
+				firstPublish: "unknown",
+				cleanFixture: false,
+			};
+			await probeFixture(
+				{
+					lang: "ast-grep",
+					file: "sample.ts",
+					auxiliaryServerIds: ["ast-grep"],
+				},
+				dst,
+				row,
+			);
+			expect(row.serverId).toBe("ast-grep");
+			expect(row.behavior).toBe("publishes-versioned");
+			expect(row.detail).toContain("dirtyPubs=2(v:2) cleanPubs=1(v:1)");
+			expect(row.detail).toContain("dirtyDiags=1");
+		} finally {
+			fs.rmSync(dst, { recursive: true, force: true });
+		}
+	});
+	describe("#4615 publish-trace attribution (document-scoped, fail-closed)", () => {
+		it("drops a publish row that names no document", () => {
+			// A line from a writer that predates the path stamp cannot be shown to
+			// be this fixture's, so it is not evidence in either direction. Dropping
+			// it under-counts a phase (conservative); keeping it is how a foreign
+			// client decided a classification.
+			expect(
+				drainRows(pubLine("typescript", 1), "typescript", "/proj/x.ts"),
+			).toEqual([]);
+		});
+
+		it("drops another live client's publish for the same server id", () => {
+			const window =
+				pubLine("typescript", 0, "/proj/x.ts") +
+				pubLine("typescript", 1, "/proj/other-fixture/bad.ts");
+			expect(
+				drainRows(window, "typescript", "/proj/x.ts").map((p) => p.diags),
+			).toEqual([0]);
+		});
+
+		it("probeFixture classifies a clean fixture empty-only when a foreign row lands in its phase (#4615)", async () => {
+			// The plant: the clean fixture's own settled answer is the empty publish,
+			// and a still-live sibling fixture's finding-bearing row flushes into
+			// the same phase — the 2026-10-18..20 sequence, reproduced in the sink's
+			// arrival order. A clean fixture's file has no finding to publish, so
+			// `direct` from it is never its measurement.
+			const row = await probePhaseTrace((absFile) => [
+				pubLine("typescript", 0, absFile),
+				pubLine("typescript", 1, "/proj/other-fixture/bad.ts"),
+			]);
+			expect(row.firstPublish).toBe("empty-only");
+			expect(row.firstPublish).not.toBe("direct");
+			expect(row.detail).toContain("first-publish=empty-only");
+		});
+
+		it("probeFixture refuses the direct class from a clean fixture even on its own path (#4615)", async () => {
+			// The same file name never carries a finding in a `clean: true` fixture,
+			// so a finding-bearing row attributed to it means the trace (or the
+			// fixture's flag) is wrong. Refuse the class instead of writing it.
+			const row = await probePhaseTrace((absFile) => [
+				pubLine("typescript", 1, absFile),
+			]);
+			expect(row.firstPublish).toBe("unknown");
+			expect(row.detail).toContain("refused (#4615)");
+		});
+
+		it("keeps a clean fixture's own empty-first class out of the matrix (#4615)", async () => {
+			// The reviewer's sequence, end to end: the clean fixture's OWN document
+			// publishes the empty set and then a finding-bearing one — the shape
+			// `classifyFirstPublish` reads as `empty-first` — and no dirty sibling
+			// exists (an unmeasured or absent one). A clean file has no finding to
+			// publish, so this trace is not the axis's measurement in EITHER
+			// comparable class: refusing only `direct` refused half the gap. The
+			// producer must refuse the row, and the resolver must hand the matrix
+			// nothing rather than the clean fixture's class.
+			const row = await probePhaseTrace((absFile) => [
+				pubLine("typescript", 0, absFile),
+				pubLine("typescript", 1, absFile),
+			]);
+			expect(row.firstPublish).toBe("unknown");
+			expect(row.detail).toContain("first-publish=unknown");
+			expect(row.detail).toContain("refused (#4615)");
+			const resolved = resolveTargetLangRows([
+				{
+					lang: "typescript-clean",
+					cleanFixture: true,
+					behavior: String(row.behavior),
+					firstPublish: String(row.firstPublish),
+				},
+			]);
+			expect(resolved).toHaveLength(1);
+			expect(resolved[0].firstPublishFrom).toBeUndefined();
+			expect(resolved[0].firstPublish).not.toBe("empty-first");
+			expect(buildMatrixObservations(resolved)[0].firstPublish).toBeNull();
+		});
+
+		it("pins terraform's recorded burst as direct under document scoping (#4615 cross-document attribution)", () => {
+			// Recurrence: #4615 cross-document attribution, second instance. The
+			// pre-#4615 drainer kept rows by server id alone, so terraform-ls's
+			// EMPTY set for the WORKSPACE DIRECTORY URI, published in the same ~1 ms
+			// burst as the file's own finding, counted as the dirty file's first
+			// publish and classified `empty-first`. That is how the 2026-10-17..20
+			// nights were read. The fixture is one recorded burst (2026-10-22,
+			// terraform-ls 0.39.0): the directory row (diags=0, path = the workspace
+			// directory) leads each pair, then bad.tf (diags=1). Scoped to bad.tf,
+			// the first dirty-phase row is the file's own finding: `direct`.
+			const file = "/proj/terraform-burst/bad.tf";
+			const burst = fs.readFileSync(
+				path.join(
+					process.cwd(),
+					"tests/fixtures/extension-logs/probe-clean-signal-terraform-burst.log",
+				),
+				"utf8",
+			);
+			const scoped = drainRows(burst, "terraform", file);
+			expect(scoped.map((publish) => publish.diags)).toEqual([1, 1, 1]);
+			expect(scoped.every((publish) => publish.path === file)).toBe(true);
+			expect(classifyFirstPublish(scoped.slice(0, 2)).firstPublish).toBe(
+				"direct",
+			);
+			// The directory rows are real in the same burst. Pinned here so the
+			// test cannot pass by the directory rows being absent from the fixture.
+			expect(
+				drainRows(burst, "terraform", "/proj/terraform-burst").map(
+					(publish) => publish.diags,
+				),
+			).toEqual([0, 0, 0]);
+		});
+
+		/**
+		 * Drive the production row construction for a `clean: true` fixture whose
+		 * dirty phase appends exactly `buildLines(absFile)` to the sink.
+		 */
+		async function probePhaseTrace(
+			buildLines: (absFile: string) => string[],
+		): Promise<Record<string, unknown> & { detail: string }> {
+			const dst = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-probe-clean-attr-"),
+			);
+			try {
+				const absFile = path.join(dst, "clean.ts");
+				fs.writeFileSync(absFile, "export const x = 1;\n");
+				let log = Buffer.alloc(0);
+				const drain = createPublishTraceDrainer({
+					readLog() {
+						return {
+							size: log.length,
+							read(start) {
+								const chunk = log.subarray(start).toString("utf8");
+								return { chunk, bytesRead: log.length - start };
+							},
+						};
+					},
+				});
+				let touches = 0;
+				const probeFixture = createProbeFixture({
+					// #4362 shape 66: seeded from the shared LSPService factory, so
+					// only the two methods this cell drives are overridden (the
+					// service-double ratchet flags a hand-rolled service object).
+					// The factory's `Record<string, unknown>` is looser than the
+					// three-method shape `createProbeFixture` declares, hence the
+					// same cast this file's trust-refusal cell already uses.
+					lsp: makeLspServiceDouble({
+						supportsLSP: () => true,
+						touchFile: async () => {
+							touches += 1;
+							if (touches === 1) {
+								log = Buffer.concat([
+									log,
+									Buffer.from(buildLines(absFile).join("")),
+								]);
+							}
+							return { diags: [], inconclusive: false };
+						},
+						getWorkspaceDiagnosticsSupport: async () => ({
+							mode: "push-only",
+						}),
+					}) as never,
+					repoRoot: process.cwd(),
+					install: false,
+					initLSPConfig: undefined,
+					getServersForFileWithConfig: () => [{ id: "typescript" }],
+					bootstrapFixtureWorkspace: async () => ({ absFile }),
+					drainPublishTrace: drain,
+					pubLogSize: () => log.length,
+					sleep: async () => undefined,
+				});
+				const row = {
+					lang: "typescript-clean",
+					serverId: undefined as string | undefined,
+					behavior: "unknown",
+					tier: 0,
+					tierLabel: "",
+					mode: "?",
+					detail: "",
+					firstPublish: "unknown",
+					cleanFixture: true,
+				};
+				await probeFixture(
+					{ lang: "typescript-clean", file: "clean.ts", clean: true },
+					dst,
+					row,
+				);
+				return row;
+			} finally {
+				fs.rmSync(dst, { recursive: true, force: true });
+			}
+		}
+	});
+
+	describe("#4615 first-publish axis prefers the dirty fixture", () => {
+		const dirtyTypeScript = {
+			lang: "typescript",
+			behavior: "publishes-unversioned",
+			tier: 2,
+			tierLabel: "2*",
+			firstPublish: "direct",
+			cleanFixture: false,
+		};
+		const cleanTypeScript = {
+			lang: "typescript-clean",
+			behavior: "silent",
+			tier: 3,
+			tierLabel: "3",
+			firstPublish: "empty-only",
+			cleanFixture: true,
+		};
+
+		it("takes clean-behavior from the clean fixture and first-publish from the dirty one", () => {
+			const [row] = resolveTargetLangRows([dirtyTypeScript, cleanTypeScript]);
+			expect(row.lang).toBe("typescript");
+			expect(row.behavior).toBe("silent");
+			expect(row.tierLabel).toBe("3");
+			// The matrix cell's own value: the dirty fixture's measurement.
+			expect(row.firstPublish).toBe("direct");
+			expect(row.firstPublishFrom).toBe("typescript");
+		});
+
+		it("resolves identically when the clean fixture is probed first", () => {
+			const [row] = resolveTargetLangRows([cleanTypeScript, dirtyTypeScript]);
+			expect(row.behavior).toBe("silent");
+			expect(row.firstPublish).toBe("direct");
+			expect(row.firstPublishFrom).toBe("typescript");
+		});
+
+		it("never derives a first-publish class from a clean fixture alone", () => {
+			const [row] = resolveTargetLangRows([cleanTypeScript]);
+			expect(row.lang).toBe("typescript");
+			expect(row.firstPublish).toBe("empty-only");
+			expect(row.firstPublishFrom).toBeUndefined();
+			expect(COMPARABLE_FIRST_PUBLISH.has(String(row.firstPublish))).toBe(
+				false,
+			);
+		});
+
+		it("names the fixture behind each resolved row's class (#4615 nightly log)", () => {
+			// The probe's summary line, pure so it is testable: `firstPublishFrom`
+			// used to reach only the tests, so a clean-authored class would have
+			// been committed with nothing in the nightly log naming its author.
+			expect(
+				describeFirstPublishAuthors(
+					resolveTargetLangRows([dirtyTypeScript, cleanTypeScript]),
+				),
+			).toBe("typescript <- typescript");
+			// A clean row that carries a comparable class anyway names no author,
+			// so the log reads "none" rather than inventing one.
+			expect(
+				describeFirstPublishAuthors(
+					resolveTargetLangRows([
+						{ ...cleanTypeScript, firstPublish: "empty-first" },
+					]),
+				),
+			).toBe("none");
+		});
+
+		it("refuses a comparable class a clean row carries anyway (#4615 seam defence)", () => {
+			// The producer refuses every comparable class from a clean fixture, and
+			// this seam keys on who may AUTHOR the axis rather than on which class
+			// arrived: a row any other caller built with `empty-first` on a clean
+			// fixture cannot become the matrix's class either — alone (the dirty
+			// sibling absent) or beside an unmeasured dirty sibling.
+			const leaked = { ...cleanTypeScript, firstPublish: "empty-first" };
+			const [alone] = resolveTargetLangRows([leaked]);
+			expect(alone.firstPublishFrom).toBeUndefined();
+			expect(COMPARABLE_FIRST_PUBLISH.has(String(alone.firstPublish))).toBe(
+				false,
+			);
+			expect(buildMatrixObservations([alone])[0].firstPublish).toBeNull();
+			for (const order of [
+				[leaked, { ...dirtyTypeScript, firstPublish: "unknown" }],
+				[{ ...dirtyTypeScript, firstPublish: "unknown" }, leaked],
+			]) {
+				const [merged] = resolveTargetLangRows(order);
+				expect(merged.firstPublishFrom).toBeUndefined();
+				expect(COMPARABLE_FIRST_PUBLISH.has(String(merged.firstPublish))).toBe(
+					false,
+				);
+				expect(buildMatrixObservations([merged])[0].firstPublish).toBeNull();
+			}
+		});
+	});
+
+	// Recurrence #4514 (acceptance 2): trust kept the server from launching, no
+	// publish ever arrived, and the row read "no publish observed (server
+	// slow/absent)" for six nights. Drives the production row construction with
+	// a server that publishes nothing, and varies only the trust refusal.
+	describe.each([
+		["trust refused", "refused: project trust is unknown", true],
+		["trust adopted", undefined, false],
+	])(
+		"probeFixture with a silent server, %s (#4514)",
+		(_name, refusal, refused) => {
+			it("names the refusal in the row instead of 'no publish observed'", async () => {
+				const dst = fs.mkdtempSync(
+					path.join(os.tmpdir(), "pi-lens-probe-refusal-"),
+				);
+				try {
+					const absFile = path.join(dst, "sample.yaml");
+					fs.writeFileSync(absFile, "a: 1\n");
+					const probeFixture = createProbeFixture({
+						// The shared double (an inline literal would be a second hand-rolled
+						// service in this file, flake-shape service-double): a silent server.
+						lsp: makeLspServiceDouble({
+							supportsLSP: () => true,
+							touchFile: async () => undefined,
+							getWorkspaceDiagnosticsSupport: async () => ({}),
+						}) as never,
+						repoRoot: process.cwd(),
+						install: false,
+						initLSPConfig: undefined,
+						getServersForFileWithConfig: () => [{ id: "yaml" }],
+						bootstrapFixtureWorkspace: async () => ({ absFile }),
+						trustRefusal: async () => refusal,
+						drainPublishTrace: Object.assign(() => undefined, {
+							reset: () => undefined,
+						}),
+						pubLogSize: () => 0,
+						sleep: async () => undefined,
+					});
+					const row = {
+						lang: "yaml",
+						serverId: undefined as string | undefined,
+						behavior: "unknown",
+						tier: 0,
+						tierLabel: "",
+						mode: "?",
+						detail: "",
+						firstPublish: "unknown",
+						cleanFixture: false,
+					};
+					await probeFixture({ lang: "yaml", file: "sample.yaml" }, dst, row);
+					expect(row.behavior).toBe("unknown");
+					if (refused) {
+						expect(row.detail).toBe("refused: project trust is unknown");
+						expect(row.mode).toBe("refused: project trust is unknown");
+					} else {
+						expect(row.detail).toContain("no publish observed");
+						expect(row.mode).toBe("unknown");
+					}
+				} finally {
+					fs.rmSync(dst, { recursive: true, force: true });
+				}
+			});
+		},
+	);
+	it("classifies a versioned clean-transition publisher as publishes-versioned (tier 2)", () => {
+		// ast-grep-shaped: re-publishes WITH a version on a clean transition.
+		const v = classifyCleanBehavior({
+			dirtyPublishes: 2,
+			dirtyVersioned: 2,
+			cleanTransitionPublishes: 1,
+			cleanTransitionVersioned: 1,
+		});
+		expect(v.behavior).toBe("publishes-versioned");
+		expect(v.tier).toBe(2);
+		expect(v.tierLabel).toBe("2");
+	});
+
+	it("classifies a version-less clean-transition publisher as publishes-unversioned (tier 2*)", () => {
+		// opengrep-shaped: re-publishes on the clean transition but every push is
+		// version-less — the wait still early-returns at runtime (the client accepts
+		// a version-less publish as fresh), so this is NOT the budget-wait case.
+		const v = classifyCleanBehavior({
+			dirtyPublishes: 2,
+			dirtyVersioned: 0,
+			cleanTransitionPublishes: 1,
+			cleanTransitionVersioned: 0,
+		});
+		expect(v.behavior).toBe("publishes-unversioned");
+		expect(v.tier).toBe(2);
+		expect(v.tierLabel).toBe("2*");
+	});
+
+	it("classifies dirty-publish + clean-silence as silent (tier 3 — the #458 target)", () => {
+		// typescript-shaped: demonstrably alive (published on the dirty touch) but
+		// demonstrably silent on clean transitions — the budget-wait case.
+		const v = classifyCleanBehavior({
+			dirtyPublishes: 2,
+			dirtyVersioned: 0,
+			cleanTransitionPublishes: 0,
+			cleanTransitionVersioned: 0,
+		});
+		expect(v.behavior).toBe("silent");
+		expect(v.tier).toBe(3);
+		expect(v.tierLabel).toBe("3");
+	});
+
+	it("a versioned clean publish wins even when the dirty phase was version-less", () => {
+		// The clean-transition phase is the discriminator, not the dirty phase.
+		const v = classifyCleanBehavior({
+			dirtyPublishes: 1,
+			dirtyVersioned: 0,
+			cleanTransitionPublishes: 2,
+			cleanTransitionVersioned: 1,
+		});
+		expect(v.behavior).toBe("publishes-versioned");
+		expect(v.tierLabel).toBe("2");
+	});
+
+	it("reports unknown (not tier 3) when the server never published at all", () => {
+		// Conservative: a slow/absent server must not be mislabeled as measured-silent.
+		const v = classifyCleanBehavior({
+			dirtyPublishes: 0,
+			dirtyVersioned: 0,
+			cleanTransitionPublishes: 0,
+			cleanTransitionVersioned: 0,
+		});
+		expect(v.behavior).toBe("unknown");
+		expect(v.tier).toBe(0);
+		expect(v.tierLabel).toBe("");
+	});
+
+	it("tolerates missing/garbage observation fields", () => {
+		expect(classifyCleanBehavior({}).behavior).toBe("unknown");
+		expect(
+			classifyCleanBehavior(undefined as unknown as Record<string, never>)
+				.behavior,
+		).toBe("unknown");
+	});
+});
+
+describe("checkCleanSignalDrift (#529)", () => {
+	it("flags marked-not-silent when the marker says silent but the probe observed a publish", () => {
+		// The stale-marker direction: wait-policy/strategies.ts is too pessimistic.
+		const d = checkCleanSignalDrift(
+			{ lang: "typescript", behavior: "publishes-unversioned" },
+			true,
+		);
+		expect(d.kind).toBe("marked-not-silent");
+		expect(d.detail).toContain("typescript");
+		expect(d.detail).toContain("publishes-unversioned");
+	});
+
+	it("flags silent-not-marked when the probe observed silence but no marker is set", () => {
+		// The pre-#458 tsserver situation: cascade burns a full wait it could skip.
+		const d = checkCleanSignalDrift(
+			{ lang: "python", behavior: "silent" },
+			undefined,
+		);
+		expect(d.kind).toBe("silent-not-marked");
+		expect(d.detail).toContain("python");
+	});
+
+	it("is consistent when a silent observation matches a true marker", () => {
+		const d = checkCleanSignalDrift(
+			{ lang: "typescript", behavior: "silent" },
+			true,
+		);
+		expect(d.kind).toBe("consistent");
+	});
+
+	it("is consistent when a non-silent observation matches an absent/false marker", () => {
+		const d = checkCleanSignalDrift(
+			{ lang: "yaml", behavior: "publishes-unversioned" },
+			undefined,
+		);
+		expect(d.kind).toBe("consistent");
+	});
+
+	it("never treats 'unknown' as drift evidence in either direction (#240 doctrine)", () => {
+		// A server marked silentOnClean:true whose probe came back unknown (slow/absent
+		// this run) must NOT be reported as "marker says silent, observed not-silent" —
+		// unknown means we didn't see it publish at all, not that it's not silent.
+		const markedButUnknown = checkCleanSignalDrift(
+			{ lang: "typescript", behavior: "unknown" },
+			true,
+		);
+		expect(markedButUnknown.kind).toBe("not-comparable");
+
+		const unmarkedAndUnknown = checkCleanSignalDrift(
+			{ lang: "some-new-server", behavior: "unknown" },
+			undefined,
+		);
+		expect(unmarkedAndUnknown.kind).toBe("not-comparable");
+	});
+
+	it("tolerates a falsy marker value explicitly set to false (same as undefined)", () => {
+		const d = checkCleanSignalDrift(
+			{ lang: "rust-analyzer", behavior: "silent" },
+			false,
+		);
+		expect(d.kind).toBe("silent-not-marked");
+	});
+
+	// #558: typescript7/typescript7-clean get an explicit `false` expectation
+	// instead of classic's shared "typescript" marker (probe-clean-signal.mjs's
+	// `lookupSilentOnClean`, out of unit-test scope — see the file header). #558
+	// set it on a 2026-07-12 reading of native-ts7 publishing on clean. The
+	// `silent` rows the nightly filed from 2026-10-21 were classic's launch
+	// (#5348, tests/scripts/probe-launch-variant.test.ts); the second
+	// case is what a push-only silent native build would file.
+	it("is consistent when native-ts7 is observed publishing on clean against its own expected-false marker (#558)", () => {
+		const d = checkCleanSignalDrift(
+			{ lang: "typescript7-clean", behavior: "publishes-unversioned" },
+			false,
+		);
+		expect(d.kind).toBe("consistent");
+	});
+
+	it("flags silent-not-marked when a native-ts7 launch is observed silent (#558)", () => {
+		// The explicit `false` expectation surfaces silence as a signal for a
+		// human to decide on tier3-silent for native-ts7, instead of the row
+		// being silently skipped like the old full exclusion.
+		const d = checkCleanSignalDrift(
+			{ lang: "typescript7", behavior: "silent" },
+			false,
+		);
+		expect(d.kind).toBe("silent-not-marked");
+		expect(d.detail).toContain("typescript7");
+	});
+});
+
+describe("findCleanSignalDrift (#529)", () => {
+	it("returns only the drifting rows, dropping consistent and not-comparable ones", () => {
+		const rows = [
+			{ lang: "typescript", behavior: "publishes-unversioned" }, // marked-not-silent
+			{ lang: "python", behavior: "silent" }, // silent-not-marked
+			{ lang: "yaml", behavior: "publishes-unversioned" }, // consistent
+			{ lang: "rust-analyzer", behavior: "unknown" }, // not-comparable
+		];
+		const markers: Record<string, boolean | undefined> = {
+			typescript: true,
+			python: undefined,
+			yaml: undefined,
+			"rust-analyzer": undefined,
+		};
+		const warnings = findCleanSignalDrift(rows, (lang) => markers[lang]);
+		expect(warnings).toHaveLength(2);
+		expect(warnings.map((w) => w.lang).sort()).toEqual([
+			"python",
+			"typescript",
+		]);
+		expect(
+			warnings.every(
+				(w) => w.kind !== "consistent" && w.kind !== "not-comparable",
+			),
+		).toBe(true);
+	});
+
+	it("returns an empty array when everything is consistent", () => {
+		const rows = [{ lang: "yaml", behavior: "publishes-unversioned" }];
+		const warnings = findCleanSignalDrift(rows, () => undefined);
+		expect(warnings).toHaveLength(0);
+	});
+
+	// #558: a native-ts7 row participates in the drift scan like any other row,
+	// but the caller's lookup (mirroring probe-clean-signal.mjs's
+	// lookupSilentOnClean) gives it an explicit `false` expectation instead of
+	// routing it to classic's shared "typescript" marker. Today's
+	// publishes-* observation is therefore consistent (no false alarm), while
+	// classic's own row is unaffected.
+	it("includes a native-ts7 row with its own expected-false marker, staying consistent while classic's row is unaffected (#558)", () => {
+		const rows = [
+			{ lang: "typescript", behavior: "silent" }, // consistent (classic, marked true)
+			{ lang: "typescript7-clean", behavior: "publishes-unversioned" }, // consistent (native-ts7, expected false)
+		];
+		const strategyKeyFor = (lang: string) =>
+			lang === "typescript7-clean" || lang === "typescript7" ? null : lang;
+		const markers: Record<string, boolean | undefined> = { typescript: true };
+		const warnings = findCleanSignalDrift(rows, (lang) => {
+			const key = strategyKeyFor(lang);
+			return key === null ? false : markers[key];
+		});
+		expect(warnings).toHaveLength(0);
+	});
+
+	it("flags a native-ts7 row as marked-not-silent only if it were ever mismarked true (defense in depth, not today's config)", () => {
+		const rows = [
+			{ lang: "typescript7-clean", behavior: "publishes-versioned" },
+		];
+		const warnings = findCleanSignalDrift(rows, () => true);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].lang).toBe("typescript7-clean");
+		expect(warnings[0].kind).toBe("marked-not-silent");
+	});
+});
+
+describe("auxiliary rows are not drift inputs (#5348)", () => {
+	// Recurrence it prevents: fallow-lsp (an auxiliary) published once on open
+	// and then nothing on any unsaved edit, so the probe's dirty-fixture neutral
+	// edit classified it `silent` and the nightly filed `silent-not-marked`
+	// every night from 2026-11-03. The `silentOnClean` marker is read in
+	// primary-scoped gates (cascade classifier, aggregate and silent-confirm) and
+	// in the warm-up gate only for a server with `workspaceIndexing`, which no
+	// auxiliary sets, so no marker could change an auxiliary's wait and the
+	// finding could never be acted on.
+	const fallowRow = {
+		lang: "fallow",
+		behavior: "silent",
+		firstPublish: "direct",
+		auxiliary: true,
+	};
+
+	it("does not call a silent auxiliary row silent-not-marked", () => {
+		const d = checkCleanSignalDrift(fallowRow, undefined);
+		expect(d.kind).toBe("not-comparable");
+		expect(d.detail).toContain("auxiliary");
+	});
+
+	it("drops the auxiliary row from findCleanSignalDrift but still flags a silent primary beside it", () => {
+		const warnings = findCleanSignalDrift(
+			[fallowRow, { lang: "python", behavior: "silent", auxiliary: false }],
+			() => undefined,
+		);
+		expect(warnings.map((w) => w.lang)).toEqual(["python"]);
+	});
+
+	it("keeps a row with no auxiliary flag comparable (fail closed to the old behaviour)", () => {
+		const d = checkCleanSignalDrift(
+			{ lang: "python", behavior: "silent" },
+			undefined,
+		);
+		expect(d.kind).toBe("silent-not-marked");
+	});
+
+	it("probeFixture stamps auxiliary from the registry role of the measured server", async () => {
+		// The production row construction (`createProbeFixture`) is what decides
+		// `row.auxiliary`; a unit test of the checker alone would stay green with
+		// the stamp missing (the #3665 call-site shape).
+		const dst = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-aux-row-"));
+		try {
+			const absFile = path.join(dst, "sample.ts");
+			fs.writeFileSync(absFile, "export const x = 1;\n");
+			const measure = async (
+				fx: { lang: string; file: string; auxiliaryServerIds?: string[] },
+				servers: Array<{ id: string; role?: string }>,
+			) => {
+				const probeFixture = createProbeFixture({
+					lsp: makeLspServiceDouble({
+						supportsLSP: () => true,
+						touchFile: async () => ({ diags: [], inconclusive: false }),
+						getWorkspaceDiagnosticsSupport: async () => ({ mode: "push-only" }),
+					}) as never,
+					repoRoot: process.cwd(),
+					install: false,
+					initLSPConfig: undefined,
+					getServersForFileWithConfig: () => servers,
+					bootstrapFixtureWorkspace: async () => ({ absFile }),
+					drainPublishTrace: Object.assign(() => undefined, {
+						reset: () => undefined,
+					}),
+					pubLogSize: () => 0,
+					sleep: async () => undefined,
+				});
+				const row: ProbeRow = {
+					lang: fx.lang,
+					behavior: "unknown",
+					tier: 0,
+					tierLabel: "",
+					mode: "?",
+					detail: "",
+					firstPublish: "unknown",
+					cleanFixture: false,
+				};
+				await probeFixture(fx, dst, row);
+				return row;
+			};
+			const aux = await measure(
+				{ lang: "fallow", file: "sample.ts", auxiliaryServerIds: ["fallow"] },
+				[{ id: "typescript" }, { id: "fallow", role: "auxiliary" }],
+			);
+			expect(aux.serverId).toBe("fallow");
+			expect(aux.auxiliary).toBe(true);
+			const primary = await measure({ lang: "typescript", file: "sample.ts" }, [
+				{ id: "typescript" },
+				{ id: "fallow", role: "auxiliary" },
+			]);
+			expect(primary.serverId).toBe("typescript");
+			expect(primary.auxiliary).toBe(false);
+			// A declared auxiliary the registry does not list as one is not trusted.
+			const unlisted = await measure(
+				{ lang: "fallow", file: "sample.ts", auxiliaryServerIds: ["fallow"] },
+				[{ id: "typescript" }],
+			);
+			expect(unlisted.auxiliary).toBe(false);
+		} finally {
+			fs.rmSync(dst, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("mergeSrc", () => {
+	it("combines dev + ci deterministically (dev before ci)", () => {
+		expect(mergeSrc("dev", "ci")).toBe("dev+ci");
+		expect(mergeSrc("ci", "dev")).toBe("dev+ci");
+	});
+	it("is idempotent and ignores placeholder dashes", () => {
+		expect(mergeSrc("dev+ci", "ci")).toBe("dev+ci");
+		expect(mergeSrc("—", "dev")).toBe("dev");
+		expect(mergeSrc("", "ci")).toBe("ci");
+	});
+});
+
+const DOC = `# matrix
+
+| lang | server | mode | clean-behavior | tier | src |
+|---|---|---|---|---|---|
+| json | vscode-json-language-server | pull | — | 1 | dev |
+| typescript | typescript-language-server | push-only | TBD | 2/3? | dev |
+| ast-grep | ast-grep (aux) | push-only | TBD | 2/3? | dev+ci |
+
+tail text preserved
+`;
+
+describe("md-matrix merge guard (#390)", () => {
+	it("parses the table and locates its bounds", () => {
+		const tbl = parseTable(DOC, "| lang | server |");
+		expect(tbl).not.toBeNull();
+		expect(tbl!.header).toEqual([
+			"lang",
+			"server",
+			"mode",
+			"clean-behavior",
+			"tier",
+			"src",
+		]);
+		expect(tbl!.rows).toHaveLength(3);
+	});
+
+	it("updates only owned columns of measured rows, preserving the rest", () => {
+		const tbl = parseTable(DOC, "| lang | server |")!;
+		const merged = mergeRows(
+			tbl.rows,
+			tbl.header,
+			[
+				{
+					lang: "typescript",
+					"clean-behavior": "silent",
+					tier: "3",
+					src: "dev+ci",
+				},
+			],
+			"lang",
+			["clean-behavior", "tier", "src"],
+		);
+		const ts = merged.find((r) => r[0] === "typescript")!;
+		expect(ts[3]).toBe("silent"); // clean-behavior updated
+		expect(ts[4]).toBe("3"); // tier updated
+		// `mode` (not owned) is untouched:
+		expect(ts[2]).toBe("push-only");
+	});
+
+	it("preserves rows a run did NOT measure (no regression on ubuntu-poor host)", () => {
+		const tbl = parseTable(DOC, "| lang | server |")!;
+		// Only typescript measured this run; json + ast-grep must survive verbatim.
+		const merged = mergeRows(
+			tbl.rows,
+			tbl.header,
+			[{ lang: "typescript", "clean-behavior": "silent", tier: "3" }],
+			"lang",
+			["clean-behavior", "tier"],
+		);
+		expect(merged).toHaveLength(3); // never shrinks
+		expect(merged.find((r) => r[0] === "json")).toEqual(tbl.rows[0]);
+		expect(merged.find((r) => r[0] === "ast-grep")![3]).toBe("TBD"); // untouched
+	});
+
+	it("round-trips through replaceTable, preserving surrounding text", () => {
+		const tbl = parseTable(DOC, "| lang | server |")!;
+		const merged = mergeRows(
+			tbl.rows,
+			tbl.header,
+			[{ lang: "json", mode: "pull", src: "dev+ci" }],
+			"lang",
+			["src"],
+		);
+		const out = replaceTable(
+			DOC,
+			"| lang | server |",
+			tbl.header,
+			tbl.sep,
+			merged,
+		)!;
+		expect(out).toContain("tail text preserved");
+		expect(out).toContain(
+			"| json | vscode-json-language-server | pull | — | 1 | dev+ci |",
+		);
+	});
+});
+
+describe("classifyFirstPublish (#3310)", () => {
+	// The recurrence: intelephense's EMPTY pre-index publish resolved the push
+	// wait, so a php file with an undefined-variable error rendered as
+	// "confirmed clean". The runtime hold is keyed on this classification, so a
+	// classifier that guessed either way would either re-open that false clean
+	// or stall every Tier 2 clean file.
+	it("classifies the measured intelephense shape as empty-first", () => {
+		const verdict = classifyFirstPublish([{ diags: 0 }, { diags: 2 }]);
+		expect(verdict.firstPublish).toBe("empty-first");
+		expect(verdict.reason).toContain("EMPTY");
+	});
+
+	it("classifies a server whose first publish carries the findings as direct", () => {
+		expect(
+			classifyFirstPublish([{ diags: 1 }, { diags: 0 }]).firstPublish,
+		).toBe("direct");
+	});
+
+	it("refuses to classify an all-empty dirty trace in either direction", () => {
+		// A dirty fixture the server does not diagnose is indistinguishable from
+		// an index that never finished — `empty-only` is the honest answer, and it
+		// is not comparable against the strategy marker.
+		const verdict = classifyFirstPublish([{ diags: 0 }, { diags: 0 }]);
+		expect(verdict.firstPublish).toBe("empty-only");
+		expect(COMPARABLE_FIRST_PUBLISH.has(verdict.firstPublish)).toBe(false);
+	});
+
+	it("reports unknown when nothing published at all", () => {
+		expect(classifyFirstPublish([]).firstPublish).toBe("unknown");
+		expect(classifyFirstPublish(undefined).firstPublish).toBe("unknown");
+	});
+
+	it("compares only the two classifiable values", () => {
+		expect([...COMPARABLE_FIRST_PUBLISH].sort()).toEqual([
+			"direct",
+			"empty-first",
+		]);
+	});
+
+	it("maps an alias fixture lang onto its strategy key", () => {
+		expect(strategyKeyForLang("jedi")).toBe("python-jedi");
+		expect(strategyKeyForLang("php")).toBe("php");
+		// #3347: markdown's server id is `marksman`, the key its silentOnClean
+		// marker lives under. While this mapping was missing, the drift check
+		// looked the marker up under `markdown`, found nothing, and reported the
+		// MARKED marksman as silent-not-marked on every run that reached it.
+		expect(strategyKeyForLang("markdown")).toBe("marksman");
+	});
+});
+
+describe("drift keyed by server, not fixture (#3444)", () => {
+	// Sep 25 nightly, run 36126801198, verbatim from the probe's matrix:
+	//   ast-grep           push-only   publishes-unversioned  unknown       2*
+	//   ast-grep-baseline  push-only   silent                 empty-only    3
+	// Both fixtures run `id: "ast-grep"`; the strategy table has no ast-grep
+	// silentOnClean marker, so the runtime waits the full lane for it.
+	const sep25 = [
+		{
+			lang: "ast-grep",
+			behavior: "publishes-unversioned",
+			firstPublish: "unknown",
+		},
+		{
+			lang: "ast-grep-baseline",
+			behavior: "silent",
+			firstPublish: "empty-only",
+		},
+	];
+	const noMarker = () => undefined;
+
+	it("reports no drift for the Sep 25 probe output", () => {
+		expect(findCleanSignalDrift(sep25, noMarker)).toEqual([]);
+	});
+
+	it("keys the baseline fixture to the ast-grep strategy", () => {
+		expect(strategyKeyForLang("ast-grep-baseline")).toBe("ast-grep");
+	});
+
+	it("drops a silent row whose dirty phase never carried a diagnostic", () => {
+		expect(
+			findCleanSignalDrift([sep25[1]], (lang) =>
+				lang === "ast-grep" ? undefined : true,
+			),
+		).toEqual([]);
+		expect(checkCleanSignalDrift(sep25[1], undefined).kind).toBe(
+			"not-comparable",
+		);
+	});
+
+	it("still reports a silent row the dirty phase proved alive", () => {
+		const [warning] = findCleanSignalDrift(
+			[{ ...sep25[1], firstPublish: "direct" }],
+			noMarker,
+		);
+		expect(warning).toMatchObject({
+			lang: "ast-grep",
+			kind: "silent-not-marked",
+		});
+	});
+
+	it("keeps a clean fixture's silence comparable though its dirty phase is empty", () => {
+		const [warning] = findCleanSignalDrift(
+			[
+				{
+					lang: "python",
+					behavior: "silent",
+					firstPublish: "empty-only",
+					cleanFixture: true,
+				},
+			],
+			noMarker,
+		);
+		expect(warning?.kind).toBe("silent-not-marked");
+	});
+
+	it("judges two fixtures of one server together: any clean publish disproves silence", () => {
+		const rows = [
+			{
+				lang: "ast-grep",
+				behavior: "publishes-unversioned",
+				firstPublish: "direct",
+			},
+			{ lang: "ast-grep-baseline", behavior: "silent", firstPublish: "direct" },
+		];
+		expect(findCleanSignalDrift(rows, noMarker)).toEqual([]);
+		const marked = findCleanSignalDrift(rows, () => true);
+		expect(marked).toHaveLength(1);
+		expect(marked[0]).toMatchObject({
+			lang: "ast-grep",
+			kind: "marked-not-silent",
+		});
+		expect(aggregateDriftRows(rows)).toEqual([
+			expect.objectContaining({
+				lang: "ast-grep",
+				behavior: "publishes-unversioned",
+				fixtures: ["ast-grep", "ast-grep-baseline"],
+			}),
+		]);
+	});
+});
+
+describe("buildMatrixObservations (#3401, review F3)", () => {
+	// Recurrence: a probe run whose first-publish came back `empty-only` or whose
+	// clean-behavior came back `unknown` must not reach the writer as a value, or
+	// it blanks a prior good cell (the #3310/#390 regression). The mapping used to
+	// sit inline in probe-clean-signal.mjs's `updateMatrix`, where no test could
+	// reach it: passing `r.firstPublish`/`r.behavior` unfiltered left the suite
+	// green.
+	const row = (over: Record<string, unknown>) => ({
+		targetLang: "x",
+		firstPublish: "direct",
+		behavior: "silent",
+		tierLabel: "3",
+		tier: 3,
+		...over,
+	});
+
+	it("passes a comparable first-publish and clean-behavior through with the tier label", () => {
+		expect(
+			buildMatrixObservations([
+				row({
+					targetLang: "ast-grep",
+					firstPublish: "empty-first",
+					behavior: "publishes-unversioned",
+					tierLabel: "2*",
+					tier: 2,
+				}),
+			]),
+		).toEqual([
+			{
+				lang: "ast-grep",
+				firstPublish: "empty-first",
+				cleanBehavior: "publishes-unversioned",
+				tier: "2*",
+			},
+		]);
+	});
+
+	it.each(["empty-only", "unknown", "TBD", undefined])(
+		"nulls a non-comparable first-publish (%s) so it cannot blank a prior cell",
+		(firstPublish) => {
+			expect(
+				buildMatrixObservations([row({ firstPublish })])[0].firstPublish,
+			).toBeNull();
+		},
+	);
+
+	it.each(["unknown", "no-lsp", undefined])(
+		"nulls a non-measured clean-behavior (%s)",
+		(behavior) => {
+			expect(
+				buildMatrixObservations([row({ behavior })])[0].cleanBehavior,
+			).toBeNull();
+		},
+	);
+
+	it("filters the two axes independently", () => {
+		expect(
+			buildMatrixObservations([
+				row({ firstPublish: "direct", behavior: "unknown" }),
+				row({ firstPublish: "empty-only", behavior: "publishes-versioned" }),
+			]).map((o) => [o.firstPublish, o.cleanBehavior]),
+		).toEqual([
+			["direct", null],
+			[null, "publishes-versioned"],
+		]);
+	});
+
+	it("falls back to the numeric tier when there is no tier label", () => {
+		expect(
+			buildMatrixObservations([row({ tierLabel: "", tier: 3 })])[0].tier,
+		).toBe("3");
+	});
+});
+
+describe("targetLangForFixture (#3401)", () => {
+	// Recurrence: a subset probe scopes its bookkeeping to the langs it probed;
+	// `typescript-clean` writes the `typescript` row, so scoping it by the raw
+	// fixture lang would leave the row it just measured outside the scope.
+	it("maps a clean fixture onto its base lang and leaves other langs alone", () => {
+		expect(targetLangForFixture("typescript-clean", true)).toBe("typescript");
+		expect(targetLangForFixture("typescript", false)).toBe("typescript");
+		expect(targetLangForFixture("typescript7-clean", true)).toBe("typescript7");
+		expect(targetLangForFixture("ast-grep-baseline")).toBe("ast-grep-baseline");
+		// Only a clean fixture is renamed: a dirty fixture keeps its own name.
+		expect(targetLangForFixture("x-clean", false)).toBe("x-clean");
+	});
+});

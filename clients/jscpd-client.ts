@@ -1,0 +1,566 @@
+/**
+ * jscpd Client for pi-lens
+ *
+ * Detects copy-paste / duplicate code blocks across the project.
+ * Helps the agent avoid unknowingly duplicating logic that already exists.
+ *
+ * Requires: npm install -D jscpd
+ * Docs: https://github.com/kucherenko/jscpd
+ */
+
+import type { AnalysedRootSignal } from "./analysed-root.js";
+import { createSubsystemLogger } from "./extension-log.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	getExcludedDirGlobs,
+	getProjectIgnoreGlobs,
+	getProjectIgnoreMatcher,
+} from "./file-utils.js";
+import { findNodeToolBinary } from "./package-manager.js";
+import {
+	isAtOrAboveHomeDir,
+	isFullyQualified,
+	realpathOrResolve,
+	toPosix,
+} from "./path-utils.js";
+import { getJscpdMaxEntriesDerived } from "./project-scale.js";
+import { isJstsFactFile } from "./file-kinds.js";
+import { isDeclarationFile } from "./generated-artifacts.js";
+
+// Non-JS/TS source extensions jscpd's tokenizers cover; the JS/TS family
+// answers through the registry seam (`isJstsFactFile`) (#5446).
+const JSCPD_WALK_OTHER_SOURCE =
+	/\.(py|pyi|java|go|rs|rb|php|swift|kt|kts|dart|lua|scala|c|h|cpp|cc|cxx|hpp|hxx|cs|m|mm)$/;
+import {
+	createAvailabilityChecker,
+	findManagedNodeToolBinary,
+	resolveAvailableOrInstall,
+} from "./dispatch/runners/utils/runner-helpers.js";
+import { nestedWorktreeOffsets } from "./scratch-tree-policy.js";
+import { parseReportJson, runReportScan } from "./report-scan.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
+import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
+import { shouldRecurseIntoDir, walkTreeStackSync } from "./source-walker.js";
+
+// --- Types ---
+
+export interface DuplicateClone {
+	fileA: string;
+	startA: number;
+	fileB: string;
+	startB: number;
+	lines: number;
+	tokens: number;
+}
+
+export interface JscpdResult extends AnalysedRootSignal {
+	success: boolean;
+	clones: DuplicateClone[];
+	duplicatedLines: number;
+	totalLines: number;
+	percentage: number;
+	/**
+	 * #3600: the wall-clock time this run READ the bytes its clones were
+	 * computed from, stamped at the top of `runScan` before the spawn. A caller
+	 * that JOINS the in-flight promise reads the initiator's stamp, so a row
+	 * folded into the widget is judged against the real read rather than the
+	 * joiner's later lane start. Absent on an early refusal or an error result;
+	 * neither shape produces a widget row.
+	 */
+	scannedAt?: string;
+}
+
+const EMPTY_RESULT: JscpdResult = {
+	success: false,
+	clones: [],
+	duplicatedLines: 0,
+	totalLines: 0,
+	percentage: 0,
+};
+
+const SCAN_TIMEOUT_MS = 30_000;
+
+/** jscpd's own config-file names, in its discovery order, checked at `cwd` only
+ * (jscpd does not walk up). */
+const JSCPD_CONFIG_FILENAMES = [".jscpd.json", "jscpd.json"];
+
+/**
+ * The project's own jscpd config, or `null` when it ships none: a
+ * `.jscpd.json`/`jscpd.json` file, or a `package.json` `jscpd` field. jscpd
+ * discovers either unaided, but `--min-lines`/`--min-tokens`/`--ignore` on the
+ * CLI override whatever the config sets -- passing them unconditionally
+ * silently discarded a project's own thresholds and ignore list (#1731,
+ * discipline A). `--ignore` REPLACES the config's `ignore`, so the list is read
+ * here to be merged with the linked-worktree exclusion (#4117). A config file
+ * wins outright over the package.json field, as in jscpd (measured, 5.4.0: with
+ * both present only the file's `ignore` applies; it does not read `jscpd.json`
+ * at all, a name this list keeps from before #4117). `ignoreList: null` means the
+ * config is there but its list cannot be read.
+ */
+function readProjectJscpdConfig(
+	cwd: string,
+): { ignoreList: string[] | null } | null {
+	const fromObject = (config: unknown): { ignoreList: string[] | null } => {
+		const list = (config as { ignore?: unknown } | null)?.ignore;
+		if (list === undefined) return { ignoreList: [] };
+		return Array.isArray(list) && list.every((e) => typeof e === "string")
+			? { ignoreList: list as string[] }
+			: { ignoreList: null };
+	};
+	for (const name of JSCPD_CONFIG_FILENAMES) {
+		const file = path.join(cwd, name);
+		if (!fs.existsSync(file)) continue;
+		try {
+			return fromObject(JSON.parse(fs.readFileSync(file, "utf-8")));
+		} catch {
+			return { ignoreList: null };
+		}
+	}
+	try {
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(cwd, "package.json"), "utf-8"),
+		);
+		if (pkg && typeof pkg === "object" && pkg.jscpd !== undefined) {
+			return fromObject(pkg.jscpd);
+		}
+	} catch {
+		// No/malformed package.json — "no project config" is the honest answer.
+	}
+	return null;
+}
+
+/**
+ * `--ignore` globs for the linked worktrees under `cwd` (#4117): the path
+ * relative to `cwd` plus `/**`. jscpd matches `--ignore` against cwd-relative
+ * paths (measured, 5.4.0: an absolute pattern ignores nothing). A path a comma
+ * would split or a glob character would misread is counted, not passed.
+ */
+function worktreeIgnoreGlobs(cwd: string): string[] {
+	const globs: string[] = [];
+	for (const offset of nestedWorktreeOffsets(cwd)) {
+		const inside = toPosix(offset);
+		const unsafe = inside.includes(",")
+			? "comma-in-path"
+			: /[*?[\]{}()!\\]/.test(inside)
+				? "glob-char-in-path"
+				: null;
+		if (unsafe) {
+			incrementDegradationCount({
+				kind: "scan-worktree-exclusion-skipped",
+				subject: "jscpd",
+				reason: `${unsafe}: ${inside} not ignored under ${cwd}`,
+			});
+			continue;
+		}
+		globs.push(`${inside}/**`);
+	}
+	return globs;
+}
+
+const jscpdAvailability = createAvailabilityChecker(
+	"jscpd",
+	"",
+	["--version"],
+	{
+		probeTimeout: 1500,
+		// One definition of the managed-shim fast path, shared with knip (#1476).
+		fastPath: () => findManagedNodeToolBinary("jscpd"),
+	},
+);
+
+// --- Client ---
+
+export class JscpdClient {
+	// Absolute path of a MANAGED jscpd (the global ~/.pi-lens tools shim
+	// discovered by the availability fast path, or the ensureTool install
+	// result), else null. Nullable on purpose: a bare-name sentinel can't
+	// distinguish "resolved" from "on PATH" — ensureTool may legitimately
+	// return a bare command for an already-spawnable tool (#1289 review).
+	// Project-local binaries are NOT stored; each scan resolves those against
+	// its own cwd via findNodeToolBinary.
+	private jscpdManagedPath: string | null = null;
+	private inFlight = new Map<string, Promise<JscpdResult>>();
+	// Pending availability probes. A scan holds no `inFlight` entry until its
+	// own probe settles, so `shutdown()` must see the probe too (#4505).
+	private probing = new Set<Promise<boolean>>();
+	private log: (msg: string) => void;
+
+	constructor(verbose = false) {
+		this.log = verbose ? createSubsystemLogger("jscpd") : () => {};
+	}
+
+	/**
+	 * Wait for scans already started by this client to settle. Test owners use
+	 * this as the lifecycle barrier before removing fixture roots; the scan
+	 * promise includes the jscpd child and its report-directory cleanup.
+	 *
+	 * A scan registers in `inFlight` only after its availability probe settles,
+	 * and the session_start task probes once before `scan()` probes again. The
+	 * loop therefore repeats until a pass finds no probe and no scan. Both sets
+	 * drop an entry before its promise settles, so an empty pass ends the loop
+	 * and a pass over pending work never spins. The wait is bounded by the work
+	 * already started: each probe by `probeTimeout` (1.5 s, tool install off in
+	 * tests) and each scan by `SCAN_TIMEOUT_MS` (30 s); the loop adds none of its
+	 * own and ends once the client is idle.
+	 */
+	async shutdown(): Promise<void> {
+		do {
+			await Promise.allSettled([...this.probing, ...this.inFlight.values()]);
+		} while (this.probing.size > 0 || this.inFlight.size > 0);
+	}
+
+	/**
+	 * Fast recursive source file presence check.
+	 * Avoids running jscpd when repo has no relevant source files.
+	 *
+	 * Originally this gate accepted only JS/TS extensions (commit 8b5d588).
+	 * That made pi-lens's jscpd integration effectively JS/TS-only even
+	 * though jscpd's tokenizer covers 15+ languages. Pure-Python /
+	 * pure-Go / pure-Rust / pure-Java / etc. repos got zero clone
+	 * detection. Closes #126: extend the gate to every language jscpd
+	 * tokenizes well. Languages with no jscpd tokenizer (Gleam, Zig,
+	 * Fish) are deliberately excluded — the gate change wouldn't help
+	 * them.
+	 */
+	private hasSourceFilesRecursive(rootDir: string): boolean {
+		const ignoreMatcher = getProjectIgnoreMatcher(rootDir);
+		const state = { visited: 0 };
+		// #776: derived from the `maxProjectFiles` scale knob (project-scale.ts),
+		// reproducing this same 6,000 default at the default base.
+		const MAX_ENTRIES = getJscpdMaxEntriesDerived(rootDir);
+
+		// #761: the traversal loop, readdir-safety, and directory-recursion
+		// decision are the shared `walkTreeStackSync` engine; this client keeps
+		// its own per-entry policy (skip ALL symlinks — files too — before the
+		// dir/file branch, its own multi-language source regex, and a
+		// per-directory entry budget via `shouldStop`, matching the pre-#761
+		// `while (stack.length > 0 && visited < MAX_ENTRIES)` condition: the
+		// current directory's entry loop always finishes, but no further
+		// directory is popped once the budget is spent).
+		return walkTreeStackSync(
+			rootDir,
+			(entry, fullPath) => {
+				state.visited += 1;
+				if (entry.isSymbolicLink()) return "skip";
+				if (entry.isDirectory()) {
+					return shouldRecurseIntoDir(entry, fullPath, {
+						ignoreMatcher,
+						followSymlinks: true,
+					})
+						? "recurse"
+						: "skip";
+				}
+				if (!entry.isFile()) return "skip";
+				// #1974: extension gate before isIgnored — the regex test is cheap
+				// per-call; isIgnored recompiles minimatch patterns per ancestor dir
+				// and should only run for files that already look like source.
+				if (
+					isJstsFactFile(entry.name) ||
+					JSCPD_WALK_OTHER_SOURCE.test(entry.name)
+				) {
+					if (isDeclarationFile(entry.name)) return "skip";
+					if (ignoreMatcher.isIgnored(fullPath, false)) return "skip";
+					return "stop";
+				}
+				return "skip";
+			},
+			{ shouldStop: () => state.visited >= MAX_ENTRIES },
+		);
+	}
+
+	/**
+	 * Check if jscpd is available, auto-install if not
+	 */
+	ensureAvailable(): Promise<boolean> {
+		const probe: Promise<boolean> = this.probeAvailable().finally(() => {
+			this.probing.delete(probe);
+		});
+		this.probing.add(probe);
+		return probe;
+	}
+
+	private async probeAvailable(): Promise<boolean> {
+		const resolved = await resolveAvailableOrInstall(
+			jscpdAvailability,
+			"jscpd",
+			process.cwd(),
+		);
+		if (!resolved) return false;
+		if (isFullyQualified(resolved)) this.jscpdManagedPath = resolved;
+		return true;
+	}
+
+	/**
+	 * #1623: public availability verdict for callers outside the dispatch
+	 * graph (mode=full's fresh-fetch) that need to say WHY `ensureAvailable()`
+	 * most recently returned false, using the SAME outcome/cause the shared
+	 * `jscpdAvailability` checker already tracks — not a re-guessed "jscpd
+	 * binary unavailable" that can't tell a transient retry-cooldown probe
+	 * from a durable absence.
+	 */
+	getAvailabilityVerdict(): {
+		outcome: ReturnType<typeof jscpdAvailability.getOutcome>;
+		cause: ReturnType<typeof jscpdAvailability.getVerdict>["cause"];
+		retryAtMs: number;
+	} {
+		const verdict = jscpdAvailability.getVerdict(process.cwd());
+		return {
+			outcome: verdict.outcome,
+			cause: verdict.cause,
+			retryAtMs: verdict.retryAtMs,
+		};
+	}
+
+	/**
+	 * Scan a directory for duplicate code blocks.
+	 * Uses a temp output dir to capture JSON report.
+	 * @param isTsProject - If true, excludes .js files (they're compiled artifacts in TS projects)
+	 *
+	 * Root contract (#747/#250): unlike `KnipClient`/`DeadCodeClient`, this
+	 * client does NOT resolve a project root via `findNearestMarkerRoot`, so it
+	 * has historically relied on every caller to guard the scan root itself. The
+	 * `isAtOrAboveHomeDir` refusal below is belt-and-braces internal protection
+	 * so a FUTURE caller that forgets that contract can't spawn a whole-$HOME
+	 * jscpd walk (the observed OOM: a jscpd run from a WSL home reached 44 GB
+	 * RSS). `options.homeDir` overrides `os.homedir()` for tests.
+	 */
+	async scan(
+		cwd: string,
+		minLines = 5,
+		minTokens = 50,
+		isTsProject = false,
+		options: { homeDir?: string } = {},
+	): Promise<JscpdResult> {
+		const targetDir = path.resolve(cwd);
+
+		// #747/#250: never walk from a cwd at/above $HOME — from there jscpd's
+		// tokenizer would run across every unrelated repo under home. By real path
+		// on both sides (#4911), so a link on either side cannot slip past.
+		if (
+			isAtOrAboveHomeDir(
+				realpathOrResolve(targetDir),
+				realpathOrResolve(options.homeDir ?? os.homedir()),
+			)
+		) {
+			this.log(`Refusing scan of unsafe root at/above home: ${targetDir}`);
+			return { ...EMPTY_RESULT };
+		}
+
+		// Return early for non-existent or empty directories before probing/installing.
+		if (!fs.existsSync(targetDir)) {
+			return { ...EMPTY_RESULT };
+		}
+		if (!this.hasSourceFilesRecursive(targetDir)) {
+			return { ...EMPTY_RESULT, success: true };
+		}
+
+		if (!(await this.ensureAvailable())) {
+			return { ...EMPTY_RESULT };
+		}
+
+		const key = `${targetDir}:${minLines}:${minTokens}:${isTsProject}`;
+		const existing = this.inFlight.get(key);
+		if (existing) {
+			this.log(`Scan already in flight for ${targetDir}; sharing result`);
+			return existing;
+		}
+
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same key
+		// mid-flight, after which the next caller starts a duplicate scan.
+		const promise = this.runScan(
+			targetDir,
+			minLines,
+			minTokens,
+			isTsProject,
+		).finally(() => {
+			if (this.inFlight.get(key) === promise) this.inFlight.delete(key);
+		});
+		this.inFlight.set(key, promise);
+		return promise;
+	}
+
+	private runScan(
+		cwd: string,
+		minLines: number,
+		minTokens: number,
+		isTsProject: boolean,
+	): Promise<JscpdResult> {
+		// The command the scan actually ran, named in the missing-report reason
+		// (#1816): a `npx` fallback and a project-local binary fail differently.
+		// Read when the reason is built, which is after `spawn` settled.
+		let command = "jscpd";
+		return runReportScan("jscpd", {
+			spawn: async ({ outDir }) => {
+				// Build ignore pattern from shared exclusions + scanner-specific patterns.
+				// Keep setup inside the guard: the report directory already exists, and
+				// setup can read project-controlled ignore files (#4133).
+				const baseIgnores = [
+					...getExcludedDirGlobs(),
+					...getProjectIgnoreGlobs(cwd),
+					"**/*.md",
+					"**/*.txt",
+					"**/*.json",
+					"**/*.yaml",
+					"**/*.yml",
+					"**/*.toml",
+					"**/*.lock",
+					"**/*.test.*",
+					"**/*.spec.*",
+					"**/*.poc.test.*",
+					"**/__tests__/**",
+					"**/tests/**",
+				];
+				if (isTsProject) {
+					baseIgnores.push("**/*.js", "**/*.jsx");
+				}
+
+				// Prefer a local/global-installed jscpd (any manager) over npx (#375).
+				const bin = await findNodeToolBinary("jscpd", cwd);
+				const { cmd, prefix } = bin
+					? { cmd: bin, prefix: [] as string[] }
+					: this.jscpdManagedPath
+						? { cmd: this.jscpdManagedPath, prefix: [] as string[] }
+						: { cmd: "npx", prefix: ["jscpd"] };
+				command = cmd;
+				// A project's own jscpd config wins outright (#1731, discipline A):
+				// these flags all override whatever it sets, so the thresholds are not
+				// passed when the project ships one and jscpd discovers it unaided.
+				// `--ignore` replaces the config's list, so under a config it is passed
+				// only to leave out linked worktrees (#4117), carrying the config's own
+				// entries; a list that cannot be read is left alone.
+				const config = readProjectJscpdConfig(cwd);
+				const worktreeGlobs = worktreeIgnoreGlobs(cwd);
+				let patterns: string[] | undefined;
+				if (config === null) {
+					patterns = [...baseIgnores, ...worktreeGlobs];
+				} else if (worktreeGlobs.length > 0) {
+					if (config.ignoreList === null) {
+						incrementDegradationCount({
+							kind: "scan-worktree-exclusion-skipped",
+							subject: "jscpd",
+							reason: `config-ignore-unreadable: ${worktreeGlobs.length} linked worktree(s) under ${cwd} not ignored`,
+						});
+					} else {
+						patterns = [...config.ignoreList, ...worktreeGlobs];
+					}
+				}
+				return safeSpawnAsync(
+					cmd,
+					[
+						...prefix,
+						".",
+						...(config === null
+							? [
+									"--min-lines",
+									String(minLines),
+									"--min-tokens",
+									String(minTokens),
+								]
+							: []),
+						"--reporters",
+						"json",
+						"--output",
+						outDir,
+						...(patterns === undefined ? [] : ["--ignore", patterns.join(",")]),
+					],
+					{
+						timeout: SCAN_TIMEOUT_MS,
+						// A cache-only npx fallback must not read the project's `.npmrc`
+						// (#4268 acceptance 3); local/managed jscpd keeps the project cwd.
+						cwd,
+						...(cmd === "npx" ? getIsolatedNpxSpawnOptions() : {}),
+					},
+				);
+			},
+			// #3600: the lifecycle stamps `scannedAt` before the spawn, so a widget
+			// row's freshness is judged against the run's own read time. The exit
+			// code is not part of the verdict here: #1736's measured table (jscpd
+			// 3.5.10) is now the lifecycle's, and a report that exists is parsed
+			// whatever the exit.
+			parse: (raw, scannedAt) => ({
+				...this.parseReport(raw),
+				scannedAt,
+			}),
+			// jscpd's result carries no summary: the reason an agent can read is the
+			// `runner-empty-result` row `recordFailure` writes. A zero exit that wrote
+			// no report stays a successful empty run (#1736's measured table), so the
+			// arm follows the lifecycle's verdict instead of calling every cell failed.
+			fail: (failure) => ({
+				...EMPTY_RESULT,
+				success: failure.success === true,
+			}),
+			recordFailure: (failure) =>
+				incrementDegradationCount({
+					kind: "runner-empty-result",
+					subject: "jscpd",
+					reason: failure.summary,
+				}),
+			failureFields: () => ({ command }),
+			log: this.log,
+		});
+	}
+
+	formatResult(result: JscpdResult, maxClones = 8): string {
+		if (!result.success || result.clones.length === 0) return "";
+
+		const pct = result.percentage.toFixed(1);
+		let output = `[jscpd] ${result.clones.length} duplicate block(s) — ${pct}% of codebase (${result.duplicatedLines}/${result.totalLines} lines):\n`;
+
+		for (const clone of result.clones.slice(0, maxClones)) {
+			const a = `${path.basename(clone.fileA)}:${clone.startA}`;
+			const b = `${path.basename(clone.fileB)}:${clone.startB}`;
+			output += `  ${clone.lines} lines — ${a} ↔ ${b}\n`;
+		}
+
+		if (result.clones.length > maxClones) {
+			output += `  ... and ${result.clones.length - maxClones} more\n`;
+		}
+
+		return output;
+	}
+
+	// --- Internal ---
+
+	/**
+	 * Turn jscpd's `jscpd-report.json` into the result shape. Input that is not a
+	 * jscpd report throws: `runReportScan` turns that into a recorded failed
+	 * scan, so a broken report never reads as a scan that ran and found nothing
+	 * (#5411). #1736: `statistics.total` holds the stats, not `statistics.clones`.
+	 */
+	private parseReport(raw: string): JscpdResult {
+		const data: any = parseReportJson("jscpd", raw);
+		// Stats live in statistics.total, not statistics.clones
+		const total = data.statistics?.total ?? {};
+
+		const duplicatedLines: number = total.duplicatedLines ?? 0;
+		const totalLines: number = total.lines ?? 0;
+		const percentage: number =
+			total.percentage ??
+			(totalLines > 0 ? (duplicatedLines / totalLines) * 100 : 0);
+
+		const rawClones: any[] = data.duplicates ?? [];
+		const clones: DuplicateClone[] = rawClones.map((c: any) => ({
+			fileA: c.firstFile?.name ?? "",
+			startA: c.firstFile?.start ?? 0,
+			fileB: c.secondFile?.name ?? "",
+			startB: c.secondFile?.start ?? 0,
+			lines: c.lines ?? 0,
+			tokens: c.tokens ?? 0,
+		}));
+
+		// #2154: the one jscpd site that parsed a scan of this root.
+		return {
+			success: true,
+			analyzed: true,
+			clones,
+			duplicatedLines,
+			totalLines,
+			percentage,
+		};
+	}
+}

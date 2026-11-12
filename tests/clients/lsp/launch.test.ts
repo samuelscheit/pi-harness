@@ -1,0 +1,481 @@
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	removeTempDirSync,
+	setupTestEnvironment,
+	useTrackedTempDirs,
+} from "../test-utils.js";
+
+/**
+ * The Windows registry PATH read starts `powershell.exe` through the spawn
+ * seam's `spawnSync` (#4530; it was a raw `execFileSync`). An empty answer
+ * keeps the launch on the process PATH, as the `execFileSync` double's empty
+ * string did before.
+ */
+function emptyRegistryRead() {
+	return { status: 0, stdout: "", stderr: "" };
+}
+
+// These launch tests use fake timers and don't exercise Windows Ruby drive-root
+// discovery. Stub the #1137 drive-root readers so `buildAugmentedPath`'s async
+// `fs.promises.readdir("C:\\")` (real threadpool I/O, not fake-timer driven)
+// can't stall the spawn sequence under `vi.useFakeTimers()`. Ruby-dir behavior
+// is covered by tests/clients/lsp/ruby-drive-dirs.test.ts.
+vi.mock("../../../clients/lsp/ruby-drive-dirs.js", () => ({
+	getRubyVersionDirNamesSync: () => [],
+	getRubyVersionDirNamesAsync: async () => [],
+}));
+
+// Single parameterized fake for the six near-identical `MockChildProcess`
+// classes this file used to declare inline, one per `vi.doMock("node:child_
+// process", ...)` factory. `vi.doMock` (unlike `vi.mock`) isn't hoisted, so
+// its factory can close over a module-scope class like this one.
+class MockStream extends EventEmitter {}
+class MockChildProcess extends EventEmitter {
+	stdin = new MockStream();
+	stdout = new MockStream();
+	stderr = new MockStream();
+	exitCode: number | null = null;
+	killed = false;
+	constructor(public pid: number) {
+		super();
+	}
+}
+
+describe("lsp launch", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		// resetModules does not clear the mock registry (#2883).
+		vi.doUnmock("node:child_process");
+		vi.resetModules();
+		vi.clearAllMocks();
+	});
+	// Spawns are mocked, so nothing but this file owns the fixture roots.
+	useTrackedTempDirs("pi-lens-shim-", "pi-lens-ps1-", "pi-lens-launch-");
+
+	it.runIf(process.platform !== "win32")(
+		"spawns LSP servers in their own process group on POSIX",
+		async () => {
+			const spawnMock = vi.fn(() => new MockChildProcess(2468));
+
+			vi.doMock("node:child_process", () => ({
+				spawnSync: vi.fn(emptyRegistryRead),
+				execFileSync: vi.fn(() => ""),
+				spawn: spawnMock,
+			}));
+
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			await launchLSP("vscode-html-language-server", ["--stdio"], {
+				cwd: "/tmp/project",
+			});
+
+			expect(spawnMock).toHaveBeenCalledWith(
+				"vscode-html-language-server",
+				["--stdio"],
+				expect.objectContaining({ detached: true }),
+			);
+		},
+	);
+
+	it("isolates concurrent adopted and owned launch permission (#4299 R2-F1)", async () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-launch-scope-"),
+		);
+		const command = path.join(root, "node_modules", ".bin", "language-server");
+		fs.mkdirSync(path.dirname(command), { recursive: true });
+		fs.writeFileSync(command, "");
+		const spawnMock = vi.fn(() => new MockChildProcess(2468));
+		vi.doMock("node:child_process", () => ({
+			spawnSync: vi.fn(emptyRegistryRead),
+			execFileSync: vi.fn(() => ""),
+			spawn: spawnMock,
+		}));
+		const { launchLSP, withLspProjectCodePermission } =
+			await import("../../../clients/lsp/launch.js");
+		const { setProjectTrustState, resetProjectTrust } =
+			await import("../../../clients/project-trust.js");
+		setProjectTrustState("trusted");
+		try {
+			// Both continuations resume after the other scope has been installed;
+			// a process-global flag borrows the owned permission and executes twice.
+			const launch = () =>
+				Promise.resolve().then(() => launchLSP(command, [], { cwd: root }));
+			const results = await Promise.allSettled([
+				withLspProjectCodePermission(false, launch),
+				withLspProjectCodePermission(true, launch),
+			]);
+			expect(results[0].status).toBe("rejected");
+			expect(results[1].status).toBe("fulfilled");
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+			// Outside any scope there is no root permission, so a project-local
+			// launcher is refused even under trusted trust (#4296 R3-F1).
+			await expect(launch()).rejects.toThrow();
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+		} finally {
+			resetProjectTrust();
+			removeTempDirSync(root);
+		}
+	});
+	it("redacts secrets in crash-adjacent session-start writes", async () => {
+		const tempDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-launch-log-"),
+		);
+		const token = `ghp_${"a".repeat(36)}`;
+		const command = path.join(
+			tempDir,
+			process.platform === "win32" ? "server.exe" : "server",
+		);
+
+		vi.doMock("node:child_process", () => ({
+			spawnSync: vi.fn(emptyRegistryRead),
+			execFileSync: vi.fn(() => ""),
+			spawn: vi.fn(() => new MockChildProcess(8642)),
+		}));
+		// #5231: spread the real module. safe-spawn.ts reads
+		// `isToolInstallDisabled` on the Windows registry-PATH probe, and a
+		// factory without it threw on the Windows unit lane.
+		vi.doMock("../../../clients/env-utils.js", async (importOriginal) => ({
+			...(await importOriginal<
+				typeof import("../../../clients/env-utils.js")
+			>()),
+			isTestMode: () => false,
+		}));
+		// `PI_LENS_HOME` is the knob `getGlobalPiLensDir` reads.
+		const previousHome = process.env.PI_LENS_HOME;
+		process.env.PI_LENS_HOME = tempDir;
+		// #2506: sessionstart.log resolves through the LOG dir, so the double
+		// must move that too — the assertion below reads
+		// `<tempDir>/sessionstart.log`, which is only where launch.ts writes if
+		// this resolver points at tempDir as well. #2516 round 2 moved the log
+		// resolver off `file-utils.ts` onto the cycle-free `probe-home-state.ts`
+		// leaf, so this doubles THAT module; doubling file-utils.js alone leaves
+		// launch.ts writing to the real (vitest-pinned) log root.
+		vi.doMock(
+			"../../../clients/probe-home-state.js",
+			async (importOriginal) => ({
+				// #4530: the data-dir resolver (`machineStateDir`) stays real.
+				...(await importOriginal()),
+				getGlobalPiLensLogDir: () => tempDir,
+			}),
+		);
+
+		try {
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			await launchLSP(command, [token], {
+				cwd: tempDir,
+				startupFailureWindowMs: 1,
+			});
+
+			// No drain needed (#4381 sweep): launch.ts keeps its own
+			// `logSessionStart`, which writes with `fs.appendFileSync`, so the
+			// line is on disk before `launchLSP` returns.
+			const log = fs.readFileSync(
+				path.join(tempDir, "sessionstart.log"),
+				"utf8",
+			);
+			expect(log).not.toContain(token);
+			expect(log).toContain("[REDACTED:github-token]");
+		} finally {
+			// #4530: the spawn seam's one-per-session notice and ledger record for
+			// a dropped search-path entry (the checkout's own `node_modules/.bin`
+			// on a test runner's PATH) are async appends to extension.log and
+			// latency.log under the doubled log dir; drain every writer before
+			// the dir is removed, or a late append recreates it.
+			const { flushAllNdjsonWriters } =
+				await import("../../../clients/ndjson-logger.js");
+			await flushAllNdjsonWriters();
+			vi.doUnmock("../../../clients/env-utils.js");
+			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = previousHome;
+			vi.doUnmock("../../../clients/probe-home-state.js");
+			removeTempDirSync(tempDir);
+		}
+	});
+
+	it("leaves probe-home-state.js un-truncated for later cases in this file", async () => {
+		// Regression for the previous test's `vi.doMock("../../../clients/
+		// probe-home-state.js", ...)` double, which stubbed only
+		// `getGlobalPiLensLogDir`. `vi.resetModules()` in `afterEach` clears the
+		// real-module cache but NOT the doMock registry, so a missing
+		// `vi.doUnmock` for that module leaves every later dynamic import of it
+		// (direct, or transitive through degradation-ledger.js) seeing the
+		// truncated fake instead of the real module.
+		const probeHomeState = await import("../../../clients/probe-home-state.js");
+		expect(typeof probeHomeState.getProbeHomeRedirectEvent).toBe("function");
+		expect(typeof probeHomeState.getProbeHomeResolution).toBe("function");
+	});
+
+	// lane: windows-vitest
+	it.runIf(process.platform === "win32")(
+		"treats delayed shell-backed startup failure as launch failure",
+		async () => {
+			// #5305: an absent `.cmd` now reads absent, so the pre-spawn gate
+			// would throw before the spawn. Plant a real non-npm shim so the cell
+			// still reaches the delayed exit 1 from a present shell-backed program.
+			const shimDir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shim = path.join(shimDir, "bash-language-server.cmd");
+			fs.writeFileSync(shim, "@echo off\necho hello");
+			vi.useFakeTimers();
+
+			vi.doMock("node:child_process", () => {
+				return {
+					spawnSync: vi.fn(emptyRegistryRead),
+					execFileSync: vi.fn(() => ""),
+					spawn: vi.fn(() => {
+						const proc = new MockChildProcess(4321);
+						setTimeout(() => {
+							proc.exitCode = 1;
+							proc.emit("exit", 1, null);
+							proc.emit("close", 1, null);
+						}, 120);
+						return proc;
+					}),
+				};
+			});
+
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			const launchPromise = launchLSP(shim, ["start"], {
+				cwd: "C:\\fake",
+			});
+			const rejection = expect(launchPromise).rejects.toThrow(
+				/exited immediately with code 1/i,
+			);
+
+			await vi.advanceTimersByTimeAsync(150);
+
+			await rejection;
+		},
+	);
+
+	// lane: windows-vitest
+	it.runIf(process.platform === "win32")(
+		"resolves bare commands through where before spawning",
+		async () => {
+			const tempDir = setupTestEnvironment("pi-lens-launch-").tmpDir;
+			const resolvedBinary = path.join(tempDir, "taplo.exe");
+			fs.writeFileSync(resolvedBinary, "");
+			vi.doMock("node:child_process", () => {
+				return {
+					spawnSync: vi.fn(emptyRegistryRead),
+					execFileSync: vi.fn((command: string, args: string[]) => {
+						if (command === "where" && args[0] === "taplo") {
+							return `${resolvedBinary}\r\n`;
+						}
+						return "";
+					}),
+					spawn: vi.fn(() => new MockChildProcess(9876)),
+				};
+			});
+
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			const launched = await launchLSP("taplo", ["lsp", "stdio"], {
+				cwd: "C:\\fake",
+			});
+
+			expect(launched.pid).toBe(9876);
+		},
+	);
+
+	describe("isCmdShimValid", () => {
+		it("returns true when the shim target exists", async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shimDir = path.join(dir, "bin");
+			fs.mkdirSync(shimDir, { recursive: true });
+			const shim = path.join(shimDir, "test.cmd");
+			const target = path.join(shimDir, "..", "pkg", "bin", "cli.js");
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, "");
+			fs.writeFileSync(shim, `@"%~dp0\\..\\pkg\\bin\\cli.js" %*`);
+
+			const { isCmdShimValid } = await import("../../../clients/lsp/launch.js");
+			expect(isCmdShimValid(shim)).toBe(true);
+		});
+
+		it("returns false when the shim target is missing", async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shimDir = path.join(dir, "bin");
+			fs.mkdirSync(shimDir, { recursive: true });
+			const shim = path.join(shimDir, "test.cmd");
+			fs.writeFileSync(shim, `@"%~dp0\\..\\pkg\\bin\\cli.js" %*`);
+
+			const { isCmdShimValid } = await import("../../../clients/lsp/launch.js");
+			expect(isCmdShimValid(shim)).toBe(false);
+		});
+
+		it("returns true for non-npm shims", async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shimDir = path.join(dir, "bin");
+			fs.mkdirSync(shimDir, { recursive: true });
+			const shim = path.join(shimDir, "test.cmd");
+			fs.writeFileSync(shim, `@echo off\necho hello`);
+
+			const { isCmdShimValid } = await import("../../../clients/lsp/launch.js");
+			expect(isCmdShimValid(shim)).toBe(true);
+		});
+
+		// #5305 recurrence: a missing project-local `.cmd` read as a valid shim
+		// (the catch answered "present"), so the next candidate was never tried.
+		it("returns false when the shim file does not exist", async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const { isCmdShimValid } = await import("../../../clients/lsp/launch.js");
+			expect(isCmdShimValid(path.join(dir, "nonexistent-shim.cmd"))).toBe(
+				false,
+			);
+			expect(isCmdShimValid(path.join(dir, "no-dir", "shim.cmd"))).toBe(false);
+		});
+
+		// #5305: a path that is not a file is not a shim (EISDIR on read).
+		it("returns false when the shim path is a directory", async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shim = path.join(dir, "dir.cmd");
+			fs.mkdirSync(shim);
+			const { isCmdShimValid } = await import("../../../clients/lsp/launch.js");
+			expect(isCmdShimValid(shim)).toBe(false);
+		});
+
+		// #5305 rule: a file that exists but cannot be read is PRESENT. The failure
+		// is cmd.exe's to report as a runtime error, not a missing install for the
+		// installer to overwrite. chmod 000 does not bind root or Windows.
+		it("returns true when the shim file exists but is unreadable", async ({
+			skip,
+		}) => {
+			skip(
+				process.platform === "win32" ||
+					(typeof process.getuid === "function" && process.getuid() === 0),
+			);
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shim = path.join(dir, "locked.cmd");
+			fs.writeFileSync(shim, `@"%~dp0\\..\\pkg\\bin\\cli.js" %*`);
+			fs.chmodSync(shim, 0o000);
+			try {
+				const { isCmdShimValid } =
+					await import("../../../clients/lsp/launch.js");
+				expect(isCmdShimValid(shim)).toBe(true);
+			} finally {
+				fs.chmodSync(shim, 0o644);
+			}
+		});
+
+		it("handles .mjs targets", async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shimDir = path.join(dir, "bin");
+			fs.mkdirSync(shimDir, { recursive: true });
+			const shim = path.join(shimDir, "test.cmd");
+			const target = path.join(shimDir, "..", "pkg", "bin", "cli.mjs");
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, "");
+			fs.writeFileSync(shim, `@"%~dp0\\..\\pkg\\bin\\cli.mjs" %*`);
+
+			const { isCmdShimValid } = await import("../../../clients/lsp/launch.js");
+			expect(isCmdShimValid(shim)).toBe(true);
+		});
+	});
+
+	// lane: windows-vitest
+	it.runIf(process.platform === "win32")(
+		"rejects immediately for an invalid .cmd shim without spawning",
+		async () => {
+			const dir = setupTestEnvironment("pi-lens-shim-").tmpDir;
+			const shimDir = path.join(dir, "bin");
+			fs.mkdirSync(shimDir, { recursive: true });
+			const shim = path.join(shimDir, "test.cmd");
+			fs.writeFileSync(shim, `@"%~dp0\\..\\pkg\\bin\\cli.js" %*`);
+
+			const spawnSpy = vi.fn(() => {
+				throw new Error("spawn should not be called");
+			});
+			vi.doMock("node:child_process", () => {
+				return {
+					spawnSync: vi.fn(emptyRegistryRead),
+					execFileSync: vi.fn(() => ""),
+					spawn: spawnSpy,
+				};
+			});
+
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			await expect(launchLSP(shim, ["start"], { cwd: dir })).rejects.toThrow(
+				/LSP \.cmd shim target not found/i,
+			);
+			expect(spawnSpy).not.toHaveBeenCalled();
+		},
+	);
+
+	// lane: windows-vitest
+	it.runIf(process.platform === "win32")(
+		"bypasses .ps1 to .cmd sibling on Windows",
+		async () => {
+			vi.useFakeTimers();
+			const dir = setupTestEnvironment("pi-lens-ps1-").tmpDir;
+			const ps1 = path.join(dir, "test.ps1");
+			const cmd = path.join(dir, "test.cmd");
+			fs.writeFileSync(ps1, `"$basedir/../pkg/bin/cli.js" "$@"`);
+			fs.writeFileSync(cmd, `@"%~dp0\\..\\pkg\\bin\\cli.js" %*`);
+
+			let spawnedCommand: string | undefined;
+			vi.doMock("node:child_process", () => {
+				return {
+					spawnSync: vi.fn(emptyRegistryRead),
+					execFileSync: vi.fn(() => ""),
+					spawn: vi.fn((command: string) => {
+						spawnedCommand = command;
+						return new MockChildProcess(1234);
+					}),
+				};
+			});
+
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			const launchPromise = launchLSP(ps1, ["start"], { cwd: dir });
+			await vi.advanceTimersByTimeAsync(600);
+			const result = await launchPromise;
+
+			expect(spawnedCommand).toContain("test.cmd");
+			expect(result.pid).toBe(1234);
+		},
+	);
+
+	// lane: windows-vitest
+	it.runIf(process.platform === "win32")(
+		"bypasses .ps1 to direct node execution when .cmd sibling is missing",
+		async () => {
+			vi.useFakeTimers();
+			const dir = setupTestEnvironment("pi-lens-ps1-").tmpDir;
+			// The wrapper resolves `$basedir/../pkg/bin/cli.js`: keep both under the
+			// fixture root. `path.join(dir, "..", "pkg")` put the package directly in
+			// the shared tmpdir, outside the root `useTrackedTempDirs` removes, so it
+			// outlived the file (#4019).
+			const ps1 = path.join(dir, "bin", "test.ps1");
+			const jsTarget = path.join(dir, "pkg", "bin", "cli.js");
+			fs.mkdirSync(path.dirname(ps1), { recursive: true });
+			fs.mkdirSync(path.dirname(jsTarget), { recursive: true });
+			fs.writeFileSync(jsTarget, "console.log('hello')");
+			fs.writeFileSync(ps1, `"$basedir/../pkg/bin/cli.js" "$@"`);
+
+			let spawnedCommand: string | undefined;
+			let spawnedArgs: string[] | undefined;
+			vi.doMock("node:child_process", () => {
+				return {
+					spawnSync: vi.fn(emptyRegistryRead),
+					execFileSync: vi.fn(() => ""),
+					spawn: vi.fn((command: string, args: string[]) => {
+						spawnedCommand = command;
+						spawnedArgs = args;
+						return new MockChildProcess(5678);
+					}),
+				};
+			});
+
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			const launchPromise = launchLSP(ps1, ["start"], { cwd: dir });
+			await vi.advanceTimersByTimeAsync(100);
+			const result = await launchPromise;
+
+			expect(spawnedCommand).toBe(process.execPath);
+			expect(spawnedArgs).toContain(jsTarget);
+			expect(spawnedArgs).toContain("start");
+			expect(result.pid).toBe(5678);
+		},
+	);
+});

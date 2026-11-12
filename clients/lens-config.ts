@@ -1,0 +1,742 @@
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
+import {
+	resetIgnoredConfigWarnCache,
+	warnIgnoredConfigOnce,
+} from "./config-warn.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
+import { errorClassName } from "./error-class.js";
+import {
+	assignFlagConfigSection,
+	flagConfigSectionKeys,
+	flagValueFromConfig,
+	getLensFlagSpec,
+	GLOBAL_NON_FLAG_CONFIG_SECTIONS,
+	LENS_FLAGS,
+	PROJECT_NON_FLAG_CONFIG_SECTIONS,
+	readFlagConfigValue,
+	readLazyToolsSetting,
+} from "./lens-flag-registry.js";
+import {
+	type ConfigLocation,
+	CANONICAL_GLOBAL_CONFIG_FILE,
+	canonicalPathIdentity,
+	getPiLensGlobalConfigPath,
+	getProductionGlobalConfigResolution,
+	GLOBAL_CONFIG_LOCATIONS,
+	LEGACY_ROOT_LSP_KEYS,
+} from "./config-locations.js";
+// Re-exported so this module's own, pre-existing import sites (`./lens-config.js`
+// / `../lens-config.js`) keep working. The function itself now lives in
+// `config-locations.ts` (#2426 review round 3, S1) — see the doc comment there.
+export {
+	getPiLensGlobalConfigPath,
+	getProductionGlobalConfigResolution,
+	isResolvedGlobalConfigPath,
+	resolveGlobalConfigLocation,
+	resetGlobalConfigLocationCache,
+} from "./config-locations.js";
+import {
+	ignoredRecordCollector,
+	readConfigDocument,
+	reportConfigReadFailure,
+	reportPiLensConfigRecords,
+	resolveOnePiLensConfigDocument,
+} from "./config-resolve.js";
+import {
+	findNestedProjectMutationValue,
+	type PiLensProjectConfig,
+} from "./project-lens-config.js";
+import { pathsEqual } from "./path-utils.js";
+import { readToolConfig } from "./tool-config.js";
+
+/**
+ * The canonical global location, looked up rather than constructed, so a change
+ * to the shared table cannot leave this loader describing a file that is no
+ * longer canonical.
+ */
+function globalCanonicalLocation(): ConfigLocation {
+	const location = GLOBAL_CONFIG_LOCATIONS.find(
+		(candidate) => candidate.relativePath === CANONICAL_GLOBAL_CONFIG_FILE,
+	);
+	if (!location) {
+		throw new Error(
+			`no canonical global config location named ${CANONICAL_GLOBAL_CONFIG_FILE}`,
+		);
+	}
+	return location;
+}
+
+type PiLensFormatMode = "deferred" | "immediate";
+
+/**
+ * The accepted range of the global `lsp.queryMaxFileLines` key (#5306): the
+ * line limit of the explicit single-file `lens_diagnostics source=lsp` query.
+ *
+ * MIN is the shared 5000-line bound (`RUNTIME_CONFIG.pipeline.lspMaxFileLines`,
+ * pinned equal by `tests/clients/lsp/content-limits.test.ts`; `runtime-config.ts`
+ * imports this module, so it cannot be imported back): the key only RAISES the
+ * query's limit, never lowers it below what every other path allows.
+ *
+ * MAX is the largest size anyone measured (investigation #5306: 40,000 lines is
+ * clangd 28-50 s and +1.9 GB resident for one document). Past it no cost is
+ * known, and the 30 s wait cap (`EXPLICIT_QUERY_MAX_WAIT_MS`) could not outlast
+ * the server anyway. The docs suggest 20000 (clangd ~11 s, ~+0.95 GB).
+ */
+export const LSP_QUERY_MAX_FILE_LINES_MIN = 5000;
+export const LSP_QUERY_MAX_FILE_LINES_MAX = 40_000;
+
+/** The `{ enabled?: boolean }` section every registry flag key lives under. */
+interface PiLensToggleConfig {
+	enabled?: boolean;
+}
+
+export interface PiLensGlobalConfig {
+	tools?: Record<string, { enabled?: boolean }>;
+	startup?: {
+		mode?: "quick" | "full" | "minimal";
+		scans?: { enabled?: boolean };
+	};
+	/**
+	 * Gitignore-style patterns excluded from pi-lens scans across ALL projects.
+	 * Merged at LOWEST precedence: a project `.gitignore` or `.pi-lens.json`
+	 * `ignore` (including `!negation`) overrides these. See #252.
+	 */
+	ignore?: string[];
+	dispatch?: {
+		/**
+		 * Minimum wall-clock budget (ms) for every dispatch runner.
+		 * Acts as a floor: effective timeout = max(runner.timeoutMs ?? 30_000, runnerTimeoutFloorMs).
+		 * Useful for large monorepos where slow toolchains (e.g. cargo clippy) exceed
+		 * any runner's declared budget. Also overridable via PI_LENS_RUNNER_TIMEOUT_FLOOR_MS.
+		 */
+		runnerTimeoutFloorMs?: number;
+	};
+	widget?: {
+		/** Whether the diagnostics widget is visible when a session starts. */
+		visible?: boolean;
+	};
+	/** Whether pi-lens runs at all this session (`--no-lens`). */
+	lens?: PiLensToggleConfig;
+	/** Whether unified LSP diagnostics run (`--no-lsp`). */
+	lsp?: PiLensToggleConfig & {
+		/**
+		 * #5306: line limit of the explicit single-file `lens_diagnostics
+		 * source=lsp` query. Global-only (a project file cannot raise a user's
+		 * resource policy); a whole number in
+		 * [`LSP_QUERY_MAX_FILE_LINES_MIN`, `LSP_QUERY_MAX_FILE_LINES_MAX`].
+		 */
+		queryMaxFileLines?: number;
+	};
+	/** Whether the test runner fires on write (`--no-tests`). */
+	tests?: PiLensToggleConfig;
+	/** Whether delta mode limits diagnostics to new ones (`--no-delta`). */
+	delta?: PiLensToggleConfig;
+	/** Whether the experimental commit/push blocker runs (`--lens-guard`). */
+	guard?: PiLensToggleConfig;
+	/** Whether the Opengrep auxiliary LSP attaches (`--no-opengrep`). */
+	opengrep?: PiLensToggleConfig;
+	/** Whether the ast-grep auxiliary LSP attaches (`--no-ast-grep`). */
+	astGrep?: PiLensToggleConfig;
+	/** Whether the zizmor auxiliary LSP attaches (`--no-zizmor`). */
+	zizmor?: PiLensToggleConfig;
+	/** Whether the typos auxiliary LSP attaches (`--no-typos`). */
+	typos?: PiLensToggleConfig;
+	/** Whether SpotBugs runs on Java and Kotlin files (`--lens-spotbugs`; opt-in). */
+	spotbugs?: PiLensToggleConfig;
+	/** Whether the read-before-edit behavior monitor runs (`--no-read-guard`). */
+	readGuard?: PiLensToggleConfig & {
+		/** Widen small reads to enclosing boundaries. Defaults true (`--no-read-expansion`). */
+		expandReads?: boolean;
+	};
+	format?: {
+		/** Whether auto-formatting is enabled. */
+		enabled?: boolean;
+		/** When to run auto-formatting after write/edit tool results. */
+		mode?: PiLensFormatMode;
+	};
+	autofix?: {
+		/**
+		 * Whether the pipeline may apply deterministic linter fixes (Biome,
+		 * Ruff, ESLint, ...). Defaults true. A project `.pi-lens.json`
+		 * `autofix.enabled` overrides this in either direction (#792).
+		 */
+		enabled?: boolean;
+	};
+	actionableWarnings?: {
+		/** Write turn-delta fixable warning reports and inject a short advisory. */
+		enabled?: boolean;
+		/** Enrich warning reports with LSP code-action titles. */
+		includeLspCodeActions?: boolean;
+		/** Restrict reporting to warnings introduced by this turn. */
+		deltaOnly?: boolean;
+		autoFix?: {
+			/** Experimental conservative agent_end warning autofix. Defaults false. */
+			enabled?: boolean;
+			/**
+			 * Cap on quickfixes applied per turn. Defaults 5. `0` keeps the report
+			 * but applies nothing. Documented since #792 but only wired up in #166.
+			 */
+			maxFixes?: number;
+		};
+	};
+	contextInjection?: {
+		/**
+		 * Whether pi-lens prepends automatic findings (session-start guidance,
+		 * turn-end findings, test findings) into the next model turn via the
+		 * `context` hook. Defaults true. Set false to keep tools/LSP/read-guard/
+		 * formatting running while avoiding prompt-cache invalidation from injected
+		 * messages. Findings are still cached for `lens_diagnostics` / `/lens-health`.
+		 */
+		enabled?: boolean;
+		/**
+		 * #2967: whether the session-start orientation demands pre-existing
+		 * blocking errors be fixed. Defaults true (the shipped wording). Set
+		 * false when the task's scope excludes pre-existing debt, so the
+		 * orientation stops telling the agent it must fix it.
+		 */
+		requirePreExistingFixes?: boolean;
+	};
+	turnSummary?: {
+		/**
+		 * Opt-in, transcript-persistent per-turn summary of diagnostics found,
+		 * autofixes applied, and autoformats applied (#484). Defaults false —
+		 * absence of this key means off. One collapsed/expandable entry per turn,
+		 * only emitted when the turn's collection is non-empty.
+		 */
+		enabled?: boolean;
+	};
+}
+
+/**
+ * Same warn-once-per-(path, reason) contract as project-lens-config.ts's
+ * `warnInvalidConfigOnce` — a malformed global config value is logged once
+ * and then treated as absent, rather than silently dropped (#792). Since #2418
+ * the latch, the log line, the durable ledger row, and the stable-coded
+ * notification all live in the one shared seam.
+ */
+function warnInvalidGlobalConfigOnce(
+	configPath: string,
+	reason: string,
+	code?: ConfigDiagnosticCode,
+): void {
+	warnIgnoredConfigOnce({
+		subsystem: "lens-config",
+		file: configPath,
+		reason,
+		...(code === undefined ? {} : { code }),
+	});
+}
+
+/** For tests that need to force the warn-once cache to reset between cases. */
+export function resetGlobalConfigWarnCache(): void {
+	resetIgnoredConfigWarnCache("lens-config");
+}
+
+function asConfigObject(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/**
+ * Report a probe-error RETENTION decision once (global-config-location PR,
+ * refs #2457; review H2 remedy B).
+ *
+ * Fired by `loadPiLensGlobalConfig` when it derived the path itself and the
+ * resolution retained a location whose existence probe THREW. The record
+ * names the retained path (subject) and the failed probe's error class;
+ * once per session via `recordDegradationOnce`. A successful
+ * non-canonical selection fires nothing (opt-in by file creation, visible
+ * via `pilens_effective_config`).
+ */
+function reportGlobalConfigProbeRetention(): void {
+	const resolution = getProductionGlobalConfigResolution();
+	if (
+		resolution.source !== "legacy-default-unprobed" &&
+		resolution.source !== "pi-coding-agent-dir-unprobed"
+	) {
+		return;
+	}
+	recordDegradationOnce({
+		kind: "config-location-probe-failed",
+		subject: resolution.path,
+		// #3704/#3696: subject already carries the unbounded path; keep the
+		// fixed diagnostic ahead of it so the ledger cap cannot erase it.
+		reason: `existence probe failed (${resolution.existsProbeFailed?.errorClassName}); the location is retained as the config source and its read failures report through PILENS_CFG_0001`,
+		metadata: { subsystem: "lens-config", configPath: resolution.path },
+	});
+}
+
+/** Report a lower-precedence global config that exists beside the winner. */
+function reportGlobalConfigShadowing(): void {
+	const resolution = getProductionGlobalConfigResolution();
+	if (resolution.shadowedPath === undefined) return;
+	const winningPath = canonicalPathIdentity(resolution.path);
+	const shadowedPath = canonicalPathIdentity(resolution.shadowedPath);
+	recordDegradationOnce({
+		kind: "config-location-shadowed",
+		subject: winningPath,
+		reason: `shadowed global config ${shadowedPath}; winning path is the record subject`,
+		metadata: {
+			subsystem: "lens-config",
+			configPath: winningPath,
+			shadowedPath,
+		},
+		code: "PILENS_CFG_0010",
+	});
+}
+
+export function loadPiLensGlobalConfig(
+	configPath?: string,
+): PiLensGlobalConfig | undefined {
+	// An unresolvable existence probe on the derived path is the one decision
+	// that must carry its own bounded record (#3251 review H2 remedy B): the
+	// resolution RETAINED the location it could not evaluate, the read below
+	// reports its own `config-ignored` row when it fails, and this record
+	// names the retention decision itself - the failed probe's path and error
+	// class - so "different settings silently applying" is impossible.
+	// Explicit-path callers stay silent (#2427 quiet contract); the default
+	// parameter is evaluated FIRST so the body can tell derived from explicit.
+	const derivedPath = configPath === undefined;
+	if (derivedPath) {
+		reportGlobalConfigProbeRetention();
+		reportGlobalConfigShadowing();
+	}
+	const resolvedPath = configPath ?? getPiLensGlobalConfigPath();
+	const location = globalCanonicalLocation();
+	// #2445: this used to be `JSON.parse(fs.readFileSync(...))` inside a bare
+	// `catch { return undefined; }`, so a malformed `~/.pi-lens/config.json`
+	// produced ZERO signal of its own — no log line, no ledger row, no
+	// notification. The only thing a user saw was the LSP loader's report of the
+	// SAME file, mislabelled "ignoring invalid LSP config", because that loader
+	// resolves the canonical global too. Both halves are fixed together: the
+	// read/parse failure is reported here, under `lens-config`, and
+	// `reportConfigReadFailure` derives the subsystem from the DOCUMENT so the
+	// LSP loader's report of this file lands under `lens-config` as well and the
+	// warn-once latch collapses the two into one honest notice.
+	const outcome = readConfigDocument(resolvedPath);
+	if (outcome.status === "missing") return undefined;
+	if (outcome.status === "error") {
+		reportConfigReadFailure({
+			file: resolvedPath,
+			location,
+			tier: "global",
+			error: outcome.error,
+			sourceText: outcome.sourceText,
+		});
+		return undefined;
+	}
+	// Every notice this projection composes is BUFFERED and bounded once, at the
+	// end, through the SAME `ignoredRecordCollector` the project loader uses
+	// (#2426 review round 6, F3; round 7, F2). It used to report each one the
+	// moment it was composed, with no collector anywhere in this function, so
+	// the unknown-top-level-key scan below — whose count is the number of keys
+	// the user typed — put 100 notifications on screen for a 100-key
+	// `~/.pi-lens/config.json` while the project loader's identical scan of an
+	// identical file produced 19 and a count. Two changelog fragments already
+	// claimed one bound for every producer; this is the producer that did not
+	// have one.
+	//
+	// Round 6 gave it that bound by COPYING the project loader's, which left two
+	// spellings of one record literal differing only in a tier. Round 7 moved
+	// the seam into `config-resolve.ts`, which both loaders already import, and
+	// made the tier an argument. This loader never passes a `{ parseError }`:
+	// its read/parse failure is reported above by `reportConfigReadFailure`,
+	// before the projection starts.
+	//
+	// The flush is in a `finally` so a throw in the projection still delivers
+	// what was composed before it, on top of the whole-config record the catch
+	// adds.
+	const { note, records: notedRecords } = ignoredRecordCollector(
+		resolvedPath,
+		"global",
+	);
+	try {
+		const parsed = outcome.value;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			// The other half of the same silence: a file that PARSES but is a list
+			// or a scalar is not a config either, and was dropped without a word.
+			note("top-level value must be an object", "PILENS_CFG_0001");
+			return undefined;
+		}
+
+		// Through the #2425 core (#2426). The canonical global file is resolved as
+		// a single `global`-tier source against the canonical schema, so the depth
+		// bound, the prototype-key policy and the declared `lsp.*` types apply to
+		// `~/.pi-lens/config.json` exactly as they do to `.pi-lens.json`. The
+		// field-by-field projection below is unchanged and keeps owning the
+		// per-key prose its tests assert on — the core validates the SHAPE, this
+		// function still decides what a bad value is called.
+		const document = {
+			tier: "global" as const,
+			file: resolvedPath,
+			location,
+			value: parsed,
+		};
+		const resolved = resolveOnePiLensConfigDocument(document);
+		// EVERY record this document produced (#2426 review round 3, F1) — not
+		// filtered to what this loader "owns". `reportPiLensConfigRecords` derives
+		// the reporting subsystem per record; the warn-once latch collapses a
+		// duplicate report of the SAME record from the LSP loader's resolution of
+		// this same file (it resolves the canonical global too) into one notice.
+		reportPiLensConfigRecords(resolved.records);
+		const raw = resolved.value;
+		const warnInvalid = note;
+		const config: Record<string, unknown> = {};
+		const toolConfig = readToolConfig(raw, warnInvalid);
+		if (toolConfig) config.tools = toolConfig;
+		// #4687 item 7: `tools.lazy` is "auto" | true | false. Its registry row
+		// reads it through `readGlobal`, so the boolean copy below skips it and
+		// this is where an invalid value is reported, never silently dropped.
+		const toolsSection = asConfigObject(raw.tools);
+		if (toolsSection && "lazy" in toolsSection) {
+			const lazy = readLazyToolsSetting(raw);
+			if (lazy === undefined)
+				warnInvalid(
+					'tools.lazy must be "auto", true, or false',
+					"PILENS_CFG_0005",
+				);
+			else config.tools = { ...(config.tools as object), lazy };
+		}
+
+		for (const spec of LENS_FLAGS) {
+			if (spec.readGlobal) continue;
+			assignFlagConfigSection(raw, config, spec.configKey, warnInvalid);
+		}
+
+		const ignore = Array.isArray(raw.ignore)
+			? raw.ignore.filter((p): p is string => typeof p === "string")
+			: undefined;
+		if (ignore && ignore.length > 0) config.ignore = ignore;
+
+		const startup = asConfigObject(raw.startup);
+		if (startup) {
+			const startupConfig: PiLensGlobalConfig["startup"] = {};
+			const mode = startup.mode;
+			const scans = asConfigObject(startup.scans);
+			if (mode === "quick" || mode === "full" || mode === "minimal")
+				startupConfig.mode = mode;
+			else if ("mode" in startup)
+				warnInvalid(
+					'startup.mode must be "quick", "full", or "minimal"',
+					"PILENS_CFG_0005",
+				);
+			if (scans) {
+				if (typeof scans.enabled === "boolean") {
+					startupConfig.scans = { enabled: scans.enabled };
+				} else if ("enabled" in scans)
+					warnInvalid(
+						"startup.scans.enabled must be a boolean",
+						"PILENS_CFG_0005",
+					);
+			}
+			if (startupConfig.mode !== undefined || startupConfig.scans !== undefined)
+				config.startup = startupConfig;
+		}
+
+		// #5306: `lsp.queryMaxFileLines` is a number with no CLI flag, parsed here
+		// like `actionableWarnings.autoFix.maxFixes`. Out of range is ignored with
+		// a warning, never clamped: a silently shrunken limit would be a different
+		// setting from the one the user wrote.
+		const lspSection = asConfigObject(raw.lsp);
+		if (lspSection && "queryMaxFileLines" in lspSection) {
+			const lines = lspSection.queryMaxFileLines;
+			if (
+				typeof lines === "number" &&
+				Number.isInteger(lines) &&
+				lines >= LSP_QUERY_MAX_FILE_LINES_MIN &&
+				lines <= LSP_QUERY_MAX_FILE_LINES_MAX
+			) {
+				config.lsp = { ...(config.lsp as object), queryMaxFileLines: lines };
+			} else {
+				warnInvalid(
+					`lsp.queryMaxFileLines must be a whole number from ${LSP_QUERY_MAX_FILE_LINES_MIN} to ${LSP_QUERY_MAX_FILE_LINES_MAX}; ignored`,
+					"PILENS_CFG_0005",
+				);
+			}
+		}
+
+		const dispatch = asConfigObject(raw.dispatch);
+		if (dispatch) {
+			const floor = dispatch.runnerTimeoutFloorMs;
+			if (typeof floor === "number" && Number.isFinite(floor) && floor > 0) {
+				config.dispatch = { runnerTimeoutFloorMs: floor };
+			} else {
+				// #533: warn only when the key is PRESENT but malformed — an absent
+				// key stays silent so a config that never mentions it is not falsely
+				// flagged. Same warn-once path as the maxFixes case below.
+				if ("runnerTimeoutFloorMs" in dispatch) {
+					warnInvalid(
+						"dispatch.runnerTimeoutFloorMs must be a positive finite number",
+						"PILENS_CFG_0005",
+					);
+				}
+				config.dispatch = { runnerTimeoutFloorMs: undefined };
+			}
+		}
+
+		const autoFix = asConfigObject(
+			asConfigObject(raw.actionableWarnings)?.autoFix,
+		);
+		if (autoFix && "maxFixes" in autoFix) {
+			if (
+				typeof autoFix.maxFixes === "number" &&
+				Number.isFinite(autoFix.maxFixes) &&
+				autoFix.maxFixes >= 0
+			) {
+				config.actionableWarnings ??= {};
+				const warnings = config.actionableWarnings as Record<string, unknown>;
+				warnings.autoFix ??= {};
+				(warnings.autoFix as Record<string, unknown>).maxFixes = Math.floor(
+					autoFix.maxFixes,
+				);
+			} else {
+				warnInvalid(
+					"actionableWarnings.autoFix.maxFixes must be a non-negative finite number",
+					"PILENS_CFG_0005",
+				);
+			}
+		}
+
+		// #2967: a config-only sibling of `contextInjection.enabled` (no CLI
+		// flag), parsed here the way `actionableWarnings.autoFix.maxFixes` is.
+		// The section is already recognized through the flag registry.
+		const contextInjection = asConfigObject(raw.contextInjection);
+		if (contextInjection && "requirePreExistingFixes" in contextInjection) {
+			if (typeof contextInjection.requirePreExistingFixes === "boolean") {
+				config.contextInjection ??= {};
+				(
+					config.contextInjection as Record<string, unknown>
+				).requirePreExistingFixes = contextInjection.requirePreExistingFixes;
+			} else {
+				warnInvalid(
+					"contextInjection.requirePreExistingFixes must be a boolean",
+					"PILENS_CFG_0005",
+				);
+			}
+		}
+
+		const widget = asConfigObject(raw.widget);
+		if (widget) {
+			if (typeof widget.visible === "boolean") {
+				config.widget = { visible: widget.visible };
+			} else {
+				// #533: present-but-wrong-type warns; absent stays silent.
+				if ("visible" in widget) {
+					warnInvalid("widget.visible must be a boolean", "PILENS_CFG_0005");
+				}
+				config.widget = { visible: undefined };
+			}
+		}
+
+		const format = asConfigObject(raw.format);
+		if (format) {
+			config.format ??= {};
+			const formatSection = config.format as Record<string, unknown>;
+			if (format.mode === "immediate" || format.mode === "deferred") {
+				formatSection.mode = format.mode;
+			} else {
+				// #533: a present-but-invalid mode (e.g. "immedaite") warns and // spellchecker:disable-line
+				// falls back; an absent mode stays silent.
+				if ("mode" in format) {
+					warnInvalid(
+						'format.mode must be "immediate" or "deferred"',
+						"PILENS_CFG_0005",
+					);
+				}
+				formatSection.mode = undefined;
+			}
+		}
+
+		// #533 hygiene: a completely unknown top-level key (e.g. a typo like
+		// `lps` for `lsp`) is otherwise dropped silently, so a setting the user
+		// thought they made does nothing with no signal. Warn once per key. The
+		// recognized set is single-sourced (#883): the flag sections derived
+		// from the registry plus the declared non-flag global sections
+		// (`GLOBAL_NON_FLAG_CONFIG_SECTIONS`, which co-locates `$schema` and the
+		// hand-parsed namespaces beside the registry). Adding a flag needs no
+		// edit here; adding a namespace is a one-line edit in that one constant.
+		//
+		// `LEGACY_ROOT_LSP_KEYS` joins them for #2426 review round 4, F1. The four
+		// legacy root LSP keys are read out of THIS file by the LSP loader and
+		// their values are applied, exactly as they are in a project
+		// `.pi-lens.json` — where `PROJECT_FOREIGN_CONFIG_NAMESPACES` has
+		// tolerated them since #2426. The global scan never got the same
+		// treatment, so `~/.pi-lens/config.json` with a root `warmFiles` both
+		// honored the setting and called it a typo in the same session. Spread
+		// from the registry-derived list rather than restated: `lens-config.ts`
+		// already imports `config-locations.ts`, which derives it from
+		// `DEPRECATED_CONFIG_SURFACES`, so the accepted set and the removal
+		// schedule cannot drift apart and there is no second copy of the names.
+		const knownGlobalConfigKeys = new Set<string>([
+			...flagConfigSectionKeys(LENS_FLAGS),
+			...GLOBAL_NON_FLAG_CONFIG_SECTIONS,
+			...LEGACY_ROOT_LSP_KEYS,
+		]);
+		for (const key of Object.keys(raw)) {
+			if (!knownGlobalConfigKeys.has(key)) {
+				warnInvalid(
+					PROJECT_NON_FLAG_CONFIG_SECTIONS.includes(key)
+						? `"${key}" is a project-scoped pi-lens setting; set it in <project>/.pi-lens.json, not in the global config; ignored`
+						: `unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
+					"PILENS_CFG_0004",
+				);
+			}
+		}
+
+		return config as PiLensGlobalConfig;
+	} catch (error) {
+		// #2426 review round 5, S-C. The other half of #2445's silence. The
+		// read/parse failure above now reports, but everything AFTER the parse —
+		// the resolution through the core and the field-by-field projection —
+		// still sat under a bare `catch { return undefined }`, so a throw in any
+		// of it dropped the WHOLE global config with no log line, no ledger row
+		// and no notification: pi-lens ran on defaults and said nothing, which is
+		// the exact defect #2445 was filed for.
+		//
+		// `PILENS_CFG_0008` ("config resolution failed; whole configuration
+		// ignored") rather than `0001`, and the ERROR CLASS only, never its
+		// message, which could quote the file — the same rule `resolveConfig`'s
+		// own guard follows for the same reason. Round 5 used `0005` here, which
+		// is registered as a per-FIELD rejection: a user matching on it would
+		// have expected one setting to be missing rather than the whole file
+		// (#2426 review round 6, S1). `errorClassName` (#2451) is the ONE
+		// implementation of "class name, never the message" — this loader
+		// already imports `config-warn.js` for the rest of the seam, so it could
+		// call `normalizeParseErrorReason({ classOnly: true })` directly, but
+		// calling the same leaf `config-warn.ts` itself delegates to keeps every
+		// caller of this guarantee, `config-core/` included, on ONE
+		// implementation rather than two that happen to agree today.
+		warnInvalidGlobalConfigOnce(
+			resolvedPath,
+			`global config could not be interpreted (${errorClassName(error)}); configuration ignored`,
+			"PILENS_CFG_0008",
+		);
+		return undefined;
+	} finally {
+		reportPiLensConfigRecords(notedRecords());
+	}
+}
+
+export function getGlobalIgnorePatterns(configPath?: string): string[] {
+	return loadPiLensGlobalConfig(configPath)?.ignore ?? [];
+}
+
+export function getGlobalWidgetDefaultVisible(configPath?: string): boolean {
+	return loadPiLensGlobalConfig(configPath)?.widget?.visible !== false;
+}
+
+/** Per-turn quickfix cap; undefined means "use the built-in default of 5". */
+export function getGlobalActionableWarningMaxFixes(
+	configPath?: string,
+): number | undefined {
+	return loadPiLensGlobalConfig(configPath)?.actionableWarnings?.autoFix
+		?.maxFixes;
+}
+
+/**
+ * #5306: the explicit single-file diagnostics query's line limit from the
+ * global config, or undefined when unset or invalid (the query then keeps the
+ * shared bound).
+ */
+export function getGlobalLspQueryMaxFileLines(
+	configPath?: string,
+): number | undefined {
+	return loadPiLensGlobalConfig(configPath)?.lsp?.queryMaxFileLines;
+}
+
+/** Which tier decided a resolved flag's value — for provenance in debug/skip logs (#792). */
+export type PiLensFlagSource =
+	| "env"
+	| "cli"
+	| "project"
+	| `nested-project:${string}`
+	| "global"
+	| "default";
+
+export interface ResolvedPiLensFlag {
+	value: boolean | string | undefined;
+	source: PiLensFlagSource;
+}
+
+/**
+ * Resolve a flag AND report which config tier decided it — same precedence
+ * as {@link resolvePiLensFlag} (which now delegates here), just also
+ * returning the `source` so callers can log e.g.
+ * "(--no-autofix, source=project)" instead of a bare boolean (#792).
+ *
+ * Every tier is driven by `clients/lens-flag-registry.ts` (#166): the spec's
+ * `configKey` is read out of each config object rather than matched by a
+ * per-flag branch, so a new toggle needs no change here at all.
+ *
+ * Precedence: env → cli → nested-project → project → global → default.
+ * Project tiers apply to `scope: "project"` flags only (maintainer decision —
+ * project wins over global, including re-enabling; only an explicit CLI
+ * disabling flag outranks project config). A name with no registry entry
+ * passes its CLI value straight through, which is how untyped string flags
+ * like `--lens-opengrep-config` keep working.
+ */
+export function resolvePiLensFlagWithSource(
+	name: string,
+	value: boolean | string | undefined,
+	config: PiLensGlobalConfig | undefined,
+	projectConfig?: PiLensProjectConfig,
+	editedFilePath?: string,
+	projectRoot?: string,
+): ResolvedPiLensFlag {
+	const spec = getLensFlagSpec(name);
+	if (spec?.env && process.env[spec.env] === "1") {
+		return { value: true, source: "env" };
+	}
+	if (value) return { value, source: "cli" };
+	if (!spec) return { value, source: "default" };
+
+	if (spec.scope === "project") {
+		const nested =
+			editedFilePath && projectRoot
+				? findNestedProjectMutationValue(spec, editedFilePath, projectRoot)
+				: undefined;
+		if (nested) {
+			return {
+				value: flagValueFromConfig(spec, nested.value),
+				source: pathsEqual(nested.dir, projectRoot as string)
+					? "project"
+					: (`nested-project:${nested.dir}` as const),
+			};
+		}
+		const projectValue = readFlagConfigValue(projectConfig, spec.configKey);
+		if (projectValue !== undefined) {
+			return {
+				value: flagValueFromConfig(spec, projectValue),
+				source: "project",
+			};
+		}
+	}
+
+	const globalValue = spec.readGlobal
+		? spec.readGlobal((config ?? {}) as Record<string, unknown>)
+		: readFlagConfigValue(config, spec.configKey);
+	if (globalValue !== undefined) {
+		return { value: flagValueFromConfig(spec, globalValue), source: "global" };
+	}
+
+	return { value: spec.default, source: "default" };
+}
+
+export function resolvePiLensFlag(
+	name: string,
+	value: boolean | string | undefined,
+	config: PiLensGlobalConfig | undefined,
+	projectConfig?: PiLensProjectConfig,
+	editedFilePath?: string,
+	projectRoot?: string,
+): boolean | string | undefined {
+	return resolvePiLensFlagWithSource(
+		name,
+		value,
+		config,
+		projectConfig,
+		editedFilePath,
+		projectRoot,
+	).value;
+}

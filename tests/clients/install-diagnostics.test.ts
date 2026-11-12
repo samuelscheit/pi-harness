@@ -1,0 +1,232 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Lang, parse } from "@ast-grep/napi";
+import { describe, expect, it } from "vitest";
+import {
+	collectInstallDiagnostics,
+	formatInstallDiagnostics,
+	grammarsInstalled,
+	installDiagnosticNotes,
+} from "../../clients/install-diagnostics.js";
+import { setupTestEnvironment } from "./test-utils.js";
+
+describe("install-diagnostics", () => {
+	it("collects an environment fingerprint without throwing", () => {
+		const d = collectInstallDiagnostics();
+		expect(d.piLensVersion).toBeTruthy();
+		expect(d.runtime).toMatch(/node|bun/);
+		expect(d.platform).toContain("-");
+		expect(d.deps.map((x) => x.name)).toContain("typescript");
+		// In this repo's flat node_modules everything resolves.
+		expect(d.deps.find((x) => x.name === "typescript")?.resolved).toBe(true);
+	});
+
+	// The module is the report a user pastes when `minimatch` (or another
+	// critical dep) did not resolve (#285/#335), so it must load without it.
+	// `clients/path-utils.ts` imports `minimatch`: routing the `realpathSync` at
+	// the `pkgRealDir` site through `realpathOrResolve` (the #4689 batch 2
+	// proposal) would make this import throw exactly when the report is needed.
+	// It admits only Node built-ins and the dependency-free ladder in
+	// `scripts/lib/`, and refuses every other specifier, relative or bare.
+	it("imports nothing that a missing runtime dependency could take down", () => {
+		const root = path.resolve(
+			path.dirname(fileURLToPath(import.meta.url)),
+			"../..",
+		);
+		const specifiers = (file: string): string[] => {
+			const tree = parse(
+				file.endsWith(".ts") ? Lang.TypeScript : Lang.JavaScript,
+				fs.readFileSync(path.join(root, file), "utf8"),
+			).root();
+			const dynamic = tree
+				.findAll({
+					rule: {
+						kind: "call_expression",
+						has: { field: "function", kind: "import" },
+					},
+				})
+				.map((node) => `dynamic ${node.text()}`);
+			return [
+				...tree.findAll({ rule: { kind: "import_statement" } }),
+				...tree.findAll({ rule: { kind: "export_statement" } }),
+			]
+				.flatMap((node) => {
+					const source = node.field("source")?.text();
+					return source === undefined ? [] : [source.slice(1, -1)];
+				})
+				.concat(dynamic);
+		};
+		const admitted = (spec: string) =>
+			spec.startsWith("node:") ||
+			spec === "../scripts/lib/web-tree-sitter-dir.mjs";
+		const own = specifiers("clients/install-diagnostics.ts");
+		expect(own.length).toBeGreaterThan(0);
+		expect(own.filter((spec) => !admitted(spec))).toEqual([]);
+		const ladder = specifiers("scripts/lib/web-tree-sitter-dir.mjs");
+		expect(ladder.filter((spec) => !spec.startsWith("node:"))).toEqual([]);
+	});
+
+	it("formats a paste-able block with the cause and a report URL", () => {
+		const out = formatInstallDiagnostics(
+			collectInstallDiagnostics(),
+			new Error("ResolveMessage: Cannot find package 'typescript'"),
+		);
+		expect(out).toContain("pi-lens install diagnostics");
+		expect(out).toContain("LOAD ERROR: ResolveMessage");
+		expect(out).toContain("runtime:");
+		expect(out).toContain("install:");
+		expect(out).toMatch(/github\.com\/apmantza\/pi-lens\/issues/);
+	});
+
+	it("flags a missing dep as FAIL in the rendered block", () => {
+		const diag = collectInstallDiagnostics();
+		diag.deps = [
+			{
+				name: "typescript",
+				resolved: false,
+				error: "ERR_MODULE_NOT_FOUND ...",
+			},
+		];
+		diag.notes = ["unresolved deps note"];
+		const out = formatInstallDiagnostics(diag);
+		expect(out).toContain("FAIL typescript");
+		expect(out).toContain("note: unresolved deps note");
+	});
+});
+
+// #3424: the grammar probe through its injected ladder inputs. The Unit tests
+// lane's own node_modules/web-tree-sitter/grammars is empty, so the live probe
+// has no stable answer there; these fixtures give every case one.
+describe("grammarsInstalled (#3424)", () => {
+	const compiledHost = (specifier: string): string => {
+		throw Object.assign(new Error(`Cannot find package '${specifier}'`), {
+			code: "MODULE_NOT_FOUND",
+		});
+	};
+
+	function webTreeSitterPackage(root: string, withGrammar: boolean): string {
+		const dir = path.join(root, "node_modules", "web-tree-sitter");
+		fs.mkdirSync(path.join(dir, "grammars"), { recursive: true });
+		fs.writeFileSync(
+			path.join(dir, "package.json"),
+			JSON.stringify({ name: "web-tree-sitter" }),
+		);
+		fs.writeFileSync(path.join(dir, "tree-sitter.wasm"), "");
+		if (withGrammar)
+			fs.writeFileSync(
+				path.join(dir, "grammars", "tree-sitter-typescript.wasm"),
+				"",
+			);
+		return dir;
+	}
+
+	it("finds populated grammars under the package root on a compiled host", () => {
+		const env = setupTestEnvironment("pi-lens-grammar-probe-");
+		try {
+			webTreeSitterPackage(env.tmpDir, true);
+			expect(
+				grammarsInstalled({
+					resolve: compiledHost,
+					packageRoot: () => env.tmpDir,
+					cwd: () => path.join(env.tmpDir, "elsewhere"),
+				}),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports an empty grammars directory as missing", () => {
+		const env = setupTestEnvironment("pi-lens-grammar-probe-");
+		try {
+			webTreeSitterPackage(env.tmpDir, false);
+			expect(
+				grammarsInstalled({
+					resolve: compiledHost,
+					packageRoot: () => env.tmpDir,
+					cwd: () => env.tmpDir,
+				}),
+			).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("follows the resolver when it answers, wherever the package lives", () => {
+		const env = setupTestEnvironment("pi-lens-grammar-probe-");
+		try {
+			const dir = webTreeSitterPackage(path.join(env.tmpDir, "store"), true);
+			expect(
+				grammarsInstalled({
+					resolve: () => path.join(dir, "tree-sitter.wasm"),
+					packageRoot: () => path.join(env.tmpDir, "no-package-here"),
+					cwd: () => path.join(env.tmpDir, "no-package-here"),
+				}),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Recurrence (#1185 F2): the packed install ships the core grammars in
+	// `<package root>/grammars` and nothing fills web-tree-sitter's own dir, so
+	// probing only the latter reported "grammars missing / postinstall did not
+	// run" in the pasted fingerprint for a healthy install. Same fact the
+	// install selftest measures, through `findCoreGrammarDir`.
+	it("finds the grammars the tarball bundles under the package root", () => {
+		const env = setupTestEnvironment("pi-lens-grammar-probe-");
+		try {
+			webTreeSitterPackage(env.tmpDir, false);
+			const bundled = path.join(env.tmpDir, "grammars");
+			fs.mkdirSync(bundled, { recursive: true });
+			fs.writeFileSync(path.join(bundled, "tree-sitter-typescript.wasm"), "");
+			expect(
+				grammarsInstalled({
+					resolve: compiledHost,
+					packageRoot: () => env.tmpDir,
+					cwd: () => path.join(env.tmpDir, "elsewhere"),
+				}),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports missing when no rung finds the package", () => {
+		const env = setupTestEnvironment("pi-lens-grammar-probe-");
+		try {
+			expect(
+				grammarsInstalled({
+					resolve: compiledHost,
+					packageRoot: () => env.tmpDir,
+					cwd: () => env.tmpDir,
+				}),
+			).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("installDiagnosticNotes (#3424)", () => {
+	it("names the compiled-host cause when a runtime dependency did not resolve", () => {
+		const [note] = installDiagnosticNotes({
+			depsUnresolved: true,
+			astGrepCli: true,
+			grammars: true,
+		});
+		expect(note).toContain("pnpm symlink store");
+		expect(note).toContain("bun build --compile");
+	});
+
+	it("adds no dependency note when every dependency resolved", () => {
+		expect(
+			installDiagnosticNotes({
+				depsUnresolved: false,
+				astGrepCli: true,
+				grammars: true,
+			}),
+		).toEqual([]);
+	});
+});

@@ -1,0 +1,790 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+	createModuleReportTool,
+	createReadEnclosingTool,
+	createReadSymbolTool,
+} from "../../tools/module-report.js";
+import { toPosix } from "../../clients/path-utils.js";
+import {
+	createTempFile,
+	pinFixtureHome,
+	setupTestEnvironment,
+} from "../clients/test-utils.js";
+
+// module_report is read-only (no graph build, no LSP — #256), so these tool
+// tests need no LSP-disabling guard.
+
+type Recorded = {
+	filePath: string;
+	symbol: { name: string; kind: string; startLine: number; endLine: number };
+	toolCallId?: string;
+};
+
+describe("module_report tool", () => {
+	it("returns a navigable JSON report with derivable (not per-symbol) read args (outline)", async () => {
+		const env = setupTestEnvironment("pi-lens-modreport-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+			);
+			const tool = createModuleReportTool(() => env.tmpDir);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", view: "full-json" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(false);
+			const report = JSON.parse(String(result.content[0]?.text));
+			expect(report.available).toBe(true);
+			const add = report.api.find((e: { name: string }) => e.name === "add") as
+				| { name: string; startLine: number; endLine: number; read?: unknown }
+				| undefined;
+			expect(add).toBeTruthy();
+			// No per-symbol `read` block (#512) — offset/limit are pure derivations
+			// of startLine/endLine on the report's own `path`.
+			expect(add?.read).toBeUndefined();
+			expect(add?.startLine).toBeGreaterThan(0);
+			expect(add?.endLine).toBeGreaterThanOrEqual(add?.startLine ?? 0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolves the summary-json preset with metrics off", async () => {
+		const env = setupTestEnvironment("pi-lens-modreport-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+			);
+			const tool = createModuleReportTool(() => env.tmpDir);
+			const result = await tool.execute(
+				"summary",
+				{ path: "sample.ts", view: "summary-json" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			const report = JSON.parse(String(result.content[0]?.text));
+			expect(report).not.toHaveProperty("view");
+			expect(report.provenance.symbols).toBe("syntax");
+			expect(result.details.view).toBe("summary-json");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("includes callback count in details", async () => {
+		const env = setupTestEnvironment("pi-lens-modreport-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"callbacks.ts",
+				"export function run(ctx: any) {\n  return { resetLSPService: () => ctx.ui.setStatus('x') };\n}\n",
+			);
+			const tool = createModuleReportTool(() => env.tmpDir);
+			const result = await tool.execute(
+				"callbacks",
+				{ path: "callbacks.ts", focus: "reset ctx", view: "full-json" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.details.callbacks).toBeGreaterThan(0);
+			const report = JSON.parse(String(result.content[0]?.text));
+			expect(report.callbacks[0].name).toContain("resetLSPService");
+			expect(report.recommendedReads[0].symbol).toContain("resetLSPService");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports isError for a non-symbol-bearing file", async () => {
+		const env = setupTestEnvironment("pi-lens-modreport-tool-");
+		try {
+			createTempFile(env.tmpDir, "data.json", "{}\n");
+			const tool = createModuleReportTool(() => env.tmpDir);
+			const result = await tool.execute(
+				"1",
+				{ path: "data.json" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("read_enclosing tool", () => {
+	it("returns the enclosing callback body and records read coverage", async () => {
+		const env = setupTestEnvironment("pi-lens-readenc-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"callbacks.ts",
+				[
+					"export function run(ctx: any) {",
+					"  return {",
+					"    resetLSPService: () => {",
+					"      ctx.ui.setStatus('x');",
+					"    },",
+					"  };",
+					"}",
+				].join("\n"),
+			);
+			const recorded: Recorded[] = [];
+			const tool = createReadEnclosingTool(
+				() => env.tmpDir,
+				(filePath, symbol, toolCallId) =>
+					recorded.push({ filePath, symbol, toolCallId }),
+			);
+
+			const result = await tool.execute(
+				"read-enclosing",
+				{ path: "callbacks.ts", line: 4 },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+
+			expect(result.isError).toBeUndefined();
+			expect(String(result.content[0]?.text)).toContain("ctx.ui.setStatus");
+			expect(recorded).toHaveLength(1);
+			expect(recorded[0].symbol).toMatchObject({
+				name: "run.resetLSPService@3",
+				kind: "object_property_callback",
+				startLine: 3,
+				endLine: 5,
+			});
+			expect(result.details).toMatchObject({ readRecorded: true });
+			// #3521: the host call id is the record's branch provenance.
+			expect(recorded[0].toolCallId).toBe("read-enclosing");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns a helpful error for oversized enclosing ranges", async () => {
+		const env = setupTestEnvironment("pi-lens-readenc-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function big() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n",
+			);
+			const tool = createReadEnclosingTool(
+				() => env.tmpDir,
+				() => undefined,
+			);
+
+			const result = await tool.execute(
+				"read-enclosing",
+				{ path: "sample.ts", line: 3, maxLines: 2 },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+
+			expect(result.isError).toBe(true);
+			expect(String(result.content[0]?.text)).toContain("above maxLines 2");
+			expect(result.details).toMatchObject({
+				found: false,
+				name: "big",
+				kind: "function",
+				startLine: 1,
+				endLine: 5,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Guards #5372: the maxLines >= 1 clamp lived only in the MCP adapter, so
+	// pi served the whole body for maxLines 0 and reported "above maxLines
+	// -5" / "above maxLines 2.5" where MCP answered 1 / 1 / 2.
+	it("clamps maxLines to a floored minimum of 1, as MCP does (#5372)", async () => {
+		const env = setupTestEnvironment("pi-lens-readenc-clamp-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				[
+					"export function ten(a: number) {",
+					"  const b = a + 1;",
+					"  const c = b + 1;",
+					"  const d = c + 1;",
+					"  const e = d + 1;",
+					"  return e;",
+					"}",
+				].join("\n"),
+			);
+			const tool = createReadEnclosingTool(
+				() => env.tmpDir,
+				() => undefined,
+			);
+			const cases: Array<[number, string]> = [
+				[0, "above maxLines 1"],
+				[-5, "above maxLines 1"],
+				[2.5, "above maxLines 2"],
+			];
+			for (const [maxLines, expected] of cases) {
+				const result = await tool.execute(
+					"read-enclosing",
+					{ path: "sample.ts", line: 4, maxLines },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				expect(result.isError).toBe(true);
+				expect(String(result.content[0]?.text)).toContain(expected);
+			}
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Guards the engine-side aroundLine guard that replaces the deleted MCP
+	// adapter clamp (#5372): a non-finite aroundLine must keep the fallback
+	// chain (maxLines), not turn the slice limit into NaN.
+	it("keeps the maxLines fallback when aroundLine is not finite", async () => {
+		const env = setupTestEnvironment("pi-lens-readenc-around-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function big() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n",
+			);
+			const tool = createReadEnclosingTool(
+				() => env.tmpDir,
+				() => undefined,
+			);
+			const result = await tool.execute(
+				"read-enclosing",
+				{
+					path: "sample.ts",
+					line: 4,
+					maxLines: 3,
+					aroundLine: Number.NaN,
+					onOversize: "slice",
+				},
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			// sliceLimit falls back to the clamped maxLines (3), not NaN.
+			expect(result.details).toMatchObject({
+				found: true,
+				partial: true,
+				enclosingEndLine: 6,
+			});
+			const sliced = String(result.content[0]?.text);
+			expect(sliced).toContain("const b = 2;");
+			expect(sliced).not.toContain("export function big");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("returns and records a partial slice for oversized enclosing ranges", async () => {
+		const env = setupTestEnvironment("pi-lens-readenc-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function big() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n",
+			);
+			const recorded: Recorded[] = [];
+			const tool = createReadEnclosingTool(
+				() => env.tmpDir,
+				(filePath, symbol) => recorded.push({ filePath, symbol }),
+			);
+
+			const result = await tool.execute(
+				"read-enclosing",
+				{
+					path: "sample.ts",
+					line: 4,
+					maxLines: 2,
+					onOversize: "slice",
+					aroundLine: 3,
+				},
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+
+			expect(result.isError).toBeUndefined();
+			expect(String(result.content[0]?.text)).toContain("partial of 1-6");
+			expect(String(result.content[0]?.text)).not.toContain(
+				"export function big",
+			);
+			expect(result.details).toMatchObject({
+				found: true,
+				partial: true,
+				startLine: 3,
+				endLine: 5,
+				enclosingStartLine: 1,
+				enclosingEndLine: 6,
+				readRecorded: true,
+			});
+			expect(recorded[0].symbol).toMatchObject({
+				name: "big",
+				startLine: 3,
+				endLine: 5,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("read_symbol tool", () => {
+	it("returns the symbol body and fires the read-guard tie-in with its range", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"const noise = 1;\nexport function target(n: number): number {\n  return n * 2;\n}\n",
+			);
+			const recorded: Recorded[] = [];
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				(filePath, symbol, toolCallId) =>
+					recorded.push({ filePath, symbol, toolCallId }),
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "target" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBeUndefined();
+			const text = String(result.content[0]?.text);
+			expect(text).toContain("export function target");
+			expect(text).not.toContain("const noise");
+			// Tie-in fired exactly once with the symbol's resolved range.
+			expect(recorded).toHaveLength(1);
+			expect(recorded[0].symbol.name).toBe("target");
+			expect(recorded[0].symbol.startLine).toBe(2);
+			expect(recorded[0].symbol.endLine).toBe(4);
+			// #3521: the host call id is the record's branch provenance.
+			expect(recorded[0].toolCallId).toBe("1");
+			expect(result.details).toMatchObject({ readRecorded: true });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("still returns the body when read-guard recording throws", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function target(): number {\n  return 1;\n}\n",
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {
+					throw new Error("record failed");
+				},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "target" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBeUndefined();
+			expect(String(result.content[0]?.text)).toContain("return 1");
+			expect(result.details).toMatchObject({ readRecorded: false });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reads callback handles and records them as read-guard coverage", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"callbacks.ts",
+				[
+					"export function run(ctx: any) {",
+					"  return {",
+					"    resetLSPService: () => {",
+					"      ctx.ui.setStatus('x');",
+					"    },",
+					"  };",
+					"}",
+				].join("\n"),
+			);
+			const recorded: Recorded[] = [];
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				(filePath, symbol) => recorded.push({ filePath, symbol }),
+			);
+			const result = await tool.execute(
+				"callback",
+				{ path: "callbacks.ts", symbol: "run.resetLSPService@3" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBeUndefined();
+			expect(String(result.content[0]?.text)).toContain("ctx.ui.setStatus");
+			expect(recorded).toHaveLength(1);
+			expect(recorded[0].symbol).toMatchObject({
+				name: "run.resetLSPService@3",
+				kind: "object_property_callback",
+				startLine: 3,
+				endLine: 5,
+			});
+			expect(result.details).toMatchObject({ readRecorded: true });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does NOT record a guard read when the symbol is missing", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(env.tmpDir, "sample.ts", "export const x = 1;\n");
+			const recorded: Recorded[] = [];
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				(filePath, symbol) => recorded.push({ filePath, symbol }),
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "ghost" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			expect(recorded).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("extends the recorded read-guard range to cover an attached doc comment (#523)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				[
+					"/**", // 1
+					" * Whether agent nudges are enabled for this session.", // 2
+					" */", // 3
+					"export function isAgentNudgeEnabled(): boolean {", // 4
+					"  return true;", // 5
+					"}", // 6
+				].join("\n"),
+			);
+			const recorded: Recorded[] = [];
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				(filePath, symbol) => recorded.push({ filePath, symbol }),
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "isAgentNudgeEnabled" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBeUndefined();
+			expect(String(result.content[0]?.text)).toContain(
+				"Whether agent nudges are enabled",
+			);
+			expect(recorded).toHaveLength(1);
+			// Coverage starts at the comment, not the declaration line.
+			expect(recorded[0].symbol.startLine).toBe(1);
+			expect(recorded[0].symbol.endLine).toBe(6);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("embeds did-you-mean suggestions in the miss response (#523)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				"export function isAgentNudgeEnabled(): boolean {\n  return true;\n}\n",
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "isAgentNudgeEnable" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			expect(
+				(result.details as { suggestions?: string[] }).suggestions,
+			).toContain("isAgentNudgeEnabled");
+			expect(String(result.content[0]?.text)).toContain("Did you mean");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resolves a Class.method qualified name to the member's body (#523)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				[
+					"export class Foo {",
+					"  bar(): number {",
+					"    return 1;",
+					"  }",
+					"}",
+					"",
+					"export class Baz {",
+					"  bar(): number {",
+					"    return 2;",
+					"  }",
+					"}",
+				].join("\n"),
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "Baz.bar" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBeUndefined();
+			const text = String(result.content[0]?.text);
+			expect(text).toContain("return 2;");
+			expect(text).not.toContain("return 1;");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("notes ambiguity for a duplicate name and resolves it via kind (#523)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-tool-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				[
+					"export interface Foo {",
+					"  id: number;",
+					"}",
+					"",
+					"export function Foo(): void {}",
+				].join("\n"),
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+
+			const ambiguous = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "Foo" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(ambiguous.isError).toBeUndefined();
+			const ambiguousDetails = ambiguous.details as {
+				kind?: string;
+				ambiguous?: { count: number; kinds: string[] };
+			};
+			expect(ambiguousDetails.ambiguous).toMatchObject({ count: 2 });
+			expect(String(ambiguous.content[0]?.text)).toContain("pass `kind`");
+
+			const disambiguated = await tool.execute(
+				"2",
+				{ path: "sample.ts", symbol: "Foo", kind: "function" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			const disambiguatedDetails = disambiguated.details as {
+				kind?: string;
+				ambiguous?: { count: number; kinds: string[] };
+			};
+			expect(disambiguatedDetails.kind).toBe("function");
+			expect(disambiguatedDetails.ambiguous).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refuses an unknown kind naming the candidate kinds instead of returning another kind (#5138)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-kind-unknown-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				[
+					"export interface Foo {",
+					"  id: number;",
+					"}",
+					"",
+					"export function Foo(): void {}",
+				].join("\n"),
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "Foo", kind: "nope" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0]?.text);
+			expect(text).toContain('"nope"');
+			expect(text).toContain("function");
+			expect(text).toContain("interface");
+			// The refused call must not hand back a body as if the kind had matched.
+			expect(text).not.toContain("export interface Foo {");
+			expect(text).not.toContain("export function Foo");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refuses a known kind that matches no candidate rather than returning a different kind (#5138)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-kind-miss-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				["export interface Foo {", "  id: number;", "}"].join("\n"),
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "Foo", kind: "class" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0]?.text);
+			expect(text).toContain('"class"');
+			expect(text).not.toContain("export interface Foo {");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("distinguishes an unreadable path from a missing symbol (#5138)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-unreadable-");
+		try {
+			// A directory at the requested path: it exists, but no file bytes can be read.
+			fs.mkdirSync(path.join(env.tmpDir, "sample.ts"));
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "anything" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0]?.text);
+			expect(text).toContain("Could not inspect");
+			expect(text).not.toContain('Symbol "anything" not found');
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #4577 M2: a `path` argument is a host-supplied tool path. `resolveFile` used
+ * a bare `path.resolve(cwd, path)`, so `~/x` became `<cwd>/~/x` — a path that
+ * cannot exist — and the report answered for a file nothing had written. All
+ * three tools of this module share that one resolver.
+ */
+describe("module_report path resolution (#4577 M2)", () => {
+	it("resolves a ~ path to $HOME, not under the cwd", async () => {
+		const env = setupTestEnvironment("pi-lens-modreport-tilde-");
+		// #4591: the fixture HOME lives outside the fixture root the harness
+		// deletes, so a straggler write cannot re-create that root.
+		const { home, restore } = pinFixtureHome("modreport-tilde");
+		const homeFile = createTempFile(
+			home,
+			path.join("proj", "sample.ts"),
+			"export function fromHome(a: number): number {\n  return a;\n}\n",
+		);
+		try {
+			expect(os.homedir()).toBe(home);
+			const tool = createModuleReportTool(() => env.tmpDir);
+			const result = await tool.execute(
+				"1",
+				{ path: "~/proj/sample.ts", view: "full-json" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			// The report exists only if the tool opened the home file: the
+			// pre-fix join pointed at `<cwd>/~/proj/sample.ts`, which is absent.
+			expect(result.isError).toBe(false);
+			const report = JSON.parse(String(result.content[0]?.text));
+			expect(report.available).toBe(true);
+			expect(report.lineCount).toBe(
+				fs.readFileSync(homeFile, "utf-8").split("\n").length,
+			);
+			expect(report.api.map((entry: { name: string }) => entry.name)).toContain(
+				"fromHome",
+			);
+			// The home is outside the project root, so the display path is
+			// absolute rather than project-relative; the pre-fix spelling carried
+			// the literal `~` component instead of the home the shell expands. An
+			// absolute display path is separator-folded (`toProjectRelativePath`),
+			// so the expected side takes the same fold: on Windows `path.resolve`
+			// spells it with backslashes and the correct report would fail (#4591
+			// Greptile P1).
+			expect(report.path).toBe(toPosix(path.resolve(homeFile)));
+		} finally {
+			restore();
+			env.cleanup();
+		}
+	});
+});

@@ -1,0 +1,337 @@
+/**
+ * #2344 — lsp-spawn-heavy Vitest project coverage.
+ *
+ * The `lsp-spawn-heavy` project (vitest.config.ts, maxWorkers: 1, dead-last
+ * phase) exists for tests that spawn a REAL LSP child process and wait on its
+ * initialize handshake or first diagnostics — budgets the default project's
+ * fork storm can starve (#1022: ast-grep's first-scan rule-set compile lands
+ * inside the wait; #2332/#2340: nine contention failures on the real-wire
+ * workspace-sweep bracket). Its membership was CONVENTION until the #2340
+ * review: nothing mechanically stopped a new spawning test from landing in the
+ * default project at `maxWorkers: "50%"`, which is exactly how #2340 shipped
+ * and "cured" its failures with a serialized re-run instead of the lane.
+ *
+ * This file is that sweep, registered-or-fail in the #2088 floor family. It
+ * derives candidacy from the real test-source seams, never from a
+ * hand-maintained list:
+ *
+ *  - a call-shaped `launchLSP(` — the child boundary in
+ *    `clients/lsp/launch.js`. Tests that `vi.mock` the launch module never
+ *    contain a bare call (they stub the seam), so they stay out of the census
+ *    for free;
+ *  - a `getServerById(` registry lookup that spawns a registered production
+ *    server (the ast-grep LSP case);
+ *  - an import of the `tests/fixtures/fake-lsp-server.mjs` fixture, whose only
+ *    purpose is being launched — every current importer launches it.
+ *
+ * Every candidate must be in `lspSpawnHeavyInclude` or carry a documented
+ * exemption ([SPAWN_EXEMPTIONS]) stating why it stays in the default project:
+ * already-routed-out (integrationInclude), a seam's own unit test, or a wire
+ * interaction with no handshake-plus-first-diagnostics budget for contention
+ * to flip. `auditRegistry` supplies the two floors (an empty walk or an empty
+ * census fails loud, defect shape 10), requires a real reason per exemption,
+ * and reds a stale exemption (#1735).
+ *
+ * Known marker gap, named rather than papered over: the opt-in live suites
+ * (`*.integration.test.ts` that strays outside `integrationInclude`, e.g.
+ * typescript-classic-repair / typescript-native-vitest) spawn a REAL TypeScript server through `TypeScriptServer.spawn(...)`
+ * with NO `launchLSP(`/`getServerById(`/fixture reference, so neither marker
+ * catches them. They run only with `PI_LENS_INTEGRATION=1` and skip otherwise;
+ * their membership target belongs to a live-suite owner, not this lane.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { toPosix } from "../../clients/path-utils.js";
+// The REAL config object, not its source text (same rule and reason as
+// tests/config/timing-sensitive-coverage.test.ts: the `.js` spelling resolves
+// to the gitignored compiled `vitest.config.js`, and the sweep would silently
+// guard a stale config). Allowlisted in module-instance-coverage.test.ts.
+import vitestConfig, { integrationInclude } from "../../vitest.config.ts";
+import {
+	auditRegistry,
+	listSourceFiles,
+	readWalkedFiles,
+	relativePosix,
+	stripSource,
+} from "../support/sweep-kit.js";
+import { vitestCollects } from "../support/vitest-collection.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
+
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../..",
+);
+
+// Self-exclusion: this meta-test searches for the very markers that define a
+// spawning test, so the marker literals are split and re-joined at runtime —
+// spelled in full, this file would report itself as an unphased candidate
+// (same trick as timing-sensitive-coverage.test.ts's samplerHelper).
+const launchCall = "launchLSP" + "(";
+const registryLookup = "getServer" + "ById(";
+const fixtureName = "fake-lsp-" + "server";
+
+// Each case contains exactly one marker. These are direct detector probes,
+// not census fixtures: deleting any one marker arm must turn its own case red.
+const syntheticMarkerCases = [
+	{
+		name: "launch seam",
+		source: `await ${launchCall}(process.execPath, []);`,
+	},
+	{
+		name: "server registry",
+		source: `const server = ${registryLookup}"ast-grep";`,
+	},
+	{
+		name: "fake server fixture",
+		source: `const fixture = "tests/fixtures/${fixtureName}.mjs";`,
+	},
+] as const;
+
+/** The `include` list of the "lsp-spawn-heavy" project, read from the live config. */
+function lspSpawnHeavyInclude(): string[] {
+	const projects: unknown = vitestConfig.test?.projects;
+	if (!Array.isArray(projects)) {
+		throw new Error(
+			"vitest.config.ts default export has no test.projects array",
+		);
+	}
+	const project = projects
+		.map(
+			(entry) =>
+				(entry as { test?: { name?: unknown; include?: unknown } })?.test,
+		)
+		.find((test) => test?.name === "lsp-spawn-heavy");
+	if (!project)
+		throw new Error('vitest.config.ts has no project named "lsp-spawn-heavy"');
+	const include = project.include;
+	if (!Array.isArray(include) || include.length === 0) {
+		throw new Error('the "lsp-spawn-heavy" project has no include list');
+	}
+	return include.map((entry) => toPosix(String(entry)));
+}
+
+/**
+ * Detect by SPAWN SEAM USE, not by assertion shape. `strings: "keep"` keeps
+ * string contents (the fixture is reached through an import/path string) while
+ * still blanking comments, so a fixture mention in prose never flags a file.
+ */
+function isLspSpawnHeavy(source: string): boolean {
+	const stripped = stripSource(source, { strings: "keep" });
+	return (
+		stripped.includes(launchCall) ||
+		stripped.includes(registryLookup) ||
+		stripped.includes(fixtureName)
+	);
+}
+
+/**
+ * Deliberate, reason-carrying exceptions (#2344 census, 2026-08-29). The
+ * pre-existing population of real-child tests is 19; 4 are phased and 15 are
+ * exempted. Each reason names the structural reason it does not carry the
+ * lane's budget shape (already-routed-out, seam-self-test, or no contended
+ * first-diagnostics wait). `auditRegistry` enforces the reason length and
+ * reds any exemption whose file stops being a candidate (#1735).
+ */
+const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
+	"tests/tools/lsp-navigation-rename-first-open.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	["tests/support/fake-lsp-" + "server.test.ts"]:
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/opaque-mutation-scan.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/watched-files-created-4320.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/watched-clear-5131.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/powershell-bom-wire-5151.integration.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/server-status-readiness-5487.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/opengrep-offline-config-failure.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/opengrep-new-file-4787.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/opengrep-late-empty-4786.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/navigation-timeout.integration.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/integration.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	["tests/clients/lsp/fake-lsp-" + "server-parent-watchdog.test.ts"]:
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/did-save-notification.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/crash-respawn-debounce-wire.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/config-section-answers-4758.test.ts":
+		"#5100: phased in the fully serialized wall-clock-budget lane for the real-process-spawn admission; cannot run in two projects.",
+	"tests/clients/lsp/clangd-lazy-indexing.test.ts":
+		"launches a real clangd child only when the binary is present (skipped otherwise); asserts lazy-indexing flags, not a contended diagnostics budget",
+	"tests/clients/lsp/client-crash-logging.test.ts":
+		"drives real client-crash/exit handling against the instantly-answering fixture; assertions read the crash record, not a spawn-window budget",
+	"tests/clients/lsp/client-exit-cause-ledger.test.ts":
+		"real child exit-cause ledger cases; the fixture self-exits on a short delay, no handshake-then-diagnostics wait to starve",
+	"tests/clients/lsp/client-retention-process-scope.test.ts":
+		"real clients across two module instances to prove process-scope retention; handshake only against the instant fixture, no contention budget",
+	"tests/clients/lsp/partial-message-timer.test.ts":
+		"#5169 natural Node host exit is measured in the fully serialized wall-clock-budget lane, after lsp-spawn-heavy; the real fixture still runs",
+	"tests/clients/lsp/service-notify-cpu-liveness.test.ts":
+		"real wedged child and CPU sampling run in the serialized wall-clock-budget phase; the lower-bound wedge assertion needs that quiet phase",
+	"tests/clients/head-move-resync-4476.test.ts":
+		"#4493: real git repositories plus fake-LSP children through the tool_call/tool_result seams; phased in the serialized wall-clock-budget lane (the flake-shape admission gate requires that lane), and its waits are the hooks' own returns and a request barrier, not a handshake-plus-diagnostics budget",
+	"tests/clients/lsp/managed-fallback-after-trust-refusal-4515.test.ts":
+		"#4515: the only launchLSP call that reaches a spawn is doubled; the project-local candidate it delegates to the real launchLSP is refused by project trust before any spawn (or, under trust, is absent), so no LSP child, handshake or diagnostics wait exists to starve",
+	"tests/clients/lsp/headless-tool-call-keepalive.test.ts":
+		"#2507: the real LSP child is spawned by a headless NODE child this test runs, not by this process; it is phased in the serialized wall-clock-budget lane (the flake-shape admission gate requires that lane), and its assertions are the child's exit code and stdout, not a handshake budget",
+	"tests/clients/lsp/kill-process-tree-real-child.test.ts":
+		"#2042/#3091: the real child is `/bin/sh` launched through `launchLSP` purely to obtain a pid whose `/proc` PPid is this process — there is no language server, no handshake and no diagnostics wait to starve; each leader is killed in the test's cleanup (the #3096 eviction cases hold about 257 live children for about a second) and the assertions read which signal `killProcessTree` issued and the eviction record. It is already phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes without running twice (same shape as the two entries above).",
+	"tests/clients/instance-reaper-pid-reuse.test.ts":
+		"#3539: the one `launchLSP` call starts `/bin/sh -c sleep 30` to read the owner tag out of its /proc environ; no language server, no handshake and no diagnostics wait. The file is phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes.",
+	"tests/clients/session-repository-trust-4530.test.ts":
+		"#4530: each `launchLSP` call starts a planted `/bin/sh` stand-in that writes a marker file and exits, or is refused before any spawn; no language server, no handshake and no diagnostics wait. The file is phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes.",
+	"tests/clients/lsp/effect-tsgo-lsp.test.ts":
+		"#4914: the one real `launchLSP` call is handed a mode-644 shim or a directory at the bin path and fails before any process starts; every launch that would start is doubled, so no LSP child, handshake or diagnostics wait exists to starve",
+	"tests/clients/lsp/initialize-timeout-backstop.test.ts":
+		"POSIX-only real-child initialize-timeout backstop; waits on a 50ms timeout firing then sleeps past kill escalation — deterministic and short",
+	"tests/clients/lsp/lean-real-smoke.test.ts":
+		"real Lean child is routed through the serialized wall-clock-budget lane after the LSP spawn lane; no overlapping spawn window or competing fork storm",
+	"tests/clients/lsp/launch.test.ts":
+		"unit-tests the launchLSP seam itself over real binaries; asserts spawn/exit/failure shapes, never an LSP handshake under a timing budget",
+	"tests/clients/lsp/lifecycle.test.ts":
+		"launchLSP lifecycle cases over real scripts (spawn/exit/stop); no initialize-plus-diagnostics wait, so no fork-storm starvation window",
+	"tests/clients/lsp/liveness-probe-capability-gate.test.ts":
+		"real probe round-trips against the instantly-answering fixture under a 2s per-call budget; wire-shape assertions, historically contention-free",
+	"tests/clients/lsp/refresh-and-sync-kind.test.ts":
+		"real-wire sync-kind negotiation and didChange echo; the fixture answers instantly, no first-diagnostics wait that contention can starve",
+	"tests/clients/lsp/service-notify-inflight-throttle-real-stream.test.ts":
+		"exercises the notify-write throttle against a deliberately CPU-burning wedged fixture; the assertions describe the wedge, not a timing budget",
+	"tests/clients/lsp/service-rename-file.test.ts":
+		"real rename-file operations against the instant fixture over one fixed handshake; no diagnostics budget to lose to a fork storm",
+	"tests/clients/lsp/shutdown-live-wedged-process.test.ts":
+		"real wedged-child shutdown boundedness; 300ms budgets with a 5s ceiling and a 280ms floor — a starved host passes the floor and stays under the wide ceiling",
+	"tests/clients/lsp/teardown-logging.test.ts":
+		"asserts lsp_client_shutdown/lsp_service_reset log phases over real children; a 250ms shutdown budget against the instant fixture, no diagnostics wait",
+	"tests/clients/memory-sampler.test.ts":
+		"one real handshake proving lsp client byte attribution; asserts the memory table, never a contended wire transaction",
+	"tests/clients/memory-sampler-root-discriminator.test.ts":
+		"real handshakes at two roots proving per-root client attribution; the assertion is the side table, not a timing budget",
+	"tests/clients/lsp/idle-eviction-enabled-servers.test.ts":
+		"#3952 caller witness: every spawn seam is doubled (all LSP_SERVERS.spawn implementations and createLSPClient are mocked) and the shared idle timer runs on a fake clock, so no real LSP child is launched; the registry lookup only establishes object identity, and the assertions are the shutdown call and the respawned client generation, not a handshake-plus-diagnostics budget",
+	"tests/clients/lsp/lsp-registry-trust.test.ts":
+		"#3952 identity witness: the registry lookup only reads the catalog object and `clients/lsp/launch.js` is mocked whole-module, so no LSP child, handshake or diagnostics wait exists for a fork storm to starve",
+	// NB: these reasons must NOT spell the fixture's own name — this file
+	// self-excludes by splitting that literal at runtime, so writing it out
+	// here would make the sweep flag itself.
+	"tests/scripts/worktree-hygiene.test.ts":
+		"names the fake LSP fixture only inside synthetic process-table command strings feeding the #2435 orphan-reaper predicate; spawns nothing at all, LSP or otherwise",
+	"tests/scripts/process-scan.test.ts":
+		"names the fake LSP fixture only inside synthetic `ps`/CIM listing text used to pin the #2435 process-table parsers (moved here from the prune-agent-worktrees suite by PR #2438 review round 3, F2); it does list the real process table, but spawns no LSP child and asserts no wire timing",
+};
+
+/** The full scan and audit, over a chosen exemption map (the test below plants a stale one). */
+function auditSpawnCensus(
+	exemptions: Readonly<Record<string, string>>,
+	included: string[],
+) {
+	// Fixture projects carry *.test.ts inputs belonging to the fixture's
+	// own toolchain; vitest never runs them, so the sweep must not count
+	// them either. vitestCollects reads that from vitest.config.ts: the
+	// hand-written `tests/fixtures/` exclude it replaces never matched,
+	// because listSourceFiles passes paths relative to `tests/` (#4399).
+	// `integrationInclude` is added back: `npm run test:unit` removes those
+	// two files from collection, and without this the exemption that names
+	// one of them read as stale there while CI's `vitest run` stayed green
+	// (#5227 round 3, Greptile P1). The census is about the repo, not the
+	// invocation; staleness stays strict for every other exemption.
+	const files = listSourceFiles(path.join(repoRoot, "tests"), {
+		extensions: [".ts"],
+	}).filter((file) => {
+		const relative = relativePosix(repoRoot, file);
+		return vitestCollects(relative) || integrationInclude.includes(relative);
+	});
+
+	// readWalkedFiles: a path that vanished between the walk and the read is
+	// out of the population, not a finding (#3082 — this scan was one of the
+	// four rotating ENOENT victims).
+	const candidates = readWalkedFiles(files)
+		.filter(({ source }) => isLspSpawnHeavy(source))
+		.map(({ file }) => relativePosix(repoRoot, file));
+
+	const audit = auditRegistry({
+		sweepName: "lsp-spawn-heavy lane coverage",
+		flagged: candidates,
+		registered: included,
+		exemptions,
+		minReasonLength: 20,
+		// Calibration: 858 test files scanned on 2026-08-29 (tests/fixtures
+		// excluded); half rounded up is 429, documented floor 430.
+		scannedCount: files.length,
+		minScanned: 430,
+		// Calibration: 20 spawning-test candidates on 2026-09-09 (5 phased,
+		// 15 exempted); half rounded up is 10.
+		minFlagged: 10,
+		remediation:
+			"A test that spawns a real LSP child must run in the lsp-spawn-heavy " +
+			"lane (vitest.config.ts lspSpawnHeavyInclude) or carry a documented " +
+			"exemption in this file, or it shares the default project's fork storm " +
+			"and can starve its own handshake/diagnostics budget without any gate.",
+	});
+
+	return audit;
+}
+
+describe("lsp-spawn-heavy Vitest project coverage", () => {
+	it.each(syntheticMarkerCases)(
+		"detects the $name marker independently",
+		({ source }) => {
+			expect(isLspSpawnHeavy(source)).toBe(true);
+		},
+	);
+
+	// Recurrence (#5227 round 3): the first fix for a `test:unit` stale-exemption
+	// red must not turn into "stale exemptions pass". A planted exemption naming
+	// a file the scan does not flag (a real non-spawning test, and a path that
+	// does not exist) still reds through the same filter and audit.
+	it(
+		"still reds a stale exemption, whichever invocation runs it",
+		() => {
+			const planted = {
+				"tests/config/worker-budget.test.ts":
+					"planted: a real test file that never spawns an LSP child",
+				"tests/clients/lsp/no-such-file-5227.test.ts":
+					"planted: a path that does not exist at all",
+			};
+			const audit = auditSpawnCensus(
+				{ ...SPAWN_EXEMPTIONS, ...planted },
+				lspSpawnHeavyInclude(),
+			);
+			expect(audit.staleExemptions.sort()).toEqual(Object.keys(planted).sort());
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	it(
+		"phases or documents every test that spawns a real LSP child",
+		() => {
+			const included = lspSpawnHeavyInclude();
+			const audit = auditSpawnCensus(SPAWN_EXEMPTIONS, included);
+
+			expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+
+			// Reverse check: a renamed or deleted member must not leave a dead glob
+			// behind — the lane silently stops phasing anything at all.
+			const dead = included.filter(
+				(file) => !fs.existsSync(path.join(repoRoot, file)),
+			);
+			expect(dead, "lspSpawnHeavyInclude entries must exist on disk").toEqual(
+				[],
+			);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+});

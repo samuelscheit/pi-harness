@@ -1,0 +1,83 @@
+name: OSV scan
+
+# #1844: advisory dependency-vulnerability sweep. Split out of lint.yml into
+# its own file (rather than a job there) so a problem specific to this one
+# check -- e.g. the third-party reusable workflow it calls -- can't take
+# down the actionlint/PR-title/markdownlint jobs, which are unrelated and
+# have no such external dependency.
+
+on:
+  schedule:
+    # Weekly sweep for advisories against dependencies already in the
+    # lockfile, not just ones a PR happens to touch.
+    - cron: "0 6 * * 1"
+  # The PR-triggered scan runs only for a PR that touches the lockfile (or this
+  # file, so an edit here is exercised); schedule and workflow_dispatch scan in
+  # full. GitHub diffs a PR's merge base against its head for `paths`, so a
+  # lockfile change that landed on master after the branch was cut does not fire it.
+  pull_request:
+    branches: [master]
+    paths:
+      - package-lock.json
+      - .github/workflows/osv-scan.yml
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  osv-scan:
+    name: OSV scan (advisory)
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 4 successful master runs (only 4 runs of this
+    # conditional job exist): 9s; timeout = floor of 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # Advisory to start (see PR body / #1844): this job is NOT wired into
+    # required-checks branch protection, so it never blocks a merge on its
+    # own. That's exactly why it must NOT use continue-on-error -- a real
+    # finding should show as a red advisory check a reviewer can see and
+    # choose to act on, not a silently-green one (#1917 review F2).
+    steps:
+      # Pin to the PR's own head commit, NOT the default checkout ref (GitHub's
+      # synthetic refs/pull/N/merge commit): scan the PR's own lockfile, not a
+      # merge-drifted one that would make the result move whenever master
+      # changes independently of this PR. On schedule/workflow_dispatch there's
+      # no PR head, so this falls back to the default (current branch tip).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          persist-credentials: false
+
+      # Pinned release + checksum verification, matching the actionlint job
+      # in lint.yml -- no third-party GitHub Action, no unpinned install
+      # script piped to a shell.
+      # #5409: the fetch-verified helper caches the verified binary and retries
+      # a 504 instead of saving the error page.
+      - name: Download and verify osv-scanner v2.5.1 (linux_amd64)
+        uses: ./.github/actions/fetch-verified
+        with:
+          tool: osv-scanner
+          version: v2.5.1
+          url: https://github.com/google/osv-scanner/releases/download/v2.5.1/osv-scanner_linux_amd64
+          sha256: f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be
+          path: ${{ runner.temp }}/osv-scanner_linux_amd64
+
+      # Markdown-format output is written to both the step log and the job
+      # summary so a finding is visible in either place (#1917 review F2).
+      # Preserve the scanner's exit status through tee so a real finding still
+      # makes the job red.
+      - name: Scan package-lock.json
+        run: |
+          chmod +x "$RUNNER_TEMP/osv-scanner_linux_amd64"
+          set +e
+          "$RUNNER_TEMP/osv-scanner_linux_amd64" --format=markdown --lockfile=./package-lock.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"

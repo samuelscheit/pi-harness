@@ -1,0 +1,36 @@
+=== cell 1: helm lint reported two blockers; values.yaml was deleted this turn ===
+--- tool_result delivered to the agent ---
+base
+
+
+🔴 STOP — 1 issue(s) must be fixed:
+  L4: templates/deployment.yaml:4: nil pointer evaluating interface {}.image
+      → replicas: {{ .Values.replicas }}
+--- turn_end context message ---
+keep working
+
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+Unresolved from this turn — charts/retracted/templates/deployment.yaml:
+🔴 STOP — 1 issue(s) must be fixed:
+  L4: templates/deployment.yaml:4: nil pointer evaluating interface {}.image
+
+=== cell 2: the same two blockers; every cited file exists ===
+--- tool_result delivered to the agent ---
+base
+
+
+🔴 STOP — 2 issue(s) must be fixed:
+  L1: values.yaml:1: replicas must be an integer, got string
+      → apiVersion: apps/v1
+  L4: templates/deployment.yaml:4: nil pointer evaluating interface {}.image
+      → replicas: {{ .Values.replicas }}
+--- turn_end context message ---
+keep working
+
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+Unresolved from this turn — charts/intact/templates/deployment.yaml:
+🔴 STOP — 2 issue(s) must be fixed:
+  L1: values.yaml:1: replicas must be an integer, got string
+  L4: templates/deployment.yaml:4: nil pointer evaluating interface {}.image

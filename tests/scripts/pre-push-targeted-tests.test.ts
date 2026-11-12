@@ -1,0 +1,2504 @@
+// flake-shape: real-process-spawn — the subject is the pre-push hook's own
+// contract with git: the stdin ref lines git writes, and the script's
+// deletion-only early exit and range union (#3661). The main-level witness
+// runs the real script over a real git fixture; an in-process call cannot
+// see the CLI's exit status or its build/test skip.
+/**
+ * Tests for scripts/pre-push-targeted-tests.mjs's selection logic (#1804
+ * review round 1, findings F1/F6/F7).
+ *
+ * The pre-push hook's whole safety claim ("never the full suite") rests on
+ * this selection staying narrow. A prior basename-substring version of the
+ * content-grep pass matched any import ending in `/<basename>` regardless of
+ * directory — `index.ts` alone selected 176 test files, and a real 43-file
+ * commit selected 282 (~10 minutes). These tests pin the fix: full-path
+ * import resolution (not a basename/substring guess) plus a hard cap that
+ * keeps the change's own tests and the best-ranked import matches instead of
+ * ever approaching "the whole suite" by accident (#4489).
+ *
+ * `selectTargetedTests` resolves paths relative to `process.cwd()` (mirrors
+ * a real repo checkout: `clients/x.ts` <-> `tests/clients/x.test.ts`), so
+ * each test builds an isolated fixture tree under a temp dir and chdirs into
+ * it for the duration of the test, restoring the real cwd in `afterEach` —
+ * never touches the real `tests/`/`clients/` trees.
+ */
+
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+import { envFor, gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
+import { copyFixtureGitHelper } from "../support/fixture-git-copy.js";
+import { readNdjsonRows } from "../support/ndjson-rows.js";
+import { relativeInside } from "../../clients/path-utils.js";
+import { isProcessAlive } from "../support/process-tree.js";
+import { waitFor } from "../clients/interleaving-kit.js";
+import {
+	loadHistorySelection,
+	resolveHeadPaths,
+} from "../../scripts/lib/test-history-selection.mjs";
+import {
+	METADATA_FILENAME,
+	rollupTestHistory,
+} from "../../scripts/test-history-rollup.mjs";
+import {
+	CI_ONLY_PRE_PUSH_TESTS,
+	collectTestFiles,
+	MAX_SELECTED_TESTS,
+	TEST_TREE_GOVERNANCE_TESTS,
+	TREE_SCANNING_GOVERNANCE_TESTS,
+	changesProductionFile,
+	changesTestTreeFile,
+	selectTargetedTests,
+	resolveBaseRef,
+	resolveDiffRange,
+	ensurePrePushTmpRoot,
+	resolvePrePushTmpRoot,
+	readPrePushRecord,
+	writePrePushRecord,
+} from "../../scripts/pre-push-targeted-tests.mjs";
+
+const repoRoot = path.resolve(__dirname, "..", "..");
+
+// What the local hook runs of a registry: its CI-only members run in CI (#4724).
+const local = (tests: string[]) =>
+	tests.filter((test) => !Object.hasOwn(CI_ONLY_PRE_PUSH_TESTS, test));
+
+let fixtureDir: string | undefined;
+const originalCwd = process.cwd();
+
+function write(relPath: string, content: string) {
+	const full = path.join(fixtureDir as string, relPath);
+	fs.mkdirSync(path.dirname(full), { recursive: true });
+	fs.writeFileSync(full, content, "utf8");
+}
+
+// #4867: a real git fixture lives inside the checkout under the git-ignored
+// `.probe-home`, never at the checkout root (#4864): the plegma Bash guard
+// refuses a git write outside the worker's worktree, and a checkout fixture
+// does not belong on tmpfs (AGENTS.md, #3526).
+function fixtureRoot(prefix: string): string {
+	fs.mkdirSync(path.join(repoRoot, ".probe-home"), { recursive: true });
+	return fs.mkdtempSync(path.join(repoRoot, ".probe-home", prefix));
+}
+
+// A PI_LENS_HOME beside the fixture checkout, never inside it: the gate moves
+// a base at or inside the checkout to the default one (#5468 M1).
+const outsideRoots: string[] = [];
+function outsideHome(): string {
+	const root = fixtureRoot("pre-push-home-");
+	outsideRoots.push(root);
+	return root;
+}
+
+function enterFixture() {
+	fixtureDir = fixtureRoot("pre-push-test-");
+	process.chdir(fixtureDir);
+}
+
+afterEach(() => {
+	process.chdir(originalCwd);
+	if (fixtureDir) {
+		fs.rmSync(fixtureDir, { recursive: true, force: true });
+		fixtureDir = undefined;
+	}
+	for (const root of outsideRoots.splice(0))
+		fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("resolveDiffRange — pre-push ref population (#3661)", () => {
+	const zero = "0".repeat(40);
+
+	it("returns no ranges for a deletion-only push so the hook skips before building", () => {
+		// #3661 recurrence: a deletion's all-zero local sha was treated as a
+		// normal update, causing a failed diff and an unnecessary build.
+		expect(
+			resolveDiffRange(`(delete) ${zero} refs/heads/removed abc123\n`),
+		).toBeNull();
+	});
+
+	it("exits before the build on a deletion-only hook invocation", () => {
+		// #3661 recurrence: the hook must make the deletion decision before its
+		// build entry point, not merely avoid selecting tests afterward.
+		const result = spawnSync(
+			process.execPath,
+			[
+				path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
+				"--skip-build",
+			],
+			{
+				cwd: repoRoot,
+				encoding: "utf8",
+				input: `(delete) ${zero} refs/heads/removed abc123\n`,
+			},
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			"deletion-only push; skipping build and tests",
+		);
+	});
+
+	it.each([
+		[
+			"deletion first",
+			`(delete) ${zero} refs/heads/removed abc123\nrefs/heads/topic localsha refs/heads/topic remotesha\n`,
+		],
+		[
+			"update first",
+			`refs/heads/topic localsha refs/heads/topic remotesha\n(delete) ${zero} refs/heads/removed abc123\n`,
+		],
+	])(
+		"ignores deletion lines regardless of their order (%s)",
+		(_name, stdin) => {
+			// #3661 recurrence: reading only the first line made mixed pushes
+			// depend on ref ordering and could select a deletion range.
+			expect(resolveDiffRange(stdin)).toEqual(["origin/master...localsha"]);
+		},
+	);
+
+	it("diffs an update and a new branch against the base, never the remote tip (#4724)", () => {
+		// #4724: `remotesha...localsha` counted a merged-in master's files as the
+		// branch's own; every pushed ref now diffs against the base branch.
+		expect(
+			resolveDiffRange(
+				"refs/heads/topic localsha refs/heads/topic remotesha\n",
+				"upstream/master",
+			),
+		).toEqual(["upstream/master...localsha"]);
+		expect(
+			resolveDiffRange(`refs/heads/topic localsha refs/heads/topic ${zero}\n`),
+		).toEqual(["origin/master...localsha"]);
+		expect(resolveDiffRange("", "upstream/master")).toEqual([
+			"upstream/master...HEAD",
+		]);
+	});
+
+	it("remoteTip returns the pre-#4724 ranges: remote tip for an update, origin/master for a new branch (#4724)", () => {
+		// Recurrence (#4726 F2): the fallback for an unresolvable base must be the
+		// range set master ran, not another base range that fails the same way.
+		expect(
+			resolveDiffRange(
+				"refs/heads/a localsha refs/heads/a remotesha\n" +
+					`refs/heads/b newlocal refs/heads/b ${zero}\n`,
+				"upstream/master",
+				{ remoteTip: true },
+			),
+		).toEqual(["remotesha...localsha", "origin/master...HEAD"]);
+	});
+
+	it("deduplicates repeated ranges", () => {
+		// F3664-1 recurrence: multiple ref lines can describe the same range;
+		// main must not run the same diff and target twice.
+		expect(
+			resolveDiffRange(
+				`refs/heads/topic localsha refs/heads/topic remotesha\n` +
+					`refs/heads/topic localsha refs/heads/topic remotesha\n` +
+					`refs/heads/new newlocal refs/heads/new ${zero}\n` +
+					`refs/heads/new newlocal refs/heads/new ${zero}\n`,
+			),
+		).toEqual(["origin/master...localsha", "origin/master...newlocal"]);
+	});
+
+	it.each([
+		[
+			"update first",
+			"refs/heads/updated localsha refs/heads/updated remotesha\n" +
+				`refs/heads/new-branch newlocal refs/heads/new-branch ${zero}\n`,
+			["origin/master...localsha", "origin/master...newlocal"],
+		],
+		[
+			"new branch first",
+			`refs/heads/new-branch newlocal refs/heads/new-branch ${zero}\n` +
+				"refs/heads/updated localsha refs/heads/updated remotesha\n",
+			["origin/master...newlocal", "origin/master...localsha"],
+		],
+	])("unions an update with a new branch (%s)", (_name, stdin, expected) => {
+		// F3664-1 recurrence: a mixed push must not lose the normal update when
+		// the new branch appears before or after it.
+		expect(resolveDiffRange(stdin)).toEqual(expected);
+	});
+
+	// One real git fixture for the hook's range tests: symlinked scripts/ and
+	// node_modules/, two source files with their tests, one base commit that
+	// origin/master points at, and the hook run through the symlinked scripts/.
+	function gitFixture() {
+		fixtureDir = fixtureRoot("pre-push-test-");
+		process.chdir(fixtureDir);
+		const scriptDir = path.join(fixtureDir, "scripts");
+		fs.symlinkSync(path.join(repoRoot, "scripts"), scriptDir, "dir");
+		fs.symlinkSync(
+			path.join(repoRoot, "node_modules"),
+			path.join(fixtureDir, "node_modules"),
+			"dir",
+		);
+		// Not the repo's vitest.config.ts: its globalSetup file does not exist in
+		// this fixture (#4086 recurrence: the same shape as the history-pass
+		// fixture, missed by the first sweep). The tests import vitest because
+		// the minimal config enables no globals.
+		write(
+			"vitest.config.ts",
+			'export default { test: { include: ["tests/**/*.test.ts"] } };\n',
+		);
+		write("package.json", '{"type":"module"}\n');
+		for (const name of ["first", "second"]) {
+			write(`clients/${name}.ts`, `export const ${name} = true;\n`);
+			write(
+				`tests/clients/${name}.test.ts`,
+				`import { it } from 'vitest'; it('${name}', () => {});\n`,
+			);
+		}
+		const git = (args: string[]) =>
+			String(
+				gitExecFileSync(args, { cwd: fixtureDir, encoding: "utf8" }),
+			).trim();
+		git(["init", "--quiet", "--initial-branch=main"]);
+		git(["config", "user.name", "pi-lens test"]);
+		git(["config", "user.email", "test@example.com"]);
+		git(["add", "."]);
+		git(["commit", "--quiet", "-m", "base"]);
+		const base = git(["rev-parse", "HEAD"]);
+		git(["update-ref", "refs/remotes/origin/master", base]);
+		const commit = (file: string, content: string) => {
+			write(file, content);
+			git(["add", file]);
+			git(["commit", "--quiet", "-m", file]);
+			return git(["rev-parse", "HEAD"]);
+		};
+		const hook = (
+			input: string,
+			extra: string[] = [],
+			env: NodeJS.ProcessEnv = {},
+			probeMain: boolean | "undrained" = false,
+		) =>
+			spawnSync(
+				process.execPath,
+				probeMain
+					? [
+							"--input-type=module",
+							"-e",
+							`import { main } from ${JSON.stringify(pathToFileURL(path.join(scriptDir, "pre-push-targeted-tests.mjs")).href)}; ${probeMain === "undrained" ? "process.kill = () => { throw Object.assign(new Error('denied'), {code: 'EPERM'}); }; const realTimer = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...args) => realTimer(fn, ms === 5000 ? 50 : ms, ...args);" : ""} process.env.GATE_PID = String(process.pid); process.argv.push('--skip-build', ...${JSON.stringify(extra)}); process.exitCode = await main();`,
+						]
+					: [
+							path.join(scriptDir, "pre-push-targeted-tests.mjs"),
+							"--skip-build",
+							...extra,
+						],
+				{
+					cwd: fixtureDir,
+					encoding: "utf8",
+					input,
+					env: { ...process.env, ...env },
+				},
+			);
+		return { git, base, commit, hook };
+	}
+
+	it("passes changed files from both mixed-push ranges to selection", () => {
+		// F3664-1 witness: main must call changedFiles for both ranges; a
+		// ranges.slice(0, 1) mutation must leave one target out of this output.
+		const { base, commit, hook } = gitFixture();
+		const first = commit("clients/first.ts", "export const first = false;\n");
+		const second = commit(
+			"clients/second.ts",
+			"export const second = false;\n",
+		);
+		const result = hook(
+			`refs/heads/first ${first} refs/heads/first ${base}\nrefs/heads/new ${second} refs/heads/new ${zero}\n`,
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("tests/clients/first.test.ts");
+		expect(result.stdout).toContain("tests/clients/second.test.ts");
+		// #4086 recurrence: a fixture suite reports green without running vitest
+		// when the pre-push script reaches with-test-lock through a symlinked
+		// scripts/ directory. The known fixture test must appear in real output.
+		expect(result.stdout).toContain("2 passed");
+	});
+
+	// #4724: #4557's master merge, replayed. The remote tip is an ancestor of
+	// the merge, so `remote...local` was master's change alone; the base range
+	// is the branch's own change alone.
+	it("selects only the branch's own files after a master merge (#4724)", () => {
+		const { git, base, commit, hook } = gitFixture();
+		const remote = commit("clients/first.ts", "export const first = false;\n");
+		git(["switch", "--quiet", "--detach", base]);
+		const master = commit(
+			"clients/second.ts",
+			"export const second = false;\n",
+		);
+		git(["update-ref", "refs/remotes/origin/master", master]);
+		git(["switch", "--quiet", "main"]);
+		git(["merge", "--quiet", "--no-edit", master]);
+		const merge = git(["rev-parse", "HEAD"]);
+
+		const result = hook(`refs/heads/main ${merge} refs/heads/main ${remote}\n`);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("  - tests/clients/first.test.ts");
+		expect(result.stdout).not.toContain("tests/clients/second.test.ts");
+	});
+
+	it("prefers upstream/master only when it has commits origin/master lacks (#4724)", () => {
+		const { git, base, commit } = gitFixture();
+		// No upstream remote, as in CI and the maintainer's checkout.
+		expect(resolveBaseRef()).toBe("origin/master");
+		const ahead = commit("clients/first.ts", "export const first = false;\n");
+		git(["update-ref", "refs/remotes/upstream/master", ahead]);
+		// A fork whose origin/master lags the upstream a branch merges.
+		expect(resolveBaseRef()).toBe("upstream/master");
+		git(["update-ref", "refs/remotes/upstream/master", base]);
+		git(["update-ref", "refs/remotes/origin/master", ahead]);
+		expect(resolveBaseRef()).toBe("origin/master");
+	});
+
+	// #4724: an SSH drop after a green hook re-ran the same head five times.
+	it("skips a head that already passed the same selection, and reruns otherwise (#4724)", () => {
+		const { commit, hook } = gitFixture();
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		const push = `refs/heads/main ${head} refs/heads/main ${zero}\n`;
+		const first = hook(push);
+		expect(first.status).toBe(0);
+		expect(first.stdout).toContain("1 passed");
+
+		const again = hook(push);
+		expect(again.status).toBe(0);
+		expect(again.stdout).toContain("already passed these 1 test file(s)");
+		expect(again.stdout).not.toContain("passed (1)");
+
+		const commonDir = path.join(fixtureDir as string, ".git");
+		const record = readPrePushRecord(commonDir, head);
+		writePrePushRecord({
+			commonDir,
+			head,
+			base: zero,
+			selected: record?.selected ?? [],
+			passed: 0,
+			failed: 1,
+			skipped: 0,
+			vitestExitCode: 1,
+			wallTimeMs: 0,
+			outcome: "tests-failed",
+		});
+		const afterRed = hook(push);
+		expect(afterRed.status).toBe(0);
+		expect(afterRed.stdout).not.toContain("already passed");
+		expect(afterRed.stdout).toContain("1 passed");
+	});
+
+	// A fixture whose first test reads the source it covers, so the committed
+	// bytes can fail while the working tree passes (#4726 review F1, P2).
+	function sourceBoundFixture() {
+		const fx = gitFixture();
+		write(
+			"tests/clients/first.test.ts",
+			"import { expect, it } from 'vitest';\nimport { first } from '../../clients/first.ts';\nit('first', () => { expect(first).toBe(true); });\n",
+		);
+		fx.git(["add", "tests/clients/first.test.ts"]);
+		fx.git(["commit", "--quiet", "-m", "bound test"]);
+		fx.git([
+			"update-ref",
+			"refs/remotes/origin/master",
+			fx.git(["rev-parse", "HEAD"]),
+		]);
+		return fx;
+	}
+
+	// Recurrence (#4726 review F1, bot threads on the skip): the hook tests the
+	// working tree but stamped `tests-complete` on the pushed sha, so a dirty
+	// tree that passed made the later re-push of the failing bytes skip.
+	it("never trusts a pass from a dirty tree for the committed bytes (#4724)", () => {
+		const { git, commit, hook } = sourceBoundFixture();
+		const bad = commit("clients/first.ts", "export const first = false;\n");
+		const push = `refs/heads/main ${bad} refs/heads/main ${zero}\n`;
+		write("clients/first.ts", "export const first = true;\n");
+		const dirty = hook(push);
+		expect(dirty.status).toBe(0);
+		expect(dirty.stdout).toContain("1 passed");
+
+		git(["checkout", "--", "clients/first.ts"]);
+		const rePush = hook(push);
+		expect(rePush.stdout).not.toContain("already passed");
+		expect(rePush.status).toBe(1);
+		expect(rePush.stdout).toContain("1 failed");
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			bad,
+		);
+		expect(record?.outcome).not.toBe("tests-complete");
+	});
+
+	// Recurrence (#4726 verify F6): the tree was sampled only after the run, so a
+	// fix that was dirty when the push started and reverted during the run
+	// recorded a pass for the committed (failing) bytes.
+	it("never trusts a pass from a tree that was dirty when the run started (#4724)", () => {
+		const { git, commit, hook } = gitFixture();
+		write(
+			"tests/clients/first.test.ts",
+			[
+				"import { afterAll, expect, it } from 'vitest';",
+				"import { gitExecFileSync } from '../../scripts/lib/git-fixture-env.mjs';",
+				"import { first } from '../../clients/first.ts';",
+				"it('first', () => { expect(first).toBe(true); });",
+				// The run itself cleans the tree: the pass read the dirty bytes.
+				"afterAll(() => { gitExecFileSync(['checkout', '--', 'clients/first.ts'], { encoding: 'utf8' }); });",
+				"",
+			].join("\n"),
+		);
+		git(["add", "tests/clients/first.test.ts"]);
+		git(["commit", "--quiet", "-m", "self-cleaning test"]);
+		git([
+			"update-ref",
+			"refs/remotes/origin/master",
+			git(["rev-parse", "HEAD"]),
+		]);
+		const bad = commit("clients/first.ts", "export const first = false;\n");
+		const push = `refs/heads/main ${bad} refs/heads/main ${zero}\n`;
+		write("clients/first.ts", "export const first = true;\n");
+		const dirty = hook(push);
+		expect(dirty.status).toBe(0);
+		expect(dirty.stdout).toContain("1 passed");
+		expect(git(["status", "--porcelain", "--untracked-files=no"])).toBe("");
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			bad,
+		);
+		expect(record?.outcome).not.toBe("tests-complete");
+		expect(record?.treeBound).toBeUndefined();
+		const rePush = hook(push);
+		expect(rePush.stdout).not.toContain("already passed");
+		expect(rePush.status).toBe(1);
+	});
+
+	// Recurrence (#4726 verify F8): `after.dirty` had no witness once the
+	// pre-run check joined it; a tree that is clean when the run starts and
+	// dirty when it ends must not bind the committed bytes either.
+	it("never trusts a pass from a run that left the tree dirty (#4724)", () => {
+		const { git, commit, hook } = gitFixture();
+		write(
+			"tests/clients/first.test.ts",
+			[
+				"import { writeFileSync } from 'node:fs';",
+				"import { expect, it } from 'vitest';",
+				// The run lands a fix and leaves it uncommitted, then reads it.
+				"it('first', async () => {",
+				"  writeFileSync('clients/first.ts', 'export const first = true;\\n');",
+				"  const mod = await import('../../clients/first.ts?run');",
+				"  expect(mod.first).toBe(true);",
+				"});",
+				"",
+			].join("\n"),
+		);
+		git(["add", "tests/clients/first.test.ts"]);
+		git(["commit", "--quiet", "-m", "dirtying test"]);
+		git([
+			"update-ref",
+			"refs/remotes/origin/master",
+			git(["rev-parse", "HEAD"]),
+		]);
+		const bad = commit("clients/first.ts", "export const first = false;\n");
+		const push = `refs/heads/main ${bad} refs/heads/main ${zero}\n`;
+		const run = hook(push);
+		expect(run.status).toBe(0);
+		expect(run.stdout).toContain("1 passed");
+		expect(git(["status", "--porcelain", "--untracked-files=no"])).not.toBe("");
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			bad,
+		);
+		expect(record?.outcome).not.toBe("tests-complete");
+		expect(record?.treeBound).toBeUndefined();
+		const rePush = hook(push);
+		expect(rePush.stdout).not.toContain("already passed");
+		expect(rePush.stdout).toContain("1 passed");
+	});
+
+	// Recurrence (#4726 verify F6, HEAD axis): clean at both ends is not enough
+	// when the run moved HEAD from another commit onto the pushed one.
+	it("never trusts a pass from a run that started on a different HEAD (#4724)", () => {
+		const { git, commit, hook } = gitFixture();
+		write(
+			"tests/clients/first.test.ts",
+			[
+				"import { afterAll, expect, it } from 'vitest';",
+				"import { gitExecFileSync } from '../../scripts/lib/git-fixture-env.mjs';",
+				"import { first } from '../../clients/first.ts';",
+				"it('first', () => { expect(first).toBe(true); });",
+				"afterAll(() => { gitExecFileSync(['checkout', '--quiet', process.env.PUSHED_SHA ?? ''], { encoding: 'utf8' }); });",
+				"",
+			].join("\n"),
+		);
+		git(["add", "tests/clients/first.test.ts"]);
+		git(["commit", "--quiet", "-m", "head-moving test"]);
+		git([
+			"update-ref",
+			"refs/remotes/origin/master",
+			git(["rev-parse", "HEAD"]),
+		]);
+		const bad = commit("clients/first.ts", "export const first = false;\n");
+		commit("clients/first.ts", "export const first = true;\n");
+		const push = `refs/heads/old ${bad} refs/heads/old ${zero}\n`;
+		const run = hook(push, [], { PUSHED_SHA: bad });
+		expect(run.status).toBe(0);
+		expect(git(["rev-parse", "HEAD"])).toBe(bad);
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			bad,
+		);
+		expect(record?.outcome).not.toBe("tests-complete");
+	});
+
+	it("never trusts a pass for a pushed sha that is not the checked-out HEAD (#4724)", () => {
+		const { commit, hook } = sourceBoundFixture();
+		const bad = commit("clients/first.ts", "export const first = false;\n");
+		commit("clients/first.ts", "export const first = true;\n");
+		const push = `refs/heads/old ${bad} refs/heads/old ${zero}\n`;
+		const first = hook(push);
+		expect(first.status).toBe(0);
+		expect(first.stdout).toContain("1 passed");
+		const again = hook(push);
+		expect(again.stdout).not.toContain("already passed");
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			bad,
+		);
+		expect(record?.outcome).not.toBe("tests-complete");
+	});
+
+	// Recurrence: a record the master hook wrote for an untested sha carries no
+	// `treeBound`; the skip must treat it as unproven, not as a pass.
+	it("does not skip on a tests-complete record that was never bound to the tested tree (#4724)", () => {
+		const { commit, hook } = gitFixture();
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		const push = `refs/heads/main ${head} refs/heads/main ${zero}\n`;
+		expect(hook(push).status).toBe(0);
+		const commonDir = path.join(fixtureDir as string, ".git");
+		const record = readPrePushRecord(commonDir, head);
+		expect(record?.treeBound).toBe(true);
+		const { treeBound: _bound, ...unbound } = record as NonNullable<
+			typeof record
+		>;
+		fs.writeFileSync(
+			path.join(commonDir, "pi-lens-prepush", `${head}.json`),
+			`${JSON.stringify(unbound)}\n`,
+		);
+		const again = hook(push);
+		expect(again.stdout).not.toContain("already passed");
+		expect(again.stdout).toContain("1 passed");
+	});
+
+	// Recurrence (#4726 review F5): the skip removes the gate for one push, so
+	// it leaves the same durable trace the lock opt-out does.
+	it("logs one pre-push-skip row beside the lock log when it skips (#4724)", () => {
+		const { commit, hook } = gitFixture();
+		const home = path.join(fixtureDir as string, ".probe-home");
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		const push = `refs/heads/main ${head} refs/heads/main ${zero}\n`;
+		expect(hook(push, [], { PI_LENS_HOME: home }).status).toBe(0);
+		const again = hook(push, [], { PI_LENS_HOME: home });
+		expect(again.stdout).toContain("already passed");
+		const read = readNdjsonRows(path.join(home, "pre-push.log"));
+		expect(read.skipped).toBe(0);
+		const rows = read.rows.filter((row) => row.event === "pre-push-skip");
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			event: "pre-push-skip",
+			heads: [head],
+			selected: 1,
+		});
+	});
+
+	// Recurrence (#4726 review F2): every push now diffs `<base>...<sha>`, so a
+	// checkout without that ref selected nothing and exited 0.
+	it("falls back to the remote-tip range when the base ref is missing (#4724)", () => {
+		const { git, commit, hook } = gitFixture();
+		const remote = git(["rev-parse", "HEAD"]);
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		git(["update-ref", "-d", "refs/remotes/origin/master"]);
+		const result = hook(`refs/heads/main ${head} refs/heads/main ${remote}\n`);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("  - tests/clients/first.test.ts");
+		expect(result.stdout).toContain("falling back to the remote-tip range");
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			head,
+		);
+		expect(record?.base).toBe(remote);
+	});
+
+	it("falls back to the remote-tip range when upstream/master shares no history (#4724)", () => {
+		const { git, commit, hook } = gitFixture();
+		const remote = git(["rev-parse", "HEAD"]);
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		const emptyTree = git(["hash-object", "-t", "tree", "--stdin"]);
+		const unrelated = git(["commit-tree", emptyTree, "-m", "unrelated"]);
+		git(["update-ref", "refs/remotes/upstream/master", unrelated]);
+		expect(resolveBaseRef()).toBe("upstream/master");
+		const result = hook(`refs/heads/main ${head} refs/heads/main ${remote}\n`);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("  - tests/clients/first.test.ts");
+		expect(result.stdout).toContain("falling back to the remote-tip range");
+	});
+
+	// Drift this prevents: the fallback maps a new branch's zero remote sha to
+	// `origin/master` (its range is `origin/master...HEAD`). Without that map the
+	// record names the zero sha, a base no diff ever used, and the skip rule
+	// binds a pass to it. The update-push fallback tests above never reach the
+	// zero-sha arm (the mutation `base: head.base` stayed green on them).
+	it("records origin/master as the base of a new branch that fell back to the remote-tip range (#4724)", () => {
+		const { git, commit, hook } = gitFixture();
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		const emptyTree = git(["hash-object", "-t", "tree", "--stdin"]);
+		const unrelated = git(["commit-tree", emptyTree, "-m", "unrelated"]);
+		git(["update-ref", "refs/remotes/upstream/master", unrelated]);
+		expect(resolveBaseRef()).toBe("upstream/master");
+		const result = hook(`refs/heads/main ${head} refs/heads/main ${zero}\n`);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("falling back to the remote-tip range");
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			head,
+		);
+		expect(record?.base).toBe("origin/master");
+	});
+
+	// F3: the record names the base the selection actually diffed.
+	it("records the comparison base the selection used (#4724)", () => {
+		const { commit, hook } = gitFixture();
+		const head = commit("clients/first.ts", "export const first = false;\n");
+		expect(
+			hook(`refs/heads/main ${head} refs/heads/main ${zero}\n`).status,
+		).toBe(0);
+		const record = readPrePushRecord(
+			path.join(fixtureDir as string, ".git"),
+			head,
+		);
+		expect(record?.base).toBe("origin/master");
+	});
+
+	// Recurrence (#4047 review H3): `lane:check` was blind to a grant-none lane,
+	// whose whole deliverable is uncommitted tracked edits plus new files; the
+	// selector only diffed committed ranges, so an edit that reds 8 tests
+	// selected nothing and the gate read green.
+	it("--include-worktree adds uncommitted tracked edits and untracked files to the changed set", () => {
+		const { hook } = gitFixture();
+		// Nothing committed past origin/master: only the working tree differs.
+		write("clients/first.ts", "export const first = false;\n");
+		write(
+			"tests/clients/third.test.ts",
+			"import { it } from 'vitest'; it('third', () => {});\n",
+		);
+
+		const without = hook("");
+		expect(without.status).toBe(0);
+		expect(without.stdout).not.toContain("tests/clients/first.test.ts");
+		expect(without.stdout).not.toContain("tests/clients/third.test.ts");
+		const withTree = hook("", ["--include-worktree"]);
+		expect(withTree.status).toBe(0);
+		expect(withTree.stdout).toContain("  - tests/clients/first.test.ts");
+		expect(withTree.stdout).toContain("  - tests/clients/third.test.ts");
+	});
+
+	it("sweeps stale run directories while preserving live and foreign entries (#5468 F3)", () => {
+		// Detached late writers recreate markerless run directories after cleanup.
+		const { hook } = gitFixture();
+		const home = path.join(outsideHome(), "sweep-home");
+		const base = path.join(home, "prepush-tmp");
+		const stale = path.join(base, "run-stale");
+		const live = path.join(base, "run-live");
+		const sibling = path.join(base, "sibling");
+		const link = path.join(base, "run-link");
+		for (const dir of [stale, live, sibling])
+			fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(live, "owner.pid"), String(process.pid));
+		fs.writeFileSync(path.join(sibling, "witness"), "keep");
+		fs.symlinkSync(sibling, link, "dir");
+		fs.symlinkSync(sibling, path.join(base, "run-link-two"), "dir");
+		const result = hook(`(delete) ${zero} refs/heads/removed abc123\n`, [], {
+			PI_LENS_HOME: home,
+			// The default base, even when the caller exports the override.
+			PI_LENS_PREPUSH_TMPDIR: "",
+		});
+		expect(result.status).toBe(0);
+		expect(fs.existsSync(live)).toBe(true);
+		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+		expect(fs.readFileSync(path.join(sibling, "witness"), "utf8")).toBe("keep");
+		expect(fs.existsSync(stale)).toBe(false);
+		expect(
+			result.stderr.match(/\[pre-push\] temp sweep skipped unsafe entries/g),
+		).toHaveLength(1);
+	});
+
+	it("keeps a markerless run directory under an operator override base (#5468 r3)", () => {
+		// PI_LENS_PREPUSH_TMPDIR may name a shared directory such as /tmp, where a
+		// markerless run-* is someone else's; only our dead owner.pid is ours.
+		const { hook } = gitFixture();
+		const base = path.join(fixtureDir as string, "shared-base");
+		const foreign = path.join(base, "run-foreign");
+		const dead = path.join(base, "run-dead");
+		fs.mkdirSync(foreign, { recursive: true });
+		fs.mkdirSync(dead, { recursive: true });
+		fs.writeFileSync(path.join(foreign, "data"), "keep");
+		fs.writeFileSync(path.join(dead, "owner.pid"), "2147483646");
+		// #5468 r3 F5: parseInt read this as the dead pid 2147483646, and the
+		// sweep deleted a foreign directory on a numeric-prefix marker.
+		const malformed = path.join(base, "run-malformed");
+		fs.mkdirSync(malformed);
+		fs.writeFileSync(path.join(malformed, "owner.pid"), "2147483646not-a-pid");
+		const result = hook(`(delete) ${zero} refs/heads/removed abc123\n`, [], {
+			PI_LENS_PREPUSH_TMPDIR: base,
+		});
+		expect(result.status).toBe(0);
+		expect(fs.readFileSync(path.join(foreign, "data"), "utf8")).toBe("keep");
+		expect(fs.existsSync(dead)).toBe(false);
+		expect(fs.existsSync(malformed)).toBe(true);
+	});
+
+	it("keeps a live gate's allocation from a concurrent startup sweep (#5468 r3 F4)", () => {
+		// Recurrence: claimScratchDir created run-* before writing owner.pid, so a
+		// second gate starting inside that window swept the live, still markerless
+		// allocation as a late writer's, and the first gate died on ENOENT. The
+		// preload runs gate B's real sweep at every step of gate A's claim (after
+		// mkdtemp, before each write and rename), so any order that exposes a
+		// prefixed name before its marker reds; B stops at its own allocation.
+		const { hook } = gitFixture();
+		const home = path.join(outsideHome(), "race-home");
+		const preload = path.join(fixtureDir as string, "race-preload.mjs");
+		const bStatus = path.join(fixtureDir as string, "race-b.txt");
+		const input = `(delete) ${zero} refs/heads/removed abc123\n`;
+		fs.writeFileSync(
+			preload,
+			`import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const inBase = (p) => String(p).includes("prepush-tmp");
+let sweeps = 0;
+const sweepB = () => {
+	if (sweeps++ >= 3) return;
+	const b = spawnSync(process.execPath, process.argv.slice(1), {
+		input: ${JSON.stringify(input)},
+		encoding: "utf8",
+		env: { ...process.env, RACE_ROLE: "B" },
+	});
+	realWrite(${JSON.stringify(bStatus)}, b.stderr);
+};
+const realTemp = fs.mkdtempSync;
+const realWrite = fs.writeFileSync;
+const realRename = fs.renameSync;
+fs.mkdtempSync = (prefix, ...rest) => {
+	if (!inBase(prefix)) return realTemp(prefix, ...rest);
+	if (process.env.RACE_ROLE === "B") throw new Error("STOP_AFTER_SWEEP");
+	const dir = realTemp(prefix, ...rest);
+	sweepB();
+	return dir;
+};
+fs.writeFileSync = (file, ...rest) => {
+	if (process.env.RACE_ROLE !== "B" && inBase(file)) sweepB();
+	return realWrite(file, ...rest);
+};
+fs.renameSync = (from, ...rest) => {
+	if (process.env.RACE_ROLE !== "B" && inBase(from)) sweepB();
+	return realRename(from, ...rest);
+};
+syncBuiltinESMExports();
+`,
+		);
+		const result = hook(input, [], {
+			PI_LENS_HOME: home,
+			PI_LENS_PREPUSH_TMPDIR: "",
+			NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+		});
+		// B swept before stopping, so the race window was really exercised.
+		expect(fs.readFileSync(bStatus, "utf8")).toContain("STOP_AFTER_SWEEP");
+		expect(result.stderr).not.toContain("ENOENT");
+		expect(result.status).toBe(0);
+	});
+
+	it("allocates distinct run directories under the override base (#5439)", () => {
+		const { hook } = gitFixture();
+		const base = path.join(fixtureDir as string, "run-base");
+		const dirs = [0, 1].map(() => {
+			const result = hook(`(delete) ${zero} refs/heads/removed abc123\n`, [], {
+				PI_LENS_PREPUSH_TMPDIR: base,
+			});
+			expect(result.status).toBe(0);
+			const dir = result.stdout.match(/tmp root: (.*?) \(caller TMPDIR/)?.[1];
+			expect(dir).toBeDefined();
+			return dir as string;
+		});
+		expect(dirs[0]).not.toBe(dirs[1]);
+		for (const dir of dirs) {
+			expect(path.dirname(dir)).toBe(fs.realpathSync(base));
+			expect(path.basename(dir)).toMatch(/^run-/);
+		}
+	});
+
+	it.each([true, false])(
+		"removes the run directory after a passing=%s test run (#5439)",
+		(passing) => {
+			const { hook } = gitFixture();
+			const base = path.join(fixtureDir as string, "cleanup-base");
+			write(
+				"tests/clients/first.test.ts",
+				`import { expect, it } from 'vitest'; it('cleanup witness', () => { expect(${passing}).toBe(true); });\n`,
+			);
+			const result = hook("", ["--include-worktree"], {
+				PI_LENS_PREPUSH_TMPDIR: base,
+			});
+			expect(result.status).toBe(passing ? 0 : 1);
+			expect(result.stdout).toContain(passing ? "1 passed" : "1 failed");
+			const dir = result.stdout.match(/tmp root: (.*?) \(caller TMPDIR/)?.[1];
+			expect(dir).toBeDefined();
+			expect(fs.existsSync(dir as string)).toBe(false);
+			expect(fs.existsSync(base)).toBe(true);
+		},
+	);
+
+	it.each([
+		["SIGINT", false],
+		["SIGTERM", false],
+		["SIGTERM", true],
+	] as const)(
+		"drains the child on %s (drain failure=%s) (#5439)",
+		async (signal, undrained) => {
+			const { hook } = gitFixture();
+			const base = path.join(fixtureDir as string, "interrupt-base");
+			const workerPidFile = path.join(fixtureDir as string, "worker.pid");
+			write(
+				"tests/clients/first.test.ts",
+				`import { it } from 'vitest'; import fs from 'node:fs'; it('interrupt', async () => { fs.writeFileSync(${JSON.stringify(workerPidFile)}, String(process.pid)); process.kill(Number(process.env.GATE_PID), '${signal}'); await new Promise(r => setTimeout(r, 300)); fs.mkdirSync(process.env.TMPDIR, { recursive: true }); fs.writeFileSync(${JSON.stringify(path.join(base, "late-writer"))}, 'wrote'); });\n`,
+			);
+			const result = hook(
+				"",
+				["--include-worktree"],
+				{
+					PI_LENS_PREPUSH_TMPDIR: base,
+				},
+				undrained ? "undrained" : true,
+			);
+			// #5468: observe the writer exiting, so a slow worker cannot write
+			// after the assertion and make the cleanup witness falsely pass.
+			const workerPid = Number(fs.readFileSync(workerPidFile, "utf8"));
+			expect(workerPid).toBeGreaterThan(0);
+			await waitFor(
+				() => isProcessAlive(workerPid),
+				(alive) => !alive,
+				{ timeoutMs: 5_000 },
+			);
+			expect(result.error).toBeUndefined();
+			const dir = result.stdout.match(/tmp root: (.*?) \(caller TMPDIR/)?.[1];
+			expect(dir).toBeDefined();
+			expect(fs.existsSync(dir as string)).toBe(undrained);
+			// A recreated root loses the original owner marker.
+			expect(fs.existsSync(path.join(dir as string, "owner.pid"))).toBe(
+				undrained,
+			);
+			expect(
+				result.stderr.includes(
+					"child drain timed out; preserving temp directory",
+				),
+			).toBe(undrained);
+			expect(result.stderr.includes("child termination failed:")).toBe(
+				undrained,
+			);
+			expect(result.status).toBe(signal === "SIGINT" ? 130 : 143);
+			expect(fs.existsSync(path.join(base, "late-writer"))).toBe(undrained);
+		},
+	);
+
+	it("hands the pinned temp root to the test run, not the caller's TMPDIR (#5439)", () => {
+		// #5439 recurrence: the hook inherited the caller's TMPDIR, so the tests
+		// it spawned read macOS's long, symlinked `/private/var/folders/...`
+		// root. The spawned test reads back every var the pin sets, so dropping
+		// one assignment reds here.
+		const { hook } = gitFixture();
+		const hatch = path.join(fixtureDir as string, "pinned-tmp");
+		fs.mkdirSync(hatch, { recursive: true });
+		const expected = fs.realpathSync(hatch);
+		write("clients/first.ts", "export const first = false;\n");
+		write(
+			"tests/clients/first.test.ts",
+			'import { expect, it } from "vitest";\n' +
+				'import path from "node:path";\n' +
+				'it("reads the pinned temp root", () => {\n' +
+				"  expect(process.env.TMPDIR?.startsWith(process.env.PREPUSH_TMP_EXPECTED + path.sep + 'run-')).toBe(true);\n" +
+				"  expect(process.env.TEMP).toBe(process.env.TMPDIR);\n" +
+				"  expect(process.env.TMP).toBe(process.env.TMPDIR);\n" +
+				"});\n",
+		);
+		const caller = "/var/folders/caller-only/T";
+		const result = hook("", ["--include-worktree"], {
+			TMPDIR: caller,
+			TEMP: caller,
+			TMP: caller,
+			PI_LENS_PREPUSH_TMPDIR: hatch,
+			PREPUSH_TMP_EXPECTED: expected,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			`[pre-push] tmp root: ${expected}${path.sep}run-`,
+		);
+		expect(result.stdout).toContain("1 passed");
+	});
+
+	// #5468 Qodo M1 recurrence: a PI_LENS_HOME pinned inside the checkout put
+	// the gate's TMPDIR there, Vitest's worker HOME followed it, and the
+	// home-ceiling guard (`isAtOrAboveHomeDir`) refused 85 tests on one push.
+	// The spawned test records the TMPDIR it saw; the run dir is removed when
+	// the gate exits, so the assertions read its parent base.
+	const runRoot = (homeFor: (checkout: string, outside: string) => string) => {
+		const { hook } = gitFixture();
+		const outside = outsideHome();
+		const seen = path.join(fixtureDir as string, "seen-tmpdir.txt");
+		write("clients/first.ts", "export const first = false;\n");
+		write(
+			"tests/clients/first.test.ts",
+			'import fs from "node:fs";\nimport { it } from "vitest";\n' +
+				'it("records its temp root", () => { fs.writeFileSync(process.env.PREPUSH_TMP_SEEN as string, process.env.TMPDIR ?? ""); });\n',
+		);
+		const result = hook("", ["--include-worktree"], {
+			PI_LENS_HOME: homeFor(fixtureDir as string, outside),
+			PI_LENS_PREPUSH_TMPDIR: "",
+			PREPUSH_TMP_SEEN: seen,
+		});
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout).toContain("1 passed");
+		const root = result.stdout.match(/tmp root: (.*?) \(caller TMPDIR/)?.[1];
+		expect(root).toBeDefined();
+		return {
+			stderr: result.stderr,
+			checkout: fs.realpathSync(fixtureDir as string),
+			outside: fs.realpathSync(outside),
+			base: path.dirname(root as string),
+			children: fs.realpathSync(path.dirname(fs.readFileSync(seen, "utf8"))),
+		};
+	};
+	const notice = /\[pre-push\] temp root .* is inside the checkout; using /g;
+
+	it.each([
+		[
+			"a .probe-home inside the checkout",
+			(c: string) => path.join(c, ".probe-home"),
+		],
+		["the checkout itself", (c: string) => c],
+		[
+			"a link outside the checkout to a directory inside it",
+			(c: string, o: string) => {
+				fs.mkdirSync(path.join(c, ".probe-home"), { recursive: true });
+				const link = path.join(o, "link");
+				fs.symlinkSync(path.join(c, ".probe-home"), link, "dir");
+				return link;
+			},
+		],
+	] as const)(
+		"keeps the temp root outside the checkout when PI_LENS_HOME is %s (#5468 M1)",
+		(_name, homeFor) => {
+			const seen = runRoot(homeFor);
+			expect(relativeInside(seen.checkout, seen.base)).toBeUndefined();
+			expect(relativeInside(seen.checkout, seen.children)).toBeUndefined();
+			expect(seen.base).toBe(
+				fs.realpathSync(path.join(os.homedir(), ".pi-lens", "prepush-tmp")),
+			);
+			expect(seen.stderr.match(notice)).toHaveLength(1);
+		},
+	);
+
+	it("honours a PI_LENS_HOME outside the checkout without a notice (#5468 M1)", () => {
+		// The control: only a base at or inside the checkout falls back.
+		const seen = runRoot((_c, o) => path.join(o, "home"));
+		expect(seen.base).toBe(path.join(seen.outside, "home", "prepush-tmp"));
+		expect(seen.children).toBe(seen.base);
+		expect(seen.stderr.match(notice)).toBeNull();
+	});
+});
+
+describe("pre-push temp root pin (#5439)", () => {
+	// Recurrence: the gate inherited the caller's TMPDIR, so macOS's long,
+	// symlinked `/private/var/folders/...` root redded path-sensitive tests on
+	// the same commit that passed under a short real root.
+
+	it("defaults under the machine-state home, never the caller's TMPDIR", () => {
+		const caller = "/var/folders/caller-only/T";
+		const root = resolvePrePushTmpRoot({
+			TMPDIR: caller,
+			TEMP: caller,
+			TMP: caller,
+		});
+		expect(root).toBe(path.join(os.homedir(), ".pi-lens", "prepush-tmp"));
+	});
+
+	it("honours PI_LENS_HOME as the machine-state parent", () => {
+		expect(resolvePrePushTmpRoot({ PI_LENS_HOME: "/machine/home " })).toBe(
+			path.join("/machine/home", "prepush-tmp"),
+		);
+	});
+
+	it("resolves a relative PI_LENS_HOME, like getLockPath", () => {
+		const root = resolvePrePushTmpRoot({ PI_LENS_HOME: "rel-home-5439" });
+		expect(root).toBe(path.join(path.resolve("rel-home-5439"), "prepush-tmp"));
+		expect(path.isAbsolute(root)).toBe(true);
+	});
+
+	it("gives PI_LENS_PREPUSH_TMPDIR precedence over PI_LENS_HOME, resolved", () => {
+		const root = resolvePrePushTmpRoot({
+			PI_LENS_HOME: "/machine/home",
+			PI_LENS_PREPUSH_TMPDIR: "relative/hatch",
+		});
+		expect(root).toBe(path.resolve("relative/hatch"));
+		expect(path.isAbsolute(root)).toBe(true);
+	});
+
+	it("creates a missing root and answers its kernel-real path", () => {
+		fixtureDir = fixtureRoot("prepush-tmp-create-");
+		const root = path.join(fixtureDir, "nested", "prepush-tmp");
+		expect(fs.existsSync(root)).toBe(false);
+		expect(ensurePrePushTmpRoot(root)).toBe(fs.realpathSync(root));
+		expect(fs.statSync(root).isDirectory()).toBe(true);
+	});
+
+	it("resolves a symlinked root, so the /var spelling cannot recur", () => {
+		fixtureDir = fixtureRoot("prepush-tmp-link-");
+		const real = path.join(fixtureDir, "real");
+		const linked = path.join(fixtureDir, "linked");
+		fs.mkdirSync(real);
+		fs.symlinkSync(real, linked, "dir");
+		expect(ensurePrePushTmpRoot(linked)).toBe(fs.realpathSync(real));
+	});
+});
+
+describe("entry-point guard through the real CLIs (#4086)", () => {
+	const lockScript = path.join(repoRoot, "scripts/with-test-lock.mjs");
+	const selectorScript = path.join(
+		repoRoot,
+		"scripts/pre-push-targeted-tests.mjs",
+	);
+	const importProbe = (script: string) =>
+		`import(${JSON.stringify(pathToFileURL(script).href)}).then(() => console.log("IMPORT-OK"));`;
+	const run = (args: string[], input?: string, cwd = repoRoot) =>
+		spawnSync(process.execPath, args, {
+			cwd,
+			encoding: "utf8",
+			input,
+			timeout: 30_000,
+			env: { ...process.env, PI_LENS_TEST_NO_LOCK: "1" },
+		});
+
+	// Outside any repo: a guard that wrongly runs the selector's main() on import
+	// then fails fast on git instead of running the real hook over this checkout.
+	const runAway = (args: string[], input?: string) =>
+		run(args, input, os.tmpdir());
+
+	it.each([
+		["with-test-lock", lockScript],
+		["pre-push-targeted-tests", selectorScript],
+	])(
+		"importing %s from `node -e` (bare and with an argument) and from stdin is not the entry point and exits 0",
+		(_name, script) => {
+			// #4086 review F2 recurrence: an entry check that threw on an
+			// unresolvable argv[1] made merely importing a script exit 1 under
+			// `node -e foo` (argv[1] = "foo") or stdin (argv[1] = "-"). The negative
+			// direction too: a guard that is always true would run main() on import
+			// (with-test-lock prints its usage and exits 2).
+			const bare = runAway(["-e", importProbe(script)]);
+			expect(bare.stderr).toBe("");
+			expect(bare.stdout).toBe("IMPORT-OK\n");
+			expect(bare.status).toBe(0);
+			// A real file that is not this script: the only shape that reaches the
+			// compare with a resolvable argv[1], so it is the one an always-true
+			// guard cannot hide behind a failed realpath.
+			const otherFile = runAway([
+				"-e",
+				importProbe(script),
+				path.join(repoRoot, "package.json"),
+			]);
+			expect(otherFile.stderr).toBe("");
+			expect(otherFile.stdout).toBe("IMPORT-OK\n");
+			expect(otherFile.status).toBe(0);
+			const viaEval = runAway(["-e", importProbe(script), "foo"]);
+			expect(viaEval.stderr).toBe("");
+			expect(viaEval.stdout).toBe("IMPORT-OK\n");
+			expect(viaEval.status).toBe(0);
+			const viaStdin = runAway(["-"], importProbe(script));
+			expect(viaStdin.stderr).toBe("");
+			expect(viaStdin.stdout).toBe("IMPORT-OK\n");
+			expect(viaStdin.status).toBe(0);
+		},
+	);
+
+	it("reaches both CLIs through a symlinked scripts/ under --preserve-symlinks-main", () => {
+		// #4086 review F5 recurrence: under --preserve-symlinks-main the main
+		// module's import.meta.url keeps its symlinked spelling, so a guard that
+		// realpaths only argv[1] sees a lexical self path, returns false, and the
+		// CLI exits 0 having done nothing. Default Node already realpaths the
+		// main URL, which is why the default-mode witness above cannot see this.
+		enterFixture();
+		const linked = path.join(fixtureDir as string, "scripts");
+		fs.symlinkSync(path.join(repoRoot, "scripts"), linked, "dir");
+		const lock = run([
+			"--preserve-symlinks-main",
+			path.join(linked, "with-test-lock.mjs"),
+			"--",
+			process.execPath,
+			"-e",
+			"console.log('RAN')",
+		]);
+		expect(lock.stdout).toContain("RAN");
+		expect(lock.status).toBe(0);
+		const selector = run(
+			[
+				"--preserve-symlinks-main",
+				path.join(linked, "pre-push-targeted-tests.mjs"),
+				"--skip-build",
+			],
+			`(delete) ${"0".repeat(40)} refs/heads/removed abc123\n`,
+		);
+		expect(selector.stdout).toContain(
+			"deletion-only push; skipping build and tests",
+		);
+		expect(selector.status).toBe(0);
+	});
+});
+
+describe("selectTargetedTests — path-mirror pass", () => {
+	it("keeps the live production and tests scanner populations on their own change paths", () => {
+		// #3951 F1: the census union allowed a tests-tree scanner to move to the
+		// production registry while a tests-only push stopped selecting it.
+		// These literal populations are independently reviewed against the live
+		// census; exercise the production selector on the real checkout inventory.
+		const productionScanners = [
+			// #4535: walks the production trees for every disk-change subscriber.
+			"tests/clients/disk-change-census-4535.test.ts",
+			"tests/clients/mutation-bridge-lineage-epoch-sweep.test.ts",
+			"tests/clients/session-state-conformance.test.ts",
+			"tests/config/glossary-synonym-sweep.test.ts",
+			"tests/config/runner-group-id-census.test.ts",
+			// #5418: walks clients/dispatch/runners for every CLI a runner probes,
+			// and docs for the dispatch-runner tables and the autofix list.
+			"tests/config/registry-parity.test.ts",
+			"tests/config/runner-config-presence-census.test.ts",
+			"tests/config/covers-config-claim-sweep.test.ts",
+			"tests/config/shell-dialect-ownership-sweep.test.ts",
+			"tests/config/strictness-ratchet.test.ts",
+			"tests/config/hook-await-bounds.test.ts",
+			"tests/config/dmts-export-drift.test.ts",
+			"tests/config/vi-mock-export-sweep.test.ts",
+			"tests/config/vi-domock-undo.test.ts",
+			"tests/config/degradation-kind-coverage.test.ts",
+			"tests/config/degradation-kind-order.test.ts",
+			"tests/config/sweep-floor-coverage.test.ts",
+			"tests/config/tracked-control-bytes.test.ts",
+			"tests/config/session-scope-sweep.test.ts",
+			"tests/config/lsp-idle-eviction-measurement.test.ts",
+			"tests/clients/atomic-write-sweep.test.ts",
+			"tests/clients/availability-classifiedby-ok-sweep.test.ts",
+			"tests/clients/availability-policy-coverage.test.ts",
+			"tests/clients/bounded-telemetry-sweep.test.ts",
+			// Shape 4: walks the production trees for abort listeners.
+			"tests/clients/abort-listener-release-sweep.test.ts",
+			"tests/clients/single-flight-ratchet.test.ts",
+			"tests/config/bounded-container-guard.test.ts",
+			"tests/scripts/dist-freshness.test.ts",
+			"tests/config/turn-state-partition-owner-sweep.test.ts",
+			"tests/config/project-trust-seam-ratchet.test.ts",
+			"tests/config/pr-smoke-paths.test.ts",
+			"tests/tools/diagnostics-route-switch-matrix.test.ts",
+			"tests/config/path-identity-sweep.test.ts",
+			// #2556: walks the production trees and tests/support, so both change kinds
+			// arm it.
+			"tests/config/path-containment-sweep.test.ts",
+			// #4590: walks both trees, so both change kinds must arm it.
+			"tests/config/env-path-key-composition-sweep.test.ts",
+			"tests/config/git-fixture-governance.test.ts",
+			// #4946: walks the four production roots for flag reads.
+			"tests/config/flag-read-registry-sweep.test.ts",
+			// #5273 r1 F1: walks clients/, tools/ and mcp/ for `includeNamedFiles` callers.
+			"tests/clients/source-filter-named-files.test.ts",
+		];
+		const testScanners = [
+			"tests/clients/flake-shape-ratchet.test.ts",
+			"tests/clients/fixture-home-teardown.test.ts",
+			"tests/real-harness/bridge-reload-ts.test.ts",
+			"tests/real-harness/bridge-reload.test.ts",
+			"tests/real-harness/child-exit.test.ts",
+			"tests/real-harness/clean-verdict.test.ts",
+			"tests/real-harness/unchecked-report.test.ts",
+			"tests/real-harness/diagnostic-provenance.test.ts",
+			"tests/real-harness/lifecycle.test.ts",
+			"tests/real-harness/negative.test.ts",
+			"tests/real-harness/provider-compatibility.test.ts",
+			"tests/real-harness/read-guard-moves.test.ts",
+			"tests/real-harness/scenario-1.test.ts",
+			"tests/real-harness/scenario-2.test.ts",
+			"tests/real-harness/scenario-3.test.ts",
+			"tests/real-harness/tools-enabled.test.ts",
+			"tests/config/handler-verdict-sweep.test.ts",
+			"tests/config/pi-mock-importer-sweep.test.ts",
+			"tests/config/sink-read-drain-sweep.test.ts",
+			"tests/config/path-containment-sweep.test.ts",
+			"tests/config/env-path-key-composition-sweep.test.ts",
+			"tests/config/git-fixture-governance.test.ts",
+			"tests/config/real-home-reader-registry.test.ts",
+			"tests/config/test-env-restore-sweep.test.ts",
+			"tests/config/test-server-teardown-sweep.test.ts",
+			"tests/config/module-instance-coverage.test.ts",
+			"tests/config/nightly-evaluated-floors.test.ts",
+			"tests/config/tmp-fixture-hygiene.test.ts",
+			"tests/config/tmp-hygiene-leak-origin.test.ts",
+			"tests/config/vacuous-skip-coverage.test.ts",
+			"tests/scripts/ci-shuffle-census.test.ts",
+			"tests/support/ast-census.test.ts",
+			"tests/support/host-event-shape-scan.test.ts",
+			"tests/support/source-walkers-vanished-dir.test.ts",
+			// #4522: walks both captured-fixture trees, so a fixture change arms it.
+			"tests/clients/dispatch/smoke-fixture-coverage.test.ts",
+		];
+		// Pin live scanner shapes behind the independent buckets: direct
+		// production walk, delegated tests/support walk, and the production walk
+		// that enters through a support re-export. The census's import-alias and
+		// default-export fixtures below cover the other resolver entry forms.
+		expect(productionScanners).toContain(
+			"tests/config/hook-await-bounds.test.ts",
+		);
+		expect(testScanners).toContain("tests/clients/flake-shape-ratchet.test.ts");
+		expect(TREE_SCANNING_GOVERNANCE_TESTS).toEqual(productionScanners);
+		expect(TEST_TREE_GOVERNANCE_TESTS).toEqual(testScanners);
+
+		const allTests = collectTestFiles(path.join(repoRoot, "tests")).map(
+			(file) => path.relative(repoRoot, file).split(path.sep).join("/"),
+		);
+		const production = selectTargetedTests(
+			["clients/__production_probe__.ts"],
+			allTests,
+		);
+		const testsOnly = selectTargetedTests(
+			["tests/support/__test_probe__.ts"],
+			allTests,
+		);
+		expect(production.selected).toEqual(local(productionScanners));
+		expect(testsOnly.selected).toEqual(local(testScanners));
+	});
+
+	it("selects the registered tree scanners for production changes", () => {
+		enterFixture();
+		for (const test of TREE_SCANNING_GOVERNANCE_TESTS)
+			write(test, "it('governance');\n");
+		write("clients/review-graph/git-identity.ts", "export {}\n");
+
+		const result = selectTargetedTests(
+			["clients/review-graph/git-identity.ts"],
+			collectTestFiles("tests"),
+		);
+
+		// Prevents tree scanners from disappearing from a production-file push
+		// because they do not import the changed module (#3426).
+		expect(changesProductionFile("clients/review-graph/git-identity.ts")).toBe(
+			true,
+		);
+		expect(result.selected).toEqual(local(TREE_SCANNING_GOVERNANCE_TESTS));
+	});
+
+	it("arms the registry for tools, mcp, scripts, and the root index", () => {
+		for (const file of ["tools/x.ts", "mcp/x.ts", "scripts/x.mjs", "index.ts"])
+			expect(changesProductionFile(file)).toBe(true);
+	});
+
+	it("selects the exact mirrored test path for a changed source file", () => {
+		enterFixture();
+		write("clients/foo/bar.ts", "export const x = 1;\n");
+		write(
+			"tests/clients/foo/bar.test.ts",
+			"import { x } from '../../../clients/foo/bar.js';\n",
+		);
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/foo/bar.ts"], allTests);
+
+		expect(result.selected).toEqual(["tests/clients/foo/bar.test.ts"]);
+		expect(result.unmatched).toEqual([]);
+		expect(result.capped).toBe(false);
+	});
+
+	it("defers a CI-only real-spawn suite to CI and reports it (#3426 H3432-1)", () => {
+		enterFixture();
+		const ciOnlyFile = Object.keys(CI_ONLY_PRE_PUSH_TESTS)[0];
+		expect(ciOnlyFile).toBeDefined();
+		write(ciOnlyFile as string, "it('hook', () => {});\n");
+
+		const allTests = collectTestFiles("tests");
+		const prePush = selectTargetedTests([ciOnlyFile as string], allTests);
+		// The budget-busting suite never enters the local pre-push selection…
+		expect(prePush.selected).toEqual([]);
+		// …and its deferral is disclosed, never silently dropped.
+		expect(prePush.excludedCiOnly).toEqual([ciOnlyFile]);
+		expect(prePush.capped).toBe(false);
+
+		// The CI job admits it through the same production entry point.
+		const ci = selectTargetedTests([ciOnlyFile as string], allTests, {
+			includeCiOnly: true,
+		});
+		expect(ci.selected).toEqual([ciOnlyFile]);
+		expect(ci.excludedCiOnly).toEqual([]);
+	});
+
+	// #3472 recurrence (#3492, 2026-09-26): a new test's real 60 s setTimeout
+	// pushed with the flake-shape ratchet red, because the ratchet scans the
+	// tests tree and neither the mirror nor the import pass selects it. The
+	// changed files are 0b5cb182a's own.
+	it("arms the tests-tree ratchet when a pushed change touches the tests tree", () => {
+		enterFixture();
+		for (const test of TEST_TREE_GOVERNANCE_TESTS)
+			write(test, "it('ratchet');\n");
+		write("clients/lsp/client.ts", "export {}\n");
+		write("tests/clients/lsp/diagnostics-fence.test.ts", "it('x');\n");
+
+		const changed = [
+			".changelog/3484-fence-hold-record.md",
+			"clients/lsp/client.ts",
+			"tests/clients/lsp/diagnostics-fence.test.ts",
+		];
+		const result = selectTargetedTests(changed, collectTestFiles("tests"));
+
+		expect(TEST_TREE_GOVERNANCE_TESTS).toContain(
+			"tests/clients/flake-shape-ratchet.test.ts",
+		);
+		expect([...result.selected].sort()).toEqual(
+			[
+				"tests/clients/lsp/diagnostics-fence.test.ts",
+				...local(TEST_TREE_GOVERNANCE_TESTS),
+			].sort(),
+		);
+		// A support-module change reaches the ratchet too: it counts helpers
+		// under tests/support (the #2885 never-settling-promise detector).
+		expect(changesTestTreeFile("tests/support/fake-child.ts")).toBe(true);
+		expect(
+			selectTargetedTests(
+				["tests/support/fake-child.ts"],
+				collectTestFiles("tests"),
+			).selected,
+		).toEqual(local(TEST_TREE_GOVERNANCE_TESTS));
+	});
+
+	it("leaves the tests-tree ratchet out of a push that touches no test file", () => {
+		enterFixture();
+		for (const test of TEST_TREE_GOVERNANCE_TESTS)
+			write(test, "it('ratchet');\n");
+		write("clients/foo/bar.ts", "export const x = 1;\n");
+
+		const allTests = collectTestFiles("tests");
+		expect(changesTestTreeFile("clients/foo/bar.ts")).toBe(false);
+		expect(changesTestTreeFile("docs/tests/x.md")).toBe(false);
+		// #4590: a scanner that walks BOTH trees is registered in both lists, so a
+		// production change arms it through TREE_SCANNING_GOVERNANCE_TESTS. Every
+		// tests-ONLY scanner stays out of a push that touches no test file.
+		const bothTreeScanners = TEST_TREE_GOVERNANCE_TESTS.filter((test) =>
+			TREE_SCANNING_GOVERNANCE_TESTS.includes(test),
+		);
+		expect(
+			selectTargetedTests(["clients/foo/bar.ts"], allTests).selected,
+		).toEqual(bothTreeScanners);
+		expect(selectTargetedTests(["docs/tests/x.md"], allTests).selected).toEqual(
+			[],
+		);
+	});
+
+	// #4104 (Greptile P2 on PR #4557): walk-files.mjs has no direct importer, so
+	// the import index selected none of the walker's own tests. Recurrence: an
+	// edit to the shared walker that runs no vanished-directory or sort pin
+	// before the push.
+	it("selects the walker's own tests for a change to scripts/lib/walk-files.mjs", () => {
+		enterFixture();
+		write("scripts/lib/walk-files.mjs", "export function walkFiles() {}\n");
+		write(
+			"tests/support/source-walkers-vanished-dir.test.ts",
+			"it('vanished', () => {});\n",
+		);
+		write("tests/support/sweep-kit.test.ts", "it('sweep', () => {});\n");
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(
+			["scripts/lib/walk-files.mjs"],
+			allTests,
+		);
+
+		expect(result.selected).toEqual([
+			"tests/support/source-walkers-vanished-dir.test.ts",
+			"tests/support/sweep-kit.test.ts",
+		]);
+		expect(result.unmatched).toEqual([]);
+		expect(result.capped).toBe(false);
+	});
+
+	it("always includes a changed test file itself", () => {
+		enterFixture();
+		write("tests/clients/foo/bar.test.ts", "it('x', () => {});\n");
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(
+			["tests/clients/foo/bar.test.ts"],
+			allTests,
+		);
+
+		expect(result.selected).toEqual(["tests/clients/foo/bar.test.ts"]);
+	});
+});
+
+describe("selectTargetedTests — import-resolution pass (full path, not basename)", () => {
+	it("selects a sibling test file that imports the changed module by its real path", () => {
+		enterFixture();
+		write("clients/foo/bar.ts", "export const x = 1;\n");
+		// No mirrored tests/clients/foo/bar.test.ts — only a differently-named
+		// sibling that imports it, the shared-seam-wiring-test shape.
+		write(
+			"tests/wiring-suite.test.ts",
+			"import { x } from '../clients/foo/bar.js';\n",
+		);
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/foo/bar.ts"], allTests);
+
+		expect(result.selected).toEqual(["tests/wiring-suite.test.ts"]);
+	});
+
+	it("does NOT select a test file that merely shares the changed file's basename in a different directory (the #1804 review regression)", () => {
+		enterFixture();
+		// Two files named `bar.ts` in different directories — the exact shape
+		// that broke the old basename-substring matcher: `/${base}` matched
+		// both `clients/foo/bar` and `clients/other/bar` imports alike.
+		write("clients/foo/bar.ts", "export const x = 1;\n");
+		write("clients/other/bar.ts", "export const y = 2;\n");
+		write(
+			"tests/clients/foo/bar.test.ts",
+			"import { x } from '../../../clients/foo/bar.js';\n",
+		);
+
+		const allTests = collectTestFiles("tests");
+		// Changing clients/other/bar.ts must NOT pull in
+		// tests/clients/foo/bar.test.ts — that test never imports
+		// clients/other/bar at all, it only shares the basename "bar".
+		const result = selectTargetedTests(["clients/other/bar.ts"], allTests);
+
+		expect(result.selected).toEqual([]);
+		expect(result.unmatched).toEqual(["clients/other/bar.ts"]);
+	});
+
+	it("resolves .js import specifiers against a .ts changed file (compiled-output convention)", () => {
+		enterFixture();
+		write("clients/foo/bar.ts", "export const x = 1;\n");
+		write(
+			"tests/clients/foo/other-name.test.ts",
+			"import { x } from '../../../clients/foo/bar.js';\n",
+		);
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/foo/bar.ts"], allTests);
+
+		expect(result.selected).toEqual(["tests/clients/foo/other-name.test.ts"]);
+	});
+});
+
+describe("selectTargetedTests — the >25-file cap (F1)", () => {
+	it("keeps only the best MAX_SELECTED_TESTS import matches, by path among equals, once matches exceed it", () => {
+		enterFixture();
+		write("clients/shared.ts", "export const shared = 1;\n");
+
+		const testCount = MAX_SELECTED_TESTS + 1;
+		for (let i = 0; i < testCount; i++) {
+			write(
+				`tests/generated-${String(i).padStart(2, "0")}.test.ts`,
+				`import { shared } from '../clients/shared.js';\n`,
+			);
+		}
+
+		const allTests = collectTestFiles("tests");
+		expect(allTests.length).toBe(testCount);
+
+		const result = selectTargetedTests(["clients/shared.ts"], allTests);
+
+		// Mutation-proof: if the cap check were removed or off-by-one'd the
+		// wrong way, `selected` would contain all `testCount` entries and
+		// `capped` would read false — this assertion goes red on either.
+		expect(result.capped).toBe(true);
+		expect(result.totalBeforeCap).toBe(testCount);
+		// #4489 recurrence: a capped selection used to keep no import match at
+		// all. Equally specific matches break the tie by path, so the last one
+		// is the one dropped.
+		expect([...result.selected].sort()).toEqual(
+			allTests.filter((test) => !test.endsWith("generated-25.test.ts")).sort(),
+		);
+	});
+
+	// #3215 lane 3: history picks are bounded by their own cap, so a hub-module
+	// change that caps the import selection must still run them, and the
+	// import-only tests it dropped stay dropped (the cap's own contract).
+	it("keeps history picks when the import selection caps, and counts none of them toward the cap", () => {
+		enterFixture();
+		write("clients/shared.ts", "export const shared = 1;\n");
+		for (let i = 0; i < MAX_SELECTED_TESTS; i++)
+			write(
+				`tests/generated-${String(i).padStart(2, "0")}.test.ts`,
+				`import { shared } from '../clients/shared.js';\n`,
+			);
+		write("tests/by-history.test.ts", "export const h = 1;\n");
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/shared.ts"], allTests, {
+			historyPicks: ["tests/by-history.test.ts"],
+		});
+		// 25 import matches do not cap; one more would. The history pick is the
+		// 26th selected file and must not trip the cap by itself.
+		expect(result.capped).toBe(false);
+		expect(result.selected).toHaveLength(MAX_SELECTED_TESTS + 1);
+		write(
+			`tests/generated-${MAX_SELECTED_TESTS}.test.ts`,
+			`import { shared } from '../clients/shared.js';\n`,
+		);
+		const capped = selectTargetedTests(
+			["clients/shared.ts"],
+			collectTestFiles("tests"),
+			{ historyPicks: ["tests/by-history.test.ts"] },
+		);
+		expect(capped.capped).toBe(true);
+		// The cap keeps MAX_SELECTED_TESTS import matches and the history pick
+		// rides on top of them (#4489).
+		expect(capped.selected).toHaveLength(MAX_SELECTED_TESTS + 1);
+		expect(capped.selected).toContain("tests/by-history.test.ts");
+		expect(capped.selected).not.toContain(
+			`tests/generated-${MAX_SELECTED_TESTS}.test.ts`,
+		);
+		expect(capped.fromHistory).toEqual(["tests/by-history.test.ts"]);
+	});
+
+	it("counts an import match that only history kept as a history pick on a capped selection", () => {
+		// Recurrence: PR #4026 review F4. A capped selection drops the import
+		// matches; a pick that history also named is kept because of history, and
+		// the hook's capped line must count it as one.
+		enterFixture();
+		write("clients/shared.ts", "export const shared = 1;\n");
+		for (let i = 0; i <= MAX_SELECTED_TESTS; i++)
+			write(
+				`tests/generated-${String(i).padStart(2, "0")}.test.ts`,
+				`import { shared } from '../clients/shared.js';\n`,
+			);
+		// generated-25 is last by path, so the ranking drops it and only history
+		// keeps it; generated-03 survives the ranking, so history added nothing.
+		const result = selectTargetedTests(
+			["clients/shared.ts"],
+			collectTestFiles("tests"),
+			{
+				historyPicks: [
+					"tests/generated-25.test.ts",
+					"tests/generated-03.test.ts",
+				],
+			},
+		);
+		expect(result.capped).toBe(true);
+		expect(result.selected).toHaveLength(MAX_SELECTED_TESTS + 1);
+		expect(result.selected).toContain("tests/generated-25.test.ts");
+		expect(result.fromHistory).toEqual(["tests/generated-25.test.ts"]);
+	});
+
+	it("does not let a history pick smuggle a CI-only suite into the local pre-push run", () => {
+		// Recurrence: #3426 H3432-1 kept budget-busting suites out of the hook;
+		// the history pass must go through the same exclusion.
+		enterFixture();
+		const [ciOnly] = Object.keys(CI_ONLY_PRE_PUSH_TESTS);
+		write(ciOnly as string, "export const t = 1;\n");
+		write("clients/x.ts", "export const x = 1;\n");
+		const allTests = collectTestFiles("tests");
+		const local = selectTargetedTests(["clients/x.ts"], allTests, {
+			historyPicks: [ciOnly as string],
+		});
+		expect(local.selected).not.toContain(ciOnly);
+		expect(local.fromHistory).toEqual([]);
+		const ci = selectTargetedTests(["clients/x.ts"], allTests, {
+			historyPicks: [ciOnly as string],
+			includeCiOnly: true,
+		});
+		expect(ci.selected).toContain(ciOnly);
+	});
+
+	// #3492 (2026-09-26): 0b5cb182a changed clients/lsp/client.ts, which 71
+	// test files match, so the heuristic selection capped and the hook ran
+	// NOTHING; the raw 60 s timer it added reached CI. The registries are
+	// bounded by construction, so a capped push still runs them.
+	it("still runs the armed governance registries when the heuristic selection caps", () => {
+		enterFixture();
+		for (const test of [
+			...TREE_SCANNING_GOVERNANCE_TESTS,
+			...TEST_TREE_GOVERNANCE_TESTS,
+		])
+			write(test, "it('governance');\n");
+		write("clients/lsp/client.ts", "export const shared = 1;\n");
+		for (let i = 0; i < MAX_SELECTED_TESTS + 1; i++) {
+			write(
+				`tests/clients/lsp/generated-${i}.test.ts`,
+				`import { shared } from '../../../clients/lsp/client.js';\n`,
+			);
+		}
+		write("tests/clients/lsp/diagnostics-fence.test.ts", "it('x');\n");
+
+		const result = selectTargetedTests(
+			[
+				".changelog/3484-fence-hold-record.md",
+				"clients/lsp/client.ts",
+				"tests/clients/lsp/diagnostics-fence.test.ts",
+			],
+			collectTestFiles("tests"),
+		);
+
+		expect(result.capped).toBe(true);
+		// Deduped: the #4590 sweep walks both trees and sits in both registries, so
+		// the union counts it once (a Set is what the selection itself uses).
+		const registries = local([
+			...new Set([
+				...TREE_SCANNING_GOVERNANCE_TESTS,
+				...TEST_TREE_GOVERNANCE_TESTS,
+			]),
+		]);
+		for (const registry of registries)
+			expect(result.selected).toContain(registry);
+		// The changed test file survives the cap (#4489), and the rest of the
+		// selection is the ranked import matches.
+		expect(result.selected).toContain(
+			"tests/clients/lsp/diagnostics-fence.test.ts",
+		);
+		expect(result.selected).toHaveLength(
+			registries.length + 1 + MAX_SELECTED_TESTS,
+		);
+		// The registries never push the heuristic selection over the cap.
+		for (let i = MAX_SELECTED_TESTS - 1; i <= MAX_SELECTED_TESTS + 1; i++)
+			fs.rmSync(`tests/clients/lsp/generated-${i}.test.ts`, { force: true });
+		const underCap = selectTargetedTests(
+			["clients/lsp/client.ts", "tests/clients/lsp/diagnostics-fence.test.ts"],
+			collectTestFiles("tests"),
+		);
+		expect(underCap.capped).toBe(false);
+		expect(underCap.selected).toContain(
+			"tests/clients/lsp/generated-0.test.ts",
+		);
+	});
+
+	it("does not cap when the match count is exactly at the limit", () => {
+		enterFixture();
+		write("clients/shared.ts", "export const shared = 1;\n");
+
+		for (let i = 0; i < MAX_SELECTED_TESTS; i++) {
+			write(
+				`tests/generated-${i}.test.ts`,
+				`import { shared } from '../clients/shared.js';\n`,
+			);
+		}
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/shared.ts"], allTests);
+
+		expect(result.capped).toBe(false);
+		expect(result.selected.length).toBe(MAX_SELECTED_TESTS);
+	});
+});
+
+// #4489: the cap dropped the change's own tests with the rest of the import
+// matches (31 of 113 own tests recalled over 20 merged PRs, 17 of them capped),
+// so a fixer's red-first test never ran locally.
+describe("selectTargetedTests — own tests and ranking under the cap (#4489)", () => {
+	// The selector reads `from "…"` specifiers, not bare side-effect imports.
+	const importsOf = (spec: string) => `import * as m from '${spec}';\n`;
+	const pad = (i: number) => String(i).padStart(2, "0");
+
+	function hubFixture(importers: number) {
+		enterFixture();
+		write("clients/hub.ts", "export const hub = 1;\n");
+		for (let i = 0; i < importers; i++)
+			write(`tests/hub-${pad(i)}.test.ts`, importsOf("../clients/hub.js"));
+	}
+
+	it("keeps a changed test file and the mirrored test of a changed source file past the cap", () => {
+		hubFixture(MAX_SELECTED_TESTS + 5);
+		write("clients/mirrored.ts", "export const m = 1;\n");
+		write("tests/clients/mirrored.test.ts", "it('m');\n");
+		write("tests/zz-own-red-first.test.ts", "it('own');\n");
+
+		const result = selectTargetedTests(
+			[
+				"clients/hub.ts",
+				"clients/mirrored.ts",
+				"tests/zz-own-red-first.test.ts",
+			],
+			collectTestFiles("tests"),
+		);
+
+		expect(result.capped).toBe(true);
+		expect(result.selected).toContain("tests/zz-own-red-first.test.ts");
+		expect(result.selected).toContain("tests/clients/mirrored.test.ts");
+		expect(result.selectionReasons.get("tests/zz-own-red-first.test.ts")).toBe(
+			"changed",
+		);
+		expect(result.selectionReasons.get("tests/clients/mirrored.test.ts")).toBe(
+			"mirror",
+		);
+		// Both own tests ride on top of the import cap.
+		expect(result.selected).toHaveLength(MAX_SELECTED_TESTS + 2);
+	});
+
+	it("counts none of the change's own tests against the cap", () => {
+		// Exactly MAX_SELECTED_TESTS import matches plus two own tests: the old
+		// count was 27 > 25 and capped, dropping everything but the registries.
+		hubFixture(MAX_SELECTED_TESTS);
+		write("clients/mirrored.ts", "export const m = 1;\n");
+		write("tests/clients/mirrored.test.ts", "it('m');\n");
+		write("tests/zz-own-red-first.test.ts", "it('own');\n");
+
+		const result = selectTargetedTests(
+			[
+				"clients/hub.ts",
+				"clients/mirrored.ts",
+				"tests/zz-own-red-first.test.ts",
+			],
+			collectTestFiles("tests"),
+		);
+
+		expect(result.capped).toBe(false);
+		expect(result.selected).toHaveLength(MAX_SELECTED_TESTS + 2);
+	});
+
+	it("ranks a capped selection's import matches by fewest importers of the changed file, then by path", () => {
+		// A specific file imported by 3 tests and a hub imported by 30. Both
+		// change; the 3 specific importers must outrank every hub importer even
+		// though their paths sort last, and a test that imports both ranks as a
+		// specific importer.
+		hubFixture(30);
+		write("clients/specific.ts", "export const s = 1;\n");
+		for (const name of ["zz-a", "zz-b"])
+			write(`tests/${name}.test.ts`, importsOf("../clients/specific.js"));
+		write(
+			"tests/zz-both.test.ts",
+			importsOf("../clients/specific.js") + importsOf("../clients/hub.js"),
+		);
+
+		const result = selectTargetedTests(
+			["clients/hub.ts", "clients/specific.ts"],
+			collectTestFiles("tests"),
+		);
+
+		expect(result.capped).toBe(true);
+		expect(result.selected).toHaveLength(MAX_SELECTED_TESTS);
+		for (const name of ["zz-a", "zz-b", "zz-both"])
+			expect(result.selected).toContain(`tests/${name}.test.ts`);
+		// The remaining 22 slots go to the hub importers, first by path.
+		const hubKept = result.selected.filter((test) =>
+			test.startsWith("tests/hub-"),
+		);
+		expect(hubKept.sort()).toEqual(
+			Array.from(
+				{ length: MAX_SELECTED_TESTS - 3 },
+				(_, i) => `tests/hub-${pad(i)}.test.ts`,
+			),
+		);
+	});
+});
+
+describe("selectTargetedTests — no-match fallback (F7)", () => {
+	it("reports a changed file with no covering test as unmatched, selects nothing for it", () => {
+		enterFixture();
+		write("clients/orphan.ts", "export const o = 1;\n");
+		write("tests/clients/unrelated.test.ts", "it('x', () => {});\n");
+
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/orphan.ts"], allTests);
+
+		expect(result.selected).toEqual([]);
+		expect(result.unmatched).toEqual(["clients/orphan.ts"]);
+		expect(result.capped).toBe(false);
+	});
+});
+
+describe("pre-push result records (#4034)", () => {
+	it("writes selected reasons and vitest counts under the git common dir", () => {
+		const commonDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-prepush-record-"),
+		);
+		const now = new Date("2026-10-07T12:00:00.000Z");
+		writePrePushRecord({
+			commonDir,
+			head: "a".repeat(40),
+			base: "b".repeat(40),
+			at: now,
+			selected: [
+				{ file: "tests/import.test.ts", reason: "import" },
+				{ file: "tests/history.test.ts", reason: "history" },
+				{ file: "tests/governance.test.ts", reason: "governance" },
+			],
+			passed: 2,
+			failed: 1,
+			skipped: 3,
+			vitestExitCode: 1,
+			wallTimeMs: 417,
+			outcome: "tests-failed",
+		});
+		const record = readPrePushRecord(commonDir, "a".repeat(40));
+		expect(record).toMatchObject({
+			head: "a".repeat(40),
+			base: "b".repeat(40),
+			passed: 2,
+			failed: 1,
+			skipped: 3,
+			vitestExitCode: 1,
+			wallTimeMs: 417,
+			outcome: "tests-failed",
+		});
+		expect(record?.selected).toEqual([
+			{ file: "tests/import.test.ts", reason: "import" },
+			{ file: "tests/history.test.ts", reason: "history" },
+			{ file: "tests/governance.test.ts", reason: "governance" },
+		]);
+		fs.rmSync(commonDir, { recursive: true, force: true });
+	});
+
+	it("prunes records older than fourteen days when writing", () => {
+		const commonDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-prepush-prune-"),
+		);
+		const dir = path.join(commonDir, "pi-lens-prepush");
+		fs.mkdirSync(dir);
+		const old = path.join(dir, `${"c".repeat(40)}.json`);
+		fs.writeFileSync(old, "{}\n");
+		fs.utimesSync(
+			old,
+			new Date("2026-09-01T00:00:00.000Z"),
+			new Date("2026-09-01T00:00:00.000Z"),
+		);
+		writePrePushRecord({
+			commonDir,
+			head: "d".repeat(40),
+			base: "e".repeat(40),
+			at: new Date("2026-10-07T00:00:00.000Z"),
+			selected: [],
+			passed: 0,
+			failed: 0,
+			skipped: 0,
+			vitestExitCode: null,
+			wallTimeMs: 0,
+			outcome: "build-only",
+		});
+		expect(fs.existsSync(old)).toBe(false);
+		fs.rmSync(commonDir, { recursive: true, force: true });
+	});
+});
+
+describe(".husky hooks — PI_LENS_SKIP_HOOKS accepts any non-empty value (F8)", () => {
+	it("pre-commit formats only staged files through the pinned binary (#3426)", () => {
+		const hook = fs.readFileSync(
+			path.join(repoRoot, ".husky/pre-commit"),
+			"utf8",
+		);
+		expect(hook).toContain(
+			"git diff --cached --name-only --diff-filter=ACMR -z",
+		);
+		expect(hook).toContain(
+			"npx --no-install oxfmt --check --no-error-on-unmatched-pattern",
+		);
+		expect(hook).not.toContain("npm install oxfmt --no-save");
+	});
+
+	it.each(["1", "true"])(
+		"pre-commit exits 0 and skips without running checks when PI_LENS_SKIP_HOOKS=%s",
+		(value) => {
+			const result = spawnSync("sh", [".husky/pre-commit"], {
+				cwd: repoRoot,
+				env: { ...process.env, PI_LENS_SKIP_HOOKS: value },
+				encoding: "utf8",
+			});
+
+			expect(result.status).toBe(0);
+			expect(result.stdout).toContain("[pre-commit] skipped");
+		},
+	);
+
+	it.each(["1", "true"])(
+		"pre-push exits 0 and skips without running the targeted-test script when PI_LENS_SKIP_HOOKS=%s",
+		(value) => {
+			const result = spawnSync("sh", [".husky/pre-push"], {
+				cwd: repoRoot,
+				env: { ...process.env, PI_LENS_SKIP_HOOKS: value },
+				encoding: "utf8",
+				input: "",
+			});
+
+			expect(result.status).toBe(0);
+			expect(result.stdout).toContain("[pre-push] skipped");
+		},
+	);
+});
+
+// #3886: the pre-push self-scan now lives INSIDE scripts/pre-push-targeted-tests.mjs,
+// after its build (the scan imports compiled `clients/` modules) and after the
+// deletion-only early return, and is skipped under --skip-build. These cases
+// drive the real `.husky/pre-push` -> wrapper chain with the real `npm`
+// executable resolving fixture package.json scripts, so a fake npm that
+// ignores argv can no longer hide an ordering or resolution defect (r1 S2).
+describe("pre-push ast-grep self-scan (#3886)", () => {
+	const roots: string[] = [];
+
+	afterEach(() => {
+		for (const root of roots.splice(0))
+			fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	function git(root: string, ...args: string[]): string {
+		return String(
+			gitExecFileSync(
+				[
+					"-c",
+					"user.name=t",
+					"-c",
+					"user.email=t@example.com",
+					"-c",
+					"commit.gpgsign=false",
+					...args,
+				],
+				{ cwd: root, encoding: "utf8" },
+			),
+		).trim();
+	}
+
+	function put(root: string, rel: string, content: string) {
+		const full = path.join(root, rel);
+		fs.mkdirSync(path.dirname(full), { recursive: true });
+		fs.writeFileSync(full, content, "utf8");
+	}
+
+	/** Copies the hook + wrapper, links `node_modules`, and runs the case with a
+	 * scrubbed env (no ambient PI_LENS_* / VITEST). `input` is the git ref line
+	 * a real pre-push receives on stdin. */
+	function runHook(root: string, input: string) {
+		const home = path.join(root, "home");
+		fs.mkdirSync(home, { recursive: true });
+		const env = envFor(root);
+		for (const key of Object.keys(env))
+			if (
+				/^(VITEST|PI_LENS_|PILENS_|NODE_OPTIONS$|GITHUB_STEP_SUMMARY$)/.test(
+					key,
+				)
+			)
+				delete env[key];
+		Object.assign(env, {
+			PI_LENS_HOME: home,
+			PI_LENS_TEST_LOCK_TIMEOUT_MS: "300",
+			PATH: `${path.join(repoRoot, "node_modules/.bin")}:${env.PATH ?? ""}`,
+		});
+		return spawnSync("sh", [".husky/pre-push"], {
+			cwd: root,
+			env,
+			encoding: "utf8",
+			input,
+		});
+	}
+
+	/** Sources the hook + wrapper from this tree and a `build` stub that writes
+	 * `built.marker`. `astgrep:self-scan` refuses to run before that marker
+	 * exists, so the test observes the real build-before-scan ordering through
+	 * real npm resolution. */
+	function makeOrderingFixture({ build = "write", distBuild = "write" } = {}) {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-prepush-scan-order-"),
+		);
+		roots.push(root);
+		for (const rel of [
+			".husky/pre-push",
+			"scripts/pre-push-targeted-tests.mjs",
+			"scripts/with-test-lock.mjs",
+			"scripts/lib/is-main-module.mjs",
+			"scripts/lib/suite-lock.mjs",
+			"scripts/lib/scratch-dir.mjs",
+			"scripts/lib/process-scan.mjs",
+			"scripts/lib/pr-worktree.mjs",
+			"scripts/lib/test-history-selection.mjs",
+			"scripts/lib/vitest-summary.mjs",
+		])
+			put(root, rel, fs.readFileSync(path.join(repoRoot, rel), "utf8"));
+		put(
+			root,
+			"scan.mjs",
+			[
+				'import fs from "node:fs";',
+				'if (!fs.existsSync("built.marker")) {',
+				'  console.error("[scan] refused: build marker missing");',
+				"  process.exit(1);",
+				"}",
+				'console.log("[scan] ran after build");',
+				"",
+			].join("\n"),
+		);
+		put(
+			root,
+			"package.json",
+			JSON.stringify({
+				scripts: {
+					build:
+						build === "fail"
+							? 'node -e "process.exit(7)"'
+							: "node -e \"require('node:fs').writeFileSync('built.marker','1')\"",
+					"build:dist":
+						distBuild === "fail"
+							? 'node -e "process.exit(8)"'
+							: "node -e \"require('node:fs').mkdirSync('dist/clients/lsp',{recursive:true}); require('node:fs').writeFileSync('dist/clients/lsp/server-traits.js','1')\"",
+					"astgrep:self-scan": "node scan.mjs",
+				},
+			}),
+		);
+		put(root, "clients/lsp/server-traits.ts", "export const fixture = true;\n");
+		fs.symlinkSync(
+			path.join(repoRoot, "node_modules"),
+			path.join(root, "node_modules"),
+			"junction",
+		);
+		git(root, "init", "-q");
+		git(root, "add", ".husky", "scripts", "package.json", "scan.mjs");
+		git(root, "commit", "-q", "-m", "base");
+		const base = git(root, "rev-parse", "HEAD");
+		git(root, "update-ref", "refs/remotes/origin/master", base);
+		put(root, "docs/readme.md", "# docs\n");
+		git(root, "add", "docs");
+		git(root, "commit", "-q", "-m", "docs");
+		const head = git(root, "rev-parse", "HEAD");
+		return { root, refs: `refs/heads/t ${head} refs/heads/t ${base}\n` };
+	}
+
+	it("builds before the self-scan: an unbuilt tree on a docs-only push exits 0", () => {
+		const fx = makeOrderingFixture();
+		const result = runHook(fx.root, fx.refs);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("[scan] ran after build");
+		expect(fs.existsSync(path.join(fx.root, "built.marker"))).toBe(true);
+		expect(result.stdout).toContain(
+			"[pre-push] dist/ missing or stale (dist/clients/lsp/server-traits.js); running npm run build:dist...",
+		);
+		expect(
+			fs.existsSync(path.join(fx.root, "dist/clients/lsp/server-traits.js")),
+		).toBe(true);
+	});
+
+	it("reports a dist build failure before the self-scan", () => {
+		const fx = makeOrderingFixture({ distBuild: "fail" });
+		const result = runHook(fx.root, fx.refs);
+		expect(result.status).toBe(1);
+		expect(result.stdout + result.stderr).toContain(
+			"[pre-push] dist build failed; run `npm run build:dist` to rebuild dist/.",
+		);
+		expect(result.stdout + result.stderr).not.toContain(
+			"[scan] ran after build",
+		);
+		const recordPath = path.join(
+			fx.root,
+			".git",
+			"pi-lens-prepush",
+			`${fx.refs.split(/\s+/)[1]}.json`,
+		);
+		expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toMatchObject({
+			outcome: "build-failed",
+		});
+	});
+
+	it("records a build failure after the provisional tests-not-started record", () => {
+		const fx = makeOrderingFixture({ build: "fail" });
+		const result = runHook(fx.root, fx.refs);
+		const recordPath = path.join(
+			fx.root,
+			".git",
+			"pi-lens-prepush",
+			`${fx.refs.split(/\s+/)[1]}.json`,
+		);
+		expect(result.status).toBe(1);
+		expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toMatchObject({
+			outcome: "build-failed",
+		});
+	});
+
+	it("a deletion-only push exits 0 before the build or the self-scan", () => {
+		const fx = makeOrderingFixture();
+		const zero = "0".repeat(40);
+		const result = runHook(
+			fx.root,
+			`(delete) ${zero} refs/heads/gone abc123\n`,
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			"deletion-only push; skipping build and tests",
+		);
+		expect(fs.existsSync(path.join(fx.root, "built.marker"))).toBe(false);
+	});
+
+	const VIOLATION = [
+		'import { writeFileSync } from "node:fs";',
+		"function f(file: string, data: unknown) {",
+		"  writeFileSync(file, JSON.stringify(data));",
+		"}",
+		"",
+	].join("\n");
+
+	/** A git fixture that runs the REAL scan: copied scan scripts, the compiled
+	 * `clients/` modules the lib imports, the shipped `rules/` symlinked, and a
+	 * `package.json` whose `astgrep:self-scan` runs the real wrapper. */
+	function makeRealScanFixture({ plantTracked }: { plantTracked: boolean }) {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-prepush-scan-real-"),
+		);
+		roots.push(root);
+		for (const rel of [
+			".husky/pre-push",
+			"scripts/pre-push-targeted-tests.mjs",
+			"scripts/with-test-lock.mjs",
+			"scripts/lib/is-main-module.mjs",
+			"scripts/lib/suite-lock.mjs",
+			"scripts/lib/scratch-dir.mjs",
+			"scripts/lib/process-scan.mjs",
+			"scripts/lib/pr-worktree.mjs",
+			"scripts/lib/test-history-selection.mjs",
+			"scripts/lib/vitest-summary.mjs",
+			"scripts/run-astgrep-pi-lens.mjs",
+			"scripts/lib/astgrep-self-scan.mjs",
+		])
+			put(root, rel, fs.readFileSync(path.join(repoRoot, rel), "utf8"));
+		// The scan lib's Git calls go through the copied helper, which resolves its
+		// maintenance policy relative to itself (#4552 R2).
+		copyFixtureGitHelper(root);
+		put(root, "clients/clean.ts", "export const clean = 1;\n");
+		put(root, "tests/clean.test.ts", "export const t = 1;\n");
+		// The scan lib imports compiled clients/; symlink the real twins so their
+		// own relative imports resolve in the real tree. Only clients/clean.ts is
+		// tracked, so tracked-file enumeration stays legible.
+		fs.symlinkSync(
+			path.join(repoRoot, "clients/safe-spawn.js"),
+			path.join(root, "clients/safe-spawn.js"),
+		);
+		// The scan wrapper adopts project trust itself (#4530).
+		fs.symlinkSync(
+			path.join(repoRoot, "clients/project-trust.js"),
+			path.join(root, "clients/project-trust.js"),
+		);
+		fs.symlinkSync(
+			path.join(repoRoot, "clients/string-utils.js"),
+			path.join(root, "clients/string-utils.js"),
+		);
+		fs.symlinkSync(
+			path.join(repoRoot, "rules"),
+			path.join(root, "rules"),
+			"dir",
+		);
+		fs.symlinkSync(
+			path.join(repoRoot, "node_modules"),
+			path.join(root, "node_modules"),
+			"junction",
+		);
+		put(
+			root,
+			"package.json",
+			JSON.stringify({
+				scripts: {
+					build: 'node -e "process.exit(0)"',
+					"astgrep:self-scan": "node scripts/run-astgrep-pi-lens.mjs",
+				},
+			}),
+		);
+		git(root, "init", "-q");
+		git(root, "add", ".husky", "scripts", "package.json", "clients", "tests");
+		git(root, "commit", "-q", "-m", "base");
+		const base = git(root, "rev-parse", "HEAD");
+		git(root, "update-ref", "refs/remotes/origin/master", base);
+		put(root, "clients/planted.ts", VIOLATION);
+		if (plantTracked) git(root, "add", "clients/planted.ts");
+		put(root, "clients/clean.ts", "export const clean = 2;\n");
+		git(root, "add", "clients/clean.ts");
+		git(root, "commit", "-q", "-m", "head");
+		const head = git(root, "rev-parse", "HEAD");
+		return { root, refs: `refs/heads/t ${head} refs/heads/t ${base}\n` };
+	}
+
+	it("blocks a push with a self-scan finding in a tracked file", () => {
+		const fx = makeRealScanFixture({ plantTracked: true });
+		// The guard lives in the wrapper now, so drive the wrapper directly: a
+		// green pre-fix run proves the scan was not reached from the hook's old
+		// position alone.
+		const result = spawnSync(
+			process.execPath,
+			["scripts/pre-push-targeted-tests.mjs"],
+			{ cwd: fx.root, encoding: "utf8", input: fx.refs, env: envFor(fx.root) },
+		);
+		expect(result.status).toBe(1);
+		expect(`${result.stdout}\n${result.stderr}`).toMatch(
+			/no-raw-json-store-write .*clients\/planted\.ts/,
+		);
+	});
+
+	it("does not block on an untracked planted file", () => {
+		const fx = makeRealScanFixture({ plantTracked: false });
+		// Drive the hook so the current-head scan's whole-directory walk would
+		// see the untracked plant; the fix must not.
+		const result = runHook(fx.root, fx.refs);
+		expect(result.status).toBe(0);
+	});
+
+	it("--skip-build skips the build and the self-scan", () => {
+		const fx = makeOrderingFixture();
+		// The scan stub refuses to run before `built.marker` exists, so a scan
+		// that leaks out of the build branch reds here instead of staying a
+		// vacuous "skipped under --skip-build" claim.
+		const result = spawnSync(
+			process.execPath,
+			["scripts/pre-push-targeted-tests.mjs", "--skip-build"],
+			{ cwd: fx.root, encoding: "utf8", input: fx.refs, env: envFor(fx.root) },
+		);
+		expect(result.status).toBe(0);
+		expect(`${result.stdout}\n${result.stderr}`).not.toContain("[scan]");
+		expect(fs.existsSync(path.join(fx.root, "built.marker"))).toBe(false);
+	});
+});
+
+describe("history pass through the real hook and real git (#3215 lane 3)", () => {
+	function repo() {
+		fixtureDir = fixtureRoot("history-pass-test-");
+		const cwd = fixtureDir as string;
+		const git = (args: string[]) =>
+			String(gitExecFileSync(args, { cwd, encoding: "utf8" }));
+		git(["init", "--quiet", "--initial-branch=main"]);
+		git(["config", "user.name", "pi-lens test"]);
+		git(["config", "user.email", "test@example.com"]);
+		const commit = (files: Record<string, string>, message: string) => {
+			for (const [file, content] of Object.entries(files)) write(file, content);
+			git(["add", "."]);
+			git(["commit", "--quiet", "-m", message]);
+			return git(["rev-parse", "HEAD"]).trim();
+		};
+		return { cwd, git, commit };
+	}
+
+	it("resolves each head to its own first-parent paths, and omits a merge commit and a head the clone lacks", () => {
+		// Recurrence: the selector attributes a failing head to the paths it
+		// changed; a merge commit has no such diff (its paths would be the whole
+		// of master's side) and an unmerged PR head is simply not in the clone.
+		const { cwd, git, commit } = repo();
+		const base = commit(
+			{ "rules/x/a.yml": "a\n", "docs/readme.md": "r\n" },
+			"base",
+		);
+		const topic = commit(
+			{ "rules/x/b.yml": "b\n", "docs/z.md": "z\n" },
+			"topic",
+		);
+		git(["checkout", "--quiet", "-b", "side", base]);
+		const side = commit({ "side.txt": "s\n" }, "side");
+		git(["checkout", "--quiet", "main"]);
+		git(["merge", "--quiet", "--no-ff", "-m", "merge side", side]);
+		const merge = git(["rev-parse", "HEAD"]).trim();
+		const missing = "f".repeat(40);
+		const resolved = resolveHeadPaths([topic, merge, missing, side], { cwd });
+		expect([...resolved.keys()].sort()).toEqual([side, topic].sort());
+		expect(resolved.get(topic)).toEqual(["docs/z.md", "rules/x/b.yml"]);
+		expect(resolved.get(side)).toEqual(["side.txt"]);
+	});
+
+	it("reads the summary from the data-branch ref, and degrades to unavailable when the ref is absent", () => {
+		// Recurrence: the CI advisory job and a developer clone have only the
+		// `origin/data/test-history` remote-tracking ref; a missing ref (a fresh
+		// clone, a fork) must disclose "unavailable", never throw into the hook.
+		const { cwd, git, commit } = repo();
+		const failing = commit({ "rules/x/a.yml": "a\n" }, "round 1");
+		const noRef = loadHistorySelection({
+			changed: ["rules/x/b.yml"],
+			allTests: ["tests/scripts/rule-catalogs.test.ts"],
+			cwd,
+		});
+		expect(noRef.status).toBe("unavailable");
+		expect(noRef.detail).toContain("history unreadable");
+		expect(noRef.detail).toContain("origin/data/test-history");
+		write(
+			"history/summary.json",
+			JSON.stringify({
+				generatedAt: new Date().toISOString(),
+				heads: [failing],
+				failures: [
+					{
+						file: "tests/scripts/rule-catalogs.test.ts",
+						headSha: failing,
+						flake: false,
+					},
+				],
+			}),
+		);
+		git(["add", "history/summary.json"]);
+		git(["commit", "--quiet", "-m", "data"]);
+		git(["update-ref", "refs/remotes/origin/data/test-history", "HEAD"]);
+		// The checked-out tree no longer holds the summary: only the ref does.
+		git(["reset", "--quiet", "--hard", "HEAD~1"]);
+		const viaRef = loadHistorySelection({
+			changed: ["rules/x/b.yml"],
+			allTests: ["tests/scripts/rule-catalogs.test.ts"],
+			cwd,
+		});
+		expect(viaRef.picks).toEqual(["tests/scripts/rule-catalogs.test.ts"]);
+	});
+
+	/** Runs the real hook over a real git fixture whose history summary the real
+	 * rollup wrote from a Windows-rooted artifact (so the selection also proves
+	 * #3367's repo-relative key is what the checkout's paths match). */
+	function runHookWithHistory({
+		baseFiles,
+		failingChange,
+		pushedChange,
+	}: {
+		baseFiles: Record<string, string>;
+		failingChange: Record<string, string>;
+		pushedChange: Record<string, string>;
+	}) {
+		const { cwd, git, commit } = repo();
+		for (const link of ["scripts", "node_modules"])
+			fs.symlinkSync(path.join(repoRoot, link), path.join(cwd, link), "dir");
+		// Not the repo's vitest.config.ts: its globalSetup file does not exist in
+		// this fixture. #4086 recurrence: the symlinked lock wrapper was a silent
+		// no-op, so the repo config was never loaded and exit 0 was an artifact.
+		fs.writeFileSync(
+			path.join(cwd, "vitest.config.ts"),
+			'export default { test: { include: ["tests/**/*.test.ts"] } };\n',
+		);
+		fs.writeFileSync(path.join(cwd, "package.json"), '{"type":"module"}\n');
+		const passing = "import { it } from 'vitest';\nit('ok', () => {});\n";
+		commit(
+			{
+				"tests/scripts/rule-catalogs.test.ts": passing,
+				"tests/config/sweep-floor-coverage.test.ts": passing,
+				...baseFiles,
+			},
+			"base",
+		);
+		const failingHead = commit(failingChange, "round 1");
+		const pushed = commit(pushedChange, "round 2");
+		// Round 1 is on the base, so the pushed range is round 2 alone (#4724).
+		git(["update-ref", "refs/remotes/origin/master", failingHead]);
+		const artifact = path.join(cwd, ".history-artifact");
+		fs.mkdirSync(artifact);
+		fs.writeFileSync(
+			path.join(artifact, METADATA_FILENAME),
+			JSON.stringify({
+				headSha: failingHead,
+				runId: "1",
+				lane: "win32",
+				recordedAt: new Date().toISOString(),
+			}),
+		);
+		fs.writeFileSync(
+			path.join(artifact, "vitest-results.json"),
+			JSON.stringify({
+				testResults: [
+					"scripts\\rule-catalogs",
+					"config\\sweep-floor-coverage",
+				].map((name) => ({
+					name: `D:\\a\\pi-lens\\pi-lens\\tests\\${name}.test.ts`,
+					status: "failed",
+					duration: 5,
+				})),
+			}),
+		);
+		const summary = path.join(cwd, ".history-summary.json");
+		rollupTestHistory({
+			artifactPaths: [artifact],
+			historyPath: path.join(cwd, ".history.ndjson"),
+			summaryPath: summary,
+		});
+		const stepSummary = path.join(cwd, ".step-summary.md");
+		const result = spawnSync(
+			process.execPath,
+			[
+				path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
+				"--skip-build",
+				"--history-summary",
+				summary,
+			],
+			{
+				cwd,
+				encoding: "utf8",
+				env: { ...process.env, GITHUB_STEP_SUMMARY: stepSummary },
+				input: `refs/heads/topic ${pushed} refs/heads/topic ${failingHead}\n`,
+			},
+		);
+		const stepText = fs.existsSync(stepSummary)
+			? fs.readFileSync(stepSummary, "utf8")
+			: "";
+		return { result, stepText };
+	}
+
+	it("adds the tests that failed on a past head touching the same directory, from a summary the real rollup wrote", () => {
+		// #3214 round 1: a rule YAML change reds only rule-catalogs.test.ts, which
+		// imports nothing the YAML is; the hook must select it from history.
+		const { result } = runHookWithHistory({
+			baseFiles: { "rules/x/seed.yml": "seed\n" },
+			failingChange: { "rules/x/a.yml": "a\n" },
+			pushedChange: { "rules/x/b.yml": "b\n" },
+		});
+		expect(result.stdout).toContain("history selection selected");
+		expect(result.stdout).toContain(
+			"history added tests/scripts/rule-catalogs.test.ts",
+		);
+		expect(result.stdout).toContain(
+			"history added tests/config/sweep-floor-coverage.test.ts",
+		);
+		expect(result.stdout).toContain("running 2 targeted test file(s)");
+		expect(result.status).toBe(0);
+	}, 120_000);
+
+	it("labels a capped selection's history picks as history picks, not governance registry suites, beside the ranked import matches", () => {
+		// Recurrence: PR #4026 review F4. On the capped path `selected` is the
+		// armed registries plus the history picks, and the console line and the
+		// step summary called all of it "governance registry suite(s)".
+		const importers = Object.fromEntries(
+			Array.from({ length: MAX_SELECTED_TESTS + 1 }, (_, i) => [
+				`tests/gen-${i}.test.ts`,
+				"import { hub } from '../clients/hub.js';\nimport { it } from 'vitest';\nvoid hub;\nit('ok', () => {});\n",
+			]),
+		);
+		const { result, stepText } = runHookWithHistory({
+			baseFiles: { "clients/hub.ts": "export const hub = 1;\n", ...importers },
+			failingChange: { "clients/other.ts": "a\n" },
+			pushedChange: { "clients/hub.ts": "export const hub = 2;\n" },
+		});
+		// sweep-floor-coverage is an armed registry suite; rule-catalogs is the
+		// history pick; the 26 importers of the hub keep their best 25 (#4489).
+		expect(result.stdout + result.stderr).toContain(
+			`running the change's 0 own test file(s), the ${MAX_SELECTED_TESTS} import match(es) with the fewest importers first (ties by path), 1 governance registry suite(s) and 1 history pick(s)`,
+		);
+		expect(stepText).toContain(
+			"cap exceeded (25); running the change's 0 own test file(s)",
+		);
+		expect(stepText).toContain(
+			"1 governance registry suite(s) and 1 history pick(s)",
+		);
+		expect(stepText).not.toContain("governance registries only");
+		expect(result.status).toBe(0);
+	}, 120_000);
+
+	it("counts a capped selection's own mirrored test in the warning", () => {
+		// Recurrence: PR #4494 review M15. describeCappedKeep could drop the
+		// mirror count and every capped-warning test still passed, because each
+		// asserted "0 own test file(s)".
+		const importers = Object.fromEntries(
+			Array.from({ length: MAX_SELECTED_TESTS + 1 }, (_, i) => [
+				`tests/gen-${i}.test.ts`,
+				"import { hub } from '../clients/hub.js';\nimport { it } from 'vitest';\nvoid hub;\nit('ok', () => {});\n",
+			]),
+		);
+		const { result, stepText } = runHookWithHistory({
+			baseFiles: {
+				"clients/hub.ts": "export const hub = 1;\n",
+				"tests/clients/hub.test.ts":
+					"import { it } from 'vitest';\nit('ok', () => {});\n",
+				...importers,
+			},
+			failingChange: { "clients/other.ts": "a\n" },
+			pushedChange: { "clients/hub.ts": "export const hub = 2;\n" },
+		});
+		expect(result.stdout + result.stderr).toContain(
+			`running the change's 1 own test file(s), the ${MAX_SELECTED_TESTS} import match(es)`,
+		);
+		expect(stepText).toContain(
+			"cap exceeded (25); running the change's 1 own test file(s)",
+		);
+		expect(result.status).toBe(0);
+	}, 120_000);
+});

@@ -1,0 +1,1954 @@
+import fs from "node:fs/promises";
+import {
+	type BigIntStats,
+	type Stats,
+	readFileSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
+import path from "node:path";
+import { URL } from "node:url";
+import {
+	isUnderDir,
+	kernelPathIdentityAsync,
+	normalizeEphemeralMapKey,
+	normalizeMapKey,
+	pathsEqual,
+	realpathOrResolveAsync,
+	uriToDiskPath,
+	uriToPath,
+} from "./path-utils.js";
+import {
+	convertCharacterOffset,
+	type PositionEncoding,
+} from "./position-encoding.js";
+import { lineTextAt } from "./content-scan.js";
+import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
+import {
+	refuseOutOfRootWrites,
+	type SourceWriteExit,
+	writeSourceFile,
+} from "../write-source-file.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
+import { hashDiagnosticContent } from "./diagnostic-binding.js";
+import { peekOwnedLspService } from "./service-singleton.js";
+import { FILE_CREATED, FILE_DELETED } from "./watch-queue.js";
+import { logLatency } from "../latency-logger.js";
+import {
+	detectLineEnding,
+	normalizeToLF,
+	restoreLineEndings,
+} from "../host-edit-normalize.js";
+import { toPosix, walkUpDirs } from "../path-utils.js";
+
+interface LSPPosition {
+	line: number;
+	character: number;
+}
+
+interface LSPRange {
+	start: LSPPosition;
+	end: LSPPosition;
+}
+
+export interface LSPTextEdit {
+	range: LSPRange;
+	newText: string;
+}
+
+interface TextDocumentEdit {
+	textDocument: { uri: string; version?: number | null };
+	edits: unknown[];
+}
+
+interface ResourceOptions {
+	overwrite?: boolean;
+	ignoreIfExists?: boolean;
+	ignoreIfNotExists?: boolean;
+	recursive?: boolean;
+}
+
+interface CreateFileOp {
+	kind: "create";
+	uri: string;
+	options?: ResourceOptions;
+}
+
+interface RenameFileOp {
+	kind: "rename";
+	oldUri: string;
+	newUri: string;
+	options?: ResourceOptions;
+}
+
+interface DeleteFileOp {
+	kind: "delete";
+	uri: string;
+	options?: ResourceOptions;
+}
+
+interface AppliedWorkspaceFileDetail {
+	filePath: string;
+	range?: { start: number; end: number };
+	ranges?: Array<{ start: number; end: number }>;
+	authorshipUnknown?: boolean;
+	importsChanged?: boolean;
+}
+
+export interface AppliedWorkspaceEdit {
+	descriptions: string[];
+	files: string[];
+	/** Total logical operations, including text edits and resource operations. */
+	operationTotal: number;
+	/** Number of logical operations that actually reached disk. */
+	appliedOperationTotal: number;
+	/** Bounded samples; totals above remain explicit in the result. */
+	appliedOperationIndexes: number[];
+	operationCounts: {
+		textEdits: number;
+		create: number;
+		rename: number;
+		delete: number;
+	};
+	fileDetails: AppliedWorkspaceFileDetail[];
+}
+
+/**
+ * #5417: the edit names a path outside the session's writable roots (an
+ * adopted sibling project, a vendor path). Thrown before the first write; the
+ * refusal itself is recorded by `refuseOutOfRootWrites`.
+ */
+export class WorkspaceEditRefusedError extends Error {
+	constructor(readonly paths: readonly string[]) {
+		super(
+			`workspace edit refused: ${paths.join(", ")} ${paths.length === 1 ? "is" : "are"} outside the session's writable roots`,
+		);
+		this.name = "WorkspaceEditRefusedError";
+	}
+}
+
+export interface ApplyWorkspaceEditOptions {
+	/**
+	 * #5417: the workspace root each path's class is judged against, when the
+	 * caller knows it. Absent, the mutation context's project root, then `cwd`
+	 * (the language-server root) stand in.
+	 */
+	sessionRoot?: string;
+	/** The encoding used by the server that produced these positions. */
+	positionEncoding?: PositionEncoding;
+	/** Current client-side LSP document versions, keyed by normalized path. */
+	documentVersions?: ReadonlyMap<string, number>;
+	/** Optional shared bookkeeping for a mutation initiated by pi-lens. */
+	mutationContext?: LspMutationContext;
+	/** Rename flows use one outer bookkeeping record after their resource rename. */
+	observe?: boolean;
+	/**
+	 * #3541: the bytes a caller's edit positions were computed from, keyed by
+	 * the file's realpath (a caller and the edit's URI can spell one file
+	 * differently, and `normalizeMapKey` keeps a symlinked directory's
+	 * spelling). Checked against the disk inside pi's mutation queue; a
+	 * mismatch refuses the whole edit with {@link StaleWorkspaceEditContentError}.
+	 */
+	expectedContent?: ReadonlyMap<string, string>;
+	/**
+	 * #4346: where the watched-files events of applied resource operations go.
+	 * A service applying its own edit passes itself; otherwise the process's
+	 * LSP service, when one exists (none is ever created for this).
+	 */
+	watchedFileSink?: WatchedFileSink;
+}
+
+/** The one service method a resource operation's watched-files event needs. */
+export interface WatchedFileSink {
+	notifyExternalFileChange(filePath: string, type: number): Promise<void>;
+}
+
+/**
+ * #3541: a file changed between the read an edit was computed from and the
+ * edit's turn in pi's mutation queue. Thrown by the preflight, before any write.
+ */
+export class StaleWorkspaceEditContentError extends Error {}
+
+/**
+ * #3541/#3601: refuse an edit whose content cannot be shown to be what it was
+ * computed from. One ledger count and one {@link StaleWorkspaceEditContentError}
+ * naming the file, for the preflight's own mismatch and for a caller that
+ * refuses a file it cannot bind (`lsp_navigation`'s rename).
+ */
+export function refuseStaleWorkspaceEdit(filePath: string, why: string): never {
+	incrementDegradationCount({
+		kind: "lsp-edit-stale-content",
+		subject: filePath,
+		reason: `${why}; the edit was not applied`,
+	});
+	throw new StaleWorkspaceEditContentError(
+		`stale text document content for ${filePath}: ${why}`,
+	);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPosition(value: unknown): value is LSPPosition {
+	return (
+		isRecord(value) &&
+		Number.isFinite(value.line) &&
+		Number.isInteger(value.line) &&
+		(value.line as number) >= 0 &&
+		Number.isFinite(value.character) &&
+		Number.isInteger(value.character) &&
+		(value.character as number) >= 0
+	);
+}
+
+function comparePosition(a: LSPPosition, b: LSPPosition): number {
+	return a.line === b.line ? a.character - b.character : a.line - b.line;
+}
+
+function isRange(value: unknown): value is LSPRange {
+	if (!isRecord(value) || !isPosition(value.start) || !isPosition(value.end)) {
+		return false;
+	}
+	return comparePosition(value.start, value.end) <= 0;
+}
+
+function isTextEdit(value: unknown): value is LSPTextEdit {
+	return (
+		isRecord(value) && isRange(value.range) && typeof value.newText === "string"
+	);
+}
+
+function parseTextEdits(value: unknown, context: string): LSPTextEdit[] {
+	if (!Array.isArray(value))
+		throw new Error(`${context}.edits must be an array`);
+	if (!value.every(isTextEdit))
+		throw new Error(`malformed text edit in ${context}`);
+	return value;
+}
+
+function parseVersion(
+	value: unknown,
+	context: string,
+): number | null | undefined {
+	if (value === undefined || value === null) return value;
+	if (
+		!Number.isFinite(value) ||
+		!Number.isInteger(value) ||
+		(value as number) < 0
+	) {
+		throw new Error(`${context}.version must be a nonnegative integer or null`);
+	}
+	return value as number;
+}
+
+function parseResourceOptions(
+	value: unknown,
+	kind: string,
+): ResourceOptions | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) throw new Error(`${kind}.options must be an object`);
+	const allowed = new Set(
+		kind === "delete"
+			? ["ignoreIfNotExists", "recursive"]
+			: ["overwrite", "ignoreIfExists"],
+	);
+	for (const key of Object.keys(value)) {
+		if (!allowed.has(key) || typeof value[key] !== "boolean") {
+			throw new Error(`invalid ${kind}.options.${key}`);
+		}
+	}
+	if (value.overwrite === true && value.ignoreIfExists === true) {
+		throw new Error(`${kind} cannot set both overwrite and ignoreIfExists`);
+	}
+	if (kind !== "delete" && value.ignoreIfNotExists !== undefined) {
+		throw new Error(`${kind} does not support ignoreIfNotExists`);
+	}
+	if (kind === "delete" && value.overwrite !== undefined) {
+		throw new Error(`delete does not support overwrite`);
+	}
+	return value as ResourceOptions;
+}
+
+function parseTextDocumentEdit(
+	value: unknown,
+	context: string,
+): TextDocumentEdit | null {
+	if (!isRecord(value) || !isRecord(value.textDocument)) return null;
+	if (typeof value.textDocument.uri !== "string") {
+		throw new Error(`${context}.textDocument.uri must be a string`);
+	}
+	const version = parseVersion(
+		value.textDocument.version,
+		`${context}.textDocument`,
+	);
+	return {
+		textDocument: { uri: value.textDocument.uri, version },
+		edits: parseTextEdits(value.edits, context),
+	};
+}
+
+function parseWorkspaceEdit(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): void {
+	if (!isRecord(edit)) throw new Error("workspace edit must be an object");
+	if (edit.changes !== undefined) {
+		if (!isRecord(edit.changes))
+			throw new Error("workspace edit changes must be an object");
+		for (const [uri, edits] of Object.entries(edit.changes)) {
+			if (typeof uri !== "string")
+				throw new Error("workspace edit URI must be a string");
+			parseTextEdits(edits, `changes[${uri}]`);
+		}
+	}
+	if (
+		edit.documentChanges !== undefined &&
+		!Array.isArray(edit.documentChanges)
+	) {
+		throw new Error("workspace edit documentChanges must be an array");
+	}
+	for (const [index, change] of (edit.documentChanges ?? []).entries()) {
+		const text = parseTextDocumentEdit(change, `documentChanges[${index}]`);
+		if (text) continue;
+		if (!isRecord(change) || typeof change.kind !== "string") {
+			throw new Error(`malformed documentChanges[${index}]`);
+		}
+		switch (change.kind) {
+			case "create":
+				if (typeof change.uri !== "string")
+					throw new Error("create.uri must be a string");
+				parseResourceOptions(change.options, "create");
+				break;
+			case "rename":
+				if (
+					typeof change.oldUri !== "string" ||
+					typeof change.newUri !== "string"
+				) {
+					throw new Error("rename requires oldUri and newUri strings");
+				}
+				parseResourceOptions(change.options, "rename");
+				break;
+			case "delete":
+				if (typeof change.uri !== "string")
+					throw new Error("delete.uri must be a string");
+				parseResourceOptions(change.options, "delete");
+				break;
+			default:
+				throw new Error(
+					`unsupported workspace resource operation: ${change.kind}`,
+				);
+		}
+	}
+}
+
+function formatRange(range: LSPRange): string {
+	return `${range.start.line + 1}:${range.start.character + 1}-${range.end.line + 1}:${range.end.character + 1}`;
+}
+
+function rangesOverlap(a: LSPRange, b: LSPRange): boolean {
+	return (
+		comparePosition(a.start, b.end) < 0 && comparePosition(b.start, a.end) < 0
+	);
+}
+
+function positionsEqual(a: LSPPosition, b: LSPPosition): boolean {
+	return a.line === b.line && a.character === b.character;
+}
+
+function isEmptyRange(range: LSPRange): boolean {
+	return positionsEqual(range.start, range.end);
+}
+
+/**
+ * Order edits for reverse-application to a string: latest position first, so an
+ * earlier splice never shifts a not-yet-applied edit's offsets. Ties break to
+ * match LSP insertion semantics:
+ *   - same start, larger END first → a replace anchored at position P applies
+ *     before a zero-width insert at P, so the insert lands at the (post-replace)
+ *     boundary instead of being clobbered — and the result no longer depends on
+ *     listing order (P3-1, insert-at-replace-boundary);
+ *   - same start AND end (e.g. several zero-width inserts at one point) → later
+ *     ARRAY index first, so applying in this reverse order reproduces the edits'
+ *     original array order (the #1066 same-position-insert invariant).
+ *
+ * This ordering is NOT idempotent for the same-range tie (re-sorting flips the
+ * array index), so it MUST be applied exactly once, at the string-write site,
+ * over array-order input. `normalizeTextEditsForContent` deliberately returns
+ * edits in array order (never pre-sorted) so this single sort is the only pass.
+ */
+function sortEditsForApplication(edits: LSPTextEdit[]): LSPTextEdit[] {
+	return edits
+		.map((edit, index) => ({ edit, index }))
+		.sort((a, b) => {
+			const startDelta = comparePosition(
+				b.edit.range.start,
+				a.edit.range.start,
+			);
+			if (startDelta !== 0) return startDelta;
+			const endDelta = comparePosition(b.edit.range.end, a.edit.range.end);
+			if (endDelta !== 0) return endDelta;
+			return b.index - a.index;
+		})
+		.map(({ edit }) => edit);
+}
+
+/**
+ * Deduplicate exact non-empty duplicate edits and reject genuinely overlapping
+ * ranges, returning the survivors in their ORIGINAL ARRAY ORDER. Zero-width
+ * inserts are never deduplicated (their multiplicity is meaningful). Overlap is
+ * checked on a position-sorted copy so the check is order-independent, but the
+ * returned order is preserved for the single downstream application sort.
+ */
+function validateTextEdits(edits: LSPTextEdit[]): LSPTextEdit[] {
+	const unique: LSPTextEdit[] = [];
+	const seen = new Set<string>();
+	for (const edit of edits) {
+		if (!isEmptyRange(edit.range)) {
+			const key = textEditKey("", edit);
+			if (seen.has(key)) continue;
+			seen.add(key);
+		}
+		unique.push(edit);
+	}
+	const ordered = sortEditsForApplication(unique);
+	for (let index = 0; index < ordered.length - 1; index++) {
+		const later = ordered[index]?.range;
+		const earlier = ordered[index + 1]?.range;
+		if (later && earlier && comparePosition(earlier.end, later.start) > 0) {
+			throw new Error(
+				`overlapping LSP edits: ${formatRange(earlier)} conflicts with ${formatRange(later)}`,
+			);
+		}
+	}
+	return unique;
+}
+
+function utf16Position(
+	content: string,
+	position: LSPPosition,
+	encoding: PositionEncoding,
+): LSPPosition {
+	const line = lineTextAt(content, position.line);
+	const wireLength = convertCharacterOffset(encoding, line, line.length);
+	// `lineTextAt` splits on `\n` only and keeps a trailing `\r`, so the "real"
+	// (spec) end of line content is BEFORE that `\r`, not after it. Clamp to
+	// that boundary rather than `line.length`/`wireLength`, which include the
+	// `\r`. `\r` is exactly one code unit in every encoding, so the clamped
+	// wire length is always `wireLength - 1` when a `\r` is present.
+	const hasTrailingCR = line.endsWith("\r");
+	const clampedLength = hasTrailingCR ? line.length - 1 : line.length;
+	const clampedWireLength = hasTrailingCR ? wireLength - 1 : wireLength;
+	if (position.character > clampedWireLength) {
+		// LSP 3.17: a character past the end of the line defaults to the line
+		// length. Clamp to the UTF-16 line length rather than throwing (whole-line
+		// and whole-document sentinel ranges rely on this) — landing the position
+		// at the CRLF boundary, not between `\r` and `\n`. Otherwise the whole-line
+		// sentinel replace `(0,0)-(0,999)` would eat the `\r` and a char-past-EOL
+		// insert would land mid-CRLF (P2-1 corruption on Windows repos).
+		//
+		// This also covers a caller-supplied position that is NOT past the line's
+		// full (with-`\r`) length but still lands strictly between `\r` and `\n`
+		// (i.e. `position.character === wireLength` when a `\r` is present): that
+		// position is `> clampedWireLength` too, since `clampedWireLength ===
+		// wireLength - 1`, so it clamps to the same CRLF-safe boundary instead of
+		// slipping through as an "in-bounds" position (#1147 P3-5, general class
+		// beyond #1120's strict past-EOL clamp).
+		return { line: position.line, character: clampedLength };
+	}
+	if (encoding === "utf-16") return position;
+	// Find the UTF-16 offset whose encoded prefix has exactly this length. This
+	// rejects offsets in the middle of a UTF-8 sequence or UTF-16 surrogate pair.
+	for (let offset = 0; offset <= line.length; offset++) {
+		// A UTF-32 position cannot split a UTF-16 surrogate pair.
+		if (encoding === "utf-32" && offset > 0 && offset < line.length) {
+			const previous = line.charCodeAt(offset - 1);
+			const current = line.charCodeAt(offset);
+			if (
+				previous >= 0xd800 &&
+				previous <= 0xdbff &&
+				current >= 0xdc00 &&
+				current <= 0xdfff
+			)
+				continue;
+		}
+		if (convertCharacterOffset(encoding, line, offset) === position.character) {
+			return { line: position.line, character: offset };
+		}
+	}
+	throw new Error(
+		`text edit character ${position.character} is not a ${encoding} boundary`,
+	);
+}
+
+function normalizeTextEditsForContent(
+	content: string,
+	edits: LSPTextEdit[],
+	encoding: PositionEncoding,
+): LSPTextEdit[] {
+	const lines = content.split("\n");
+	const lastLine = Math.max(0, lines.length - 1);
+	// The target file's dominant EOL style, detected the same way the host edit
+	// tool does (first-occurrence-wins). Every `newText` is normalized to this
+	// style below so a server-supplied bare `\n` can never be spliced verbatim
+	// into a CRLF file and produce mixed line endings — the LSP workspace-edit
+	// apply path now shares the exact contract the host-edit path already
+	// enforces via `host-edit-normalize.ts` (#1147 P3-5, general class). A no-op
+	// for LF files: `restoreLineEndings` is the identity when `ending === "\n"`.
+	const ending = detectLineEnding(content);
+	const clamp = (position: LSPPosition): LSPPosition => {
+		// LSP 3.17: a line past the end of the document defaults to the end of the
+		// document (last line, its length). Clamp rather than throw so a large
+		// sentinel end position — e.g. the (0,0)-(9999,0) whole-document replace
+		// idiom — resolves to a real range instead of failing.
+		if (position.line >= lines.length) {
+			return { line: lastLine, character: (lines[lastLine] ?? "").length };
+		}
+		return utf16Position(content, position, encoding);
+	};
+	const converted = edits.map((edit) => {
+		const start = clamp(edit.range.start);
+		const end = clamp(edit.range.end);
+		if (comparePosition(start, end) > 0)
+			throw new Error("text edit range is out of order");
+		return {
+			...edit,
+			range: { start, end },
+			newText: restoreLineEndings(normalizeToLF(edit.newText), ending),
+		};
+	});
+	// Return array order (validated, deduped); the single application-ordering
+	// sort happens once at the string-write site in applyTextEditsToString.
+	return validateTextEdits(converted);
+}
+
+export function applyTextEditsToString(
+	content: string,
+	edits: LSPTextEdit[],
+	positionEncoding: PositionEncoding = "utf-16",
+): string {
+	const lines = content.split("\n");
+	// normalizeTextEditsForContent returns array order; sort for reverse
+	// application exactly once, here, at the single string-write site.
+	const normalized = sortEditsForApplication(
+		normalizeTextEditsForContent(content, edits, positionEncoding),
+	);
+	for (const edit of normalized) {
+		const { start, end } = edit.range;
+		if (start.line === end.line) {
+			const line = lines[start.line] ?? "";
+			lines[start.line] =
+				line.slice(0, start.character) +
+				edit.newText +
+				line.slice(end.character);
+			continue;
+		}
+		const startLine = lines[start.line] ?? "";
+		const endLine = lines[end.line] ?? "";
+		const replacement =
+			startLine.slice(0, start.character) +
+			edit.newText +
+			endLine.slice(end.character);
+		lines.splice(
+			start.line,
+			end.line - start.line + 1,
+			...replacement.split("\n"),
+		);
+	}
+	return lines.join("\n");
+}
+
+export async function normalizeWorkspaceEditToUtf16(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	positionEncoding: PositionEncoding,
+	cwd: string,
+): Promise<{
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}> {
+	parseWorkspaceEdit(edit);
+	if (positionEncoding === "utf-16") return edit;
+
+	// Use the same ordered planner and virtual resource/content model as the
+	// eventual apply. This is important for edits such as rename(oldDir, newDir)
+	// followed by a text edit at newDir/file.ts: the destination is not on disk
+	// yet, but its content is available through the virtual move.
+	const planned = planWorkspaceEdit(edit, true);
+	const prepared = await preflightWorkspaceEdit(planned, cwd, {
+		positionEncoding,
+	});
+	const normalizedByOrigin = new Map<string, LSPTextEdit[]>();
+	for (const op of planned) {
+		if (op.kind !== "text") continue;
+		for (const origin of op.origins ?? []) {
+			normalizedByOrigin.set(
+				textEditOriginKey(origin),
+				prepared.textByOrigin.get(textEditOriginKey(origin)) ?? [],
+			);
+		}
+	}
+
+	const changes: Record<string, unknown[]> = {};
+	for (const uri of Object.keys(edit.changes ?? {})) {
+		changes[uri] =
+			normalizedByOrigin.get(
+				textEditOriginKey({ kind: "changes", uri, edits: [] }),
+			) ?? [];
+	}
+	const documentChanges: unknown[] = [];
+	for (const [index, change] of (edit.documentChanges ?? []).entries()) {
+		const text = parseTextDocumentEdit(change, `documentChanges[${index}]`);
+		if (!text) {
+			documentChanges.push(change);
+			continue;
+		}
+		documentChanges.push({
+			...(change as Record<string, unknown>),
+			edits:
+				normalizedByOrigin.get(
+					textEditOriginKey({ kind: "documentChanges", index, edits: [] }),
+				) ?? [],
+		});
+	}
+	return {
+		...(edit.changes !== undefined ? { changes } : {}),
+		...(edit.documentChanges !== undefined ? { documentChanges } : {}),
+	};
+}
+
+function flattenWorkspaceTextEdits(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): Map<string, LSPTextEdit[]> {
+	parseWorkspaceEdit(edit);
+	const buckets = new Map<string, { uri: string; edits: LSPTextEdit[] }>();
+	const push = (uri: string, edits: unknown[]) => {
+		const textEdits = parseTextEdits(edits, uri);
+		if (textEdits.length === 0) return;
+		const key = pathIndexKey(uri);
+		const existing = buckets.get(key);
+		if (existing) existing.edits.push(...textEdits);
+		else buckets.set(key, { uri, edits: [...textEdits] });
+	};
+	for (const [uri, edits] of Object.entries(edit.changes ?? {}))
+		push(uri, edits);
+	for (const change of edit.documentChanges ?? []) {
+		const text = parseTextDocumentEdit(change, "documentChanges");
+		if (text) push(text.textDocument.uri, text.edits);
+	}
+	return new Map([...buckets.values()].map(({ uri, edits }) => [uri, edits]));
+}
+
+function textEditKey(uri: string, edit: LSPTextEdit): string {
+	return [
+		pathIndexKey(uri),
+		edit.range.start.line,
+		edit.range.start.character,
+		edit.range.end.line,
+		edit.range.end.character,
+		edit.newText,
+	].join(":");
+}
+
+export interface MergeWorkspaceEditsResult {
+	edit: { changes: Record<string, LSPTextEdit[]> };
+	droppedConflicts: number;
+	inputEditCount: number;
+	serverIds: string[];
+	/** The provenance side channel, keyed by the same normalized path as `edit`. */
+	sourceClientKeys: ReadonlyMap<string, readonly string[]>;
+}
+
+export function mergeWorkspaceTextEditsByPriority(
+	entries: Array<{
+		serverId: string;
+		clientKey?: string;
+		edit:
+			| { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }
+			| null
+			| undefined;
+	}>,
+): MergeWorkspaceEditsResult {
+	const merged = new Map<
+		string,
+		{ uri: string; edits: LSPTextEdit[]; sourceClientKeys: Set<string> }
+	>();
+	// Exact-duplicate dedup is a CROSS-SERVER concern only: two servers proposing
+	// the identical non-empty replace should collapse to one. Zero-width inserts
+	// are never deduplicated here — same as `validateTextEdits` on the normal
+	// apply path — because their multiplicity is meaningful: a single server can
+	// legitimately emit several identical zero-width inserts at one position
+	// (e.g. `willRenameFiles` producing "QQ" twice for an "aQQbc" edit), and
+	// deduping on exact key alone would silently drop the duplicate within that
+	// one server's own edit, contradicting the invariant documented above
+	// `validateTextEdits`.
+	const seenExact = new Set<string>();
+	let droppedConflicts = 0;
+	let inputEditCount = 0;
+	const serverIds: string[] = [];
+	for (const entry of entries) {
+		serverIds.push(entry.serverId);
+		if (!entry.edit) continue;
+		for (const [uri, edits] of flattenWorkspaceTextEdits(entry.edit)) {
+			const key = pathIndexKey(uri);
+			const bucket = merged.get(key) ?? {
+				uri,
+				edits: [],
+				sourceClientKeys: new Set<string>(),
+			};
+			const kept = bucket.edits;
+			for (const edit of edits) {
+				inputEditCount += 1;
+				const exactKey = isEmptyRange(edit.range)
+					? undefined
+					: textEditKey(uri, edit);
+				if (exactKey !== undefined && seenExact.has(exactKey)) continue;
+				if (
+					kept.some((existing) => rangesOverlap(existing.range, edit.range))
+				) {
+					droppedConflicts += 1;
+					continue;
+				}
+				if (exactKey !== undefined) seenExact.add(exactKey);
+				kept.push(edit);
+				bucket.sourceClientKeys.add(entry.clientKey ?? entry.serverId);
+			}
+			if (kept.length > 0) merged.set(key, bucket);
+		}
+	}
+	const changes: Record<string, LSPTextEdit[]> = {};
+	const sourceClientKeys = new Map<string, readonly string[]>();
+	for (const [key, { uri, edits, sourceClientKeys: sources }] of merged) {
+		changes[uri] = edits;
+		sourceClientKeys.set(key, [...sources]);
+	}
+	return {
+		edit: { changes },
+		droppedConflicts,
+		inputEditCount,
+		serverIds,
+		sourceClientKeys,
+	};
+}
+
+type TextEditOrigin =
+	| { kind: "changes"; uri: string; edits: LSPTextEdit[] }
+	| { kind: "documentChanges"; index: number; edits: LSPTextEdit[] };
+
+type WorkspaceEditOp =
+	| {
+			kind: "text";
+			uri: string;
+			edits: LSPTextEdit[];
+			version?: number | null;
+			origins?: TextEditOrigin[];
+	  }
+	| CreateFileOp
+	| RenameFileOp
+	| DeleteFileOp;
+
+function pathIndexKey(uri: string): string {
+	// uriToPath already resolves the path through normalizeFilePath, including
+	// realpath canonicalization for existing files. Re-canonicalizing that
+	// result with normalizeMapKey made every planner lookup perform a second
+	// synchronous filesystem walk; this index is call-scoped, so the cheap fold
+	// is sufficient after the first canonicalization.
+	return normalizeEphemeralMapKey(uriToPath(uri));
+}
+
+function textEditOriginKey(origin: TextEditOrigin): string {
+	// This is an input-container identity, not a filesystem/resource key. Keep
+	// the original URI spelling so two equivalent `changes` keys cannot overwrite
+	// each other's normalized output while the planner still coalesces them.
+	return origin.kind === "changes"
+		? `changes:${origin.uri}`
+		: `documentChanges:${origin.index}`;
+}
+
+function parseResource(change: Record<string, unknown>): WorkspaceEditOp {
+	const kind = change.kind;
+	if (kind === "create")
+		return {
+			kind,
+			uri: change.uri as string,
+			options: parseResourceOptions(change.options, kind),
+		};
+	if (kind === "rename")
+		return {
+			kind,
+			oldUri: change.oldUri as string,
+			newUri: change.newUri as string,
+			options: parseResourceOptions(change.options, kind),
+		};
+	if (kind === "delete")
+		return {
+			kind,
+			uri: change.uri as string,
+			options: parseResourceOptions(change.options, kind),
+		};
+	throw new Error(`unsupported workspace resource operation: ${String(kind)}`);
+}
+
+/** #3541: the on-disk path of every file a planned edit writes. */
+function plannedDiskPaths(planned: WorkspaceEditOp[]): string[] {
+	return planned.flatMap((op) =>
+		op.kind === "rename"
+			? [uriToDiskPath(op.oldUri), uriToDiskPath(op.newUri)]
+			: [uriToDiskPath(op.uri)],
+	);
+}
+
+/** #3541: the on-disk path of every file `edit` writes (text, create, both rename ends, delete). */
+export function workspaceEditDiskPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return plannedDiskPaths(planWorkspaceEdit(edit));
+}
+
+/** #3601: the on-disk path of every file `edit` writes TEXT to (the only files the content preflight compares). */
+export function workspaceEditTextPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return planWorkspaceEdit(edit).flatMap((op) =>
+		op.kind === "text" ? [uriToDiskPath(op.uri)] : [],
+	);
+}
+
+/**
+ * #3601: how far before the rename request a file's mtime may sit and still
+ * count as "written after the request". Filesystem timestamps are coarse: FAT
+ * stores 2 s, HFS+ 1 s, ext4/APFS/NTFS well under 1 ms, and Linux stamps a
+ * write with a tick-coarse clock that can trail `Date.now()` by several ms. A
+ * write made just after the request can therefore carry an mtime a little
+ * before it, so 2 s (the coarsest common granularity) is the margin. The cost
+ * is a false refusal for an unopened file written within 2 s before the
+ * request; the failure it prevents is an overwrite.
+ */
+const RENAME_MTIME_MARGIN_MS = 2000;
+
+/**
+ * #3601: what a language client last sent for a document, as the rename guard
+ * reads it. `LSPService.getTrackedContent` answers it; a client that holds no
+ * record answers nothing.
+ */
+export interface RenameTrackedSend {
+	hash: string;
+	changedAtMs?: number | undefined;
+	openedAtMs?: number | undefined;
+	openedHash?: string | undefined;
+	clientStartedAtMs?: number | undefined;
+	/** The registry key of the client holding the record; set by the lookup
+	 *  that is given the edit's contributing client keys. */
+	clientKey?: string | undefined;
+}
+
+/**
+ * #3601: the content every file a rename's edit writes text to must still hold,
+ * keyed the way `applyWorkspaceEdit` keys expected content (the file's
+ * realpath). Both rename flows use this one capture: `lsp_navigation`'s
+ * `rename` (its target is the read `openFileBestEffort` sent) and
+ * `LSPService.renameFile` (no target, since nothing read the old path).
+ *
+ * The rename's own target, when given, uses the content the pre-rename
+ * `openFileBestEffort` read and sent to the server. Any other file:
+ * - a file the language client has open: the server computed from the last
+ *   send made before the request (`requestedAtMs`, taken just before it, on the
+ *   same connection). The disk must hash to the client's last send, and that
+ *   send's bytes must not have changed at or after `requestedAtMs`: a
+ *   hook-synced write after the request makes the disk equal the last send
+ *   while the server answered from the one before it.
+ * - a file it has not opened: best effort only. The file is refused when its
+ *   mtime is at or after `requestedAtMs` minus the margin. This cannot prove
+ *   the server read the current bytes: the server answers from a copy it read
+ *   earlier, and pi-lens does not tell it about a write it did not make, so an
+ *   external write older than the margin that the server's own file watching
+ *   missed, or a write that keeps the old mtime, is applied at the server's
+ *   offsets (#3747).
+ * - a file the client first opened at or after `requestedAtMs` (#3827): the
+ *   server answered from its own copy, and that first `didOpen` stamps the
+ *   file as changed although no byte did. It takes the unopened rule only when
+ *   its mtime is older than the client's start by the margin: then the server
+ *   could only have read the bytes it holds now, and the first open adds none.
+ *   Only that first send's stamp is skipped: the disk must still hash to the
+ *   last send, and the record must still hold the first send's bytes, or the
+ *   file is refused (a write that keeps the old mtime after the first open).
+ *   A file written after the client started (a pi write whose sync lands as
+ *   that first open, say) keeps the send check and its stamp, which refuses it:
+ *   the server may hold the load-time copy, not these bytes. A client that
+ *   reports no start makes no such claim.
+ * With `sourceClientKeysByPath` (the merged edit's contributors, #3734), every
+ * contributing client's record is checked, and the records bind the file only
+ * when every contributor holds a comparable one; otherwise the file also takes
+ * the unopened rule, and its refusal names the contributors that hold none.
+ * The read that passed either check is the content the apply is then held to.
+ * A file the edit creates, or one that cannot be read, is left out of the map,
+ * matching every other `expectedContent` caller.
+ */
+export function captureRenameExpectedContent(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+	requestedAtMs: number,
+	readTrackedSend: (
+		filePath: string,
+		cwd: string,
+		sourceClientKeys?: readonly string[],
+	) => RenameTrackedSend | readonly RenameTrackedSend[] | undefined,
+	target?: { filePath: string; content: string },
+	sourceClientKeysByPath?: ReadonlyMap<string, readonly string[]>,
+): Map<string, string> {
+	const expected = new Map<string, string>();
+	let targetRealPath: string | undefined;
+	if (target !== undefined) {
+		try {
+			targetRealPath = realpathSync.native(target.filePath);
+		} catch {
+			// none: an unresolvable target path matches no file, so it binds
+			// nothing and every file takes the rules below.
+			targetRealPath = undefined;
+		}
+	}
+	for (const diskPath of workspaceEditTextPaths(edit)) {
+		let realPath: string;
+		let content: string;
+		let mtimeMs: number;
+		try {
+			realPath = realpathSync.native(diskPath);
+			content = readFileSync(realPath, "utf-8");
+			// Stat AFTER the read: a write before the read is then visible in the
+			// mtime, and one after it is caught by the apply-time comparison.
+			mtimeMs = statSync(realPath).mtimeMs;
+		} catch {
+			// none: a file that cannot be read is not bound here, matching every
+			// other expectedContent caller; the apply reports its own failure.
+			continue;
+		}
+		if (target !== undefined && realPath === targetRealPath) {
+			expected.set(realPath, target.content);
+			continue;
+		}
+		const contributorKeys = sourceClientKeysByPath?.get(
+			normalizeEphemeralMapKey(realPath),
+		);
+		const trackedResult = readTrackedSend(diskPath, cwd, contributorKeys);
+		const tracked =
+			trackedResult === undefined
+				? []
+				: Array.isArray(trackedResult)
+					? trackedResult
+					: [trackedResult];
+		// #3827: a file this client first opened at or after the request, and
+		// that nobody wrote since the client started, was unopened when the
+		// server answered and held the bytes the disk holds: the first open adds
+		// none, so its stamp is skipped. The disk must still hold the first
+		// open's bytes, then the unopened rule below applies.
+		const contentHash = hashDiagnosticContent(content);
+		let hasComparableSend = false;
+		const comparableKeys = new Set<string | undefined>();
+		for (const trackedSend of tracked) {
+			const firstOpenedAfterRequest =
+				(trackedSend.openedAtMs ?? 0) >= requestedAtMs;
+			const quietSinceClientStart =
+				trackedSend.clientStartedAtMs !== undefined &&
+				mtimeMs < trackedSend.clientStartedAtMs - RENAME_MTIME_MARGIN_MS;
+			const sent =
+				firstOpenedAfterRequest && quietSinceClientStart
+					? undefined
+					: trackedSend;
+			if (sent !== undefined) {
+				hasComparableSend = true;
+				comparableKeys.add(trackedSend.clientKey);
+				if (
+					sent.hash !== contentHash ||
+					(sent.changedAtMs ?? requestedAtMs) >= requestedAtMs
+				) {
+					refuseStaleWorkspaceEdit(
+						diskPath,
+						"it changed after the language server computed the rename from it",
+					);
+				}
+			} else if (
+				trackedSend.hash !== contentHash ||
+				trackedSend.openedHash !== trackedSend.hash
+			) {
+				// #3827 verify r2 F4: the exemption skips only the first open's own
+				// stamp. A disk that no longer holds the last send, or a record whose
+				// bytes changed after its first send, was written after that open
+				// although the mtime says otherwise (#3747's mtime-kept write).
+				refuseStaleWorkspaceEdit(
+					diskPath,
+					"it changed after the language client first opened it, after the rename was requested",
+				);
+			}
+		}
+		// #3734 r3: a record binds the file only when EVERY contributing client
+		// holds a comparable one. A contributor with none (never opened, or first
+		// opened after the request) answered from bytes nothing here can see, so
+		// the file takes the mtime rule and the refusal names that client.
+		const unboundKeys =
+			contributorKeys?.filter((key) => !comparableKeys.has(key)) ?? [];
+		const boundByRecord = hasComparableSend && unboundKeys.length === 0;
+		const noOpenCopy =
+			unboundKeys.length === 0
+				? "the language server has no open copy"
+				: `the language client ${unboundKeys.join(", ")} that edits it had no open copy`;
+		if (!boundByRecord && mtimeMs >= requestedAtMs) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				`it was written after the rename was requested and ${noOpenCopy}, so it may not have read these bytes`,
+			);
+		} else if (
+			!boundByRecord &&
+			mtimeMs >= requestedAtMs - RENAME_MTIME_MARGIN_MS
+		) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				`it was modified within ${RENAME_MTIME_MARGIN_MS / 1000} s of the rename request${unboundKeys.length === 0 ? "" : ` and ${noOpenCopy}`}; retry`,
+			);
+		}
+		expected.set(realPath, content);
+	}
+	return expected;
+}
+
+function planWorkspaceEdit(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	trackOrigins = false,
+): WorkspaceEditOp[] {
+	parseWorkspaceEdit(edit);
+	const ops: WorkspaceEditOp[] = [];
+	const pending = new Map<
+		string,
+		{
+			uri: string;
+			edits: LSPTextEdit[];
+			version?: number | null;
+			origins?: TextEditOrigin[];
+		}
+	>();
+	const descendants = new Map<string, Set<string>>();
+	const indexedAncestors = new Map<string, string[]>();
+	const seenResources = new Set<string>();
+	const pathKeys = new Map<string, string>();
+	const indexKey = (uri: string): string => {
+		const cached = pathKeys.get(uri);
+		if (cached !== undefined) return cached;
+		const key = pathIndexKey(uri);
+		pathKeys.set(uri, key);
+		return key;
+	};
+	const addIndex = (key: string): void => {
+		const ancestors: string[] = [];
+		let current = key;
+		// `key` is a normalized URI index key, not an on-disk directory. The
+		// index intentionally uses the key's own separator/root semantics, so
+		// walkUpDirs (which resolves through the host filesystem) is not suitable.
+		while (true) {
+			const set = descendants.get(current) ?? new Set<string>();
+			set.add(key);
+			descendants.set(current, set);
+			ancestors.push(current);
+			const parent = path.dirname(current);
+			if (parent === current) break;
+			current = parent;
+		}
+		indexedAncestors.set(key, ancestors);
+	};
+	const removeIndex = (key: string): void => {
+		for (const ancestor of indexedAncestors.get(key) ?? [])
+			descendants.get(ancestor)?.delete(key);
+		indexedAncestors.delete(key);
+	};
+	const queue = (
+		uri: string,
+		edits: LSPTextEdit[],
+		version: number | null | undefined,
+		origin?: TextEditOrigin,
+	): void => {
+		const key = indexKey(uri);
+		const existing = pending.get(key);
+		if (existing) {
+			// Per LSP 3.17, `version: null` means "don't check" — it is not itself a
+			// version to conflict against. Only two DIFFERENT numeric versions for the
+			// same URI are a genuine conflict; a numeric version is authoritative and
+			// adopted over a `null`/`undefined` counterpart from another edit container
+			// for the same document, so the later preflight version check (which only
+			// fires for numeric `op.version`) still validates it.
+			const existingNumeric =
+				typeof existing.version === "number" ? existing.version : undefined;
+			const incomingNumeric = typeof version === "number" ? version : undefined;
+			if (
+				existingNumeric !== undefined &&
+				incomingNumeric !== undefined &&
+				existingNumeric !== incomingNumeric
+			) {
+				throw new Error(`conflicting text document versions for ${uri}`);
+			}
+			existing.edits.push(...edits);
+			if (origin) (existing.origins ??= []).push(origin);
+			if (existingNumeric === undefined && incomingNumeric !== undefined)
+				existing.version = version;
+			return;
+		}
+		if (origin) {
+			pending.set(key, { uri, edits: [...edits], version, origins: [origin] });
+		} else {
+			pending.set(key, { uri, edits: [...edits], version });
+		}
+		addIndex(key);
+	};
+	const flushUri = (uri: string): void => {
+		const key = indexKey(uri);
+		const item = pending.get(key);
+		if (!item) return;
+		pending.delete(key);
+		removeIndex(key);
+		if (item.origins) {
+			ops.push({
+				kind: "text",
+				uri: item.uri,
+				edits: item.edits,
+				version: item.version,
+				origins: item.origins,
+			});
+		} else {
+			ops.push({
+				kind: "text",
+				uri: item.uri,
+				edits: item.edits,
+				version: item.version,
+			});
+		}
+	};
+	const flushSubtree = (uri: string): void => {
+		const key = indexKey(uri);
+		// flushUri -> removeIndex deletes `candidate` from this very Set (`key`
+		// is one of `candidate`'s ancestors by construction). No defensive copy
+		// needed: Set iterators reflect deletions safely — deleting the current
+		// or a not-yet-visited entry during iteration removes it from the
+		// remaining traversal without skipping or duplicating any other member
+		// (verified: https://tc39.es/ecma262/#sec-set.prototype.values, same
+		// guarantee already relied on for the Map iteration below and at
+		// clients/lsp/client.ts / clients/persist-debounce.ts /
+		// clients/review-graph/builder.ts). Nothing adds to `descendants`
+		// during this loop (only `addIndex` does, and it isn't called here).
+		for (const candidate of descendants.get(key) ?? []) {
+			const item = pending.get(candidate);
+			if (item) flushUri(item.uri);
+		}
+	};
+	for (const [uri, edits] of Object.entries(edit.changes ?? {})) {
+		const parsed = parseTextEdits(edits, `changes[${uri}]`);
+		queue(
+			uri,
+			parsed,
+			undefined,
+			trackOrigins ? { kind: "changes", uri, edits: parsed } : undefined,
+		);
+	}
+	for (const [index, change] of (edit.documentChanges ?? []).entries()) {
+		const text = parseTextDocumentEdit(change, `documentChanges[${index}]`);
+		if (text) {
+			queue(
+				text.textDocument.uri,
+				text.edits as LSPTextEdit[],
+				text.textDocument.version,
+				trackOrigins
+					? {
+							kind: "documentChanges",
+							index,
+							edits: text.edits as LSPTextEdit[],
+						}
+					: undefined,
+			);
+			continue;
+		}
+		const resource = parseResource(change as Record<string, unknown>);
+		const resourceKey =
+			resource.kind === "rename"
+				? `rename:${indexKey(resource.oldUri)}:${indexKey(resource.newUri)}`
+				: `${resource.kind}:${indexKey(resource.uri)}`;
+		if (seenResources.has(resourceKey))
+			throw new Error(`duplicate workspace resource operation: ${resourceKey}`);
+		seenResources.add(resourceKey);
+		if (resource.kind === "create") flushUri(resource.uri);
+		else if (resource.kind === "rename") {
+			flushSubtree(resource.oldUri);
+			flushSubtree(resource.newUri);
+		} else flushSubtree(resource.uri);
+		ops.push(resource);
+	}
+	// flushUri deletes from `pending` — the same Map being iterated here — but
+	// Map iterators reflect deletions safely (see flushSubtree above), so no
+	// defensive copy is needed.
+	for (const item of pending.values()) flushUri(item.uri);
+	return ops;
+}
+
+/** Test-only planning probe used by the scaled occupancy regression. */
+export function __planWorkspaceEditForTest(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): number {
+	return planWorkspaceEdit(edit).length;
+}
+
+function relativeToCwd(filePath: string, cwd: string): string {
+	const rel = path.relative(cwd, filePath) || path.basename(filePath);
+	return toPosix(rel);
+}
+
+// Matches an import declaration or a re-export-from declaration — the two
+// statement shapes that actually change a module's dependency edges. Also
+// matches a bare `from "..."` continuation line WITHOUT a leading `import`/
+// `export`, so a formatter-wrapped multiline import
+//   import {
+//     foo,
+//   } from "./old";
+// still flags its specifier line as import-relevant even though line 1
+// ("import {") doesn't itself contain the module path. Fail-safe direction:
+// this can over-match a non-import line that happens to contain `from "..."`
+// (e.g. a string literal), but that only risks over-reporting `importsChanged`
+// (the safe direction — master's prior /^import\s/m heuristic over-invalidated
+// too), never under-reporting a real specifier change.
+const IMPORT_RELEVANT_LINE =
+	/^\s*import\b|^\s*export\s[^;]*\bfrom\s|\bfrom\s+['"]/;
+
+/**
+ * A stable signature of the import/re-export-from lines in `text`, order-
+ * preserved. Used to detect whether a text edit actually changed the file's
+ * import graph (P3-6) rather than merely landing in a file that HAS imports —
+ * `fileDetails[].importsChanged` gates expensive downstream dependency-graph
+ * re-checks (see `cache-manager.ts`'s `importsChanged` filter and
+ * `lsp-mutation.ts`'s `addModifiedRange`), so over-reporting "changed" on
+ * every edit to an already-import-bearing file defeats that gate. This is a
+ * LINE-signature heuristic, not a parse: a multiline import whose specifier
+ * ("from" line) is untouched but whose bound-name list changes on an
+ * interior line (e.g. renaming one of several named imports without
+ * touching the `import {`/`} from "..."` lines) is not detected — narrower
+ * than a full import-statement diff, but still strictly safer than the prior
+ * "file merely contains any import" heuristic. Known pre-existing gaps
+ * (unaddressed here, same as before): dynamic `import(...)` calls and
+ * `require(...)` are not import-relevant lines by this heuristic.
+ */
+function importsSignature(text: string): string {
+	return text
+		.split("\n")
+		.filter((line) => IMPORT_RELEVANT_LINE.test(line))
+		.join("\n");
+}
+
+export function summarizeWorkspaceEdit(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+): string[] {
+	const lines: string[] = [];
+	for (const [uri, edits] of flattenWorkspaceTextEdits(edit))
+		lines.push(
+			`Apply ${edits.length} edit(s) to ${relativeToCwd(uriToPath(uri), cwd)}`,
+		);
+	for (const change of edit.documentChanges ?? []) {
+		if (!isRecord(change) || typeof change.kind !== "string") continue;
+		if (change.kind === "create" && typeof change.uri === "string")
+			lines.push(`Create ${relativeToCwd(uriToPath(change.uri), cwd)}`);
+		else if (
+			change.kind === "rename" &&
+			typeof change.oldUri === "string" &&
+			typeof change.newUri === "string"
+		)
+			lines.push(
+				`Rename ${relativeToCwd(uriToPath(change.oldUri), cwd)} → ${relativeToCwd(uriToPath(change.newUri), cwd)}`,
+			);
+		else if (change.kind === "delete" && typeof change.uri === "string")
+			lines.push(`Delete ${relativeToCwd(uriToPath(change.uri), cwd)}`);
+	}
+	return lines;
+}
+
+type VirtualFile = { exists: boolean; directory: boolean; content?: string };
+
+async function lstatOrMissing(filePath: string): Promise<Stats | undefined> {
+	try {
+		return await fs.lstat(filePath);
+	} catch (err) {
+		if ((err as { code?: string }).code === "ENOENT") return undefined;
+		throw err;
+	}
+}
+
+/**
+ * True when two `lstat` results denote the SAME on-disk entry. Requires a
+ * matching `dev` AND a matching, NONZERO `ino`. The nonzero guard is
+ * load-bearing: ino-less filesystems (FAT32/exFAT, some SMB redirectors,
+ * VirtualBox shared folders) report `ino: 0` for every entry via libuv, so
+ * without it two DISTINCT files would compare `(dev, 0) === (dev, 0)` and a
+ * rename would be misclassified as a case-only alias and silently clobber the
+ * destination. Comparing the BigInt fields (from `lstat({ bigint: true })`)
+ * also avoids the double-precision loss on NTFS 64-bit file IDs >= 2^53 that a
+ * `number` `ino` would suffer (which could false-equal distinct files).
+ * Anything that is not a confident same-entry match returns false → the caller
+ * falls back to the destination-exists check (fail-closed). Exported for direct
+ * unit coverage of the ino-0 guard.
+ */
+export function isSameFsIdentity(
+	a: { dev: bigint; ino: bigint },
+	b: { dev: bigint; ino: bigint },
+): boolean {
+	return a.dev === b.dev && a.ino !== 0n && b.ino !== 0n && a.ino === b.ino;
+}
+
+async function bigintLstatOrMissing(
+	filePath: string,
+): Promise<BigIntStats | undefined> {
+	try {
+		return await fs.lstat(filePath, { bigint: true });
+	} catch (err) {
+		if ((err as { code?: string }).code === "ENOENT") return undefined;
+		throw err;
+	}
+}
+
+/**
+ * True when two paths name the SAME on-disk entry — how a case-only rename on a
+ * case-insensitive FS is told apart from a genuine destination conflict without
+ * branching on `process.platform`. `lstat` (not `stat`) so a symlink is compared
+ * as itself, consistent with the rest of the preflight's symlink policy. See
+ * `isSameFsIdentity` for the dev/ino identity rules (and the ino-0 fail-closed
+ * guard for ino-less filesystems).
+ */
+async function isSameFsEntry(a: string, b: string): Promise<boolean> {
+	const [statA, statB] = await Promise.all([
+		bigintLstatOrMissing(a),
+		bigintLstatOrMissing(b),
+	]);
+	return Boolean(statA && statB && isSameFsIdentity(statA, statB));
+}
+
+async function assertParentIsUsable(
+	filePath: string,
+	stateFor: (filePath: string) => Promise<VirtualFile>,
+): Promise<void> {
+	// `filePath` is the confined identity and `stateFor` keys its overlay by it,
+	// so the climb takes the names as given: a second resolution would look up
+	// a directory the overlay never recorded.
+	for (const current of walkUpDirs(path.dirname(filePath), {
+		spelling: true,
+	})) {
+		const known = await stateFor(current);
+		if (known.exists) {
+			if (!known.directory)
+				throw new Error(`resource parent is not a directory: ${current}`);
+			return;
+		}
+	} // The walk ran off the filesystem root: no ancestor exists.
+	throw new Error(`resource parent does not exist: ${filePath}`);
+}
+
+/**
+ * The identity a workspace edit may act on: a name the kernel answered for.
+ * `realpathOrResolveAsync` falls back to the spelling when a component refuses
+ * for a reason other than absence (`EACCES`, `ELOOP`), which is the right key
+ * for a queue and the wrong answer at a trust boundary: the confiner would
+ * prove containment for a path whose real name it never learned, where this
+ * file's former `resolveExistingAncestor` rethrew every errno that is not
+ * `ENOENT`/`ENOTDIR` and refused the whole edit (#4689 r2 F-CR2).
+ */
+async function requireKernelIdentity(
+	filePath: string,
+	subject: string,
+): Promise<string> {
+	const identity = await kernelPathIdentityAsync(filePath);
+	if (identity === undefined || !identity.kernelConfirmed)
+		throw new Error(`workspace edit path identity is unresolvable: ${subject}`);
+	return identity.identity;
+}
+
+async function createWorkspaceUriConfiner(
+	cwd: string,
+): Promise<(uri: string) => Promise<string>> {
+	const root = await requireKernelIdentity(cwd, cwd);
+	return async (uri: string): Promise<string> => {
+		let filePath = "";
+		try {
+			const parsed = new URL(uri);
+			if (
+				parsed.protocol !== "file:" ||
+				(parsed.host !== "" && parsed.hostname !== "localhost")
+			)
+				throw new Error("URI must be a local file URI");
+			filePath = uriToPath(uri);
+		} catch (err) {
+			throw new Error(
+				`invalid workspace edit URI ${uri}: ${err instanceof Error ? err.message : String(err)}`,
+				{ cause: err },
+			);
+		}
+		if (!path.isAbsolute(filePath))
+			throw new Error(`workspace edit path escapes workspace: ${uri}`);
+		const resolved = await requireKernelIdentity(filePath, uri);
+		if (!isUnderDir(resolved, root))
+			throw new Error(`workspace edit path escapes workspace: ${uri}`);
+		return filePath;
+	};
+}
+
+/** Validate a resource-only workspace edit without applying any mutation. */
+export async function validateWorkspaceEdit(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+): Promise<void> {
+	const planned = planWorkspaceEdit(edit);
+	await preflightWorkspaceEdit(planned, cwd, {});
+}
+
+async function preflightWorkspaceEdit(
+	planned: WorkspaceEditOp[],
+	cwd: string,
+	options: ApplyWorkspaceEditOptions,
+): Promise<{
+	text: Map<WorkspaceEditOp, LSPTextEdit[]>;
+	textByOrigin: Map<string, LSPTextEdit[]>;
+	ignored: Set<WorkspaceEditOp>;
+}> {
+	const confine = await createWorkspaceUriConfiner(cwd);
+	const virtual = new Map<string, VirtualFile>();
+	// State for a path that `resolveVirtualPath` cannot resolve to a physical
+	// address — i.e. a path CURRENTLY vacated by an earlier rename in this same
+	// edit (its "from" address, still shadowed by an active virtual move) — but
+	// which a later `create` op in the same ordered edit re-establishes at that
+	// exact address. Keyed on the raw (unresolved) query path because there is
+	// no physical path to key `virtual` on. Consulted only when `resolveVirtualPath`
+	// returns undefined, so it never shadows a real physical/virtual-move address.
+	const virtualOverrides = new Map<string, VirtualFile>();
+	const virtualMoves: Array<{
+		from: string;
+		to: string;
+		directory: boolean;
+	}> = [];
+	const virtualTombstones: Array<{ path: string; directory: boolean }> = [];
+	const text = new Map<WorkspaceEditOp, LSPTextEdit[]>();
+	const textByOrigin = new Map<string, LSPTextEdit[]>();
+	const ignored = new Set<WorkspaceEditOp>();
+	const resolveVirtualPath = (filePath: string): string | undefined => {
+		let resolved = filePath;
+		for (let index = virtualMoves.length - 1; index >= 0; index--) {
+			const move = virtualMoves[index];
+			if (
+				isUnderDir(resolved, move.to) &&
+				(move.directory || pathsEqual(resolved, move.to))
+			) {
+				const suffix = path.relative(move.to, resolved);
+				resolved = suffix ? path.join(move.from, suffix) : move.from;
+				continue;
+			}
+			if (
+				isUnderDir(resolved, move.from) &&
+				(move.directory || pathsEqual(resolved, move.from))
+			) {
+				return undefined;
+			}
+		}
+		return resolved;
+	};
+	const isTombstoned = (filePath: string): boolean =>
+		virtualTombstones.some(
+			(tombstone) =>
+				pathsEqual(filePath, tombstone.path) ||
+				(tombstone.directory && isUnderDir(filePath, tombstone.path)),
+		);
+	const clearTombstonesUnder = (filePath: string): void => {
+		for (let index = virtualTombstones.length - 1; index >= 0; index--) {
+			const tombstone = virtualTombstones[index];
+			if (
+				pathsEqual(tombstone.path, filePath) ||
+				isUnderDir(tombstone.path, filePath)
+			) {
+				virtualTombstones.splice(index, 1);
+			}
+		}
+	};
+	const stateFor = async (filePath: string): Promise<VirtualFile> => {
+		if (isTombstoned(filePath)) return { exists: false, directory: false };
+		const physicalPath = resolveVirtualPath(filePath);
+		if (!physicalPath) {
+			return (
+				virtualOverrides.get(normalizeMapKey(filePath)) ?? {
+					exists: false,
+					directory: false,
+				}
+			);
+		}
+		const key = normalizeMapKey(physicalPath);
+		const known = virtual.get(key);
+		if (known) return known;
+		const stat = await lstatOrMissing(physicalPath);
+		const value = {
+			exists: Boolean(stat),
+			directory: stat?.isDirectory() ?? false,
+		};
+		virtual.set(key, value);
+		return value;
+	};
+	const contentFor = async (
+		filePath: string,
+		state: VirtualFile,
+	): Promise<string> => {
+		if (!state.exists || state.directory)
+			throw new Error(`text edit target is not a file: ${filePath}`);
+		if (state.content !== undefined) return state.content;
+		const physicalPath = resolveVirtualPath(filePath);
+		if (!physicalPath)
+			throw new Error(`text edit target does not exist: ${filePath}`);
+		const content = await fs.readFile(physicalPath, "utf-8");
+		// `?.` skips the identity lookup when no caller passed expected content.
+		const expected = options.expectedContent?.get(
+			await realpathOrResolveAsync(physicalPath),
+		);
+		if (expected !== undefined && expected !== content) {
+			refuseStaleWorkspaceEdit(
+				filePath,
+				"the file changed after the edit was computed from it",
+			);
+		}
+		state.content = content;
+		return content;
+	};
+	for (const op of planned) {
+		if (op.kind === "text") {
+			const filePath = await confine(op.uri);
+			const state = await stateFor(filePath);
+			if (op.version !== undefined && op.version !== null) {
+				const current = options.documentVersions?.get(
+					normalizeMapKey(filePath),
+				);
+				if (current === undefined || current !== op.version)
+					throw new Error(
+						`stale text document version for ${filePath}: expected ${op.version}, current ${current ?? "unknown"}`,
+					);
+			}
+			const content = await contentFor(filePath, state);
+			const encoding = options.positionEncoding ?? "utf-16";
+			const normalized = normalizeTextEditsForContent(
+				content,
+				op.edits,
+				encoding,
+			);
+			text.set(op, normalized);
+
+			// Keep the normalized edits attached to their original LSP containers.
+			// A planner operation can combine `changes` with a documentChanges text
+			// edit for the same URI, so the combined validation above remains the
+			// authority while this assignment preserves version/resource ordering.
+			for (const origin of op.origins ?? []) {
+				// Origins are already validated together above, but must retain
+				// multiplicity: identical zero-width insertions are meaningful and
+				// must not be deduplicated while restoring the original containers.
+				textByOrigin.set(
+					textEditOriginKey(origin),
+					normalizeTextEditsForContent(content, origin.edits, encoding),
+				);
+			}
+			state.content = applyTextEditsToString(content, normalized);
+			continue;
+		}
+		if (op.kind === "create") {
+			const filePath = await confine(op.uri);
+			const state = await stateFor(filePath);
+			await assertParentIsUsable(filePath, stateFor);
+			if (state.exists) {
+				if (op.options?.ignoreIfExists) {
+					ignored.add(op);
+					continue;
+				}
+				if (!op.options?.overwrite || state.directory)
+					throw new Error(`create target already exists: ${filePath}`);
+				state.content = "";
+			} else {
+				clearTombstonesUnder(filePath);
+				state.exists = true;
+				state.directory = false;
+				state.content = "";
+				const physicalPath = resolveVirtualPath(filePath);
+				if (physicalPath) virtual.set(normalizeMapKey(physicalPath), state);
+				// `resolveVirtualPath` returns undefined for a path currently shadowed
+				// by an earlier rename's vacated "from" address in this same ordered
+				// edit (P3-3): the created state has nowhere physical to live, so it
+				// must be recorded in the override overlay keyed on the raw query path
+				// instead — otherwise a later op addressing this exact path (e.g. a
+				// text edit) would see it as still-vacated/nonexistent.
+				else virtualOverrides.set(normalizeMapKey(filePath), state);
+			}
+			continue;
+		}
+		if (op.kind === "rename") {
+			const oldPath = await confine(op.oldUri);
+			const newPath = await confine(op.newUri);
+			// "Must differ" is a property of the on-disk target, not the case-folded
+			// map key. A case-only rename (foo.txt → Foo.txt) is a legitimate refactor
+			// whose decoded paths differ even though they collapse to a single key on a
+			// case-insensitive filesystem — so compare the decoded disk paths here, and
+			// treat a same-key-different-case pair as a real rename below.
+			const oldDisk = uriToDiskPath(op.oldUri);
+			const newDisk = uriToDiskPath(op.newUri);
+			if (toPosix(path.resolve(oldDisk)) === toPosix(path.resolve(newDisk))) {
+				throw new Error("rename source and destination must differ");
+			}
+			const source = await stateFor(oldPath);
+			if (!source.exists)
+				throw new Error(`rename source does not exist: ${oldPath}`);
+			// Captured BEFORE this rename's own `virtualMoves`/override mutations
+			// below, so it reflects how `source` was actually resolved: `true` when
+			// `oldPath` is itself shadowed by an earlier rename in this edit and the
+			// state came from the `virtualOverrides` overlay (P3-3) rather than a
+			// physically-addressable entry.
+			const sourceFromOverride = resolveVirtualPath(oldPath) === undefined;
+			await assertParentIsUsable(newPath, stateFor);
+			const destination = await stateFor(newPath);
+			if (destination.exists) {
+				// Decide "already exists" by on-disk IDENTITY, not a platform-keyed path
+				// fold. A case-only (or otherwise-aliased) rename whose destination
+				// resolves to the SAME FS entry as the source is a legitimate refactor,
+				// not a conflict — detected here on ANY case-insensitive FS (win32, macOS
+				// APFS/HFS+), per the #1024 "probe the FS, don't branch on platform"
+				// lesson. Conversely, on a case-SENSITIVE FS where both spellings are
+				// distinct real files, this stays a genuine conflict (closing the inverse
+				// silent-clobber edge that a win32-only fold left open).
+				//
+				// P3-8: when the source exists only VIRTUALLY (e.g. created earlier in
+				// this same ordered edit and never yet written to disk), `isSameFsEntry`
+				// lstats disk and finds nothing there, so it can never recognize a
+				// case-only alias for a not-yet-physical file. `stateFor` keys the
+				// `virtual`/override maps on the SAME case-folded identity used for
+				// physical aliasing, so if `destination` and `source` resolved to the
+				// identical cached VirtualFile object, they are — by construction of
+				// that keying — the same virtual entry (a case-insensitive-FS alias);
+				// checked as a fast, disk-free first branch before falling back to the
+				// physical probe (which remains untouched for genuinely-physical paths).
+				const aliasesSource =
+					destination === source || (await isSameFsEntry(oldDisk, newDisk));
+				if (!aliasesSource) {
+					if (op.options?.ignoreIfExists) {
+						ignored.add(op);
+						continue;
+					}
+					if (!op.options?.overwrite)
+						throw new Error(`rename destination already exists: ${newPath}`);
+				}
+			}
+			clearTombstonesUnder(newPath);
+			if (!source.directory) await contentFor(oldPath, source);
+			if (sourceFromOverride) {
+				// P3 (round-2 review): a purely virtual entry (created earlier in this
+				// same edit at a path vacated by an even earlier rename) has no
+				// physical address for a `virtualMoves` shadow to resolve against —
+				// `resolveVirtualPath` walks that list by PHYSICAL path chasing, which
+				// cannot represent "this virtual entry moved again." Pushing a move
+				// here would leave the stale `virtualOverrides[oldPath]` entry
+				// claiming `exists: true` forever (a later `create(oldPath)` would be
+				// falsely rejected, and reads of the new address wouldn't reliably
+				// find it either). Instead, migrate the state object directly: drop
+				// the stale key and re-key it under the destination, placing it back
+				// in `virtual` (physically addressable) or `virtualOverrides` (still
+				// shadowed) depending on whether the destination itself currently
+				// resolves to a physical path.
+				virtualOverrides.delete(normalizeMapKey(oldPath));
+				const destinationPhysicalPath = resolveVirtualPath(newPath);
+				if (destinationPhysicalPath)
+					virtual.set(normalizeMapKey(destinationPhysicalPath), source);
+				else virtualOverrides.set(normalizeMapKey(newPath), source);
+			} else {
+				// Keep descendants lazy: a later text edit under a renamed directory
+				// resolves through this virtual move to the original physical path.
+				// This preserves ordered workspace-edit semantics without walking the
+				// entire subtree during preflight.
+				virtualMoves.push({
+					from: oldPath,
+					to: newPath,
+					directory: source.directory,
+				});
+			}
+			continue;
+		}
+		const filePath = await confine(op.uri);
+		const state = await stateFor(filePath);
+		if (!state.exists) {
+			if (op.options?.ignoreIfNotExists) ignored.add(op);
+			else throw new Error(`delete target does not exist: ${filePath}`);
+		} else {
+			if (state.directory && !op.options?.recursive)
+				throw new Error(`delete directory requires recursive: ${filePath}`);
+			state.exists = false;
+			state.content = undefined;
+			virtualTombstones.push({ path: filePath, directory: state.directory });
+		}
+	}
+	return { text, textByOrigin, ignored };
+}
+
+/**
+ * #4346: a resource operation changes which paths exist, and a server that
+ * caches a failed lookup (Pyrefly, pyright) only drops it on a watched-files
+ * Created or Deleted. A file watcher would report these; pi-lens is that
+ * watcher for its own writes. With no sink and no service, nothing is sent and
+ * no service is created.
+ */
+async function announceResourceOperations(
+	changes: ReadonlyArray<{ filePath: string; type: number }>,
+	sink: WatchedFileSink | undefined,
+): Promise<void> {
+	const target = sink ?? peekOwnedLspService<WatchedFileSink>();
+	if (!target) return;
+	for (const change of changes) {
+		await target.notifyExternalFileChange(change.filePath, change.type);
+	}
+}
+
+/**
+ * Applies a workspace edit. All URI, shape, version, resource-precondition and
+ * text-bound checks happen in preflight before the first write. Once preflight
+ * succeeds, an unexpected filesystem failure may still leave earlier mutations
+ * applied; this is intentionally the existing no-rollback boundary.
+ */
+export async function applyWorkspaceEdit(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+	options: ApplyWorkspaceEditOptions = {},
+): Promise<AppliedWorkspaceEdit> {
+	const descriptions: string[] = [];
+	const touchedFiles = new Set<string>();
+	const fileDetails: AppliedWorkspaceFileDetail[] = [];
+	const appliedOperationIndexes: number[] = [];
+	let appliedOperationTotal = 0;
+	let operationIndex = 0;
+	const operationCounts = { textEdits: 0, create: 0, rename: 0, delete: 0 };
+	const resourceChanges: Array<{ filePath: string; type: number }> = [];
+	const planned = planWorkspaceEdit(edit);
+	let operationTotal = 0;
+	let prepared: Awaited<ReturnType<typeof preflightWorkspaceEdit>>;
+	const operationSize = (op: WorkspaceEditOp): number =>
+		op.kind === "text" ? (prepared.text.get(op)?.length ?? 0) : 1;
+	const markApplied = (op: WorkspaceEditOp): void => {
+		const count = operationSize(op);
+		for (let index = 0; index < count; index++) {
+			if (appliedOperationIndexes.length < 100) {
+				appliedOperationIndexes.push(operationIndex + index);
+			}
+		}
+		appliedOperationTotal += count;
+		operationIndex += count;
+	};
+	const skipOperation = (op: WorkspaceEditOp): void => {
+		operationIndex += operationSize(op);
+	};
+	const makeResult = (): AppliedWorkspaceEdit => ({
+		descriptions,
+		files: [...touchedFiles],
+		operationTotal,
+		appliedOperationTotal,
+		appliedOperationIndexes,
+		operationCounts,
+		fileDetails,
+	});
+	// #3541: the read-modify-write of every path runs inside pi's mutation
+	// queue, so an agent edit of one of them cannot land between this
+	// edit's read and its write (and be erased by it). #5417: a path outside
+	// the session's writable roots refuses the whole edit before its first
+	// write, and the edit's bookkeeping is recorded on every exit of it.
+	const queuePaths = plannedDiskPaths(planned);
+	const target = {
+		filePaths: queuePaths,
+		record: async (exit: SourceWriteExit<void>): Promise<void> => {
+			await announceResourceOperations(
+				resourceChanges,
+				options.watchedFileSink,
+			);
+			if (options.mutationContext && options.observe !== false) {
+				recordLspMutation(options.mutationContext, {
+					results: [makeResult()],
+					status: !exit.ok
+						? "failed"
+						: appliedOperationTotal > 0
+							? "success"
+							: "skipped",
+				});
+			}
+		},
+	};
+	try {
+		const queueStart = Date.now();
+		await writeSourceFile(target, async () => {
+			logLatency({
+				type: "phase",
+				filePath: cwd,
+				phase: "lsp_edit_queue_wait",
+				durationMs: Date.now() - queueStart,
+				metadata: { paths: queuePaths.length },
+			});
+			prepared = await preflightWorkspaceEdit(planned, cwd, options);
+			// The paths are judged after the preflight confined them to the
+			// workspace and before the first write, so a workspace-escaping path
+			// keeps its own refusal and nothing is half-applied (#5417).
+			const refused = refuseOutOfRootWrites(
+				queuePaths,
+				options.sessionRoot ??
+					options.mutationContext?.runtime?.projectRoot ??
+					cwd,
+				"lsp-edit",
+			);
+			if (refused.length > 0) throw new WorkspaceEditRefusedError(refused);
+			for (const op of planned) {
+				const size = operationSize(op);
+				if (op.kind === "text") operationCounts.textEdits += size;
+				else operationCounts[op.kind]++;
+				operationTotal += size;
+			}
+			for (const op of planned) {
+				if (prepared.ignored.has(op)) {
+					skipOperation(op);
+					continue;
+				}
+				if (op.kind === "text") {
+					// Report/key on the normalized path (forward-slash, realpath-canonical),
+					// but read/write the decoded on-disk path so the URI's casing is honored
+					// on win32 (see uriToDiskPath).
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					const edits = prepared.text.get(op) ?? [];
+					if (edits.length === 0) {
+						skipOperation(op);
+						continue;
+					}
+					const content = await fs.readFile(diskPath, "utf-8");
+					const updated = applyTextEditsToString(content, edits, "utf-16");
+					const changesLineCount = edits.some((edit) => {
+						const removedLines = edit.range.end.line - edit.range.start.line;
+						const insertedLines = (edit.newText.match(/\r\n|\r|\n/g) ?? [])
+							.length;
+						return removedLines !== insertedLines;
+					});
+					await fs.writeFile(diskPath, updated, "utf-8");
+					const start = Math.min(
+						...edits.map((item) => item.range.start.line + 1),
+					);
+					const end = Math.max(
+						...edits.map(
+							(item) =>
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						),
+					);
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
+						range: { start, end },
+						ranges: edits.map((item) => ({
+							start: item.range.start.line + 1,
+							end:
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						})),
+						authorshipUnknown: changesLineCount,
+						importsChanged:
+							importsSignature(content) !== importsSignature(updated),
+					});
+					markApplied(op);
+					descriptions.push(
+						`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`,
+					);
+				} else if (op.kind === "create") {
+					// Create on the decoded path so `NewFile.txt` is not lowercased on win32;
+					// report/key on the normalized path.
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					await fs.mkdir(path.dirname(diskPath), { recursive: true });
+					if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
+					else await fs.writeFile(diskPath, "", { flag: "wx" });
+					resourceChanges.push({ filePath: diskPath, type: FILE_CREATED });
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
+						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
+						importsChanged: false,
+					});
+					markApplied(op);
+					descriptions.push(`Created ${relativeToCwd(filePath, cwd)}`);
+				} else if (op.kind === "rename") {
+					// Rename on the decoded paths so the destination casing is honored (and a
+					// case-only rename actually changes the name); report on normalized paths.
+					const oldPath = uriToPath(op.oldUri);
+					const newPath = uriToPath(op.newUri);
+					const oldDisk = uriToDiskPath(op.oldUri);
+					const newDisk = uriToDiskPath(op.newUri);
+					await fs.mkdir(path.dirname(newDisk), { recursive: true });
+					if (op.options?.overwrite)
+						await fs.rm(newDisk, { recursive: true, force: true });
+					await fs.rename(oldDisk, newDisk);
+					resourceChanges.push(
+						{ filePath: oldDisk, type: FILE_DELETED },
+						{ filePath: newDisk, type: FILE_CREATED },
+					);
+					touchedFiles.add(oldPath);
+					touchedFiles.add(newPath);
+					fileDetails.push(
+						{
+							filePath: oldPath,
+							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
+							importsChanged: true,
+						},
+						{
+							filePath: newPath,
+							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
+							importsChanged: true,
+						},
+					);
+					markApplied(op);
+					descriptions.push(
+						`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`,
+					);
+				} else {
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					await fs.rm(diskPath, {
+						recursive: op.options?.recursive === true,
+						force: false,
+					});
+					resourceChanges.push({ filePath: diskPath, type: FILE_DELETED });
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
+						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
+						importsChanged: true,
+					});
+					markApplied(op);
+					descriptions.push(`Deleted ${relativeToCwd(filePath, cwd)}`);
+				}
+			}
+		});
+	} catch (err) {
+		const partial = makeResult();
+		const already = [...touchedFiles];
+		if (already.length > 0) {
+			const alreadyList = already
+				.map((f) => `  • ${relativeToCwd(f, cwd)}`)
+				.join("\n");
+			const failure = new Error(
+				`Workspace edit failed mid-application — ${already.length} file(s) already written, no rollback performed:\n${alreadyList}\nCause: ${err instanceof Error ? err.message : String(err)}`,
+			) as Error & { appliedWorkspaceEdit?: AppliedWorkspaceEdit };
+			failure.appliedWorkspaceEdit = partial;
+			throw failure;
+		}
+		throw err;
+	}
+	return makeResult();
+}
