@@ -3,9 +3,10 @@
 // Every Pi process that runs a release watches the release's source branch. A new commit is
 // deployed by whichever process sees it first (the others find it deployed), after its extensions
 // pass an import check; a running dashboard of an older release is restarted on the new one. Each
-// session then reloads into the deployed release as soon as it is idle (never during a run): at
-// once when it is idle already, else when its run settles. Pi itself (vendor/pi) cannot be
-// swapped in a running process; a session says so once when a release changed it.
+// session then reloads into the deployed release with `pi.requestReload()`: at once when idle,
+// else at the next turn boundary of its run (the run continues on the new tools and prompt; a tool
+// call running then finishes on the old code), else when the run settles. Pi itself (vendor/pi)
+// cannot be swapped in a running process; a session says so once when a release changed it.
 //
 // Running from a repository checkout (tests, development) this extension does nothing.
 
@@ -15,7 +16,6 @@ import { restartOutdated } from "../../dashboard/server/launch.ts";
 import { changedBetween, currentRelease, type DeployOptions, type DeployResult, deploy, refFiles, shortCommit } from "../lib/release.ts";
 import { RELEASE, type ReleaseMarker } from "../lib/repository.ts";
 
-export const RELOAD_COMMAND = "harness-reload";
 const POLL_MS = 3000;
 
 /** Per process, across reloads (module state is new after each): the release the process started with and last loaded. */
@@ -38,15 +38,7 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 	const state = (processState.__harnessRelease ??= { started: loaded.commit, loaded: loaded.commit });
 	state.loaded = loaded.commit;
 
-	pi.registerCommand(RELOAD_COMMAND, {
-		description: "Reload the harness into the deployed release",
-		handler: async (_args, ctx) => {
-			await ctx.reload();
-		},
-	});
-
 	let timer: ReturnType<typeof setInterval> | undefined;
-	let requested = false;
 	let busy = false;
 	let fingerprint = "";
 	const reported = new Set<string>();
@@ -55,13 +47,8 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 		const deployed = currentRelease(agentDir);
 		return deployed !== undefined && deployed.commit !== loaded.commit;
 	};
-	const requestReload = () => {
-		if (requested) return;
-		requested = true;
-		pi.sendUserMessage(`/${RELOAD_COMMAND}`, { expandPromptTemplates: true });
-	};
 
-	/** Deploy a new commit of the branch if its ref moved, then reload when idle and outdated. */
+	/** Deploy a new commit of the branch if its ref moved, then reload when outdated (Pi picks the moment; repeated requests are one). */
 	const tick = async (ctx: ExtensionContext) => {
 		if (busy) return;
 		busy = true;
@@ -78,7 +65,7 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 				}
 				if (result.status === "deployed") await restartDashboard(result.commit).catch(() => undefined);
 			}
-			if (outdated() && ctx.isIdle()) requestReload();
+			if (outdated()) pi.requestReload();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (!reported.has(message)) {
@@ -102,10 +89,6 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 		timer = setInterval(() => void tick(ctx), pollMs);
 		timer.unref?.();
 		void tick(ctx);
-	});
-	// A session busy when the release changed reloads once its run settles.
-	pi.on("agent_settled", () => {
-		if (outdated()) requestReload();
 	});
 	pi.on("session_shutdown", () => clearInterval(timer));
 }

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { changedBetween, commitToSource, currentLink, currentRelease, type DeployResult, deploy, harnessDir, switchTo } from "../extensions/lib/release.ts";
 import { inSource, type ReleaseMarker } from "../extensions/lib/repository.ts";
-import release, { RELOAD_COMMAND } from "../extensions/release/index.ts";
+import release from "../extensions/release/index.ts";
 
 let dir: string;
 let source: string;
@@ -217,18 +217,16 @@ describe("release extension", () => {
 	type Handler = (event: unknown, ctx: unknown) => unknown;
 	const marker = (commit: string): ReleaseMarker => ({ commit, source, branch: "main", subject: "s", deployedAt: "" });
 
-	/** The extension with a fake Pi; `idle` decides whether the session runs. */
-	function load(loaded: string, options: { idle?: boolean; deploy?: () => Promise<DeployResult> } = {}) {
+	/** The extension with a fake Pi that counts reload requests. */
+	function load(loaded: string, options: { deploy?: () => Promise<DeployResult> } = {}) {
 		const handlers = new Map<string, Handler>();
-		const sent: string[] = [];
 		const notes: [string, string][] = [];
-		const commands: string[] = [];
 		const restarted: string[] = [];
-		const ctx = { isIdle: () => options.idle ?? true, ui: { notify: (text: string, level: string) => notes.push([text, level]) } };
+		const reloads = { requested: 0 };
+		const ctx = { ui: { notify: (text: string, level: string) => notes.push([text, level]) } };
 		const pi = {
 			on: (name: string, handler: Handler) => handlers.set(name, handler),
-			registerCommand: (name: string) => commands.push(name),
-			sendUserMessage: (text: string) => sent.push(text),
+			requestReload: () => reloads.requested++,
 		};
 		release(pi as never, {
 			agentDir,
@@ -240,39 +238,23 @@ describe("release extension", () => {
 		const start = async (reason = "startup") => {
 			await handlers.get("session_start")!({ reason }, ctx);
 		};
-		return { handlers, sent, notes, commands, restarted, ctx, start, stop: () => handlers.get("session_shutdown")?.({}, ctx) };
+		return { handlers, reloads, notes, restarted, ctx, start, stop: () => handlers.get("session_shutdown")?.({}, ctx) };
 	}
 	afterEach(() => {
 		delete (globalThis as { __harnessRelease?: unknown }).__harnessRelease;
 	});
 
-	test("an idle session deploys a new commit and reloads into it; the dashboard follows", async () => {
+	test("a session deploys a new commit and requests a reload into it, idle or running; the dashboard follows", async () => {
 		const first = (await deployMain()).commit;
 		const session = load(first);
-		assert.deepEqual(session.commands, [RELOAD_COMMAND]);
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
 		const second = commit("second");
 		await session.start();
-		await until(() => session.sent.length > 0 && session.restarted.length > 0);
-		await new Promise((wait) => setTimeout(wait, 100));
+		await until(() => session.reloads.requested > 0 && session.restarted.length > 0);
 		session.stop();
 		assert.equal(currentRelease(agentDir)!.commit, second);
-		assert.deepEqual(session.sent, [`/${RELOAD_COMMAND}`], "once");
 		assert.deepEqual(session.restarted, [second]);
-	});
-
-	test("a running session waits for its run to settle", async () => {
-		const first = (await deployMain()).commit;
-		const session = load(first, { idle: false });
-		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
-		const second = commit("second");
-		await session.start();
-		await until(() => currentRelease(agentDir)?.commit === second);
-		await new Promise((wait) => setTimeout(wait, 100));
-		assert.deepEqual(session.sent, [], "not during a run");
-		await session.handlers.get("agent_settled")!({}, session.ctx);
-		session.stop();
-		assert.deepEqual(session.sent, [`/${RELOAD_COMMAND}`]);
+		assert.deepEqual([...session.handlers.keys()].sort(), ["session_shutdown", "session_start"], "no waiting for the run to settle: Pi picks the moment");
 	});
 
 	test("an up-to-date session does nothing; a failed commit is reported once", async () => {
@@ -280,13 +262,13 @@ describe("release extension", () => {
 		const session = load(first);
 		await session.start();
 		await new Promise((wait) => setTimeout(wait, 100));
-		assert.deepEqual(session.sent, []);
+		assert.equal(session.reloads.requested, 0);
 		writeFileSync(join(source, "lib", "value.ts"), "export const value = ;\n");
 		const bad = commit("broken");
 		await until(() => session.notes.length > 0);
 		await new Promise((wait) => setTimeout(wait, 100));
 		session.stop();
-		assert.deepEqual(session.sent, [], "stays on the release that loads");
+		assert.equal(session.reloads.requested, 0, "stays on the release that loads");
 		assert.equal(session.notes.length, 1);
 		assert.match(session.notes[0]![0], new RegExp(`Harness commit ${bad.slice(0, 9)} was not deployed; this session keeps ${first.slice(0, 9)}`));
 	});
@@ -333,7 +315,7 @@ describe("release extension", () => {
 
 	test("running from a repository checkout it does nothing", () => {
 		const handlers: string[] = [];
-		release({ on: (name: string) => handlers.push(name), registerCommand: () => handlers.push("command") } as never, { agentDir });
+		release({ on: (name: string) => handlers.push(name), requestReload: () => handlers.push("reload") } as never, { agentDir });
 		assert.deepEqual(handlers, []);
 	});
 });
