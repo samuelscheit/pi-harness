@@ -13,6 +13,7 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
+import type { CompactionReason } from "../../src/core/session-manager.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -397,7 +398,7 @@ describe("AgentSession compaction characterization", () => {
 
 	it("notifies extensions when auto-compaction fails", async () => {
 		const failedEvents: Array<{
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionReason;
 			errorMessage?: string;
 			aborted: boolean;
 			willRetry: boolean;

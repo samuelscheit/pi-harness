@@ -32,7 +32,13 @@ import {
 	type StreamFn,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, getCurrentTools, retryDelayMs } from "@earendil-works/pi-ai";
+import {
+	contentText,
+	getCurrentSystemMessage,
+	getCurrentTools,
+	getPromptCacheTtlMs,
+	retryDelayMs,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -65,7 +71,7 @@ import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
-import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
+import { type CacheWarmer, type CacheWarmingStatus, isPromptCacheCold } from "./cache-warmer.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -126,6 +132,7 @@ import { exportSessionToJsonl } from "./session-export.ts";
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
+	type CompactionReason,
 	type ContextEditEntry,
 	getLatestCompactionEntry,
 	type SessionEntry,
@@ -220,13 +227,13 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_start"; reason: CompactionReason }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionReason;
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -245,7 +252,7 @@ export type AgentSessionEvent =
 	| {
 			type: "summarization_retry_attempt_start";
 			source: "compaction";
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionReason;
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "bash_execution_update"; id?: string; delta: string };
@@ -834,6 +841,27 @@ export class AgentSession {
 			model.contextWindow,
 			this.settingsManager.getCompactionSettings(this.model),
 		);
+	}
+
+	/**
+	 * Compact with a cheap model when the prompt cache has expired and the context is large.
+	 *
+	 * Once the cache entry is gone, the next request writes the whole context to the cache again
+	 * at the session model's write price. Summarizing first with `compaction.coldCache.model`
+	 * costs a fraction of that and leaves a much smaller context to write.
+	 */
+	private async _compactColdCache(): Promise<void> {
+		const cold = this.settingsManager.getColdCacheCompaction();
+		const model = this.model;
+		if (!cold || !model || isVirtualModel(model)) return;
+		const branch = this.sessionManager.getBranch();
+		const ttlMs = getPromptCacheTtlMs(model, { cacheRetention: this.settingsManager.getCacheRetention() });
+		if (!isPromptCacheCold(branch, ttlMs, Date.now())) return;
+		const tokens = estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens;
+		if (tokens < cold.minTokens) return;
+		const summaryModel = this._modelRuntime.getModel(cold.model.provider, cold.model.id);
+		if (!summaryModel) return;
+		await this._runAutoCompaction("cold", false, summaryModel);
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -2012,6 +2040,7 @@ export class AgentSession {
 		const lastAssistant = this._findLastAssistantMessage();
 		if (lastAssistant) {
 			await this._checkCompaction(lastAssistant, false);
+			await this._compactColdCache();
 		}
 
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
@@ -2893,7 +2922,7 @@ export class AgentSession {
 		model: Model<any>,
 		customInstructions: string | undefined,
 		signal: AbortSignal,
-		reason: "manual" | "threshold" | "overflow",
+		reason: CompactionReason,
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
@@ -3016,7 +3045,7 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, "manual");
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3262,7 +3291,11 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: Exclude<CompactionReason, "manual">,
+		willRetry: boolean,
+		summaryModel?: Model<any>,
+	): Promise<boolean> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
@@ -3329,7 +3362,7 @@ export class AgentSession {
 				// Shared default summary generator, also used by manual compaction.
 				const compactResult = await this._runDefaultCompaction(
 					preparation,
-					model,
+					summaryModel ?? model,
 					undefined,
 					abortController.signal,
 					reason,
@@ -3342,7 +3375,7 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage, reason);
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -3895,7 +3928,7 @@ export class AgentSession {
 	 * the TUI needs to render the retry and recreate the underlying indicator.
 	 */
 	private _summarizationRetryCallbacks(
-		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
+		source: { source: "branchSummary" } | { source: "compaction"; reason: CompactionReason },
 	): RetryCallbacks {
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {

@@ -745,4 +745,35 @@ describe("SettingsManager", () => {
 			expect(manager.getShellPath()).toBe(homedir());
 		});
 	});
+
+	describe("prompt cache settings", () => {
+		it("reads cache retention, the idle warming limit and cold-cache compaction", () => {
+			const defaults = SettingsManager.inMemory({});
+			expect(defaults.getCacheRetention()).toBeUndefined();
+			expect(defaults.getCacheWarmingIdleMs()).toBe(30 * 60_000);
+			expect(defaults.getColdCacheCompaction()).toBeUndefined();
+
+			const set = SettingsManager.inMemory({
+				cacheRetention: "long",
+				cacheWarmingIdleMinutes: 60,
+				compaction: { coldCache: { minTokens: 50_000, model: "anthropic/claude-haiku-5-5" } },
+			});
+			expect(set.getCacheRetention()).toBe("long");
+			expect(set.getCacheWarmingIdleMs()).toBe(60 * 60_000);
+			expect(set.getColdCacheCompaction()).toEqual({ minTokens: 50_000, model: { provider: "anthropic", id: "claude-haiku-5-5" } });
+		});
+
+		it("ignores invalid values and turns cold-cache compaction off with compaction", () => {
+			const invalid = SettingsManager.inMemory({
+				cacheRetention: "forever" as never,
+				cacheWarmingIdleMinutes: 0,
+				compaction: { coldCache: { minTokens: 10, model: "no-slash" } },
+			});
+			expect(invalid.getCacheRetention()).toBeUndefined();
+			expect(invalid.getCacheWarmingIdleMs()).toBe(30 * 60_000);
+			expect(invalid.getColdCacheCompaction()).toBeUndefined();
+			const disabled = SettingsManager.inMemory({ compaction: { enabled: false, coldCache: { minTokens: 10, model: "a/b" } } });
+			expect(disabled.getColdCacheCompaction()).toBeUndefined();
+		});
+	});
 });

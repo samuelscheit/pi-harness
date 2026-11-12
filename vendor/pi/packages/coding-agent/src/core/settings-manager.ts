@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import type { CacheRetention, Model } from "@earendil-works/pi-ai";
 import type { ScrollViewScrollbar, TerminalCapabilities, WheelScrollLines } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -892,6 +892,17 @@ export class SettingsManager {
 		};
 	}
 
+	/** Cold-cache compaction (see `compaction.coldCache`), or undefined when it is off or invalid. */
+	getColdCacheCompaction(): { minTokens: number; model: { provider: string; id: string } } | undefined {
+		const cold = this.settings.compaction?.coldCache;
+		if (!this.getCompactionEnabled() || !cold || typeof cold.model !== "string") return undefined;
+		const slash = cold.model.indexOf("/");
+		if (slash <= 0 || slash === cold.model.length - 1) return undefined;
+		const minTokens = Number.isSafeInteger(cold.minTokens) && cold.minTokens >= 0 ? cold.minTokens : undefined;
+		if (minTokens === undefined) return undefined;
+		return { minTokens, model: { provider: cold.model.slice(0, slash), id: cold.model.slice(slash + 1) } };
+	}
+
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? SETTINGS_DEFAULTS.branchSummary.reserveTokens,
@@ -948,6 +959,18 @@ export class SettingsManager {
 		this.globalSettings.cacheWarming = mode;
 		this.markModified("cacheWarming");
 		this.save();
+	}
+
+	/** Read from global settings only because warming costs money. */
+	getCacheWarmingIdleMs(): number {
+		const minutes = this.globalSettings.cacheWarmingIdleMinutes;
+		return (typeof minutes === "number" && minutes >= 1 ? minutes : SETTINGS_DEFAULTS.cacheWarmingIdleMinutes) * 60_000;
+	}
+
+	/** Prompt cache retention for requests; undefined leaves it to PI_CACHE_RETENTION and the provider default. */
+	getCacheRetention(): CacheRetention | undefined {
+		const retention = this.settings.cacheRetention;
+		return retention === "none" || retention === "short" || retention === "long" ? retention : undefined;
 	}
 
 	getProviderRetrySettings(): { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number } {
