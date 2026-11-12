@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { stale } from "../dashboard/server/launch.ts";
-import { type Dashboard, startDashboard } from "../dashboard/server/server.ts";
+import { allowedHost, type Dashboard, lanUrls, startDashboard } from "../dashboard/server/server.ts";
 import { overview, Scope, totals } from "../extensions/metrics/queries/index.ts";
 import { MIN, seed, T0 } from "./seed.ts";
 
@@ -57,7 +57,7 @@ after(async () => {
 });
 
 describe("API", () => {
-	test("binds to 127.0.0.1 and reports its index status", async () => {
+	test("reports its local URL and its index status", async () => {
 		assert.match(base, /^http:\/\/127\.0\.0\.1:\d+$/);
 		const status = (await get("/api/status")).json();
 		assert.deepEqual([status.app, status.indexing, status.generation, status.claudeIndexed], ["pi-harness-dashboard", false, 0, false]);
@@ -162,6 +162,24 @@ describe("static files", () => {
 		assert.equal((await get("/..%2Fsecret.txt")).text, index.text, "an escape from dist gets the app, not the file");
 		assert.equal((await get("/%2e%2e/secret.txt")).text, index.text);
 		assert.equal((await get("/", { method: "POST" })).status, 405);
+	});
+
+	test("answers on the LAN: by IP address, localhost or this machine's name, never another name", () => {
+		for (const host of ["127.0.0.1:4317", "192.168.178.24:4317", "100.115.203.17", "localhost:4317", "[::1]:4317", "[fe80::1]", "MacBook:4317", "macbook.local:4317", "MacBook.LOCAL"]) assert.ok(allowedHost(host, "MacBook.local"), host);
+		for (const host of ["", "evil.example:80", "macbook.evil.example", "evil.macbook.local", "192.168.178.24.nip.io", "[evil]", "localhost.evil", "1.2.3"]) assert.ok(!allowedHost(host, "MacBook.local"), host);
+	});
+
+	test("lists a URL per external IPv4 address", () => {
+		const nic = (address: string, family: "IPv4" | "IPv6", internal: boolean) => ({ address, family, internal, netmask: "", mac: "", cidr: null });
+		const interfaces = { lo0: [nic("127.0.0.1", "IPv4", true)], en0: [nic("fe80::1", "IPv6", false), nic("192.168.178.24", "IPv4", false)], utun4: [nic("100.115.203.17", "IPv4", false)] };
+		assert.deepEqual(lanUrls(4317, interfaces as never), ["http://192.168.178.24:4317", "http://100.115.203.17:4317"]);
+		assert.deepEqual(lanUrls(4317, {}), []);
+	});
+
+	test("the server answers on a LAN address", async (t) => {
+		const [lan] = dashboard.lan;
+		if (lan === undefined) return t.skip("no external IPv4 address");
+		assert.equal((await fetch(`${lan}/api/status`)).status, 200);
 	});
 
 	test("only requests addressed to this machine by name are answered", async () => {
