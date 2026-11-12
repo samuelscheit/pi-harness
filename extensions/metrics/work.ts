@@ -50,15 +50,15 @@ export interface ReportedWork {
 	effect: Effect;
 	/** Whether the tool reached its goal (details.ok). */
 	ok?: boolean;
-	/** A session the tool ran as its child (details.childSession). */
-	childSession?: string;
+	/** Sessions the tool ran as its children (details.childSessions). */
+	childSessions: string[];
 }
 
 /**
  * The work a tool result reports: the effects of the tools it called (Pi's `nestedCalls`, as
  * codemode scripts and tools built on other tools make them) and, from its details, the files it
  * changed (`changedFiles`, absolute or relative to cwd), whether it reached its goal (`ok`) and
- * the session it ran as its child (`childSession`).
+ * the sessions it ran as its children (`childSessions`).
  */
 export function reportedWork(nested: readonly { name: string; arguments?: unknown }[] | undefined, details: unknown, cwd: string): ReportedWork {
 	let effect: Effect = { files: [], writes: [], mutates: false };
@@ -69,7 +69,7 @@ export function reportedWork(nested: readonly { name: string; arguments?: unknow
 	return {
 		effect,
 		...(typeof record.ok === "boolean" ? { ok: record.ok } : {}),
-		...(typeof record.childSession === "string" && record.childSession ? { childSession: record.childSession } : {}),
+		childSessions: Array.isArray(record.childSessions) ? record.childSessions.filter((id): id is string => typeof id === "string" && id !== "") : [],
 	};
 }
 

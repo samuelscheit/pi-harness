@@ -1,5 +1,6 @@
 // The tool experiments in real Pi sessions (faux model, the harness extensions loaded through the
-// SDK): define_tool defines, calls, quotes, persists, restores and refuses; codemode and fix_loop
+// SDK): define_tool defines, calls, quotes, persists, restores and refuses; codemode, workflow and
+// fix_loop (a harness workflow)
 // are active in arm B only.
 
 import assert from "node:assert/strict";
@@ -22,11 +23,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import defineTool, { DEFINED_ENTRY } from "../extensions/define-tool/index.ts";
 import { placeholders, renderCommand, specProblem, type ToolSpec } from "../extensions/define-tool/template.ts";
-import fixLoop from "../extensions/fix-loop/index.ts";
 import { type Arm, hashArm } from "../extensions/lib/experiments.ts";
 import { runShell } from "../extensions/lib/process.ts";
 import { shellEffect } from "../extensions/metrics/shell.ts";
 import prompt from "../extensions/prompt/index.ts";
+import workflow from "../extensions/workflow/index.ts";
+import { HARNESS_WORKFLOWS } from "../extensions/workflow/library.ts";
 
 let faux: ReturnType<typeof registerFauxProvider>;
 let runtime: ModelRuntime;
@@ -58,6 +60,7 @@ beforeEach(() => {
 	writeFileSync(join(experimentsDir, "define-tool.md"), "---\ntools: define_tool\n---\n");
 	writeFileSync(join(experimentsDir, "codemode.md"), "---\ntools: codemode\n---\nUse codemode for batches.");
 	writeFileSync(join(experimentsDir, "fix-loop.md"), "---\ntools: fix_loop\n---\n");
+	writeFileSync(join(experimentsDir, "workflow.md"), "---\ntools: workflow\n---\n");
 });
 afterEach(() => {
 	for (const session of open.splice(0)) session.dispose();
@@ -72,7 +75,7 @@ function idIn(arm: Arm, experiment: string, prefix = "0190a000-0000-7000-8000-")
 	}
 }
 
-/** A Pi session with the harness's prompt, define-tool, fix-loop and the built-in codemode extensions. */
+/** A Pi session with the harness's prompt, define-tool, workflow and the built-in codemode extensions. */
 async function session(sessionManager: SessionManager): Promise<AgentSession> {
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
@@ -86,7 +89,7 @@ async function session(sessionManager: SessionManager): Promise<AgentSession> {
 			createCodemodeExtension({ mode: "on" }),
 			(pi: ExtensionAPI) => prompt(pi, experimentsDir),
 			(pi: ExtensionAPI) => defineTool(pi, experimentsDir),
-			fixLoop,
+			(pi: ExtensionAPI) => workflow(pi, { experimentsDir, workflowDirs: () => [HARNESS_WORKFLOWS, join(repo, ".pi", "workflows")], modelRuntime: async () => runtime }),
 		],
 	});
 	await resourceLoader.reload();
@@ -203,7 +206,7 @@ describe("define_tool in a session", () => {
 });
 
 describe("tools per arm", () => {
-	test("codemode, fix_loop and define_tool are declared in arm B only", async () => {
+	test("codemode, workflow, fix_loop and define_tool are declared in arm B only", async () => {
 		const b = await newSession(idIn("B", "codemode"));
 		let system = "";
 		respond((context) => {
@@ -217,7 +220,7 @@ describe("tools per arm", () => {
 		assert.equal(b.getActiveToolNames().includes("codemode"), true);
 		assert.equal(a.getActiveToolNames().includes("codemode"), false);
 		assert.match(system, /Use codemode for batches\./, "arm B's prompt section");
-		for (const [tool, experiment] of [["fix_loop", "fix-loop"], ["define_tool", "define-tool"]]) {
+		for (const [tool, experiment] of [["fix_loop", "fix-loop"], ["define_tool", "define-tool"], ["workflow", "workflow"]]) {
 			const inB = await newSession(idIn("B", experiment!, "0190c000-0000-7000-8000-"));
 			respond(fauxAssistantMessage("ok"));
 			await inB.prompt("go");
@@ -258,6 +261,81 @@ describe("tools per arm", () => {
 		assert.equal(script.error, false, script.text);
 		assert.match(script.text, /Script completed/);
 		assert.match(script.text, /hi <from script>/);
+	});
+});
+
+describe("workflow in a session", () => {
+	const double = 'export const meta = { description: "Double a number.", parameters: { type: "object", properties: { n: { type: "number" } }, required: ["n"] }, budget: 0.5 };\nexport default async function ({ n }) { return `double: ${n * 2}`; }\n';
+
+	test("scripts call the session's tools through its pipeline; failures reject; the calls are recorded on the result", async () => {
+		writeFileSync(join(repo, "notes.txt"), "alpha\nbeta\n");
+		const s = await newSession(idIn("B", "workflow"));
+		const code = [
+			"const text = await tools.read({ path: 'notes.txt' });",
+			"const listed = await tools.bash({ command: 'echo from-bash' });",
+			"const failed = await tools.bash({ command: 'echo partial; exit 4' });",
+			"let missing = '';",
+			"try { await tools.read({ path: 'nope.txt' }); } catch (e) { missing = 'read failed'; }",
+			"let unknown = '';",
+			"try { await tools.no_such_tool({}); } catch (e) { unknown = (e as Error).message; }",
+			"return [text.split('\\n')[1], listed.output.trim(), `${failed.output.trim()} ${failed.exit_code}`, missing, unknown].join(' | ');",
+		].join("\n");
+		respond(call("workflow", { code, budget: 0.1 }), fauxAssistantMessage("done"));
+		await s.prompt("go");
+		const [result] = results(s);
+		assert.equal(result!.error, false, result!.text);
+		assert.match(result!.text, /\n\nbeta \| from-bash \| partial 4 \| read failed \| .*no_such_tool/);
+		const message = s.messages.find((m) => m.role === "toolResult")!;
+		assert.ok(message.role === "toolResult");
+		assert.deepEqual(message.nestedCalls?.calls.map((c) => c.name), ["read", "bash", "bash", "read", "no_such_tool"]);
+	});
+
+	const workflowResults = (s: AgentSession) => results(s).filter((r) => r.tool === "workflow");
+
+	test("a failing script is an error result", async () => {
+		const s = await newSession(idIn("B", "workflow"));
+		respond(call("workflow", { code: "throw new Error('nope');", budget: 0.1 }), fauxAssistantMessage("done"));
+		await s.prompt("go");
+		const [result] = workflowResults(s);
+		assert.equal(result!.error, true);
+		assert.match(result!.text, /^Workflow failed[^]*Error: nope\n {4}at .*workflow\.ts:1:/);
+	});
+
+	test("a workflow saved during a turn is a tool from the next turn, and withdrawn when deleted", async () => {
+		const s = await newSession(idIn("B", "workflow"));
+		const file = join(repo, ".pi", "workflows", "double.ts");
+		respond(call("write", { path: ".pi/workflows/double.ts", content: double }), call("double", { n: "21" }), call("workflow", { code: "return await workflows.double({ n: 4 });", budget: 0.1 }), fauxAssistantMessage("done"));
+		await s.prompt("go");
+		const r = results(s);
+		assert.equal(r[1]!.tool, "double");
+		assert.equal(r[1]!.error, false, r[1]!.text);
+		assert.match(r[1]!.text, /^Workflow double completed[^]*\n\ndouble: 42$/);
+		assert.match(r[2]!.text, /\n\ndouble: 8$/);
+		rmSync(file);
+		respond(fauxAssistantMessage("ok"));
+		await s.prompt("again");
+		assert.equal(s.getActiveToolNames().includes("double"), false);
+	});
+
+	test("arm A of workflow sees neither the tool nor saved project workflows; fix_loop follows its own experiment", async () => {
+		mkdirSync(join(repo, ".pi", "workflows"), { recursive: true });
+		writeFileSync(join(repo, ".pi", "workflows", "double.ts"), double);
+		let id = "";
+		for (let i = 0; ; i++) {
+			id = `0190e000-0000-7000-8000-${String(i).padStart(12, "0")}`;
+			if (hashArm(id, "workflow") === "A" && hashArm(id, "fix-loop") === "B") break;
+		}
+		const a = await newSession(id);
+		respond(fauxAssistantMessage("ok"));
+		await a.prompt("go");
+		const active = a.getActiveToolNames();
+		assert.equal(active.includes("workflow"), false);
+		assert.equal(active.includes("double"), false);
+		assert.equal(active.includes("fix_loop"), true);
+		const b = await newSession(idIn("B", "workflow"));
+		respond(fauxAssistantMessage("ok"));
+		await b.prompt("go");
+		assert.equal(b.getActiveToolNames().includes("double"), true);
 	});
 });
 

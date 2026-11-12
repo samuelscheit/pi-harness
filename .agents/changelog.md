@@ -116,3 +116,19 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Judged by:** `ask_user` answers that are not "dismissed" (user_messages of custom type `ask_user`); no dialog cards left that Pi no longer waits for.
 
 **Revert:** restore `app.asar.pre-pi-harness` and run `node scripts/patch-t3.ts` without the `dialogs` entry; revert the `dismiss` lines in `vendor/pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts`.
+
+## 2026-11-13 — experiment: workflow (`workflow` tool, saved workflows; fix_loop becomes one)
+
+**Change:** new extension `extensions/workflow` and experiment `prompt/experiments/workflow.md` (`interacts: codemode`, which keeps running). The agent writes a TypeScript script (an async function body) that runs in-process in a `node:vm` context (compiled by jiti with line numbers kept) and does a task's procedure in code, calling a model only where a judgment is needed:
+
+- `tools.*` (the session's tools through `ctx.executeTool`: same hooks, permissions, nested-call records), `shell()` (exit codes), `llm()` (one request; with a JSON Schema the answer comes from a `respond` tool call, validated and coerced, invalid answers retried twice; results cached per session by exact input so reruns of an edited script repeat only changed calls), `agent()` (a child Pi session with its own session file naming the parent; `files` refuses edit/write elsewhere and reverts other changes after each run; agents with `files` run in parallel and never revert each other's files, unguarded writers run alone: `lock.ts`), `map()` (bounded concurrency), `changes()` (diff since the run started), `log()`, `budget`, `workflows.*`.
+- Every run has a USD budget (llm() and agent() costs); exceeding it aborts everything in flight. Only the returned value reaches the conversation (strings verbatim, data as YAML), with cost, calls, changed files; `ok: false` in the value marks the goal missed (`details.ok`).
+- Saved workflows: `<repo>/.pi/workflows/<name>.ts` and the harness's `workflows/<name>.ts` export `meta` (description, JSON Schema parameters, budget, guidelines) and a default function, and become the tool `<name>`; a file saved during a turn is a tool from the next turn. Saved workflows follow the `workflow` experiment unless an experiment names them. `extensions/workflow/api.d.ts` is both the model-facing reference (embedded in the tool description) and the declarations `npm run check` type-checks saved workflows against (`workflows/tsconfig.json`).
+- `fix_loop` is now the harness workflow `workflows/fix_loop.ts` (same parameters and behaviour, budget $5); `extensions/fix-loop` is removed, its git snapshot code moved to `extensions/lib/workspace.ts`. The `fix-loop` experiment is unchanged.
+- Index (schema 11): `details.childSessions` (a list) replaces `details.childSession`; each child is a `delegations` row of kind `tool` with `call_id` `<tool call id>/<n>`.
+
+**Evidence:** every agent turn re-reads the whole context (median request 144k), while many tasks are procedures whose steps need no conversation: the same check over many items, loops until a command passes, independent subtasks. A script holds the procedure and spends tokens only on the judgments, with cheap models where they suffice. Live check through the gateway: three Haiku classifications with a schema, one cache hit and a read-only Sonnet child cost $0.0068 in 5.6 s.
+
+**Judged by:** turns and cost per session (children included), `workflow` usage and goal rate, saved workflows created and called; guardrails: tool error rate, corrections. Crossed with `codemode`.
+
+**Revert:** `/harness experiment workflow stop`; saved workflows then stay inactive. `fix_loop` follows its own experiment.

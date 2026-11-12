@@ -353,7 +353,9 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 				result.isError ? 1 : 0, result.durationMs ?? null, life?.tokens ?? 0,
 				life?.requests ?? 0, life?.cost ?? 0, life?.version ?? null, used === undefined ? null : used ? 1 : 0, call?.mutates ? 1 : 0,
 				work?.ok === undefined ? null : work.ok ? 1 : 0);
-			if (work?.childSession) insertDelegation.run(sessionId, result.toolCallId, call?.ts ?? resultTs, "tool", work.childSession, null, result.toolName);
+			for (const [i, child] of (work?.childSessions ?? []).entries()) {
+				insertDelegation.run(sessionId, `${result.toolCallId}/${i + 1}`, call?.ts ?? resultTs, "tool", child, null, result.toolName);
+			}
 			const started = call && !result.isError ? delegation(call.name, call.args, messageText(result.content)) : undefined;
 			if (started) {
 				insertDelegation.run(sessionId, result.toolCallId, call!.ts, started.kind, started.threadId ?? null,
