@@ -12,7 +12,7 @@
 // from Pi's model catalog; Claude Code's own total (`cost-state`) is kept to check them.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { IndexResult } from "./indexer.ts";
@@ -50,17 +50,25 @@ interface ClaudeUsage {
 	cache_creation?: { ephemeral_1h_input_tokens?: number; ephemeral_5m_input_tokens?: number };
 }
 
-/** A request's cost; a one-hour cache write costs twice the input price (as Pi's calculateCost). */
-export function requestCost(usage: ClaudeUsage, prices: Prices): number {
+export interface CostSplit {
+	input: number;
+	output: number;
+	read: number;
+	write: number;
+	total: number;
+}
+
+/** A request's cost by billing rate; a one-hour cache write costs twice the input price (as Pi's calculateCost). */
+export function requestCost(usage: ClaudeUsage, prices: Prices): CostSplit {
 	const long = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
 	const short = (usage.cache_creation_input_tokens ?? 0) - long;
-	return (
-		(usage.input_tokens ?? 0) * prices.input +
-		(usage.output_tokens ?? 0) * prices.output +
-		(usage.cache_read_input_tokens ?? 0) * prices.read +
-		short * prices.write +
-		long * prices.input * 2
-	);
+	const split = {
+		input: (usage.input_tokens ?? 0) * prices.input,
+		output: (usage.output_tokens ?? 0) * prices.output,
+		read: (usage.cache_read_input_tokens ?? 0) * prices.read,
+		write: short * prices.write + long * prices.input * 2,
+	};
+	return { ...split, total: split.input + split.output + split.read + split.write };
 }
 
 const text = (content: unknown): string => {
@@ -170,11 +178,11 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 
 		const insertRequest = db.prepare(
 			`INSERT INTO requests (session_id, entry_id, ts, kind, provider, model, thinking, stop_reason, version, input, output,
-			cache_read, cache_write, prompt_tokens, cost, message_count, trigger, trigger_tokens, cache_event, cache_lost, cache_waste,
-			input_rate, read_rate, write_rate, long_retention)
-			VALUES (?, ?, ?, 'turn', 'claude-code', ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, 0, NULL, 0, NULL, 0, 0, ?, ?, ?, ?)`,
+			cache_read, cache_write, prompt_tokens, cost, cost_input, cost_output, cost_read, cost_write, message_count, trigger,
+			trigger_tokens, cache_event, cache_lost, cache_waste, input_rate, read_rate, write_rate, long_retention)
+			VALUES (?, ?, ?, 'turn', 'claude-code', ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, NULL, 0, 0, ?, ?, ?, ?)`,
 		);
-		const turns: { ts: number; promptTokens: number; cacheRead: number; writeCost: number; readRate: number }[] = [];
+		const turns: { ts: number; promptTokens: number; cacheRead: number; uncachedCost: number; readRate: number }[] = [];
 		let cost = 0;
 		for (const [key, { ts: requestTs, entry }] of requests) {
 			const message = entry.message;
@@ -186,11 +194,11 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 			const read = usage.cache_read_input_tokens ?? 0;
 			const write = usage.cache_creation_input_tokens ?? 0;
 			const input = usage.input_tokens ?? 0;
-			const requestCostValue = requestCost(usage, prices);
-			cost += requestCostValue;
+			const split = requestCost(usage, prices);
+			cost += split.total;
 			insertRequest.run(id, key, requestTs, message.model, message.stop_reason ?? null, input, usage.output_tokens ?? 0, read, write,
-				input + read + write, requestCostValue, prices.input, prices.read, writeRate, long ? 1 : 0);
-			turns.push({ ts: requestTs, promptTokens: input + read + write, cacheRead: read, writeCost: write * writeRate, readRate: prices.read });
+				input + read + write, split.total, split.input, split.output, split.read, split.write, prices.input, prices.read, writeRate, long ? 1 : 0);
+			turns.push({ ts: requestTs, promptTokens: input + read + write, cacheRead: read, uncachedCost: split.write + split.input, readRate: prices.read });
 		}
 		turns.sort((a, b) => a.ts - b.ts);
 
@@ -266,12 +274,12 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 		}
 
 		const insertPause = db.prepare(
-			`INSERT INTO idle_pauses (session_id, start_ts, end_ts, minutes, warms, warm_cost, outcome, prompt_tokens, resume_write_cost)
+			`INSERT INTO idle_pauses (session_id, start_ts, end_ts, minutes, warms, warm_cost, outcome, prompt_tokens, resume_cost)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
 		const last = Math.max(...timed.map(ts));
 		for (const pause of idlePauses(turns, [], [], last)) {
-			insertPause.run(id, pause.start, pause.end ?? null, pause.minutes, pause.warms, pause.warmCost, pause.outcome, pause.promptTokens, pause.resumeWriteCost);
+			insertPause.run(id, pause.start, pause.end ?? null, pause.minutes, pause.warms, pause.warmCost, pause.outcome, pause.promptTokens, pause.resumeCost);
 		}
 
 		const firstUser = timed.find((e) => e.type === "user" && !e.isMeta && text(e.message?.content).trim());
@@ -284,7 +292,7 @@ export function indexTranscript(db: DatabaseSync, path: string, content: string,
 		db.prepare(
 			`INSERT INTO sessions (id, file, cwd, parent_session, name, source, reported_cost, prompt_digest, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages)
 			VALUES (?, ?, ?, ?, ?, 'claude-code', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
-		).run(id, path, cwd, subagent ? sessionId : null, title ?? (subagent ? `agent ${agentId}` : basename(path, ".jsonl")),
+		).run(id, path, cwd, subagent ? sessionId : null, title ?? null,
 			reported !== undefined && Number.isFinite(reported) ? reported : null, promptDigest ?? null, Math.min(...timed.map(ts)), last,
 			turns.length, cost, compactions.length, userMessages);
 		db.prepare("INSERT OR REPLACE INTO files (path, session_id, size, mtime_ms) VALUES (?, ?, ?, ?)").run(path, id, size, mtimeMs);

@@ -8,7 +8,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { attribute, cacheEvent, ratesOf, type RequestState, requestState, type Usage } from "../extensions/metrics/attribution.ts";
 import { imageTokens, parsePrompt, versionId } from "../extensions/metrics/blocks.ts";
 import { idlePauses, indexSessions } from "../extensions/metrics/indexer.ts";
-import { diffState, report } from "../extensions/metrics/report.ts";
+import { changeSummary, changes } from "../extensions/metrics/queries/versions.ts";
+import { report } from "../extensions/metrics/report.ts";
 import { openStore, SCHEMA_VERSION } from "../extensions/metrics/store.ts";
 
 // Opus-like prices per token.
@@ -339,6 +340,29 @@ describe("indexer", () => {
 		db.close();
 	});
 
+	test("a request that failed without usage is neither a resume after a pause nor the predecessor of a rebuild", () => {
+		const db = store();
+		const head = system({ preamble: "P".repeat(4000) });
+		const lines: object[] = [{ type: "session", version: 3, id: "session-failed", timestamp: new Date(clock).toISOString(), cwd: "/work/project" }];
+		lines.push(message("sys", null, head), message("u1", "sys", user("go")));
+		lines.push(message("a1", "u1", assistant([{ type: "text", text: "done" }], "stop", usage(1, 0, 1100, 20))));
+		clock += 10 * 60_000;
+		lines.push(message("u2", "a1", user("more")));
+		lines.push(message("a2", "u2", assistant([], "error", usage(0, 0, 0, 0))));
+		lines.push(message("a3", "a2", assistant([{ type: "text", text: "ok" }], "stop", usage(1, 1100, 60, 5))));
+		writeFileSync(join(sessionsDir, "failed.jsonl"), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+		indexSessions(db, join(dir, "sessions"));
+
+		const pauses = db.prepare("SELECT outcome, resume_cost FROM idle_pauses").all().map((p) => ({ ...p }));
+		const a3 = usage(1, 1100, 60, 5).cost;
+		assert.equal(pauses.length, 1);
+		assert.equal(pauses[0]!.outcome, "warm", "a3 read the cache after the pause; the failed a2 did not count");
+		assert.ok(Math.abs(Number(pauses[0]!.resume_cost) - (a3.cacheWrite + a3.input)) < 1e-12, "what a3 paid for prompt it did not read");
+		assert.deepEqual(db.prepare("SELECT entry_id FROM requests WHERE cache_event IS NOT NULL").all(), [], "a3 is compared with a1, not with the empty a2");
+		assert.equal((db.prepare("SELECT errors FROM sessions").get() as { errors: number }).errors, 1, "the failure still counts");
+		db.close();
+	});
+
 	test("re-indexes only changed files and forgets deleted ones", () => {
 		const db = store();
 		const one = writeSession("one");
@@ -389,7 +413,7 @@ describe("indexer", () => {
 		writeSession("one");
 		writeSession("two", "/work/other");
 		indexSessions(db, join(dir, "sessions"));
-		const scoped = report(db, { cwd: "/work/project" });
+		const scoped = report(db, { project: "/work/project" });
 		assert.match(scoped, /^1 sessions, 6 model requests/);
 		assert.match(scoped, /1 interrupted/);
 		assert.match(scoped, /1 after interrupt/);
@@ -399,14 +423,14 @@ describe("indexer", () => {
 		const all = report(db);
 		assert.match(all, /^2 sessions, 12 model requests/);
 		assert.match(all, /version\s+project/);
-		assert.equal(report(db, { cwd: "/nowhere" }), "No Pi sessions recorded for this scope yet.");
+		assert.equal(report(db, { project: "/nowhere" }), "No sessions recorded for this scope yet.");
 		db.close();
 	});
 });
 
 describe("idle pauses", () => {
 	const min = 60_000;
-	const turn = (ts: number, cacheRead = 0, promptTokens = 100_000, writeCost = 0) => ({ ts, promptTokens, cacheRead, writeCost });
+	const turn = (ts: number, cacheRead = 0, promptTokens = 100_000, uncachedCost = 0) => ({ ts, promptTokens, cacheRead, uncachedCost });
 
 	test("classifies how a session resumed after a pause, and ignores short gaps", () => {
 		const turns = [
@@ -419,7 +443,7 @@ describe("idle pauses", () => {
 		const warms = [{ ts: 20 * min, cost: 0.02 }, { ts: 45 * min, cost: 0.02 }, { ts: 300 * min, cost: 0.03 }];
 		const pauses = idlePauses(turns, warms, [199 * min], 310 * min);
 		assert.deepEqual(
-			pauses.map((p) => [p.outcome, Math.round(p.minutes), p.warms, Math.round(p.warmCost * 100) / 100, p.resumeWriteCost]),
+			pauses.map((p) => [p.outcome, Math.round(p.minutes), p.warms, Math.round(p.warmCost * 100) / 100, p.resumeCost]),
 			[
 				["warm", 50, 2, 0.04, 0],
 				["cold", 66, 0, 0, 0.8],
@@ -435,9 +459,15 @@ describe("idle pauses", () => {
 	});
 });
 
-test("diffState names changed, added and removed sections and tools", () => {
-	assert.equal(diffState({ sections: { a: "1", b: "1" }, tools: { x: "1" } }, { sections: { a: "2", c: "1" }, tools: { x: "1" } }), "a -b +c");
-	assert.equal(diffState({ sections: {}, tools: {} }, { sections: {}, tools: {} }), "same");
+test("changes name changed, added and removed sections and tools; the summary counts more than four", () => {
+	const list = changes({ sections: { a: "1", b: "1" }, tools: { x: "1" } }, { sections: { a: "2", c: "1" }, tools: { x: "1" } });
+	assert.deepEqual(list, [
+		{ kind: "section", name: "a", change: "changed" },
+		{ kind: "section", name: "b", change: "removed" },
+		{ kind: "section", name: "c", change: "added" },
+	]);
+	assert.equal(changeSummary(list), "a -b +c");
+	assert.equal(changeSummary(changes({ sections: {}, tools: {} }, { sections: {}, tools: {} })), "same");
 	const many = Object.fromEntries(["a", "b", "c", "d", "e"].map((k) => [k, "1"]));
-	assert.equal(diffState({ sections: {}, tools: {} }, { sections: {}, tools: many }), "5 tools");
+	assert.equal(changeSummary(changes({ sections: { s: "1" }, tools: {} }, { sections: { s: "2" }, tools: many })), "s; 5 tools");
 });

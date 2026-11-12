@@ -1,16 +1,34 @@
-// node extensions/metrics/cli.ts [--all] [--cwd <dir>] [--since <ISO date>] [--source pi|claude-code|all]
+// node extensions/metrics/cli.ts [--all] [--cwd <dir>] [--since <ISO date>] [--until <ISO date>] [--source pi|claude-code|all] [--model <id>]
 // Prints the metrics report; the scope defaults to Pi sessions in the current directory.
 // `--source claude-code` imports ~/.claude/projects for analysis (never into harness versions).
 
 import { parseArgs } from "node:util";
-import type { Scope } from "./report.ts";
+import { SOURCES, type Source } from "./queries/index.ts";
 import { stats } from "./stats.ts";
 
-const SOURCES = ["pi", "claude-code", "all"];
 const { values } = parseArgs({
-	options: { all: { type: "boolean" }, cwd: { type: "string" }, since: { type: "string" }, source: { type: "string" } },
+	options: {
+		all: { type: "boolean" },
+		cwd: { type: "string" },
+		since: { type: "string" },
+		until: { type: "string" },
+		source: { type: "string" },
+		model: { type: "string" },
+	},
 });
-const since = values.since === undefined ? undefined : Date.parse(values.since);
-if (since !== undefined && Number.isNaN(since)) throw new Error(`--since: not a date: ${values.since}`);
-if (values.source !== undefined && !SOURCES.includes(values.source)) throw new Error(`--source: one of ${SOURCES.join(", ")}`);
-console.log(stats({ cwd: values.all ? undefined : (values.cwd ?? process.cwd()), since, source: values.source as Scope["source"] }));
+const date = (name: string, value: string | undefined) => {
+	if (value === undefined) return undefined;
+	const ms = Date.parse(value);
+	if (Number.isNaN(ms)) throw new Error(`--${name}: not a date: ${value}`);
+	return ms;
+};
+if (values.source !== undefined && !SOURCES.includes(values.source as Source)) throw new Error(`--source: one of ${SOURCES.join(", ")}`);
+console.log(
+	stats({
+		project: values.all ? undefined : (values.cwd ?? process.cwd()),
+		start: date("since", values.since),
+		end: date("until", values.until),
+		source: values.source as Source | undefined,
+		model: values.model,
+	}),
+);

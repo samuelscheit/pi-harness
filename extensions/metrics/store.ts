@@ -7,13 +7,14 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 7;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- One row per indexed session file, to skip files that did not change.
 CREATE TABLE files (path TEXT PRIMARY KEY, session_id TEXT NOT NULL, size INTEGER NOT NULL, mtime_ms REAL NOT NULL);
 CREATE TABLE sessions (
+	-- name: the session's own title when it has one (Pi's session name, Claude Code's custom title).
 	id TEXT PRIMARY KEY, file TEXT NOT NULL, cwd TEXT NOT NULL, parent_session TEXT, name TEXT,
 	-- 'pi', or 'claude-code' for sessions imported for analysis only (see claude.ts).
 	source TEXT NOT NULL DEFAULT 'pi',
@@ -33,6 +34,8 @@ CREATE TABLE requests (
 	provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT, stop_reason TEXT, version TEXT,
 	input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL,
 	prompt_tokens INTEGER NOT NULL, cost REAL NOT NULL, message_count INTEGER NOT NULL,
+	-- The cost by billing rate: uncached input, output, cache reads and cache writes (sums to cost).
+	cost_input REAL NOT NULL, cost_output REAL NOT NULL, cost_read REAL NOT NULL, cost_write REAL NOT NULL,
 	trigger TEXT, trigger_tokens INTEGER NOT NULL, cache_event TEXT, cache_lost INTEGER NOT NULL, cache_waste REAL NOT NULL,
 	-- Dollars per token this request paid (turns only), and whether it wrote its cache for one hour.
 	input_rate REAL, read_rate REAL, write_rate REAL, long_retention INTEGER NOT NULL DEFAULT 0,
@@ -79,10 +82,12 @@ CREATE TABLE compactions (
 -- Pauses longer than the short cache lifetime between two requests (or after the last one), with the
 -- warm refreshes sent during them and how the session resumed: 'warm' (read the cache), 'compacted'
 -- (a cold-cache compaction ran first), 'cold' (wrote the context again), or 'open' (no request yet).
+-- resume_cost: what the request after the pause paid for prompt it did not read from cache
+-- (cache writes and uncached input).
 CREATE TABLE idle_pauses (
 	session_id TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER, minutes REAL NOT NULL,
 	warms INTEGER NOT NULL, warm_cost REAL NOT NULL, outcome TEXT NOT NULL,
-	prompt_tokens INTEGER NOT NULL, resume_write_cost REAL NOT NULL,
+	prompt_tokens INTEGER NOT NULL, resume_cost REAL NOT NULL,
 	PRIMARY KEY (session_id, start_ts)
 );
 -- Harness versions: the prompt sections and tool definitions a request ran with, as hashes.
@@ -90,9 +95,11 @@ CREATE TABLE versions (id TEXT PRIMARY KEY, sections TEXT NOT NULL, tools TEXT N
 -- The text behind each section and tool hash, to diff versions.
 CREATE TABLE blobs (hash TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL);
 CREATE INDEX requests_version ON requests (version);
+CREATE INDEX requests_ts ON requests (ts);
 CREATE INDEX tool_results_tool ON tool_results (tool);
 CREATE INDEX tool_files_file ON tool_files (file);
 CREATE INDEX sessions_prompt ON sessions (prompt_digest);
+CREATE INDEX delegations_task ON delegations (task_digest);
 `;
 
 const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "tool_files", "delegations", "user_messages", "compactions", "idle_pauses"];
@@ -101,6 +108,8 @@ export function openStore(path: string): DatabaseSync {
 	mkdirSync(dirname(path), { recursive: true });
 	const db = new DatabaseSync(path);
 	db.exec("PRAGMA journal_mode = WAL");
+	// The dashboard indexes in a worker while Pi may index for `/harness stats`: wait for the other writer.
+	db.exec("PRAGMA busy_timeout = 10000");
 	const current = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get()
 		? (db.prepare("SELECT value FROM meta WHERE key = 'schema'").get() as { value: string } | undefined)?.value
 		: undefined;

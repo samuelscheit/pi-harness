@@ -12,5 +12,5 @@
 		"skipLibCheck": true,
 		"types": ["node"]
 	},
-	"include": ["extensions", "scripts", "test"]
+	"include": ["extensions", "scripts", "test", "dashboard/server"]
 }

@@ -7,8 +7,9 @@
     "install-harness": "node scripts/install.mjs",
     "patch-t3": "node scripts/patch-t3.ts",
     "metrics": "node extensions/metrics/cli.ts",
-    "check": "node_modules/.bin/tsc --noEmit -p .",
-    "test": "node --test 'test/**/*.test.ts'"
+    "check": "node_modules/.bin/tsc --noEmit -p . && npm --prefix dashboard run -s typecheck",
+    "test": "node --test 'test/**/*.test.ts' && npm --prefix dashboard test",
+    "dashboard": "node dashboard/server/main.ts"
   },
   "pi": {
     "extensions": [

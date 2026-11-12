@@ -1,0 +1,1794 @@
+{
+	"overview": {
+		"window": {
+			"start": null,
+			"end": null
+		},
+		"kpis": {
+			"cost": 3.9400000000000004,
+			"read": 1.32,
+			"write": 1.9000000000000001,
+			"uncached": 0.21000000000000002,
+			"output": 0.51,
+			"sessions": 4,
+			"requests": 9,
+			"sideRequests": 2,
+			"sideCost": 0.06,
+			"promptTokens": 895000,
+			"cacheReadTokens": 785000,
+			"outputTokens": 5500,
+			"waste": 0.05,
+			"aborted": 0,
+			"errors": 0
+		},
+		"previous": null,
+		"series": {
+			"unit": "hour",
+			"points": [
+				{
+					"t": "2026-11-08T10:00:00",
+					"cost": 1,
+					"read": 0.5,
+					"write": 0.3,
+					"uncached": 0.1,
+					"output": 0.1,
+					"waste": 0,
+					"requests": 1
+				},
+				{
+					"t": "2026-11-08T11:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T12:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T13:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T14:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T15:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T16:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T17:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T18:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T19:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T20:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T21:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T22:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-08T23:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T00:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T01:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T02:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T03:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T04:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T05:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T06:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T07:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T08:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T09:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T10:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T11:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T12:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T13:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T14:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T15:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T16:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T17:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T18:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T19:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T20:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T21:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T22:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-09T23:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T00:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T01:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T02:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T03:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T04:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T05:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T06:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T07:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T08:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T09:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				},
+				{
+					"t": "2026-11-10T10:00:00",
+					"cost": 2.9400000000000004,
+					"read": 0.8200000000000001,
+					"write": 1.6,
+					"uncached": 0.11,
+					"output": 0.41000000000000003,
+					"waste": 0.05,
+					"requests": 10
+				},
+				{
+					"t": "2026-11-10T11:00:00",
+					"cost": 0,
+					"read": 0,
+					"write": 0,
+					"uncached": 0,
+					"output": 0,
+					"waste": 0,
+					"requests": 0
+				}
+			]
+		},
+		"findings": [
+			{
+				"id": "thinking",
+				"severity": "critical",
+				"title": "Earlier thinking re-read every turn",
+				"detail": "15k tokens of earlier thinking were carried, against $0.51 for everything the model wrote.",
+				"cost": 1.3400000000000003,
+				"share": 0.3401015228426396,
+				"view": "drivers",
+				"params": {
+					"group": "content"
+				}
+			},
+			{
+				"id": "tool-output",
+				"severity": "critical",
+				"title": "Tool output carried in context",
+				"detail": "Results stay in every later request until a compaction. Most from bash ($0.80).",
+				"cost": 0.8,
+				"share": 0.20304568527918782,
+				"view": "context",
+				"params": {}
+			},
+			{
+				"id": "large-context",
+				"severity": "critical",
+				"title": "Contexts past 200k tokens",
+				"detail": "18% of requests carried more than 200k tokens; each one re-reads all of it.",
+				"cost": 0.7200000000000001,
+				"share": 0.18274111675126903,
+				"view": "drivers",
+				"params": {
+					"group": "context"
+				}
+			},
+			{
+				"id": "never-referenced",
+				"severity": "warning",
+				"title": "Results never referenced again",
+				"detail": "33% of results that read files were never used again (no later call on the file, never named). An upper bound for context that could go.",
+				"cost": 0.3,
+				"share": 0.07614213197969542,
+				"view": "context",
+				"params": {}
+			},
+			{
+				"id": "cold-resumes",
+				"severity": "warning",
+				"title": "Pauses that let the cache expire",
+				"detail": "1 sessions resumed after 17 min on average and paid for 250k tokens of context again; the largest cost $0.20.",
+				"cost": 0.2,
+				"share": 0.050761421319796954,
+				"view": "waste",
+				"params": {}
+			},
+			{
+				"id": "side-calls",
+				"severity": "info",
+				"title": "Side calls",
+				"detail": "1 compaction ($0.04), 1 cache_warm ($0.02).",
+				"cost": 0.06,
+				"share": 0.015228426395939083,
+				"view": "waste",
+				"params": {}
+			},
+			{
+				"id": "cache-rebuilds",
+				"severity": "info",
+				"title": "Prompt cache rebuilt mid-session",
+				"detail": "1 requests wrote again what the previous request had cached. Most of it: “model switched” (1×, $0.05).",
+				"cost": 0.05,
+				"share": 0.012690355329949238,
+				"view": "waste",
+				"params": {}
+			}
+		],
+		"topSessions": [
+			{
+				"id": "A",
+				"title": "Parent work",
+				"cwd": "/p1",
+				"source": "pi",
+				"requests": 4,
+				"cost": 1.5000000000000002,
+				"waste": 0.05,
+				"sideCost": 0.06,
+				"peakTokens": 250000,
+				"first": 1794301200000,
+				"last": 1794301800000,
+				"compactions": 1,
+				"subagents": 2,
+				"spark": [
+					100000,
+					150000,
+					200000,
+					250000
+				]
+			},
+			{
+				"id": "B",
+				"title": "Other project",
+				"cwd": "/p2",
+				"source": "pi",
+				"requests": 1,
+				"cost": 1,
+				"waste": 0,
+				"sideCost": 0,
+				"peakTokens": 100000,
+				"first": 1794128400000,
+				"last": 1794128400000,
+				"compactions": 0,
+				"subagents": 0,
+				"spark": [
+					100000
+				]
+			},
+			{
+				"id": "C",
+				"title": "Scout",
+				"cwd": "/p1",
+				"source": "pi",
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"waste": 0,
+				"sideCost": 0,
+				"peakTokens": 30000,
+				"first": 1794301320000,
+				"last": 1794301440000,
+				"compactions": 0,
+				"subagents": 0,
+				"spark": [
+					20000,
+					30000
+				]
+			},
+			{
+				"id": "D",
+				"title": "Second",
+				"cwd": "/p1",
+				"source": "pi",
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"waste": 0,
+				"sideCost": 0,
+				"peakTokens": 25000,
+				"first": 1794303030000,
+				"last": 1794303060000,
+				"compactions": 0,
+				"subagents": 0,
+				"spark": [
+					20000,
+					25000
+				]
+			}
+		],
+		"coverage": 0.6192893401015229
+	},
+	"content": {
+		"group": "content",
+		"rows": [
+			{
+				"key": "thinking",
+				"requests": 5,
+				"sessions": 0,
+				"tokens": 15000,
+				"newTokens": 1500,
+				"waste": 0,
+				"cost": 1.3400000000000003,
+				"read": 0.6000000000000001,
+				"write": 0.6,
+				"uncached": 0.14,
+				"output": 0
+			},
+			{
+				"key": "tool result: bash",
+				"requests": 5,
+				"sessions": 0,
+				"tokens": 25000,
+				"newTokens": 2500,
+				"waste": 0,
+				"cost": 0.8,
+				"read": 0.3,
+				"write": 0.5,
+				"uncached": 0,
+				"output": 0,
+				"parts": {
+					"definition": 0,
+					"call": 0,
+					"result": 0.8
+				}
+			},
+			{
+				"key": "model output",
+				"requests": 5,
+				"sessions": 0,
+				"tokens": 2500,
+				"newTokens": 250,
+				"waste": 0,
+				"cost": 0.30000000000000004,
+				"read": 0,
+				"write": 0,
+				"uncached": 0,
+				"output": 0.30000000000000004
+			},
+			{
+				"key": "tool definitions",
+				"requests": 5,
+				"sessions": 0,
+				"tokens": 4000,
+				"newTokens": 400,
+				"waste": 0,
+				"cost": 0,
+				"read": 0,
+				"write": 0,
+				"uncached": 0,
+				"output": 0,
+				"parts": {
+					"definition": 0,
+					"call": 0,
+					"result": 0
+				}
+			}
+		],
+		"coverage": 0.6192893401015229
+	},
+	"models": {
+		"group": "model",
+		"rows": [
+			{
+				"key": "claude-opus",
+				"requests": 6,
+				"sessions": 2,
+				"tokens": 900000,
+				"newTokens": 0,
+				"waste": 0.05,
+				"cost": 2.46,
+				"read": 0.92,
+				"write": 1.1,
+				"uncached": 0.14,
+				"output": 0.30000000000000004
+			},
+			{
+				"key": "claude-sonnet",
+				"requests": 4,
+				"sessions": 2,
+				"tokens": 95000,
+				"newTokens": 0,
+				"waste": 0,
+				"cost": 1.4400000000000002,
+				"read": 0.4,
+				"write": 0.8,
+				"uncached": 0.04,
+				"output": 0.2
+			},
+			{
+				"key": "compaction (model not recorded)",
+				"requests": 1,
+				"sessions": 1,
+				"tokens": 100000,
+				"newTokens": 0,
+				"waste": 0,
+				"cost": 0.04,
+				"read": 0,
+				"write": 0,
+				"uncached": 0.03,
+				"output": 0.01
+			}
+		],
+		"coverage": 0.6192893401015229
+	},
+	"context": {
+		"kpis": {
+			"cost": 3.9400000000000004,
+			"read": 1.32,
+			"write": 1.9000000000000001,
+			"uncached": 0.21000000000000002,
+			"output": 0.51,
+			"sessions": 4,
+			"requests": 9,
+			"sideRequests": 2,
+			"sideCost": 0.06,
+			"promptTokens": 895000,
+			"cacheReadTokens": 785000,
+			"outputTokens": 5500,
+			"waste": 0.05,
+			"aborted": 0,
+			"errors": 0
+		},
+		"tools": [
+			{
+				"tool": "bash",
+				"calls": 1,
+				"errors": 0,
+				"p50Ms": 100,
+				"p95Ms": 100,
+				"tokensPerResult": 5000,
+				"requestsKept": 3,
+				"carryCost": 0.3,
+				"withFiles": 1,
+				"unreferenced": 1,
+				"unreferencedCost": 0.3
+			},
+			{
+				"tool": "read",
+				"calls": 2,
+				"errors": 1,
+				"p50Ms": 5,
+				"p95Ms": 5,
+				"tokensPerResult": 1050,
+				"requestsKept": 1,
+				"carryCost": 0.03,
+				"withFiles": 2,
+				"unreferenced": 0,
+				"unreferencedCost": 0
+			}
+		],
+		"toolCosts": {
+			"group": "tool",
+			"rows": [
+				{
+					"key": "bash",
+					"requests": 10,
+					"sessions": 0,
+					"tokens": 29000,
+					"newTokens": 2900,
+					"waste": 0,
+					"cost": 0.8,
+					"read": 0.3,
+					"write": 0.5,
+					"uncached": 0,
+					"output": 0,
+					"parts": {
+						"definition": 0,
+						"call": 0,
+						"result": 0.8
+					}
+				}
+			],
+			"coverage": 0.6192893401015229
+		},
+		"results": [
+			{
+				"session": "A",
+				"title": "Parent work",
+				"call": "c1",
+				"ts": 1794301230000,
+				"tool": "bash",
+				"summary": "cat a.ts",
+				"files": [
+					"/p1/a.ts"
+				],
+				"isError": false,
+				"tokens": 5000,
+				"requestsKept": 3,
+				"carryCost": 0.3,
+				"referencedLater": false
+			},
+			{
+				"session": "C",
+				"title": "Scout",
+				"call": "cc1",
+				"ts": 1794301380000,
+				"tool": "read",
+				"summary": "a.ts",
+				"files": [
+					"/p1/a.ts"
+				],
+				"isError": false,
+				"tokens": 2000,
+				"requestsKept": 1,
+				"carryCost": 0.02,
+				"referencedLater": true
+			},
+			{
+				"session": "A",
+				"title": "Parent work",
+				"call": "c2",
+				"ts": 1794301350000,
+				"tool": "read",
+				"summary": "b.ts",
+				"files": [
+					"/p1/b.ts"
+				],
+				"isError": true,
+				"tokens": 100,
+				"requestsKept": 1,
+				"carryCost": 0.01,
+				"referencedLater": true
+			}
+		],
+		"sizes": {
+			"requests": 9,
+			"median": 100000,
+			"p90": 250000,
+			"max": 250000,
+			"bands": [
+				{
+					"band": "under 50k",
+					"requests": 4,
+					"cost": 1.4400000000000002
+				},
+				{
+					"band": "50k–100k",
+					"requests": 0,
+					"cost": 0
+				},
+				{
+					"band": "100k–200k",
+					"requests": 3,
+					"cost": 1.7200000000000002
+				},
+				{
+					"band": "200k–400k",
+					"requests": 2,
+					"cost": 0.7200000000000001
+				},
+				{
+					"band": "400k and more",
+					"requests": 0,
+					"cost": 0
+				}
+			]
+		}
+	},
+	"sessions": {
+		"total": 4,
+		"page": 1,
+		"pageSize": 25,
+		"rows": [
+			{
+				"id": "A",
+				"title": "Parent work",
+				"cwd": "/p1",
+				"source": "pi",
+				"requests": 4,
+				"cost": 1.5000000000000002,
+				"waste": 0.05,
+				"sideCost": 0.06,
+				"peakTokens": 250000,
+				"first": 1794301200000,
+				"last": 1794301800000,
+				"compactions": 1,
+				"subagents": 2,
+				"spark": [
+					100000,
+					150000,
+					200000,
+					250000
+				]
+			},
+			{
+				"id": "B",
+				"title": "Other project",
+				"cwd": "/p2",
+				"source": "pi",
+				"requests": 1,
+				"cost": 1,
+				"waste": 0,
+				"sideCost": 0,
+				"peakTokens": 100000,
+				"first": 1794128400000,
+				"last": 1794128400000,
+				"compactions": 0,
+				"subagents": 0,
+				"spark": [
+					100000
+				]
+			},
+			{
+				"id": "C",
+				"title": "Scout",
+				"cwd": "/p1",
+				"source": "pi",
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"waste": 0,
+				"sideCost": 0,
+				"peakTokens": 30000,
+				"first": 1794301320000,
+				"last": 1794301440000,
+				"compactions": 0,
+				"subagents": 0,
+				"spark": [
+					20000,
+					30000
+				]
+			},
+			{
+				"id": "D",
+				"title": "Second",
+				"cwd": "/p1",
+				"source": "pi",
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"waste": 0,
+				"sideCost": 0,
+				"peakTokens": 25000,
+				"first": 1794303030000,
+				"last": 1794303060000,
+				"compactions": 0,
+				"subagents": 0,
+				"spark": [
+					20000,
+					25000
+				]
+			}
+		]
+	},
+	"sessionA": {
+		"session": {
+			"id": "A",
+			"title": "Parent work",
+			"cwd": "/p1",
+			"source": "pi",
+			"startedAt": 1794301194000,
+			"endedAt": 1794303060000,
+			"reportedCost": null,
+			"parent": null,
+			"models": [
+				"claude-opus"
+			]
+		},
+		"totals": {
+			"cost": 1.5000000000000002,
+			"read": 0.42000000000000004,
+			"write": 0.8,
+			"uncached": 0.07,
+			"output": 0.21000000000000002,
+			"sessions": 1,
+			"requests": 4,
+			"sideRequests": 2,
+			"sideCost": 0.06,
+			"promptTokens": 700000,
+			"cacheReadTokens": 660000,
+			"outputTokens": 3000,
+			"waste": 0.05,
+			"aborted": 0,
+			"errors": 0
+		},
+		"peakTokens": 250000,
+		"timeline": [
+			{
+				"entry": "a1",
+				"ts": 1794301200000,
+				"kind": "turn",
+				"model": "claude-opus",
+				"promptTokens": 100000,
+				"cacheRead": 90000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.36000000000000004,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			},
+			{
+				"entry": "a2",
+				"ts": 1794301260000,
+				"kind": "turn",
+				"model": "claude-opus",
+				"promptTokens": 150000,
+				"cacheRead": 140000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.36000000000000004,
+				"cacheEvent": "model switched",
+				"waste": 0.05,
+				"trigger": null,
+				"stopReason": "toolUse"
+			},
+			{
+				"entry": "a3",
+				"ts": 1794301320000,
+				"kind": "turn",
+				"model": "claude-opus",
+				"promptTokens": 200000,
+				"cacheRead": 190000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.36000000000000004,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			},
+			{
+				"entry": "a4",
+				"ts": 1794301380000,
+				"kind": "turn",
+				"model": "claude-opus",
+				"promptTokens": 250000,
+				"cacheRead": 240000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.36000000000000004,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			},
+			{
+				"entry": "cmp",
+				"ts": 1794301500000,
+				"kind": "compaction",
+				"model": "",
+				"promptTokens": 100000,
+				"cacheRead": 90000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.04,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			},
+			{
+				"entry": "warm",
+				"ts": 1794301800000,
+				"kind": "cache_warm",
+				"model": "claude-opus",
+				"promptTokens": 100000,
+				"cacheRead": 90000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.02,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			}
+		],
+		"compactions": [
+			{
+				"ts": 1794301500000,
+				"reason": "threshold",
+				"tokensBefore": 250000,
+				"cost": 0.04
+			}
+		],
+		"pauses": [
+			{
+				"start": 1794301380000,
+				"end": 1794302400000,
+				"minutes": 17,
+				"outcome": "cold",
+				"warms": 1,
+				"warmCost": 0.02,
+				"resumeCost": 0.2
+			}
+		],
+		"delegations": [
+			{
+				"ts": 1794301260000,
+				"kind": "delegate",
+				"title": "Scout",
+				"child": "C"
+			},
+			{
+				"ts": 1794303000000,
+				"kind": "delegate",
+				"title": "Second",
+				"child": "D"
+			}
+		],
+		"userMessages": [
+			{
+				"ts": 1794301197000,
+				"kind": "first",
+				"text": "Do the parent work"
+			},
+			{
+				"ts": 1794301290000,
+				"kind": "steer",
+				"text": "not that file"
+			},
+			{
+				"ts": 1794301350000,
+				"kind": "after interrupt",
+				"text": "stop"
+			}
+		],
+		"children": [
+			{
+				"id": "C",
+				"title": "Scout",
+				"source": "pi",
+				"startedAt": 1794301266000,
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"children": []
+			},
+			{
+				"id": "D",
+				"title": "Second",
+				"source": "pi",
+				"startedAt": 1794303012000,
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"children": []
+			}
+		],
+		"composition": [
+			{
+				"key": "tool result: bash",
+				"requests": 4,
+				"sessions": 0,
+				"tokens": 20000,
+				"newTokens": 2000,
+				"waste": 0,
+				"cost": 0.64,
+				"read": 0.24,
+				"write": 0.4,
+				"uncached": 0,
+				"output": 0,
+				"parts": {
+					"definition": 0,
+					"call": 0,
+					"result": 0.64
+				}
+			},
+			{
+				"key": "thinking",
+				"requests": 4,
+				"sessions": 0,
+				"tokens": 12000,
+				"newTokens": 1200,
+				"waste": 0,
+				"cost": 0.6000000000000001,
+				"read": 0.16000000000000003,
+				"write": 0.4,
+				"uncached": 0.04,
+				"output": 0
+			},
+			{
+				"key": "model output",
+				"requests": 4,
+				"sessions": 0,
+				"tokens": 2000,
+				"newTokens": 200,
+				"waste": 0,
+				"cost": 0.2,
+				"read": 0,
+				"write": 0,
+				"uncached": 0,
+				"output": 0.2
+			},
+			{
+				"key": "tool definitions",
+				"requests": 4,
+				"sessions": 0,
+				"tokens": 3200,
+				"newTokens": 320,
+				"waste": 0,
+				"cost": 0,
+				"read": 0,
+				"write": 0,
+				"uncached": 0,
+				"output": 0,
+				"parts": {
+					"definition": 0,
+					"call": 0,
+					"result": 0
+				}
+			}
+		],
+		"coverage": 0.9599999999999999,
+		"rebuilds": [
+			{
+				"cause": "model switched",
+				"requests": 1,
+				"sessions": 1,
+				"lostTokens": 10000,
+				"waste": 0.05
+			}
+		],
+		"results": [
+			{
+				"session": "A",
+				"title": "Parent work",
+				"call": "c1",
+				"ts": 1794301230000,
+				"tool": "bash",
+				"summary": "cat a.ts",
+				"files": [
+					"/p1/a.ts"
+				],
+				"isError": false,
+				"tokens": 5000,
+				"requestsKept": 3,
+				"carryCost": 0.3,
+				"referencedLater": false
+			},
+			{
+				"session": "A",
+				"title": "Parent work",
+				"call": "c2",
+				"ts": 1794301350000,
+				"tool": "read",
+				"summary": "b.ts",
+				"files": [
+					"/p1/b.ts"
+				],
+				"isError": true,
+				"tokens": 100,
+				"requestsKept": 1,
+				"carryCost": 0.01,
+				"referencedLater": true
+			}
+		],
+		"bestCompaction": null
+	},
+	"sessionC": {
+		"session": {
+			"id": "C",
+			"title": "Scout",
+			"cwd": "/p1",
+			"source": "pi",
+			"startedAt": 1794301266000,
+			"endedAt": 1794301440000,
+			"reportedCost": null,
+			"parent": {
+				"id": "A",
+				"title": "Parent work"
+			},
+			"models": [
+				"claude-sonnet"
+			]
+		},
+		"totals": {
+			"cost": 0.7200000000000001,
+			"read": 0.2,
+			"write": 0.4,
+			"uncached": 0.02,
+			"output": 0.1,
+			"sessions": 1,
+			"requests": 2,
+			"sideRequests": 0,
+			"sideCost": 0,
+			"promptTokens": 50000,
+			"cacheReadTokens": 20000,
+			"outputTokens": 1000,
+			"waste": 0,
+			"aborted": 0,
+			"errors": 0
+		},
+		"peakTokens": 30000,
+		"timeline": [
+			{
+				"entry": "c-1",
+				"ts": 1794301320000,
+				"kind": "turn",
+				"model": "claude-sonnet",
+				"promptTokens": 20000,
+				"cacheRead": 0,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.36000000000000004,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			},
+			{
+				"entry": "c-2",
+				"ts": 1794301440000,
+				"kind": "turn",
+				"model": "claude-sonnet",
+				"promptTokens": 30000,
+				"cacheRead": 20000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.36000000000000004,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			}
+		],
+		"compactions": [],
+		"pauses": [],
+		"delegations": [],
+		"userMessages": [],
+		"children": [],
+		"composition": [],
+		"coverage": 0,
+		"rebuilds": [],
+		"results": [
+			{
+				"session": "C",
+				"title": "Scout",
+				"call": "cc1",
+				"ts": 1794301380000,
+				"tool": "read",
+				"summary": "a.ts",
+				"files": [
+					"/p1/a.ts"
+				],
+				"isError": false,
+				"tokens": 2000,
+				"requestsKept": 1,
+				"carryCost": 0.02,
+				"referencedLater": true
+			}
+		],
+		"bestCompaction": null
+	},
+	"sessionX1": {
+		"session": {
+			"id": "X/agent1",
+			"title": "Session agent1",
+			"cwd": "/p1",
+			"source": "claude-code",
+			"startedAt": 1794304860000,
+			"endedAt": 1794304890000,
+			"reportedCost": null,
+			"parent": {
+				"id": "X",
+				"title": "Claude Code task."
+			},
+			"models": [
+				"claude-opus"
+			]
+		},
+		"totals": {
+			"cost": 0.5,
+			"read": 0.2,
+			"write": 0.2,
+			"uncached": 0,
+			"output": 0.1,
+			"sessions": 1,
+			"requests": 1,
+			"sideRequests": 0,
+			"sideCost": 0,
+			"promptTokens": 100000,
+			"cacheReadTokens": 90000,
+			"outputTokens": 500,
+			"waste": 0,
+			"aborted": 0,
+			"errors": 0
+		},
+		"peakTokens": 100000,
+		"timeline": [
+			{
+				"entry": "xa",
+				"ts": 1794304872000,
+				"kind": "turn",
+				"model": "claude-opus",
+				"promptTokens": 100000,
+				"cacheRead": 90000,
+				"cacheWrite": 10000,
+				"output": 500,
+				"cost": 0.5,
+				"cacheEvent": null,
+				"waste": 0,
+				"trigger": null,
+				"stopReason": "toolUse"
+			}
+		],
+		"compactions": [],
+		"pauses": [],
+		"delegations": [],
+		"userMessages": [],
+		"children": [],
+		"composition": [],
+		"coverage": 0,
+		"rebuilds": [],
+		"results": [],
+		"bestCompaction": null
+	},
+	"waste": {
+		"kpis": {
+			"cost": 3.9400000000000004,
+			"read": 1.32,
+			"write": 1.9000000000000001,
+			"uncached": 0.21000000000000002,
+			"output": 0.51,
+			"sessions": 4,
+			"requests": 9,
+			"sideRequests": 2,
+			"sideCost": 0.06,
+			"promptTokens": 895000,
+			"cacheReadTokens": 785000,
+			"outputTokens": 5500,
+			"waste": 0.05,
+			"aborted": 0,
+			"errors": 0
+		},
+		"rebuilds": [
+			{
+				"cause": "model switched",
+				"requests": 1,
+				"sessions": 1,
+				"lostTokens": 10000,
+				"waste": 0.05
+			}
+		],
+		"examples": [
+			{
+				"session": "A",
+				"title": "Parent work",
+				"entry": "a2",
+				"ts": 1794301260000,
+				"cause": "model switched",
+				"promptTokens": 150000,
+				"lostTokens": 10000,
+				"waste": 0.05
+			}
+		],
+		"pauses": [
+			{
+				"outcome": "cold",
+				"pauses": 1,
+				"avgMinutes": 17,
+				"warms": 1,
+				"warmCost": 0.02,
+				"avgPromptTokens": 250000,
+				"resumeCost": 0.2
+			}
+		],
+		"coldResumes": [
+			{
+				"session": "A",
+				"title": "Parent work",
+				"start": 1794301380000,
+				"end": 1794302400000,
+				"minutes": 17,
+				"promptTokens": 250000,
+				"resumeCost": 0.2
+			}
+		],
+		"compactions": [
+			{
+				"reason": "threshold",
+				"count": 1,
+				"avgTokensBefore": 250000,
+				"cost": 0.04
+			}
+		],
+		"opportunities": {
+			"total": 0,
+			"sessions": []
+		},
+		"sideCalls": [
+			{
+				"kind": "compaction",
+				"model": "not recorded",
+				"requests": 1,
+				"sessions": 1,
+				"avgPrompt": 100000,
+				"cost": 0.04
+			},
+			{
+				"kind": "cache_warm",
+				"model": "claude-opus",
+				"requests": 1,
+				"sessions": 1,
+				"avgPrompt": 100000,
+				"cost": 0.02
+			}
+		]
+	},
+	"subagents": {
+		"started": 2,
+		"cost": 1.4400000000000002,
+		"resumes": 0,
+		"rediscoveryCost": 0.02,
+		"compared": 1,
+		"resumeWins": 0,
+		"bestCost": 1.4400000000000002,
+		"rows": [
+			{
+				"child": "C",
+				"parent": "A",
+				"title": "Scout",
+				"ts": 1794301260000,
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"wallMs": 174000,
+				"startupCost": 0.06255,
+				"rediscovered": {
+					"calls": 1,
+					"tokens": 2000,
+					"cost": 0.02
+				},
+				"alternative": null,
+				"difference": 0
+			},
+			{
+				"child": "D",
+				"parent": "A",
+				"title": "Second",
+				"ts": 1794303000000,
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"wallMs": 48000,
+				"startupCost": 0.06255,
+				"rediscovered": {
+					"calls": 0,
+					"tokens": 0,
+					"cost": 0
+				},
+				"alternative": {
+					"child": "C",
+					"title": "Scout",
+					"contextTokens": 30000,
+					"idleMs": 1560000,
+					"warm": false,
+					"cost": 0.8549500000000001
+				},
+				"difference": -0.13495000000000001
+			}
+		]
+	},
+	"versions": {
+		"rows": [
+			{
+				"id": "v1",
+				"project": "/p1",
+				"firstSeen": 1794301200000,
+				"lastSeen": 1794303060000,
+				"sessions": 3,
+				"requests": 6,
+				"cost": 2.16,
+				"costPerRequest": 0.36000000000000004,
+				"cacheShare": 0.7681159420289855,
+				"toolCalls": 2,
+				"toolErrors": 0,
+				"interrupts": 0,
+				"userMessages": {
+					"first": 1
+				},
+				"corrections": 0,
+				"previous": null,
+				"changes": []
+			},
+			{
+				"id": "v2",
+				"project": "/p1",
+				"firstSeen": 1794301320000,
+				"lastSeen": 1794301380000,
+				"sessions": 1,
+				"requests": 2,
+				"cost": 0.7200000000000001,
+				"costPerRequest": 0.36000000000000004,
+				"cacheShare": 0.9555555555555556,
+				"toolCalls": 1,
+				"toolErrors": 1,
+				"interrupts": 0,
+				"userMessages": {
+					"after interrupt": 1,
+					"steer": 1
+				},
+				"corrections": 2,
+				"previous": "v1",
+				"changes": [
+					{
+						"kind": "section",
+						"name": "base",
+						"change": "changed"
+					},
+					{
+						"kind": "section",
+						"name": "skills",
+						"change": "added"
+					}
+				]
+			},
+			{
+				"id": "v9",
+				"project": "/p2",
+				"firstSeen": 1794128400000,
+				"lastSeen": 1794128400000,
+				"sessions": 1,
+				"requests": 1,
+				"cost": 1,
+				"costPerRequest": 1,
+				"cacheShare": 0.9,
+				"toolCalls": 0,
+				"toolErrors": 0,
+				"interrupts": 0,
+				"userMessages": {},
+				"corrections": 0,
+				"previous": null,
+				"changes": []
+			}
+		]
+	},
+	"diff": {
+		"from": "v1",
+		"to": "v2",
+		"items": [
+			{
+				"kind": "section",
+				"name": "base",
+				"change": "changed",
+				"lines": [
+					{
+						"op": "same",
+						"text": "You are Pi."
+					},
+					{
+						"op": "del",
+						"text": "Be brief."
+					},
+					{
+						"op": "add",
+						"text": "Be thorough."
+					},
+					{
+						"op": "same",
+						"text": "Use tools."
+					}
+				]
+			},
+			{
+				"kind": "section",
+				"name": "skills",
+				"change": "added",
+				"lines": [
+					{
+						"op": "add",
+						"text": "skill a"
+					},
+					{
+						"op": "add",
+						"text": "skill b"
+					}
+				]
+			}
+		]
+	},
+	"options": {
+		"projects": [
+			{
+				"value": "/p1",
+				"cost": 4.94
+			},
+			{
+				"value": "/p2",
+				"cost": 1
+			}
+		],
+		"models": [
+			{
+				"value": "claude-opus",
+				"cost": 4.46
+			},
+			{
+				"value": "claude-sonnet",
+				"cost": 1.4400000000000002
+			}
+		],
+		"sources": [
+			{
+				"value": "claude-code",
+				"sessions": 2
+			},
+			{
+				"value": "pi",
+				"sessions": 4
+			}
+		]
+	}
+}
