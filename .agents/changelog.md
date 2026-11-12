@@ -150,3 +150,13 @@ Every change to the harness with its evidence, the metric that judges it, and ho
 **Effect:** uncommitted edits to prompts, experiments and extensions no longer reach sessions; they take effect on commit (seconds later, at the next idle moment).
 
 **Revert:** point `packages` in `~/.pi/agent/settings.json` back at the repository (the release extension then does nothing), or revert the commit.
+
+## 2026-11-13 — define_tool merged into workflows
+
+**Change:** `define_tool` and its experiment are removed. A command the agent keeps running with different arguments is now a saved workflow (`<repo>/.pi/workflows/<name>.ts`): its parameters are the tool's parameters, and the new script global `sh` builds the command with every interpolated value as one quoted shell word (template taken raw; values inside quotes, NUL and other types refused), the guarantee `define_tool` had. Output filtering and line limits are plain code in the workflow. The `workflow` tool carries `define_tool`'s guideline, and `api.d.ts` shows such a workflow as its example. Session-only definitions are gone: saved workflows are files of the repository, callable from the next turn and in later sessions.
+
+**Why:** a shell-template tool is a one-line saved workflow; two mechanisms for agent-defined tools meant two experiments, two registries and two persistence schemes. No `.pi/tools/*.json` definitions existed in the user's repositories to migrate.
+
+**Judged by:** the `workflow` experiment (saved workflows created and called, tool error rate). The `define-tool` experiment ends without a logged comparison (it started the same day); the sessions' recorded arms stay in their files and the index.
+
+**Revert:** revert the commit.
