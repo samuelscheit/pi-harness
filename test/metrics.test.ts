@@ -246,7 +246,7 @@ describe("indexer", () => {
 			message("a1", "u1", assistant([{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } }], "toolUse", usage(1, 0, 1100, 20))),
 			message("t1", "a1", toolResult("c1", "bash", "x".repeat(4000), { durationMs: 120 })),
 			message("a2", "t1", assistant([{ type: "toolCall", id: "c2", name: "read", arguments: { path: "a.ts" } }], "toolUse", usage(1, 1100, 1000, 20))),
-			message("t2", "a2", toolResult("c2", "read", "y".repeat(400), { isError: true, durationMs: 3 })),
+			message("t2", "a2", toolResult("c2", "read", "y".repeat(400), { isError: true, durationMs: 3, usage: usage(500, 0, 0, 100) })),
 			message("s1", "t2", user("use rg instead")),
 			message("a3", "s1", assistant([{ type: "text", text: "done" }], "stop", usage(1, 2100, 200, 5))),
 			message("u2", "a3", user("now the tests")),
@@ -294,7 +294,12 @@ describe("indexer", () => {
 		assert.ok(Math.abs((session.cost as number) - allCost.c) < 1e-12, "session cost includes side calls");
 
 		const kinds = db.prepare("SELECT kind, COUNT(*) n FROM requests GROUP BY kind ORDER BY kind").all();
-		assert.deepEqual(kinds.map((k) => ({ ...k })), [{ kind: "cache_warm", n: 1 }, { kind: "compaction", n: 1 }, { kind: "turn", n: 6 }]);
+		assert.deepEqual(kinds.map((k) => ({ ...k })), [
+			{ kind: "cache_warm", n: 1 },
+			{ kind: "compaction", n: 1 },
+			{ kind: "tool: read", n: 1 },
+			{ kind: "turn", n: 6 },
+		]);
 
 		for (const row of db.prepare(
 			`SELECT r.entry_id, r.cost, SUM(c.read_cost + c.write_cost + c.uncached_cost) parts
@@ -341,7 +346,7 @@ describe("indexer", () => {
 		utimesSync(one, new Date(), new Date(Date.now() + 5000));
 		assert.equal(indexSessions(db, join(dir, "sessions")).indexed, 1);
 		assert.equal((db.prepare("SELECT user_messages FROM sessions WHERE id = 'session-one'").get() as { user_messages: number }).user_messages, 7);
-		assert.equal((db.prepare("SELECT COUNT(*) n FROM requests WHERE session_id = 'session-one'").get() as { n: number }).n, 8, "no duplicates");
+		assert.equal((db.prepare("SELECT COUNT(*) n FROM requests WHERE session_id = 'session-one'").get() as { n: number }).n, 9, "no duplicates");
 
 		unlinkSync(one);
 		indexSessions(db, join(dir, "sessions"));

@@ -148,6 +148,10 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 			} else if (entry.type === "usage") {
 				sideCall(entry.id, ts, entry.kind, entry.provider, entry.model, entry.usage);
 				cost += entry.usage.cost.total;
+			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+				// Model work a tool did itself, such as web_search's own request.
+				sideCall(entry.id, ts, `tool: ${entry.message.toolName}`, "", "", entry.message.usage as Usage);
+				cost += entry.message.usage.cost.total;
 			} else if (entry.type === "message" && entry.message.role === "user") {
 				userMessages += 1;
 				insertUser.run(sessionId, entry.id, ts, userMessageKind(entry, byId), messageText(entry.message.content).slice(0, USER_TEXT_LIMIT));
