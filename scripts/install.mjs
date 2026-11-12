@@ -10,7 +10,9 @@
 // vendor/pi/node_modules, so its scripts, tests and type checks resolve the vendored packages.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
-// - settings.json: this repo as the only package, Opus 5.5 as the startup model
+// - settings.json: this repo as the only package, Opus 5.5 as the startup model, and prompt caching
+//                  tuned for pauses: a one-hour cache, refreshed once while idle (cacheWarmingIdleMinutes),
+//                  and a cold cache compacted with Haiku before a large context is written again.
 // - models.json:   Pi's built-in `anthropic` provider routed through the gateway (Claude models,
 //                  Messages API), and a `gateway` provider for every other gateway model
 //                  (Responses API), with context windows from the gateway's /v1/models.
@@ -27,6 +29,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
+// Below this, a compaction (summary + ~20k kept tokens) saves little over writing the context again.
+const COLD_COMPACTION_MIN_TOKENS = 50_000;
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const vendoredPi = join(root, "vendor/pi");
@@ -53,7 +57,8 @@ const gatewayModels = data
 
 const npm = (cwd, ...args) => execFileSync("npm", args, { cwd, stdio: "inherit" });
 npm(vendoredPi, "ci");
-npm(vendoredPi, "run", "build");
+// Offline: the committed model catalog, so installing needs no model-catalog downloads.
+npm(vendoredPi, "run", "build:offline");
 const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
 if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_PACKAGE)).isSymbolicLink()) {
 	npm(root, "uninstall", "-g", PI_PACKAGE);
@@ -89,6 +94,12 @@ writeJson(settingsFile, {
 	packages: [root],
 	defaultProvider: "anthropic",
 	defaultModel: "claude-opus-5-5",
+	cacheRetention: "long",
+	cacheWarmingIdleMinutes: 60,
+	compaction: {
+		...settings.compaction,
+		coldCache: { minTokens: COLD_COMPACTION_MIN_TOKENS, model: "anthropic/claude-haiku-5-5" },
+	},
 });
 
 console.log(`${agentDir}: harness ${root}, gateway ${origin} (${gatewayModels.length} non-Claude models), default anthropic/claude-opus-5-5`);

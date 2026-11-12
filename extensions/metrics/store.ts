@@ -7,7 +7,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -49,6 +49,20 @@ CREATE TABLE user_messages (
 	session_id TEXT NOT NULL, entry_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
 	PRIMARY KEY (session_id, entry_id)
 );
+-- Compactions with what triggered them (manual, threshold, overflow, cold) and what they cost.
+CREATE TABLE compactions (
+	session_id TEXT NOT NULL, entry_id TEXT NOT NULL, ts INTEGER NOT NULL, reason TEXT, tokens_before INTEGER NOT NULL,
+	cost REAL NOT NULL, PRIMARY KEY (session_id, entry_id)
+);
+-- Pauses longer than the short cache lifetime between two requests (or after the last one), with the
+-- warm refreshes sent during them and how the session resumed: 'warm' (read the cache), 'compacted'
+-- (a cold-cache compaction ran first), 'cold' (wrote the context again), or 'open' (no request yet).
+CREATE TABLE idle_pauses (
+	session_id TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER, minutes REAL NOT NULL,
+	warms INTEGER NOT NULL, warm_cost REAL NOT NULL, outcome TEXT NOT NULL,
+	prompt_tokens INTEGER NOT NULL, resume_write_cost REAL NOT NULL,
+	PRIMARY KEY (session_id, start_ts)
+);
 -- Harness versions: the prompt sections and tool definitions a request ran with, as hashes.
 CREATE TABLE versions (id TEXT PRIMARY KEY, sections TEXT NOT NULL, tools TEXT NOT NULL, first_seen INTEGER NOT NULL);
 -- The text behind each section and tool hash, to diff versions.
@@ -57,7 +71,7 @@ CREATE INDEX requests_version ON requests (version);
 CREATE INDEX tool_results_tool ON tool_results (tool);
 `;
 
-const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "user_messages"];
+const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "user_messages", "compactions", "idle_pauses"];
 
 export function openStore(path: string): DatabaseSync {
 	mkdirSync(dirname(path), { recursive: true });

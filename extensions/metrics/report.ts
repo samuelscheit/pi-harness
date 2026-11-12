@@ -113,6 +113,47 @@ export function report(db: DatabaseSync, scope: Scope = {}): string {
 		);
 	}
 
+	const pauses = all(
+		`SELECT outcome, COUNT(*) n, AVG(minutes) minutes, SUM(warms) warms, SUM(warm_cost) warm_cost,
+		AVG(prompt_tokens) tokens, SUM(resume_write_cost) write_cost FROM idle_pauses
+		WHERE session_id IN (${scoped}) GROUP BY outcome ORDER BY n DESC`,
+	);
+	if (pauses.length) {
+		const label: Record<string, string> = {
+			warm: "resumed, cache warm",
+			compacted: "resumed, compacted (cold)",
+			cold: "resumed, cache rebuilt",
+			open: "not resumed yet",
+		};
+		out.push(
+			`Pauses over 5 min (warming keeps the cache; a cold cache is compacted or rebuilt)\n${table(
+				["outcome", "pauses", "avg length", "warm refreshes", "warming cost", "avg prompt", "cache write on resume"],
+				pauses.map((p) => [
+					label[String(p.outcome)] ?? String(p.outcome),
+					String(p.n),
+					`${Math.round(Number(p.minutes))}m`,
+					String(p.warms),
+					money(Number(p.warm_cost)),
+					count(Number(p.tokens)),
+					money(Number(p.write_cost)),
+				]),
+			)}`,
+		);
+	}
+
+	const compactions = all(
+		`SELECT COALESCE(reason, 'extension') reason, COUNT(*) n, AVG(tokens_before) tokens, SUM(cost) cost FROM compactions
+		WHERE session_id IN (${scoped}) GROUP BY 1 ORDER BY n DESC`,
+	);
+	if (compactions.length) {
+		out.push(
+			`Compactions\n${table(
+				["reason", "times", "avg tokens before", "cost"],
+				compactions.map((c) => [String(c.reason), String(c.n), count(Number(c.tokens)), money(Number(c.cost))]),
+			)}`,
+		);
+	}
+
 	const tools = new Map<string, { durations: number[]; calls: number; errors: number; tokens: number; turns: number; cost: number }>();
 	for (const row of all(`SELECT tool, is_error, duration_ms, tokens, requests_in_context, lifetime_cost FROM tool_results WHERE session_id IN (${scoped})`)) {
 		const entry = tools.get(String(row.tool)) ?? { durations: [], calls: 0, errors: 0, tokens: 0, turns: 0, cost: 0 };
