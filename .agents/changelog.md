@@ -413,3 +413,17 @@ no comparable sessions yet
 **Judged by:** the same metrics as before promotion, compared by harness version (`requests.version`). Watch tool error rate and cost per turn especially.
 
 **Revert:** delete a rule file (its section and tools go), or move it back to `prompt/experiments/` with `status: running` to randomize it again.
+
+## 2026-11-12 — harness: background-work guard
+
+**Change:** new extension `extensions/background`. It prefixes every bash command with a line that writes the shell's pid to a temp file named after the call. That pid is the process group, because Pi spawns each command detached, and `&` jobs keep the group. The transcript keeps the original command.
+
+When a run is about to settle (`agent_before_settle`), the extension runs one `ps` and lists live processes in the recorded groups. If there are any, it appends a visible `background-work` message naming them, grouped by the bash command that started them, and requests one more turn. In that turn the agent should wait for them in the foreground and finish, stop them, or say why they keep running. Each set of processes is reported once, and files of finished groups are removed.
+
+**Evidence:** `docs/research/context-engineering/07-evidence-from-our-sessions.md` §10. This is the user's most repeated correction: "never end a turn waiting on background runs", 30 messages in 22 sessions over 10 days, despite instructions saying so. Prompt text did not fix it; a mechanical check at the end of the run does not depend on the model remembering.
+
+**Judged by:** recurrence of that correction cluster in new sessions (`scripts/evidence/cluster-rules.ts`), and `background-work` messages per session. Guardrail: turns after a `background-work` message that the agent ended without acting.
+
+**Limits:** a process that leaves its group (`setsid`, a daemonizing server) is not seen. Windows is not covered.
+
+**Revert:** delete `extensions/background`.
