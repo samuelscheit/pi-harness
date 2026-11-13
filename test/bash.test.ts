@@ -386,6 +386,8 @@ describe("long commands move to the background", () => {
 	});
 });
 
+/** A detach limit no bridge test reaches: several `tool` calls (each a Node start) can pass 600 ms under load. */
+const FOREGROUND_MS = 30_000;
 // A 1×1 PNG.
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 const toolResults = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "toolResult" ? [m] : []));
@@ -395,7 +397,7 @@ const repoFile = (name: string) => join(dir, "repo", name);
 describe("tools from bash", () => {
 	test("a script chains a command and the tools that look at its output; images come with the bash result", async () => {
 		writeFileSync(repoFile("shot.png"), PNG);
-		const s = await newSession();
+		const s = await newSession(FOREGROUND_MS);
 		respond(bash("echo built > out.txt && tool read out.txt && tool read shot.png && echo after"), fauxAssistantMessage("ok"));
 		await s.prompt("go");
 		const [result] = toolResults(s);
@@ -408,7 +410,7 @@ describe("tools from bash", () => {
 	});
 
 	test("failures: a failed call exits 1 with its error on stderr, usage errors and unknown tools exit 2", async () => {
-		const s = await newSession();
+		const s = await newSession(FOREGROUND_MS);
 		respond(bash("tool read missing.txt; echo \"read $?\"; tool read --bogus x; echo \"usage $?\"; tool nope; echo \"unknown $?\""), fauxAssistantMessage("ok"));
 		await s.prompt("go");
 		const text = textOf(toolResults(s)[0]!.content);
@@ -419,7 +421,7 @@ describe("tools from bash", () => {
 	});
 
 	test("set -e stops the script at a failed tool call", async () => {
-		const s = await newSession();
+		const s = await newSession(FOREGROUND_MS);
 		respond(bash("set -e; tool read missing.txt; echo unreachable"), fauxAssistantMessage("ok"));
 		await s.prompt("go");
 		const [result] = toolResults(s);
@@ -429,7 +431,7 @@ describe("tools from bash", () => {
 	});
 
 	test("JSON arguments from a heredoc, nested bash, and help", async () => {
-		const s = await newSession();
+		const s = await newSession(FOREGROUND_MS);
 		respond(
 			bash(`tool write --args - <<'EOF'\n{"path": "w.txt", "content": "from 'json'"}\nEOF\ntool bash 'cat w.txt'; echo; tool --help; tool read --help`),
 			fauxAssistantMessage("ok"),
@@ -444,7 +446,7 @@ describe("tools from bash", () => {
 	});
 
 	test("a tool command killed by its caller aborts its call, while the script goes on", async () => {
-		const s = await newSession(10_000);
+		const s = await newSession(FOREGROUND_MS);
 		const started = marker();
 		const done = marker();
 		respond(
@@ -479,7 +481,7 @@ describe("tools from bash", () => {
 			}
 		};
 		assert.deepEqual(run({ PATH: process.env.PATH }), { status: 2, stderr: "tool: works only inside the agent's bash tool\n" });
-		const s = await newSession();
+		const s = await newSession(FOREGROUND_MS);
 		respond(bash("printf %s \"$PI_TOOL_SOCKET\""), fauxAssistantMessage("ok"));
 		await s.prompt("go");
 		const socket = textOf(toolResults(s)[0]!.content);

@@ -4,8 +4,12 @@
 // of the A/B experiments (prompt/experiments, see extensions/lib/experiments.ts): in arm B their
 // prompt sections and tools; every tool an experiment names is off otherwise, unless a rule names it.
 //
-// The base replaces Pi's default preamble only; Pi still appends context files (AGENTS.md of the
-// project and its parents), the skills list and the working directory as their own sections.
+// The base replaces Pi's default preamble, and with it Pi's `tools` and `rules` sections: Pi puts
+// tools' `promptGuidelines` into `rules` only in its default prompt. So this extension renders the
+// active tools' guidelines (and extensions' global ones) as the section `tool-guidelines`; without
+// it, no tool's guidance reached the model (found 2026-11-13: the bash `tool` command went unused).
+// Pi still appends context files (AGENTS.md of the project and its parents), the skills list and
+// the working directory as their own sections.
 // Everything is read on every run, so an edit (by the user or the improvement loop), a forced arm
 // or a stopped experiment reaches running sessions as a section and tool update.
 
@@ -32,6 +36,14 @@ const GLOBAL_RULES = join(PROMPT_DIR, "AGENTS.md");
 // commit, so showing that path changed the project_context section with every release (a prompt
 // update per running session), and it is not the file to edit anyway.
 const GLOBAL_RULES_SHOWN = inSource(GLOBAL_RULES);
+
+export const TOOL_GUIDELINES_SECTION = "tool-guidelines";
+
+/** The guidelines of the selected tools in their order, then the global ones; each once, as bullets. */
+export function toolGuidelinesSection(options: { selectedTools: readonly string[]; toolGuidelines: Readonly<Record<string, readonly string[]>>; promptGuidelines: readonly string[] }): string {
+	const rules = [...new Set([...options.selectedTools.flatMap((name) => options.toolGuidelines[name] ?? []), ...options.promptGuidelines].map((rule) => rule.trim()).filter(Boolean))];
+	return rules.map((rule) => `- ${rule}`).join("\n");
+}
 
 export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DIR, rulesDir = RULES_DIR) {
 	let reported = "";
@@ -62,5 +74,8 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		const switches = toolSwitches(experiments, sessionId, arms);
 		for (const tool of ruleTools) switches.set(tool, true);
 		options.selectedTools = applyToolSwitches(options.selectedTools, switches);
+		const guidelines = toolGuidelinesSection(options);
+		if (guidelines) options.sections[TOOL_GUIDELINES_SECTION] = guidelines;
+		else delete options.sections[TOOL_GUIDELINES_SECTION];
 	});
 }

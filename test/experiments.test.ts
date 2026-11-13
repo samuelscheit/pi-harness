@@ -221,7 +221,7 @@ describe("prompt extension", () => {
 		const ctx = { hasUI: true, ui: { notify: (text: string) => notices.push(text) }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries } };
 		let tools = initialTools;
 		const run = () => {
-			const options = { customPrompt: undefined, contextFiles: [], sections: { cwd: "Current working directory: /x" } as Record<string, string>, selectedTools: [...tools] };
+			const options = { customPrompt: undefined, contextFiles: [], sections: { cwd: "Current working directory: /x" } as Record<string, string>, selectedTools: [...tools], toolGuidelines: {}, promptGuidelines: [] };
 			handler!({ systemPromptOptions: options }, ctx);
 			tools = options.selectedTools;
 			const { cwd: _, ...added } = options.sections;

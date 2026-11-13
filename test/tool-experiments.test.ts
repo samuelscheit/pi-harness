@@ -23,7 +23,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type Arm, hashArm } from "../extensions/lib/experiments.ts";
 import { runShell } from "../extensions/lib/process.ts";
-import prompt from "../extensions/prompt/index.ts";
+import prompt, { toolGuidelinesSection } from "../extensions/prompt/index.ts";
 import workflow from "../extensions/workflow/index.ts";
 import { HARNESS_WORKFLOWS } from "../extensions/workflow/library.ts";
 import { sh } from "../extensions/workflow/sh.ts";
@@ -135,6 +135,29 @@ describe("rules", () => {
 		respond(fauxAssistantMessage("ok"));
 		await without.prompt("go");
 		assert.deepEqual(["codemode", "workflow", "fix_loop"].map((tool) => without.getActiveToolNames().includes(tool)), [true, false, false], "without the rule the workflows stay off");
+	});
+});
+
+describe("tool guidelines", () => {
+	test("the active tools' guidelines reach the prompt as their own section, also with the harness's base prompt", async () => {
+		const s = await newSession(idIn("A", "codemode"));
+		let system = "";
+		respond((context) => {
+			system = JSON.stringify(context.messages.filter((m) => m.role === "system"));
+			return fauxAssistantMessage("ok");
+		});
+		await s.prompt("go");
+		assert.match(system, /<tool-guidelines>/);
+		assert.match(system, /Use read to examine files instead of cat or sed\./, "a built-in tool's guideline");
+		assert.match(system, /Inside a bash command, `tool <name> \[arguments\]`|Use workflow when a task is a procedure/, "a harness tool's guideline");
+	});
+
+	test("toolGuidelinesSection keeps the tools' order, adds global guidelines, and drops duplicates and blanks", () => {
+		assert.equal(
+			toolGuidelinesSection({ selectedTools: ["bash", "read", "none"], toolGuidelines: { read: ["R1", "shared"], bash: ["B1", " shared "], edit: ["E1"] }, promptGuidelines: ["G1", ""] }),
+			"- B1\n- shared\n- R1\n- G1",
+		);
+		assert.equal(toolGuidelinesSection({ selectedTools: [], toolGuidelines: {}, promptGuidelines: [] }), "");
 	});
 });
 
