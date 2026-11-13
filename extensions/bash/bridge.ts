@@ -18,18 +18,19 @@
 import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { createBashToolDefinition, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { EDIT_BLOCKS_HELP, runEditBlocks } from "./edit-blocks.ts";
 
 type BashDefinition = ReturnType<typeof createBashToolDefinition>;
 
 export const TOOL_COMMAND = "tool";
 export const SOCKET_ENV = "PI_TOOL_SOCKET";
 
-export const TOOL_GUIDELINE = `Inside a bash command, \`${TOOL_COMMAND} <name> [arguments]\` calls any of your tools, for example \`${TOOL_COMMAND} read shot.png\` or \`${TOOL_COMMAND} web_fetch --url https://…\` (\`${TOOL_COMMAND} --help\` lists them, \`${TOOL_COMMAND} <name> --help\` shows a tool's arguments). Text results go to stdout; a failed call prints to stderr and exits 1; images are attached to the bash call's result. So steps that depend on each other go in one command: \`cargo build && ./target/debug/app && ${TOOL_COMMAND} read shot.png\`.`;
+export const TOOL_GUIDELINE = `Inside a bash command, \`${TOOL_COMMAND} <name> [arguments]\` calls any of your tools, for example \`${TOOL_COMMAND} read shot.png\` or \`${TOOL_COMMAND} web_fetch --url https://…\` (\`${TOOL_COMMAND} --help\` lists them, \`${TOOL_COMMAND} <name> --help\` shows a tool's arguments). Text results go to stdout; a failed call prints to stderr and exits 1; images are attached to the bash call's result. So steps that depend on each other go in one command: \`cargo build && ./target/debug/app && ${TOOL_COMMAND} read shot.png\`. To change files and then check them in one command, \`${TOOL_COMMAND} edit - <<'EOF'\` takes SEARCH/REPLACE blocks for several files (format in \`${TOOL_COMMAND} edit --help\`), followed by the build or test.`;
 
 /** A JSON schema as tool parameters declare them (TypeBox). */
 interface Schema {
@@ -219,6 +220,7 @@ export function describeTool(tool: Pick<AgentTool, "name" | "description" | "par
 		"",
 		`Arrays: repeat the option or pass a JSON array. Objects: JSON. All arguments as JSON: --args '{…}', or --args - to read them from stdin (a heredoc).`,
 		"--json prints the structured result, when the tool has one.",
+		...(tool.name === "edit" ? ["", EDIT_BLOCKS_HELP] : []),
 	].join("\n");
 }
 
@@ -235,13 +237,20 @@ export function listTools(tools: readonly Pick<AgentTool, "name" | "description"
 
 const withNewline = (text: string) => (text === "" || text.endsWith("\n") ? text : `${text}\n`);
 
+export interface ToolRequest {
+	argv: readonly string[];
+	stdin?: string;
+	/** The shell's working directory when it ran `tool`; relative paths resolve against it. */
+	cwd?: string;
+}
+
 /**
  * Run one `tool` invocation: argv as the client sent it. Images of the result go to `images`
  * (attached to the bash call's result); the response names them.
  */
 export async function runToolCommand(
-	ctx: Pick<ExtensionToolContext, "tools" | "executeTool">,
-	request: { argv: readonly string[]; stdin?: string },
+	ctx: Pick<ExtensionToolContext, "tools" | "executeTool" | "cwd">,
+	request: ToolRequest,
 	images: ImageContent[],
 	signal: AbortSignal,
 ): Promise<ToolResponse> {
@@ -251,6 +260,11 @@ export async function runToolCommand(
 	if (!tool) {
 		return { stdout: "", stderr: `${TOOL_COMMAND}: unknown tool ${JSON.stringify(name)}. Tools: ${ctx.tools.map((t) => t.name).join(", ")}\n`, code: 2 };
 	}
+	const cwd = request.cwd ?? ctx.cwd;
+	if (name === "edit" && rest.length === 1 && rest[0] === "-") return runEditBlocks(ctx, request.stdin ?? "", cwd, signal);
+	if (name === "edit" && rest.length === 0) {
+		return { stdout: "", stderr: `${TOOL_COMMAND} edit: no arguments; pass \`--path\` and \`--edits\`, or \`-\` and blocks on stdin.\n\n${EDIT_BLOCKS_HELP}\n`, code: 2 };
+	}
 	let parsed: ParsedArguments;
 	try {
 		parsed = parseArguments(tool.parameters as Schema, rest, request.stdin);
@@ -259,6 +273,10 @@ export async function runToolCommand(
 		return { stdout: "", stderr: `${TOOL_COMMAND} ${name}: ${error.message}\nRun \`${TOOL_COMMAND} ${name} --help\` for its arguments.\n`, code: 2 };
 	}
 	if (parsed.help) return { stdout: withNewline(describeTool(tool)), stderr: "", code: 0 };
+	// Every tool's `path` is a file or directory: relative to the shell's directory after a `cd`, not the session's.
+	if (typeof parsed.args.path === "string" && parsed.args.path !== "" && !isAbsolute(parsed.args.path) && !parsed.args.path.startsWith("~")) {
+		parsed.args.path = resolve(cwd, parsed.args.path);
+	}
 
 	const outcome = await ctx.executeTool(name, parsed.args, { signal });
 	const result = outcome.result as AgentToolResult<unknown> & { structuredContent?: unknown };
@@ -299,7 +317,7 @@ export const bridgeLine = (binDir: string, socket: string) => `export ${SOCKET_E
  * Read one request (a JSON line), answer, close. The client keeps its side open until the answer:
  * after a half-close, its death would go unnoticed until the answer is written.
  */
-function serve(socket: Socket, handle: (request: { argv: string[]; stdin?: string }, signal: AbortSignal) => Promise<ToolResponse>, parent: AbortSignal) {
+function serve(socket: Socket, handle: (request: ToolRequest, signal: AbortSignal) => Promise<ToolResponse>, parent: AbortSignal) {
 	const controller = new AbortController();
 	const abort = () => controller.abort(parent.reason);
 	parent.addEventListener("abort", abort, { once: true });
@@ -321,9 +339,16 @@ function serve(socket: Socket, handle: (request: { argv: string[]; stdin?: strin
 		received = true;
 		let response: ToolResponse;
 		try {
-			const request = JSON.parse(buffered.slice(0, newline)) as { argv?: unknown; stdin?: unknown };
+			const request = JSON.parse(buffered.slice(0, newline)) as { argv?: unknown; stdin?: unknown; cwd?: unknown };
 			if (!Array.isArray(request.argv) || !request.argv.every((arg) => typeof arg === "string")) throw new Error("argv must be strings");
-			response = await handle({ argv: request.argv, ...(typeof request.stdin === "string" ? { stdin: request.stdin } : {}) }, controller.signal);
+			response = await handle(
+				{
+					argv: request.argv,
+					...(typeof request.stdin === "string" ? { stdin: request.stdin } : {}),
+					...(typeof request.cwd === "string" ? { cwd: request.cwd } : {}),
+				},
+				controller.signal,
+			);
 		} catch (error) {
 			response = { stdout: "", stderr: `${TOOL_COMMAND}: ${error instanceof Error ? error.message : String(error)}\n`, code: 1 };
 		}
@@ -340,7 +365,7 @@ export interface Bridge {
 }
 
 /** Open the socket of one bash call. */
-export async function openBridge(ctx: Pick<ExtensionToolContext, "tools" | "executeTool">, signal: AbortSignal, binDir: string): Promise<Bridge> {
+export async function openBridge(ctx: Pick<ExtensionToolContext, "tools" | "executeTool" | "cwd">, signal: AbortSignal, binDir: string): Promise<Bridge> {
 	const images: ImageContent[] = [];
 	const path = join(tmpdir(), `pi-tool-${process.pid}-${(state.__harnessToolSockets = (state.__harnessToolSockets ?? 0) + 1)}.sock`);
 	rmSync(path, { force: true });

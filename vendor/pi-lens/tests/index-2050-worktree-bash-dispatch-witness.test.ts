@@ -68,11 +68,14 @@ function initRepo(dir: string): string {
 	return fs.realpathSync.native(dir);
 }
 
-/** A heredoc the extractor cannot recognise as a write: no redirect, no verb. */
+/**
+ * A heredoc the extractor cannot recognise as a write: no redirect, no verb,
+ * and a computed target an inline-script scan cannot name.
+ */
 function heredocWriter(target: string): string {
 	return [
 		"node - <<'EOF'",
-		`require("node:fs").writeFileSync(${JSON.stringify(target)}, ${JSON.stringify(BLOCKING)});`,
+		`require("node:fs").writeFileSync([${JSON.stringify(target)}].join(""), ${JSON.stringify(BLOCKING)});`,
 		"EOF",
 	].join("\n");
 }

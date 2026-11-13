@@ -173,12 +173,22 @@ function initRepo(name: string): string {
 }
 
 /**
- * A heredoc that writes the file through `node`. The write extractor
- * recognises `cat > path` and a few verbs, not an interpreter's own file
- * write, so the path comes back through the git recovery and runs without
- * authorship, exactly as the python heredoc did.
+ * A heredoc that writes the file through `node` to a path it computes. The
+ * write extractor names an inline script's literal targets
+ * (`inline-script-writes.ts`), not a computed one, so the path comes back
+ * through the git recovery and runs without authorship.
  */
 function scriptWrite(file: string, content: string): Record<string, unknown> {
+	return fauxToolCall("bash", {
+		command: `node - <<'JS'\nrequire("node:fs").writeFileSync([${JSON.stringify(file)}].join(""), ${JSON.stringify(content)});\nJS`,
+	});
+}
+
+/** The same write naming its file literally, as agents write their edit scripts. */
+function namedScriptWrite(
+	file: string,
+	content: string,
+): Record<string, unknown> {
 	return fauxToolCall("bash", {
 		command: `node - <<'JS'\nrequire("node:fs").writeFileSync(${JSON.stringify(file)}, ${JSON.stringify(content)});\nJS`,
 	});
@@ -273,6 +283,38 @@ describe("#5108: a blocker on a script-written file is never rendered clean", ()
 			// disclosure names.
 			expect(listed?.text).toContain("opaque.ts");
 			expect(listed?.text).toContain("[debugger-statement]");
+			expect(handle.errors).toEqual([]);
+		},
+	);
+
+	it(
+		"a script that names the file it writes is an authored write: the STOP block reaches the bash result",
+		{ timeout: 60_000 },
+		async () => {
+			gate.results.length = 0;
+			const repo = initRepo("named-script");
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: repo,
+				flags: new Map(GUARDED_FLAGS),
+				inlineFactory: async () => (await import("../index.js")).default,
+				responses: [
+					step(namedScriptWrite("named.ts", BLOCKING_FILE), "writing"),
+					step(commitAttempt(), "committing"),
+					endTurn("done"),
+				],
+			});
+			await handle.prompt("rewrite the file with a script");
+			await Promise.all(gate.pending);
+
+			const write = gate.results.find((r) => r.command.includes("named.ts"));
+			expect(write?.text).toContain("\u{1F534} STOP");
+			expect(write?.text).toContain("debugger");
+			expect(write?.text).not.toContain("withheld");
+			// An authored blocker latches the commit gate like an edit's does.
+			const [, commit] = toolResults(handle.requests.at(-1) ?? [], "bash");
+			expect(commit?.text).toContain(GATE_BLOCK);
+			expect(commit?.text).not.toContain(RAN_MARKER);
 			expect(handle.errors).toEqual([]);
 		},
 	);

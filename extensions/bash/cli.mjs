@@ -10,9 +10,9 @@ if (!socketPath) {
 }
 
 const argv = process.argv.slice(2);
-const argsAt = argv.indexOf("--args");
+// `-` (`--args -`, `tool edit -`) reads stdin; nothing else does, so `tool` in a `while read` loop leaves the loop's input alone.
 let stdin;
-if (argsAt >= 0 && argv[argsAt + 1] === "-") {
+if (argv.includes("-")) {
 	const chunks = [];
 	for await (const chunk of process.stdin) chunks.push(chunk);
 	stdin = Buffer.concat(chunks).toString("utf8");
@@ -38,4 +38,4 @@ socket.on("end", () => {
 	process.stdout.write(response.stdout, () => process.stderr.write(response.stderr, () => process.exit(response.code)));
 });
 // One line, and the socket stays open: closing it is how the agent learns this command was killed.
-socket.write(`${JSON.stringify({ argv, ...(stdin === undefined ? {} : { stdin }) })}\n`);
+socket.write(`${JSON.stringify({ argv, cwd: process.cwd(), ...(stdin === undefined ? {} : { stdin }) })}\n`);

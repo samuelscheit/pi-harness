@@ -115,6 +115,7 @@ describe("runToolCommand", () => {
 	const signal = new AbortController().signal;
 	const ctx = (result: { content: unknown[]; structuredContent?: unknown }, isError = false, calls: unknown[] = []) => ({
 		tools,
+		cwd: "/repo",
 		executeTool: async (name: string, args: unknown) => {
 			calls.push({ name, args });
 			return { toolCall: {} as never, result: result as never, isError };
@@ -130,10 +131,24 @@ describe("runToolCommand", () => {
 			stderr: "",
 			code: 0,
 		});
-		assert.deepEqual(calls, [{ name: "read", args: { path: "a.png" } }]);
+		assert.deepEqual(calls, [{ name: "read", args: { path: "/repo/a.png" } }]);
 		assert.equal(images.length, 1);
 		assert.equal((await runToolCommand(ctx(result), { argv: ["read", "a", "--json"] }, images, signal)).stdout, '{\n  "ok": true\n}\n');
 		assert.equal(images.length, 2, "numbered across the bash call");
+	});
+
+	test("a relative path resolves against the shell's directory; absolute and home paths stay", async () => {
+		const calls: { args: unknown }[] = [];
+		const c = ctx({ content: [] }, false, calls);
+		await runToolCommand(c, { argv: ["read", "a.ts"], cwd: "/repo/sub" }, [], signal);
+		await runToolCommand(c, { argv: ["read", "../b.ts"], cwd: "/repo/sub" }, [], signal);
+		await runToolCommand(c, { argv: ["read", "/abs/c.ts"], cwd: "/repo/sub" }, [], signal);
+		await runToolCommand(c, { argv: ["read", "~/d.ts"], cwd: "/repo/sub" }, [], signal);
+		await runToolCommand(c, { argv: ["read", "e.ts"] }, [], signal);
+		assert.deepEqual(
+			calls.map((call) => (call.args as { path: string }).path),
+			["/repo/sub/a.ts", "/repo/b.ts", "/abs/c.ts", "~/d.ts", "/repo/e.ts"],
+		);
 	});
 
 	test("a failed call goes to stderr with exit code 1, also without text", async () => {

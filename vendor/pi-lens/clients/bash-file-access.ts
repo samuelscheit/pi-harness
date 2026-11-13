@@ -17,6 +17,11 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { isReadableSourceFile } from "./file-kinds.js";
+import {
+	INTERPRETER,
+	inlineScripts,
+	scriptWrites,
+} from "./inline-script-writes.js";
 import { isWindowsPath, normalizeHostToolPath } from "./path-utils.js";
 import {
 	appliedFilesOfOwnTool,
@@ -256,6 +261,8 @@ interface ShellSegmentRange {
 	 * skips, so the two lists are not index-aligned (#4713 R12).
 	 */
 	words: readonly ShellWord[];
+	/** The bodies of the heredocs fed to this command (`python3 - <<'EOF'`), in order. */
+	heredocs: string[];
 }
 
 /**
@@ -269,6 +276,8 @@ interface PendingHeredoc {
 	delimiter: string;
 	stripTabs: boolean;
 	quoted: boolean;
+	/** Index of the segment the heredoc is fed to (a heredoc makes its segment `unsupported`, so it is always kept). */
+	owner: number;
 }
 
 function parseHeredocDelimiter(
@@ -305,7 +314,7 @@ function parseHeredocDelimiter(
 		i += 1;
 	}
 	if (!delimiter) return undefined;
-	return { heredoc: { delimiter, stripTabs, quoted }, end: i - 1 };
+	return { heredoc: { delimiter, stripTabs, quoted, owner: -1 }, end: i - 1 };
 }
 
 function heredocSubstitutionBodies(body: string): string[] {
@@ -353,9 +362,14 @@ function consumeHeredocBodies(
 	command: string,
 	start: number,
 	heredocs: PendingHeredoc[],
-): { end: number; substitutions: string[] } {
+): { end: number; substitutions: string[]; bodies: string[] } {
 	let cursor = start;
 	const substitutions: string[] = [];
+	const bodies: string[] = [];
+	const take = (heredoc: PendingHeredoc, raw: string) => {
+		if (!heredoc.quoted) substitutions.push(...heredocSubstitutionBodies(raw));
+		bodies.push(heredoc.stripTabs ? raw.replace(/^\t+/gm, "") : raw);
+	};
 	for (const heredoc of heredocs) {
 		const bodyStart = cursor;
 		let found = false;
@@ -365,10 +379,7 @@ function consumeHeredocBodies(
 			let line = command.slice(cursor, end);
 			if (heredoc.stripTabs) line = line.replace(/^\t+/, "");
 			if (line.replace(/\r$/, "") === heredoc.delimiter) {
-				if (!heredoc.quoted)
-					substitutions.push(
-						...heredocSubstitutionBodies(command.slice(bodyStart, cursor)),
-					);
+				take(heredoc, command.slice(bodyStart, cursor));
 				cursor = lineEnd < 0 ? end : end + 1;
 				found = true;
 				break;
@@ -376,14 +387,11 @@ function consumeHeredocBodies(
 			cursor = lineEnd < 0 ? end : end + 1;
 		}
 		if (!found) {
-			if (!heredoc.quoted)
-				substitutions.push(
-					...heredocSubstitutionBodies(command.slice(bodyStart)),
-				);
-			return { end: command.length - 1, substitutions };
+			take(heredoc, command.slice(bodyStart));
+			return { end: command.length - 1, substitutions, bodies };
 		}
 	}
-	return { end: cursor - 1, substitutions };
+	return { end: cursor - 1, substitutions, bodies };
 }
 
 /**
@@ -569,6 +577,7 @@ function tokenizeShellCommandWithRanges(command: string): ShellSegmentRange[] {
 				grouping,
 				redirectWords,
 				words,
+				heredocs: [],
 			});
 		tokens = [];
 		words = [];
@@ -676,6 +685,8 @@ function tokenizeShellCommandWithRanges(command: string): ShellSegmentRange[] {
 				const heredocs = pendingHeredocs.splice(0);
 				flushSegment(undefined, i, "seq");
 				const consumed = consumeHeredocBodies(command, i + 1, heredocs);
+				for (const [index, heredoc] of heredocs.entries())
+					segments[heredoc.owner]?.heredocs.push(consumed.bodies[index] ?? "");
 				// A substitution's own text is NOT a range of this command: offsets
 				// here are relative to the substituted body, so a redirect inside one
 				// is not attributed to any of the command's segments (`-1`) rather
@@ -738,7 +749,7 @@ function tokenizeShellCommandWithRanges(command: string): ShellSegmentRange[] {
 			) {
 				const parsed = parseHeredocDelimiter(command, i + 2);
 				if (parsed) {
-					pendingHeredocs.push(parsed.heredoc);
+					pendingHeredocs.push({ ...parsed.heredoc, owner: segments.length });
 					i = parsed.end;
 					// The delimiter was this redirection's word.
 					redirectPending = false;
@@ -1725,6 +1736,14 @@ export function scanShellWriteScopes(
 				))
 					add(file);
 			}
+		} else if (INTERPRETER.test(verb)) {
+			// An inline script (`python3 - <<'EOF'`, `node -e …`): the files it
+			// names for writing, relative to the directory it runs in. A script
+			// opens `~/x` literally, so no tilde expands.
+			const code = args.map((arg) => arg.text);
+			for (const script of inlineScripts(verb, code, range.heredocs))
+				for (const file of scriptWrites(script).paths)
+					add({ text: file, tildeExpands: false });
 		} else if (verb === "gofmt" && args.some((arg) => arg.text === "-w")) {
 			for (const file of formatterFileArgs(args)) add(file);
 		} else if (verb === "cargo" && args[0]?.text === "fmt") {

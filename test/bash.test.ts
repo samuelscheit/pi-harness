@@ -445,6 +445,27 @@ describe("tools from bash", () => {
 		assert.match(text, /Usage: tool read <path> \[--offset <number>\] \[--limit <number>\]/);
 	});
 
+	test("tool edit - changes several files from blocks after a cd, as edit calls, and the check runs after it", async () => {
+		mkdirSync(repoFile("sub"), { recursive: true });
+		writeFileSync(repoFile("sub/a.txt"), "alpha $HOME `x`\n");
+		writeFileSync(repoFile("b.txt"), "beta\n");
+		const s = await newSession(FOREGROUND_MS);
+		const blocks = ["a.txt", "<<<<<<< SEARCH", "alpha $HOME `x`", "=======", "ALPHA $HOME `x`", ">>>>>>> REPLACE", "../b.txt", "<<<<<<< SEARCH", "beta", "=======", "BETA", ">>>>>>> REPLACE"].join("\n");
+		respond(
+			bash(`cd sub && tool edit - <<'EOF'\n${blocks}\nEOF\ncat a.txt ../b.txt; tool edit - <<'EOF' || echo "refused $?"\na.txt\n<<<<<<< SEARCH\nnot there\n=======\nx\n>>>>>>> REPLACE\nEOF\ntool edit --help | grep -c 'SEARCH'`),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("go");
+		const [result] = toolResults(s);
+		const text = textOf(result!.content);
+		assert.match(text, /Successfully replaced 1 block\(s\) in \S*sub\/a\.txt\.\nSuccessfully replaced 1 block\(s\) in \S*b\.txt\.\n/);
+		assert.match(text, /ALPHA \$HOME `x`\nBETA\n/);
+		assert.match(text, /tool edit: nothing changed, 1 of 1 files do not match:\n\S*sub\/a\.txt: [^\n]+\nrefused 1\n/);
+		assert.match(text, /\n[1-9]\n$/, "help shows the block format");
+		assert.equal(readFileSync(repoFile("sub/a.txt"), "utf8"), "ALPHA $HOME `x`\n");
+		assert.deepEqual(result!.nestedCalls?.calls.map((c) => [c.name, c.status]), [["edit", "ok"], ["edit", "ok"]], "a refused run makes no edit call");
+	});
+
 	test("a tool command killed by its caller aborts its call, while the script goes on", async () => {
 		const s = await newSession(FOREGROUND_MS);
 		const started = marker();

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { describe, test } from "node:test";
-import { parseShell, scriptWrites, shellEffect } from "../extensions/metrics/shell.ts";
+import { parseShell, shellEffect } from "../extensions/metrics/shell.ts";
+import { scriptWrites } from "../vendor/pi-lens/clients/inline-script-writes.ts";
 
 const cwd = "/repo";
 const writes = (command: string) => shellEffect(command, cwd).writes.sort();
