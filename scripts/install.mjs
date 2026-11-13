@@ -33,7 +33,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { currentLink, deploy } from "../extensions/lib/release.ts";
-import { patchApp } from "./patch-t3.ts";
+import { LAUNCH_AGENT, launchAgent } from "./patch-t3.ts";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
 const T3_APP = "/Applications/T3 Code (Nightly).app";
@@ -78,9 +78,20 @@ if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_P
 	npm(root, "uninstall", "-g", PI_PACKAGE);
 }
 npm(join(vendoredPi, "packages/coding-agent"), "link");
-// t3 unloads idle sessions unless they report background work; let pending cache warming count.
-// Every t3 update replaces the app, so this runs again on each install.
-if (existsSync(T3_APP)) console.log(patchApp(T3_APP));
+// t3's Pi adapter needs fixes it has not shipped (scripts/patch-t3.ts). Every t3 update drops them, so
+// a LaunchAgent applies them at login and whenever /Applications changes; loading it runs it now.
+const agentPlist = join(homedir(), "Library/LaunchAgents", `${LAUNCH_AGENT}.plist`);
+const patchLog = join(agentDir, "logs/patch-t3.log");
+mkdirSync(dirname(patchLog), { recursive: true });
+writeFileSync(agentPlist, launchAgent({ node: process.execPath, script: join(root, "scripts/patch-t3.ts"), app: T3_APP, log: patchLog }));
+const domain = `gui/${process.getuid()}`;
+try {
+	execFileSync("launchctl", ["bootout", `${domain}/${LAUNCH_AGENT}`], { stdio: "ignore" });
+} catch {
+	// Not loaded yet.
+}
+execFileSync("launchctl", ["bootstrap", domain, agentPlist], { stdio: "inherit" });
+console.log(`t3 patches kept applied by ${agentPlist} (log: ${patchLog})`);
 // pi-lens: install scripts skipped (its `prepare` also rewires git hooks); build and fetch the core grammars explicitly.
 npm(vendoredLens, "ci", "--ignore-scripts", "--no-audit", "--no-fund");
 npm(vendoredLens, "run", "build:dist");

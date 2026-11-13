@@ -1,12 +1,21 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
-import { PATCHES, patchBundle } from "../scripts/patch-t3.ts";
+import { afterPatch, elapsedSeconds, keepPatched, LAUNCH_AGENT, launchAgent, PATCHES, patchBundle, RESTART_WINDOW_S, startedAgoS } from "../scripts/patch-t3.ts";
+
+// An unpatched bundle: every anchor once, except those an earlier patch produces.
+const bundle = PATCHES.flatMap((patch, i) =>
+	patch.edits
+		.map(([anchor]) => anchor)
+		.filter((anchor) => !PATCHES.slice(0, i).some((earlier) => earlier.edits.some(([, replacement]) => replacement.includes(anchor)))),
+)
+	.map((anchor) => `\t\t\t${anchor}\n`)
+	.join("const x = piRecordString;\n");
 
 /** A minimal asar writer (the format Electron reads), independent of the code under test. */
 function writeArchive(path: string, tree: Record<string, string | { unpacked: true }>): void {
@@ -96,14 +105,6 @@ describe("asar rewrite", () => {
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
 	const ALL = ["cache-warming", "dialogs", "background-work", "questions", "session-questions"];
-	// An unpatched bundle: every anchor once, except those an earlier patch produces.
-	const bundle = PATCHES.flatMap((patch, i) =>
-		patch.edits
-			.map(([anchor]) => anchor)
-			.filter((anchor) => !PATCHES.slice(0, i).some((earlier) => earlier.edits.some(([, replacement]) => replacement.includes(anchor)))),
-	)
-		.map((anchor) => `\t\t\t${anchor}\n`)
-		.join("const x = piRecordString;\n");
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
 		const { text, applied } = patchBundle(bundle);
@@ -172,6 +173,89 @@ describe("patchBundle", () => {
 		try {
 			writeFileSync(join(dir, "bundle.mjs"), text);
 			execFileSync(process.execPath, ["--check", join(dir, "bundle.mjs")]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("keeping t3 patched", () => {
+	test("restarts a t3 its update just started, asks one running longer, leaves others alone", () => {
+		assert.equal(afterPatch(["questions"], undefined), "none", "not running: it loads the patches when it starts");
+		assert.equal(afterPatch([], 5), "none", "nothing applied: the running t3 has the patches");
+		assert.equal(afterPatch(["questions"], 0), "restart");
+		assert.equal(afterPatch(["questions"], RESTART_WINDOW_S - 1), "restart");
+		assert.equal(afterPatch(["questions"], RESTART_WINDOW_S), "notify", "it may be in the middle of work");
+		assert.equal(afterPatch(["dialogs", "questions"], 86_400), "notify");
+	});
+
+	test("reads ps elapsed times", () => {
+		assert.equal(elapsedSeconds("00:07"), 7);
+		assert.equal(elapsedSeconds("01:59"), 119);
+		assert.equal(elapsedSeconds("21:13:15"), 21 * 3600 + 13 * 60 + 15);
+		assert.equal(elapsedSeconds("3-00:00:01"), 3 * 86_400 + 1);
+	});
+
+	test("finds the app's main process by its executable, not a helper started with arguments", async () => {
+		// A symlink to a signed system binary, outside any `.app` bundle: a copy is killed at launch, and
+		// a bundle makes Gatekeeper ask about a damaged app. `ps` shows the path it was started by.
+		const dir = mkdtempSync(join(tmpdir(), "t3-running-"));
+		const main = join(dir, "Fake T3");
+		symlinkSync("/usr/bin/yes", main);
+		const helper = spawn(main, ["--type=helper"], { stdio: "ignore" });
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			assert.equal(startedAgoS(main), undefined, "only a helper with arguments runs");
+			const running = spawn(main, [], { stdio: "ignore" });
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				const ago = startedAgoS(main);
+				assert.ok(ago !== undefined && ago >= 0 && ago < 5, `started ${ago}s ago`);
+			} finally {
+				running.kill();
+			}
+		} finally {
+			helper.kill();
+			rmSync(dir, { recursive: true, force: true });
+		}
+		assert.equal(startedAgoS("/Applications/Not Installed.app/Contents/MacOS/Not Installed"), undefined);
+	});
+
+	test("the LaunchAgent is a valid plist that watches the app's folder and runs at load", () => {
+		const dir = mkdtempSync(join(tmpdir(), "launch-agent-"));
+		try {
+			const plist = join(dir, "agent.plist");
+			const app = "/Applications/T3 Code & <Beta>.app";
+			writeFileSync(plist, launchAgent({ node: "/usr/bin/node", script: "/repo/scripts/patch-t3.ts", app, log: "/logs/patch-t3.log" }));
+			execFileSync("plutil", ["-lint", plist]);
+			const parsed = JSON.parse(execFileSync("plutil", ["-convert", "json", "-o", "-", plist], { encoding: "utf8" }));
+			assert.deepEqual(parsed, {
+				Label: LAUNCH_AGENT,
+				ProgramArguments: ["/usr/bin/node", "/repo/scripts/patch-t3.ts", app],
+				WatchPaths: ["/Applications"],
+				RunAtLoad: true,
+				StandardOutPath: "/logs/patch-t3.log",
+				StandardErrorPath: "/logs/patch-t3.log",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("patches an app that is not running, keeps t3's original once, and is idempotent", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "t3-app-"));
+		try {
+			const app = join(dir, "T3 Test.app");
+			const archive = join(app, "Contents/Resources/app.asar");
+			mkdirSync(dirname(archive), { recursive: true });
+			writeArchive(archive, { "apps/server/dist/runtime.mjs": bundle, "apps/server/dist/other.mjs": "export {};\n" });
+			const original = readFileSync(archive);
+			assert.match(await keepPatched(app), /^patched apps\/server\/dist\/runtime\.mjs \(cache-warming, dialogs, background-work, questions, session-questions;/);
+			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
+			const patched = readFile(archive, "apps/server/dist/runtime.mjs").toString();
+			assert.equal(patched, patchBundle(bundle).text);
+			assert.equal(await keepPatched(app), "already patched");
+			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original, "the backup stays t3's own archive");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

@@ -31,11 +31,18 @@
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
-// is kept next to it as app.asar.pre-pi-harness. Every t3 update replaces the archive, so the
-// installer runs this again. Takes effect when t3 restarts.
+// is kept next to it as app.asar.pre-pi-harness. A patch takes effect when t3 restarts.
+//
+// Kept applied automatically: t3 updates through Squirrel (ShipIt swaps in the new bundle and
+// relaunches it), which drops every patch. The installer adds a LaunchAgent (`launchAgent`) that runs
+// this whenever /Applications changes and at login. The relaunched t3 usually starts before the
+// patch lands; then it is restarted at once when it launched less than RESTART_WINDOW_S ago (the
+// updater just started it, nothing is in flight), and otherwise asked to restart by a notification.
+// A t3 update that breaks a patch is reported by a notification too.
 
+import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { packedFiles, readFile, readHeader, replaceFiles } from "./lib/asar.ts";
 
 export interface Patch {
@@ -174,7 +181,8 @@ export function patchBundle(text: string, patches: Patch[] = PATCHES): { text: s
 	return { text, applied };
 }
 
-export function patchApp(app: string): string {
+/** Applies the missing patches to the app's archive; `applied` names them (empty when there were none). */
+export function patchApp(app: string): { applied: string[]; message: string } {
 	const archive = join(app, "Contents/Resources/app.asar");
 	if (!existsSync(archive)) throw new Error(`${archive}: not found`);
 	const { header } = readHeader(archive);
@@ -182,18 +190,124 @@ export function patchApp(app: string): string {
 		.map((f) => f.path)
 		.filter((path) => path.startsWith("apps/server/dist/") && path.endsWith(".mjs"))
 		.find((path) => readFile(archive, path).includes(ADAPTER));
-	if (!bundle) return "Pi adapter not found (t3 changed); nothing patched";
+	if (!bundle) throw new Error("t3 changed: its Pi adapter was not found; nothing patched");
 	const original = readFile(archive, bundle).toString("utf8");
 	const { text, applied } = patchBundle(original);
-	if (applied.length === 0) return "already patched";
+	if (applied.length === 0) return { applied, message: "already patched" };
 	const backup = `${archive}.pre-pi-harness`;
 	// The backup is t3's own archive: taken when none of the patches is applied yet (a fresh install
 	// or update), kept when an earlier run already patched this archive.
 	if (PATCHES.every((patch) => !original.includes(patch.marker))) copyFileSync(archive, backup);
+	// Written to a new file and renamed over the archive: a running t3 keeps reading the old one.
 	replaceFiles(archive, { [bundle]: Buffer.from(text, "utf8") });
-	return `patched ${bundle} (${applied.join(", ")}; original kept as ${backup}); restart t3 to apply`;
+	return { applied, message: `patched ${bundle} (${applied.join(", ")}; original kept as ${backup})` };
+}
+
+/** A t3 launched this recently was started by its updater: restarting it loses no work. */
+export const RESTART_WINDOW_S = 120;
+
+/**
+ * What the running t3 needs after a patch run, given how long ago its main process started (undefined:
+ * not running), measured right after patching. Running then, it may have loaded the old bundle.
+ */
+export function afterPatch(applied: string[], startedAgoS: number | undefined): "none" | "restart" | "notify" {
+	if (applied.length === 0 || startedAgoS === undefined) return "none";
+	return startedAgoS < RESTART_WINDOW_S ? "restart" : "notify";
+}
+
+/** Seconds in a `ps` elapsed time, `[[dd-]hh:]mm:ss`. */
+export function elapsedSeconds(etime: string): number {
+	const [days, clock] = etime.includes("-") ? etime.split("-") : ["0", etime];
+	return clock!.split(":").reduce((total, part) => total * 60 + Number(part), 0) + Number(days) * 86_400;
+}
+
+/** The app's main executable (bundle name without `.app`). */
+const executable = (app: string) => join(app, "Contents/MacOS", basename(app, ".app"));
+
+/**
+ * Seconds since a process started from `main` without arguments did (an app's main process; its
+ * helpers carry arguments), or undefined when none runs.
+ */
+export function startedAgoS(main: string): number | undefined {
+	const line = execFileSync("ps", ["-axo", "etime=,args="], { encoding: "utf8" })
+		.split("\n")
+		.map((l) => l.trim())
+		.find((l) => l.slice(l.indexOf(" ") + 1) === main);
+	return line === undefined ? undefined : elapsedSeconds(line.slice(0, line.indexOf(" ")));
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function notify(message: string): void {
+	const quoted = (text: string) => JSON.stringify(text);
+	execFileSync("osascript", ["-e", `display notification ${quoted(message)} with title "pi-harness" sound name "Funk"`]);
+}
+
+/** Quits the app and opens it again; false when it did not quit within a minute. */
+async function restart(app: string): Promise<boolean> {
+	const id = execFileSync("defaults", ["read", join(app, "Contents/Info"), "CFBundleIdentifier"], { encoding: "utf8" }).trim();
+	execFileSync("osascript", ["-e", `tell application id ${JSON.stringify(id)} to quit`]);
+	for (let waited = 0; startedAgoS(executable(app)) !== undefined; waited += 500) {
+		if (waited >= 60_000) return false;
+		await sleep(500);
+	}
+	execFileSync("open", [app]);
+	return true;
+}
+
+/** Patches the app (waiting out an update that is still swapping the bundle) and brings the running t3 onto the patches. */
+export async function keepPatched(app: string): Promise<string> {
+	const archive = join(app, "Contents/Resources/app.asar");
+	// ShipIt moves the old bundle out before moving the new one in.
+	for (let waited = 0; !existsSync(archive); waited += 1_000) {
+		if (waited >= 60_000) return `${app} not installed; nothing to patch`;
+		await sleep(1_000);
+	}
+	let result: ReturnType<typeof patchApp>;
+	try {
+		result = patchApp(app);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		notify(`t3 is not patched for the harness: ${message.slice(0, 160)}`);
+		throw error;
+	}
+	switch (afterPatch(result.applied, startedAgoS(executable(app)))) {
+		case "none":
+			return result.message;
+		case "restart":
+			if (await restart(app)) return `${result.message}; restarted t3, which its update had just started`;
+			break;
+		case "notify":
+			break;
+	}
+	notify(`t3 was patched for the harness (${result.applied.join(", ")}). Restart t3 to apply.`);
+	return `${result.message}; asked to restart t3`;
+}
+
+export const LAUNCH_AGENT = "com.pi-harness.patch-t3";
+
+/** The LaunchAgent that runs `keepPatched` at login and whenever the app's folder changes (an update swaps the bundle). */
+export function launchAgent(options: { node: string; script: string; app: string; log: string }): string {
+	const xml = (text: string) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+	const string = (text: string) => `<string>${xml(text)}</string>`;
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>${string(LAUNCH_AGENT)}
+	<key>ProgramArguments</key>
+	<array>${[options.node, options.script, options.app].map(string).join("")}</array>
+	<key>WatchPaths</key>
+	<array>${string(dirname(options.app))}</array>
+	<key>RunAtLoad</key><true/>
+	<key>StandardOutPath</key>${string(options.log)}
+	<key>StandardErrorPath</key>${string(options.log)}
+</dict>
+</plist>
+`;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-	console.log(patchApp(process.argv[2] ?? "/Applications/T3 Code (Nightly).app"));
+	const app = process.argv[2] ?? "/Applications/T3 Code (Nightly).app";
+	console.log(`${new Date().toISOString()} ${await keepPatched(app)}`);
 }
