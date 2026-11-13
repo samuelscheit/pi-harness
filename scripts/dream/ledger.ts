@@ -9,7 +9,7 @@
 //
 // The recurrence metric (docs/research/context-engineering/05): a correction matched to a rule that
 // already existed. A rule that keeps recurring after it was written does not work as text; it is a
-// candidate for a mechanical guard (like extensions/background) instead of more wording.
+// candidate for a mechanical guard (like extensions/bash) instead of more wording.
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

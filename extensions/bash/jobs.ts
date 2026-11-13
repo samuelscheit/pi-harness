@@ -20,7 +20,9 @@
 
 import { writeFileSync } from "node:fs";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { type BashToolDetails, createBashToolDefinition, type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { TOOL_GUIDELINE, withToolBridge } from "./bridge.ts";
 
 type BashResult = AgentToolResult<BashToolDetails | undefined>;
 
@@ -168,7 +170,7 @@ function reportWork(jobs: SessionJobs): void {
 /** Register the detachable bash tool and its handlers. */
 export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 	const detachAfterMs = options.detachAfterMs ?? DETACH_AFTER_MS;
-	const builtin = createBashToolDefinition(process.cwd());
+	const builtin = withToolBridge(createBashToolDefinition(process.cwd()));
 
 	pi.on("session_start", (_event, ctx) => {
 		const jobs = sessionJobs(ctx.sessionManager.getSessionId());
@@ -205,6 +207,7 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 		...builtin,
 		promptGuidelines: [
 			...(builtin.promptGuidelines ?? []),
+			TOOL_GUIDELINE,
 			`A command still running after ${detachAfterMs / 60_000} minutes, or when the user sends a message, moves to the background and keeps running; its result reaches you as a new message when it ends, also after your turn. So run long builds and tests in the foreground: no \`&\`, no sleep or poll loops waiting for them.`,
 		],
 		async execute(callId, params, signal, onUpdate, ctx): Promise<BashResult> {
@@ -265,7 +268,11 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 				// Outside any call: a throw here would be an unhandled rejection in Pi's process.
 				try {
 					reportWork(jobs);
-					jobs.api?.sendMessage({ customType: JOB_MESSAGE_TYPE, content: finishedText(job, outcome, Date.now()), display: true }, { triggerTurn: true, deliverAs: "steer" });
+					const text = finishedText(job, outcome, Date.now());
+					// Images its `tool` calls returned (bridge.ts) come with the text.
+					const images = "result" in outcome ? outcome.result.content.filter((c): c is ImageContent => c.type === "image") : [];
+					const content = images.length ? [{ type: "text" as const, text }, ...images] : text;
+					jobs.api?.sendMessage({ customType: JOB_MESSAGE_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "steer" });
 				} catch (error) {
 					console.error(`[background] cannot report the end of ${callId}:`, error);
 				}

@@ -1,4 +1,4 @@
-// The background-work guard and the detachable bash (extensions/background): parsing and messages,
+// The background-work guard and the detachable bash (extensions/bash): parsing and messages,
 // then real Pi sessions (faux model, real bash) where the agent ends a run with a background job
 // still running, and where a long command moves to the background and its end wakes the session.
 
@@ -8,11 +8,12 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, getApiProvider, registerApiProvider, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import background, { backgroundMessage, MESSAGE_TYPE, processesInGroups, readGroup, recordLine, scanGroups } from "../extensions/background/index.ts";
-import { detachedText, finishedText, JOB_MESSAGE_TYPE, sessionJobs } from "../extensions/background/jobs.ts";
+import background, { backgroundMessage, MESSAGE_TYPE, processesInGroups, readGroup, recordLine, scanGroups } from "../extensions/bash/index.ts";
+import { detachedText, finishedText, JOB_MESSAGE_TYPE, sessionJobs } from "../extensions/bash/jobs.ts";
 
 const PS = [
 	"  101   101 Ss       01:00 /bin/bash -c sleep 300 &",
@@ -120,7 +121,7 @@ before(async () => {
 		baseUrl: "http://localhost:0",
 		apiKey: "faux",
 		api: faux.api,
-		models: [{ id: "faux-1", name: "Faux", api: faux.api, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 8000 }],
+		models: [{ id: "faux-1", name: "Faux", api: faux.api, reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 8000 }],
 	});
 });
 after(() => faux.unregister());
@@ -157,7 +158,7 @@ function nestedBash(pi: ExtensionAPI) {
 const DETACH_MS = 600;
 const extensionErrors: string[] = [];
 
-async function newSession(): Promise<AgentSession> {
+async function newSession(detachAfterMs = DETACH_MS): Promise<AgentSession> {
 	const cwd = join(dir, "repo");
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
@@ -167,7 +168,7 @@ async function newSession(): Promise<AgentSession> {
 		noExtensions: true,
 		noSkills: true,
 		noContextFiles: true,
-		extensionFactories: [(pi: ExtensionAPI) => background(pi, { dir: join(dir, "groups"), detachAfterMs: DETACH_MS }), nestedBash],
+		extensionFactories: [(pi: ExtensionAPI) => background(pi, { dir: join(dir, "groups"), detachAfterMs }), nestedBash],
 	});
 	await resourceLoader.reload();
 	const { session } = await createAgentSession({
@@ -234,7 +235,8 @@ describe("in a Pi session", () => {
 	});
 });
 
-const jobMessages = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "custom" && m.customType === JOB_MESSAGE_TYPE ? [String(m.content)] : []));
+const textOf = (content: string | readonly { type: string; text?: string }[]) => (typeof content === "string" ? content : content.map((c) => c.text ?? "").join(""));
+const jobMessages = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "custom" && m.customType === JOB_MESSAGE_TYPE ? [textOf(m.content)] : []));
 const toolTexts = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "toolResult" ? [m.content.map((c) => (c.type === "text" ? c.text : "")).join("")] : []));
 const lastText = (context: { messages: readonly unknown[] }) => JSON.stringify(context.messages.at(-1));
 const jobsOf = (s: AgentSession) => sessionJobs(s.sessionManager.getSessionId()).jobs;
@@ -381,5 +383,110 @@ describe("long commands move to the background", () => {
 		await until("the wake run", settled(s, "Done after reload."));
 		assert.match(jobMessages(s)[0]!, /finished after \d s:\n\nafter-reload\n$/);
 		assert.deepEqual(work, [1, 0]);
+	});
+});
+
+// A 1×1 PNG.
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+const toolResults = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "toolResult" ? [m] : []));
+const imagesOf = (content: string | readonly { type: string }[]) => (typeof content === "string" ? [] : content.filter((c): c is ImageContent => c.type === "image"));
+const repoFile = (name: string) => join(dir, "repo", name);
+
+describe("tools from bash", () => {
+	test("a script chains a command and the tools that look at its output; images come with the bash result", async () => {
+		writeFileSync(repoFile("shot.png"), PNG);
+		const s = await newSession();
+		respond(bash("echo built > out.txt && tool read out.txt && tool read shot.png && echo after"), fauxAssistantMessage("ok"));
+		await s.prompt("go");
+		const [result] = toolResults(s);
+		assert.equal(result!.isError, false);
+		const text = textOf(result!.content);
+		assert.match(text, /^built\n/);
+		assert.match(text, /\[image 1 \(image\/png\) is attached to this bash call's result\]\nafter\n$/);
+		assert.deepEqual(imagesOf(result!.content).map((c) => c.mimeType), ["image/png"]);
+		assert.deepEqual(result!.nestedCalls?.calls.map((c) => [c.name, c.status]), [["read", "ok"], ["read", "ok"]], "recorded as nested calls of the bash call");
+	});
+
+	test("failures: a failed call exits 1 with its error on stderr, usage errors and unknown tools exit 2", async () => {
+		const s = await newSession();
+		respond(bash("tool read missing.txt; echo \"read $?\"; tool read --bogus x; echo \"usage $?\"; tool nope; echo \"unknown $?\""), fauxAssistantMessage("ok"));
+		await s.prompt("go");
+		const text = textOf(toolResults(s)[0]!.content);
+		assert.match(text, /ENOENT|not found|No such file/i);
+		assert.match(text, /\nread 1\n/);
+		assert.match(text, /tool read: unknown option --bogus; options: --path, --offset, --limit\nRun `tool read --help` for its arguments\.\nusage 2\n/);
+		assert.match(text, /tool: unknown tool "nope"\. Tools: [^\n]*\bbash\b[^\n]*\nunknown 2\n$/);
+	});
+
+	test("set -e stops the script at a failed tool call", async () => {
+		const s = await newSession();
+		respond(bash("set -e; tool read missing.txt; echo unreachable"), fauxAssistantMessage("ok"));
+		await s.prompt("go");
+		const [result] = toolResults(s);
+		assert.equal(result!.isError, true);
+		assert.doesNotMatch(textOf(result!.content), /unreachable/);
+		assert.match(textOf(result!.content), /Command exited with code 1/);
+	});
+
+	test("JSON arguments from a heredoc, nested bash, and help", async () => {
+		const s = await newSession();
+		respond(
+			bash(`tool write --args - <<'EOF'\n{"path": "w.txt", "content": "from 'json'"}\nEOF\ntool bash 'cat w.txt'; echo; tool --help; tool read --help`),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("go");
+		const text = textOf(toolResults(s)[0]!.content);
+		assert.equal(readFileSync(repoFile("w.txt"), "utf8"), "from 'json'");
+		assert.match(text, /\nfrom 'json'\n/);
+		assert.match(text, /Usage: tool <name> \[arguments\]/);
+		assert.match(text, /^ {2}read {2,}\S/m);
+		assert.match(text, /Usage: tool read <path> \[--offset <number>\] \[--limit <number>\]/);
+	});
+
+	test("a tool command killed by its caller aborts its call, while the script goes on", async () => {
+		const s = await newSession(10_000);
+		const started = marker();
+		const done = marker();
+		respond(
+			bash(`timeout 0.6 tool bash 'touch ${started}; sleep 1; touch ${done}'; echo "exit $?"; sleep 1.2; [ -e ${started} ] && echo started; [ -e ${done} ] && echo touched || echo stopped`),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("go");
+		assert.equal(textOf(toolResults(s)[0]!.content), "exit 124\nstarted\nstopped\n");
+	});
+
+	test("a command that moves to the background keeps its tools; its images come with the job's report", async () => {
+		writeFileSync(repoFile("shot.png"), PNG);
+		const s = await newSession();
+		respond(bash("sleep 1; tool read shot.png"), fauxAssistantMessage("In the background."), fauxAssistantMessage("Seen it."));
+		await s.prompt("go");
+		await until("the wake run", settled(s, "Seen it."));
+		const report = s.messages.find((m) => m.role === "custom" && m.customType === JOB_MESSAGE_TYPE);
+		assert.ok(report?.role === "custom");
+		assert.match(textOf(report.content), /finished after \d s:\n\nRead image file \[image\/png\]\n\[image 1 \(image\/png\) is attached to this bash call's result\]/);
+		assert.equal(imagesOf(report.content).length, 1);
+	});
+
+	test("outside a bash call, and after it ended, the command says it cannot reach the agent", async () => {
+		const client = new URL("../extensions/bash/cli.mjs", import.meta.url).pathname;
+		const run = (env: NodeJS.ProcessEnv) => {
+			try {
+				execFileSync(process.execPath, [client, "read", "x"], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+				return assert.fail("exits non-zero");
+			} catch (error) {
+				const { status, stderr } = error as { status: number; stderr: string };
+				return { status, stderr };
+			}
+		};
+		assert.deepEqual(run({ PATH: process.env.PATH }), { status: 2, stderr: "tool: works only inside the agent's bash tool\n" });
+		const s = await newSession();
+		respond(bash("printf %s \"$PI_TOOL_SOCKET\""), fauxAssistantMessage("ok"));
+		await s.prompt("go");
+		const socket = textOf(toolResults(s)[0]!.content);
+		assert.match(socket, /pi-tool-\d+-\d+\.sock$/);
+		assert.equal(existsSync(socket), false, "the socket is removed with the call");
+		const after = run({ PATH: process.env.PATH, PI_TOOL_SOCKET: socket });
+		assert.equal(after.status, 2);
+		assert.match(after.stderr, /cannot reach the agent/);
 	});
 });
