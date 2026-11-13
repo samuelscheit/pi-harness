@@ -1845,6 +1845,15 @@ export interface ExtensionAPI {
 	 */
 	requestReload(): void;
 
+	/**
+	 * Report how much work `key` keeps running for this session outside any agent run (jobs that will
+	 * wake the session when they end, for example). The session emits `background_work` events with
+	 * the total over all keys, so a host that unloads idle sessions keeps this one while any is
+	 * pending. Set 0 when the work is done. The count survives reloads; a reloaded extension sets it
+	 * again.
+	 */
+	setBackgroundWork(key: string, pending: number): void;
+
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
 
@@ -2209,6 +2218,8 @@ export type RefreshToolsHandler = () => void;
 
 export type RequestReloadHandler = () => void;
 
+export type SetBackgroundWorkHandler = (key: string, pending: number) => void;
+
 export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
 
 export type GetThinkingLevelHandler = () => ThinkingLevel;
@@ -2268,6 +2279,7 @@ export interface ExtensionActions {
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	requestReload: RequestReloadHandler;
+	setBackgroundWork: SetBackgroundWorkHandler;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;

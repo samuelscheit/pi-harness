@@ -438,6 +438,7 @@ export class ExtensionRunner {
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.requestReload = actions.requestReload;
+		this.runtime.setBackgroundWork = actions.setBackgroundWork;
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;

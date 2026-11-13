@@ -1956,6 +1956,14 @@ const current = pi.getThinkingLevel();  // "off" | "minimal" | "low" | "medium" 
 pi.setThinkingLevel("high");
 ```
 
+### pi.setBackgroundWork(key, pending)
+
+Report how much work your extension keeps running for the session outside any agent run, such as jobs that wake the session with `pi.sendMessage(..., { triggerTurn: true })` when they end. The session sums all keys and emits `{ type: "background_work", pending }` whenever the total changes; RPC mode forwards it, so a host that unloads idle sessions (t3) keeps this one loaded while `pending > 0`. Set `0` when the work is done. The count is kept across reloads, and a reloaded extension sets its key again.
+
+```typescript
+pi.setBackgroundWork("my-jobs", jobs.size);
+```
+
 ### pi.events
 
 Shared event bus for communication between extensions:

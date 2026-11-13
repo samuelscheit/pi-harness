@@ -226,6 +226,8 @@ export type AgentSessionEvent =
 	| { type: "agent_settled"; aborted: boolean }
 	/** Cache warming changed state: a host keeping sessions loaded can keep this one while a refresh is pending. */
 	| { type: "cache_warming"; state: CacheWarmingStatus["state"]; nextWarmAt?: number; reason?: string }
+	/** Work extensions keep running outside any run changed (`pi.setBackgroundWork`): a host keeping sessions loaded keeps this one while `pending > 0`. */
+	| { type: "background_work"; pending: number }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -526,6 +528,8 @@ export class AgentSession {
 	>;
 	/** The last cache warming state emitted, to emit changes only. */
 	private _cacheWarmingEmitted?: string;
+	/** Pending background work by extension key (`pi.setBackgroundWork`); kept across reloads. */
+	private _backgroundWork = new Map<string, number>();
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -3675,6 +3679,7 @@ export class AgentSession {
 				getSettings: () => this.settingsManager.getSettings(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				requestReload: () => this.requestReload(),
+				setBackgroundWork: (key, pending) => this.setBackgroundWork(key, pending),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {
@@ -3907,6 +3912,23 @@ export class AgentSession {
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
+	}
+
+	/** Pending background work over all keys (see ExtensionAPI.setBackgroundWork). */
+	get backgroundWork(): number {
+		let total = 0;
+		for (const pending of this._backgroundWork.values()) total += pending;
+		return total;
+	}
+
+	/** Set `key`'s pending background work; emits `background_work` when the total changes. */
+	setBackgroundWork(key: string, pending: number): void {
+		if (!Number.isInteger(pending) || pending < 0) throw new Error(`Invalid background work: ${pending}`);
+		const before = this.backgroundWork;
+		if (pending === 0) this._backgroundWork.delete(key);
+		else this._backgroundWork.set(key, pending);
+		const after = this.backgroundWork;
+		if (after !== before) this._emit({ type: "background_work", pending: after });
 	}
 
 	/**

@@ -122,6 +122,8 @@ Use `toolCallId` to correlate the lifecycle. `partialResult` is the latest parti
 | `entry_appended` | `entry` | An extension appended a custom session entry through `pi.appendEntry()`. |
 | `session_info_changed` | `name` | The session display name changed. An absent `name` means it was cleared. |
 | `thinking_level_changed` | `level` | The active thinking level changed. |
+| `cache_warming` | `state`, `nextWarmAt?`, `reason?` | Prompt cache warming changed state. A host keeping sessions loaded can keep this one while a refresh is `scheduled` or `refreshing`. |
+| `background_work` | `pending` | The work extensions keep running outside any run changed (`pi.setBackgroundWork`). A host keeping sessions loaded keeps this one while `pending > 0`. |
 
 The `entry` value uses a persisted [session entry type](session-format.md#entry-types).
 

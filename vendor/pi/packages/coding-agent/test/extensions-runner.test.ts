@@ -92,6 +92,7 @@ describe("ExtensionRunner", () => {
 		getSettings: () => ({}),
 		setActiveTools: () => {},
 		requestReload: () => {},
+		setBackgroundWork: () => {},
 		refreshTools: () => {},
 		getCommands: () => [],
 		setModel: async () => false,
