@@ -6,7 +6,9 @@
 // session then reloads into the deployed release with `pi.requestReload()`: at once when idle,
 // else at the next turn boundary of its run (the run continues on the new tools and prompt; a tool
 // call running then finishes on the old code), else when the run settles. Pi itself (vendor/pi)
-// cannot be swapped in a running process; a session says so once when a release changed it.
+// cannot be swapped in a running process, and a release's extensions may use Pi APIs newer than the
+// process has: a session reloads only into releases with the Pi it started with, and says once that
+// a newer release needs a restart.
 //
 // Running from a repository checkout (tests, development) this extension does nothing.
 
@@ -45,10 +47,24 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 	let busy = false;
 	let fingerprint = "";
 	const reported = new Set<string>();
+	/** Per deployed commit: whether it changed Pi itself since this process started. */
+	const newPi = new Map<string, Promise<boolean>>();
 
-	const outdated = () => {
+	/** Reload into the deployed release when it is newer and runs on this process's Pi; else say once that it needs a restart. */
+	const follow = async (ctx: ExtensionContext) => {
 		const deployed = currentRelease(agentDir);
-		return deployed !== undefined && deployed.commit !== loaded.commit;
+		if (deployed === undefined || deployed.commit === loaded.commit) return;
+		if (!newPi.has(deployed.commit)) newPi.set(deployed.commit, changedBetween(loaded.source, state.started, deployed.commit, "vendor/pi"));
+		if (!(await newPi.get(deployed.commit))) {
+			pi.requestReload();
+			return;
+		}
+		if (state.piNoticeShown) return;
+		state.piNoticeShown = true;
+		ctx.ui.notify(
+			`Harness ${shortCommit(deployed.commit)} needs a newer Pi (vendor/pi changed); this session keeps ${shortCommit(loaded.commit)}. Restart Pi to run it.`,
+			"warning",
+		);
 	};
 
 	/** Deploy a new commit of the branch if its ref moved, then reload when outdated (Pi picks the moment; repeated requests are one). */
@@ -69,7 +85,7 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 				// Failures are reported by the metrics extension's periodic check, which retries.
 				if (result.status === "deployed") await dashboard().catch(() => undefined);
 			}
-			if (outdated()) pi.requestReload();
+			await follow(ctx);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (!reported.has(message)) {
@@ -84,10 +100,6 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason === "reload" && previous && previous !== loaded.commit) {
 			ctx.ui.notify(`Harness reloaded: ${shortCommit(previous)} → ${shortCommit(loaded.commit)} ${loaded.subject}`, "info");
-		}
-		if (!state.piNoticeShown && state.started !== loaded.commit && (await changedBetween(loaded.source, state.started, loaded.commit, "vendor/pi"))) {
-			state.piNoticeShown = true;
-			ctx.ui.notify("Pi itself (vendor/pi) changed since this process started; restart Pi to run the new version.", "warning");
 		}
 		clearInterval(timer);
 		timer = setInterval(() => void tick(ctx), pollMs);

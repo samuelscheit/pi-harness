@@ -301,27 +301,41 @@ describe("release extension", () => {
 		assert.match(session.notes[0]![0], new RegExp(`Harness commit ${bad.slice(0, 9)} was not deployed; this session keeps ${first.slice(0, 9)}`));
 	});
 
-	test("after a reload it says what changed, and once that Pi itself needs a restart", async () => {
+	test("after a reload it says what changed", async () => {
 		const first = (await deployMain()).commit;
 		const old = load(first);
 		await old.start();
 		await new Promise((wait) => setTimeout(wait, 100));
 		old.stop();
-		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 2\n");
-		const second = commit("new pi");
+		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
+		const second = commit("harness only");
 		await deployMain();
 		const reloaded = load(second, { deploy: async () => ({ status: "current", commit: second }) });
 		await reloaded.start("reload");
-		await until(() => reloaded.notes.length >= 2);
-		reloaded.stop();
-		const texts = reloaded.notes.map(([text]) => text);
-		assert.ok(texts.includes(`Harness reloaded: ${first.slice(0, 9)} → ${second.slice(0, 9)} s`), texts.join("\n"));
-		assert.ok(texts.some((text) => /Pi itself \(vendor\/pi\) changed/.test(text)));
-		const again = load(second, { deploy: async () => ({ status: "current", commit: second }) });
-		await again.start("reload");
+		await until(() => reloaded.notes.length >= 1);
 		await new Promise((wait) => setTimeout(wait, 100));
-		again.stop();
-		assert.equal(again.notes.length, 0, "no repeated notices");
+		reloaded.stop();
+		assert.deepEqual(reloaded.notes.map(([text]) => text), [`Harness reloaded: ${first.slice(0, 9)} → ${second.slice(0, 9)} s`]);
+		assert.equal(reloaded.reloads.requested, 0, "it runs the deployed release");
+	});
+
+	test("a release that changed Pi itself is not loaded into a running process; it says once that Pi needs a restart", async () => {
+		const first = (await deployMain()).commit;
+		const session = load(first);
+		await session.start();
+		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 2\n");
+		const newPi = commit("new pi");
+		await until(() => session.notes.length > 0);
+		// Later releases need the new Pi too: still no reload, and no repeated notice.
+		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "three";\n');
+		const later = commit("harness on new pi");
+		await until(() => currentRelease(agentDir)!.commit === later);
+		await new Promise((wait) => setTimeout(wait, 100));
+		session.stop();
+		assert.equal(session.reloads.requested, 0);
+		assert.deepEqual(session.notes, [
+			[`Harness ${newPi.slice(0, 9)} needs a newer Pi (vendor/pi changed); this session keeps ${first.slice(0, 9)}. Restart Pi to run it.`, "warning"],
+		]);
 	});
 
 	test("changes to Pi itself are found from the commits alone, whatever the working tree holds", async () => {
