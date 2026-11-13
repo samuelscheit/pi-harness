@@ -13,12 +13,17 @@
 // one more turn: wait for them in the foreground and finish, stop them, or say why they keep
 // running. Each set of processes is reported once, so the agent can still end its turn on purpose.
 // A process that leaves its group (`setsid`, a daemonizing server) is not seen.
+//
+// Commands the detachable bash moved to the background (jobs.ts) are not reported: their end
+// wakes the session. For other background processes the guard offers the same: wait for them
+// with a bash command, which moves to the background after two minutes.
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { DETACH_AFTER_MS, detachableBash, sessionJobs } from "./jobs.ts";
 
 export const MESSAGE_TYPE = "background-work";
 
@@ -65,7 +70,7 @@ export function backgroundMessage(processes: readonly BackgroundProcess[], comma
 	return [
 		"Your run is about to end, but processes your bash commands started are still running in the background:",
 		...lines,
-		"Nothing wakes you when they finish: after this turn ends, their results reach no one. If the task needs them, do the remaining work that does not depend on them, then wait for them in the foreground (poll with a bounded timeout) and finish the task. If they are not needed, stop them. If they should keep running after your turn (for example a server the user asked for), say so in your reply.",
+		"Nothing wakes you when they finish: after this turn ends, their results reach no one. If the task needs them, wait for them with a bash command (for example `while kill -0 <pid> 2>/dev/null; do sleep 5; done`, then read their output): a command still running after two minutes moves to the background, and its end wakes you with its result. If they are not needed, stop them. If they should keep running after your turn (for example a server the user asked for), say so in your reply.",
 	].join("\n");
 }
 
@@ -83,8 +88,8 @@ export function scanGroups(dir: string, ps: () => string): { running: Background
 		// No bash call recorded a group yet.
 	}
 	for (const file of files) {
-		const pgid = Number(readFileSync(join(dir, file), "utf8"));
-		if (Number.isInteger(pgid) && pgid > 0) fileOf.set(pgid, file);
+		const pgid = readGroup(join(dir, file));
+		if (pgid !== undefined) fileOf.set(pgid, file);
 		else rmSync(join(dir, file), { force: true });
 	}
 	if (fileOf.size === 0) return { running: [], fileOf };
@@ -92,6 +97,16 @@ export function scanGroups(dir: string, ps: () => string): { running: Background
 	const live = new Set(running.map((p) => p.pgid));
 	for (const [pgid, file] of fileOf) if (!live.has(pgid)) rmSync(join(dir, file), { force: true });
 	return { running, fileOf };
+}
+
+/** The process group a group file holds, if any. */
+export function readGroup(file: string): number | undefined {
+	try {
+		const pgid = Number(readFileSync(file, "utf8"));
+		return Number.isInteger(pgid) && pgid > 0 ? pgid : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Per process, across reloads (module state is new after each): bash commands by call, and reported process sets, per session. */
@@ -102,6 +117,8 @@ export interface BackgroundOptions {
 	dir?: string;
 	/** `ps -A -o pid=,pgid=,stat=,etime=,command=`. */
 	ps?: () => string;
+	/** Foreground time before a bash call moves to the background. */
+	detachAfterMs?: number;
 }
 
 export default function background(pi: ExtensionAPI, options: BackgroundOptions = {}) {
@@ -111,6 +128,19 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 	const sessions = (state.__harnessBackground ??= new Map());
 	const sessionState = (id: string) => sessions.get(id) ?? sessions.set(id, { commands: new Map(), reported: new Set() }).get(id)!;
 	const sessionDir = (id: string) => join(root, encodeURIComponent(id));
+	// Beside the group files, not among them: a session directory holds group files only.
+	const logDir = (id: string) => {
+		const dir = join(`${root}-logs`, encodeURIComponent(id));
+		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+		return dir;
+	};
+
+	detachableBash(pi, {
+		detachAfterMs: options.detachAfterMs ?? DETACH_AFTER_MS,
+		groupFileOf: (id, callId) => join(sessionDir(id), encodeURIComponent(callId)),
+		logDir,
+		readGroup,
+	});
 
 	pi.on("tool_call", (event, ctx) => {
 		if (!isToolCallEventType("bash", event)) return;
@@ -123,7 +153,13 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 
 	pi.on("agent_before_settle", (event, ctx) => {
 		const id = ctx.sessionManager.getSessionId();
-		const { running, fileOf } = scanGroups(sessionDir(id), ps);
+		const { running: all, fileOf } = scanGroups(sessionDir(id), ps);
+		// A job's end wakes the session: only processes nothing will report on count.
+		const jobs = sessionJobs(id).jobs;
+		const running = all.filter((p) => {
+			const file = fileOf.get(p.pgid);
+			return file === undefined || !jobs.has(decodeURIComponent(file));
+		});
 		if (running.length === 0) return;
 		const { commands, reported } = sessionState(id);
 		const key = running
@@ -140,9 +176,13 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 		return { entries: [...event.entries, { type: "custom_message", customType: MESSAGE_TYPE, content, display: true }], continue: true };
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	// A reload keeps the session and its processes: its state stays for the reloaded instance.
+	// Otherwise the session ends here (its jobs stop in jobs.ts).
+	pi.on("session_shutdown", (event, ctx) => {
+		if (event.reason === "reload") return;
 		const id = ctx.sessionManager.getSessionId();
 		sessions.delete(id);
 		rmSync(sessionDir(id), { recursive: true, force: true });
+		rmSync(join(`${root}-logs`, encodeURIComponent(id)), { recursive: true, force: true });
 	});
 }

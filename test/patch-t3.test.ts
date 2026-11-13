@@ -95,7 +95,7 @@ describe("asar rewrite", () => {
 
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
-	const ALL = ["cache-warming", "dialogs", "session-questions"];
+	const ALL = ["cache-warming", "dialogs", "background-work", "session-questions"];
 	// An unpatched bundle: every anchor once, except those an earlier patch produces.
 	const bundle = PATCHES.flatMap((patch, i) =>
 		patch.edits
@@ -113,7 +113,9 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('if (event["type"] === "cache_warming")'));
 		assert.ok(text.includes('if (method === "dismiss")'));
 		assert.ok(!text.includes("cancelPendingPrompts(completedAt)"), "turn end still cancels dialogs");
-		assert.ok(text.includes("cacheWarmingPending || pendingPrompts.size > 0"));
+		assert.ok(text.includes("cacheWarmingPending || backgroundWorkPending || pendingPrompts.size > 0"));
+		assert.ok(text.includes('if (event["type"] === "background_work")'));
+		assert.ok(text.includes("(cacheWarmingPending || backgroundWorkPending) && threadState?.providerThread.id === providerThread.id"));
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -121,7 +123,7 @@ describe("patchBundle", () => {
 		const once = patchBundle(bundle, [cacheWarming]);
 		assert.deepEqual(once.applied, ["cache-warming"]);
 		const { text, applied } = patchBundle(once.text);
-		assert.deepEqual(applied, ["dialogs", "session-questions"]);
+		assert.deepEqual(applied, ["dialogs", "background-work", "session-questions"]);
 		assert.equal(text, patchBundle(bundle).text);
 	});
 

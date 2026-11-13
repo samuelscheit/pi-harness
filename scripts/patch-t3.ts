@@ -19,6 +19,11 @@
 //   card still vanished, silently: Pi never heard of it and kept the dialog open. A select, input or
 //   editor dialog's runtime request now carries no turn; its card keeps the turn for display.
 //   Approvals (confirm) stay the turn's: that sweep never closes them.
+// - background-work (same branch, "fix(provider-pi): keep a Pi session loaded while its extensions
+//   have background work"): a bash command the harness moved to the background wakes the session
+//   when it ends, so the session must outlive t3's 30-minute idle unload and the run must not
+//   settle early (a delegated child would report done while its build still runs). Pi (vendor/pi)
+//   emits `background_work` with the pending count (`pi.setBackgroundWork`).
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -76,6 +81,22 @@ export const PATCHES: Patch[] = [
 			[
 				"hasPendingBackgroundWork: sync(() => pendingWake !== null || cacheWarmingPending),",
 				"hasPendingBackgroundWork: sync(() => pendingWake !== null || cacheWarmingPending || pendingPrompts.size > 0),",
+			],
+		],
+	},
+	{
+		name: "background-work",
+		marker: "backgroundWorkPending",
+		edits: [
+			["let cacheWarmingPending = false;", "let cacheWarmingPending = false;\n\t\t\tlet backgroundWorkPending = false;"],
+			[
+				'cacheWarmingPending = warmingState === "scheduled" || warmingState === "refreshing";\n\t\t\t\t\treturn;\n\t\t\t\t}',
+				'cacheWarmingPending = warmingState === "scheduled" || warmingState === "refreshing";\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t\tif (event["type"] === "background_work") {\n\t\t\t\t\tconst pending = event["pending"];\n\t\t\t\t\tbackgroundWorkPending = typeof pending === "number" && pending > 0;\n\t\t\t\t\treturn;\n\t\t\t\t}',
+			],
+			["cacheWarmingPending || pendingPrompts.size > 0", "cacheWarmingPending || backgroundWorkPending || pendingPrompts.size > 0"],
+			[
+				"cacheWarmingPending && threadState?.providerThread.id === providerThread.id",
+				"(cacheWarmingPending || backgroundWorkPending) && threadState?.providerThread.id === providerThread.id",
 			],
 		],
 	},
