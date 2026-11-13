@@ -31,10 +31,10 @@ export {
 	type BranchSummaryResult,
 	type CollectEntriesResult,
 	type CompactionModel,
+	type CompactionPrices,
 	type CompactionResult,
 	type CutPointResult,
 	calculateContextTokens,
-	type CompactionPrices,
 	collectEntriesForBranchSummary,
 	compact,
 	compactionCost,
@@ -115,6 +115,7 @@ export type {
 	ExtensionToolContext,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionUIQuestion,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
 	FindToolCallEvent,
@@ -342,7 +343,13 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
-export { computeEditsDiff, type EditDiffError, type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
+export {
+	computeEditsDiff,
+	type EditDiffError,
+	type EditDiffResult,
+	generateDiffString,
+	generateUnifiedPatch,
+} from "./core/tools/edit-diff.ts";
 // Tools
 export {
 	type BashOperations,

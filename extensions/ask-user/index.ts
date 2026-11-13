@@ -5,18 +5,17 @@
 // Codex's contract: it shows the questions and returns `{"accepted":true}` at once; the answers
 // arrive later as a message that steers the running turn or starts a new one.
 //
-// In t3, each question is a question card (Pi `select`/`input` over RPC) that also takes a typed
-// answer. The terminal's select has no free-text field, so there it gets an extra option that
-// opens one.
+// One call is one Pi questions dialog (`ctx.ui.questions`): in t3 one card holding all its
+// questions, each also taking a typed answer; in the terminal the questions one after another.
+// Calls do not wait for each other: a later call's card opens at once, even while an earlier one
+// is still unanswered.
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIQuestion } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 // Codex's bundled description (codex-rs/prompts/src/model_messages.rs).
 const DESCRIPTION =
 	"Ask the user one or more questions during ongoing work. Use this tool only to request missing information, preferences, constraints, clarification, or approval. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message. Keep questions concise, self-contained, and easy to understand, using a level of detail appropriate to the user and task. The UI always allows a free-text answer, including when suggested options are provided. A preselected option is not submitted automatically.";
-
-const TYPE_ANSWER = "Type an answer…";
 
 const parameters = Type.Object(
 	{
@@ -40,13 +39,8 @@ const parameters = Type.Object(
 	{ additionalProperties: false },
 );
 
-export interface Question {
-	title: string;
-	options?: string[];
-}
-
 /** Why the questions are unusable, or undefined when they are fine. */
-export function invalidQuestions(questions: Question[]): string | undefined {
+export function invalidQuestions(questions: ExtensionUIQuestion[]): string | undefined {
 	if (questions.length === 0) return "questions must not be empty";
 	if (questions.some((q) => !q.title.trim())) return "question titles must not be empty";
 	if (questions.some((q) => q.options && (q.options.length === 0 || q.options.some((o) => !o.trim())))) {
@@ -55,26 +49,16 @@ export function invalidQuestions(questions: Question[]): string | undefined {
 	return undefined;
 }
 
-/** One answer per question; undefined when the user dismissed it. */
-async function ask(ctx: ExtensionContext, question: Question): Promise<string | undefined> {
-	if (!question.options) return ctx.ui.input(question.title);
-	if (ctx.mode !== "tui") return ctx.ui.select(question.title, question.options);
-	const choice = await ctx.ui.select(question.title, [...question.options, TYPE_ANSWER]);
-	return choice === TYPE_ANSWER ? ctx.ui.input(question.title) : choice;
-}
-
-export function formatAnswers(questions: Question[], answers: (string | undefined)[]): string {
+/** The message that delivers the answers; `answers` is undefined when the user dismissed the dialog. */
+export function formatAnswers(questions: ExtensionUIQuestion[], answers: (string | undefined)[] | undefined): string {
 	const lines = questions.map((q, i) => {
-		const answer = answers[i];
+		const answer = answers?.[i];
 		return `${questions.length > 1 ? `${i + 1}. ` : ""}${q.title}\nAnswer: ${answer === undefined ? "(dismissed without an answer)" : answer || "(empty answer)"}`;
 	});
 	return `The user answered your ask_user questions:\n\n${lines.join("\n\n")}`;
 }
 
 export default function askUser(pi: ExtensionAPI) {
-	// One dialog at a time, also across calls.
-	let queue: Promise<unknown> = Promise.resolve();
-
 	pi.registerTool({
 		name: "ask_user",
 		label: "Ask user",
@@ -87,9 +71,7 @@ export default function askUser(pi: ExtensionAPI) {
 			if (problem) throw new Error(problem);
 			if (!ctx.hasUI) throw new Error("No user interface in this session: ask the questions in your reply instead.");
 			const questions = params.questions;
-			queue = queue.then(async () => {
-				const answers: (string | undefined)[] = [];
-				for (const question of questions) answers.push(await ask(ctx, question));
+			ctx.ui.questions(questions).then((answers) => {
 				pi.sendMessage(
 					{ customType: "ask_user", content: formatAnswers(questions, answers), display: true, details: { toolCallId, questions, answers } },
 					{ deliverAs: "steer", triggerTurn: true },

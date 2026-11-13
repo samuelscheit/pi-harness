@@ -87,6 +87,7 @@ import type {
 	ExtensionRunner,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionUIQuestion,
 	ExtensionWidgetOptions,
 	MarkdownTransformer,
 	ProjectTrustContext,
@@ -304,6 +305,9 @@ function isUsageSessionEntry(item: RenderSessionItem): item is Extract<SessionEn
 // EIO: tty reads/ioctls from an orphaned background process group, or writes after hangup.
 // ENOTTY: the tty was revoked (macOS) and stdin is no longer a terminal.
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]);
+
+/** The selector option of a questions dialog that opens a text input. */
+const TYPE_AN_ANSWER = "Type an answer…";
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -2775,6 +2779,7 @@ export class InteractiveMode {
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
 			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
+			questions: (questions, opts) => this.showExtensionQuestions(questions, opts),
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
@@ -2947,6 +2952,33 @@ export class InteractiveMode {
 			);
 			this.pushExtensionDialog(input, { kind: "question", message: title });
 		});
+	}
+
+	/**
+	 * Ask an extension's questions one after another: a selector with an extra option that opens a text
+	 * input (the selector has no free-text field), or an input for a question without options. Escape
+	 * skips a question; the abort signal or the timeout (for the whole set) dismisses the rest.
+	 */
+	private async showExtensionQuestions(
+		questions: ExtensionUIQuestion[],
+		opts?: ExtensionUIDialogOptions,
+	): Promise<(string | undefined)[] | undefined> {
+		const signals = [opts?.signal, opts?.timeout ? AbortSignal.timeout(opts.timeout) : undefined].filter(
+			(signal): signal is AbortSignal => signal !== undefined,
+		);
+		const signal = signals.length > 0 ? AbortSignal.any(signals) : undefined;
+		const answers: (string | undefined)[] = [];
+		for (const [i, question] of questions.entries()) {
+			if (signal?.aborted) return undefined;
+			const title = questions.length > 1 ? `(${i + 1}/${questions.length}) ${question.title}` : question.title;
+			if (!question.options) {
+				answers.push(await this.showExtensionInput(title, undefined, { signal }));
+				continue;
+			}
+			const choice = await this.showExtensionSelector(title, [...question.options, TYPE_AN_ANSWER], { signal });
+			answers.push(choice === TYPE_AN_ANSWER ? await this.showExtensionInput(title, undefined, { signal }) : choice);
+		}
+		return signal?.aborted ? undefined : answers;
 	}
 
 	/**

@@ -696,7 +696,7 @@ If the run is aborted while `agent_before_settle` handlers are running, valid re
 
 #### ui_prompt_start / ui_prompt_end
 
-Notification-only lifecycle events for blocking user-facing extension UI prompts. They fire around `ctx.ui.select()`, `ctx.ui.confirm()`, `ctx.ui.input()`, `ctx.ui.editor()`, and `ctx.ui.custom()` so host/status integrations can report "waiting for user" instead of just "running".
+Notification-only lifecycle events for blocking user-facing extension UI prompts. They fire around `ctx.ui.select()`, `ctx.ui.confirm()`, `ctx.ui.input()`, `ctx.ui.questions()`, `ctx.ui.editor()`, and `ctx.ui.custom()` so host/status integrations can report "waiting for user" instead of just "running".
 
 Nested or overlapping prompts are coalesced into one outer waiting span. Handlers are invoked best-effort and are not awaited before showing or closing the prompt.
 
@@ -2831,6 +2831,14 @@ const ok = await ctx.ui.confirm("Delete?", "This cannot be undone");
 
 // Text input
 const name = await ctx.ui.input("Name:", "placeholder");
+
+// Several questions in one dialog (one card in RPC clients, one after another in the terminal).
+// One answer per question (undefined if skipped), or undefined if the dialog was dismissed.
+// The user can type an answer instead of picking an option; omit options for free text.
+const answers = await ctx.ui.questions([
+  { title: "Which area first?", options: ["Limitation", "Contracts"] },
+  { title: "Anything else?" },
+]);
 
 // Multi-line editor
 const text = await ctx.ui.editor("Edit:", "prefilled text");

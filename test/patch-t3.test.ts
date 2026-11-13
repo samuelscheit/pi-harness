@@ -95,7 +95,7 @@ describe("asar rewrite", () => {
 
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
-	const ALL = ["cache-warming", "dialogs", "background-work", "session-questions"];
+	const ALL = ["cache-warming", "dialogs", "background-work", "questions", "session-questions"];
 	// An unpatched bundle: every anchor once, except those an earlier patch produces.
 	const bundle = PATCHES.flatMap((patch, i) =>
 		patch.edits
@@ -116,6 +116,9 @@ describe("patchBundle", () => {
 		assert.ok(text.includes("cacheWarmingPending || backgroundWorkPending || pendingPrompts.size > 0"));
 		assert.ok(text.includes('if (event["type"] === "background_work")'));
 		assert.ok(text.includes("(cacheWarmingPending || backgroundWorkPending) && threadState?.providerThread.id === providerThread.id"));
+		assert.ok(text.includes('method !== "editor" && method !== "questions") {'), "a questions dialog is still ignored");
+		assert.ok(text.includes('"dismiss",\n\t\t\t\t\t"questions"\n\t\t\t\t].includes'), "a questions dialog waits for a turn owner");
+		assert.ok(text.includes('questions: method === "questions" ? piQuestions(nativeRequestId, event)'));
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -123,7 +126,7 @@ describe("patchBundle", () => {
 		const once = patchBundle(bundle, [cacheWarming]);
 		assert.deepEqual(once.applied, ["cache-warming"]);
 		const { text, applied } = patchBundle(once.text);
-		assert.deepEqual(applied, ["dialogs", "background-work", "session-questions"]);
+		assert.deepEqual(applied, ["dialogs", "background-work", "questions", "session-questions"]);
 		assert.equal(text, patchBundle(bundle).text);
 	});
 
@@ -143,6 +146,28 @@ describe("patchBundle", () => {
 		assert.ok(bundle, "no Pi adapter in t3's archive");
 		const { text, applied } = patchBundle(bundle);
 		assert.deepEqual(applied, ALL);
+
+		// The patched questions card and its response, run as bundled (with the bundle's own helpers).
+		const source = (start: string, end: string) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
+		const helpers = source("function piRecordField(", "function piRecordNumber(");
+		// The helpers call Effect's predicates under the bundler's (build-specific) names.
+		const isObject = /return ([\w$]+)\(input\)/.exec(helpers)![1]!;
+		const isString = /return ([\w$]+)\(value\)/.exec(helpers)![1]!;
+		const { piQuestions, piUiResponse } = new Function(
+			isObject,
+			isString,
+			`${helpers}\n${source("function piQuestions(", "const PiAdapterV2Driver")}\nreturn { piQuestions, piUiResponse };`,
+		)((v: unknown) => typeof v === "object" && v !== null, (v: unknown) => typeof v === "string");
+		const questions = piQuestions("r1", { questions: [{ title: "Area?", options: ["A", ""] }, { title: " " }] });
+		assert.deepEqual(questions, [
+			{ id: "r1:0", header: "Question", question: "Area?", options: [{ label: "A", description: "A", value: "A" }, { label: "Empty value", description: "Empty value", value: "" }] },
+			{ id: "r1:1", header: "Question", question: "Question", options: [] },
+		]);
+		const pending = { method: "questions", turnItem: { type: "user_input_request", questions } };
+		assert.deepEqual(piUiResponse(pending, undefined, { "r1:1": "typed", "r1:0": ["A"] }), { values: [null, "typed"] });
+		assert.deepEqual(piUiResponse(pending, undefined, undefined), { cancelled: true });
+		assert.deepEqual(piUiResponse({ method: "select", questionId: "q" }, undefined, { q: "A" }), { value: "A" });
+
 		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
 		try {
 			writeFileSync(join(dir, "bundle.mjs"), text);

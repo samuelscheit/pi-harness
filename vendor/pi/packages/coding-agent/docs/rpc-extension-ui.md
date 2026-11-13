@@ -4,7 +4,7 @@ Extensions can request user interaction through `ctx.ui`. In RPC mode, supported
 
 There are two categories of extension UI methods:
 
-- **Dialog methods** (`select`, `confirm`, `input`, `editor`): emit an `extension_ui_request` on stdout and block until the client sends back an `extension_ui_response` on stdin with the matching `id`.
+- **Dialog methods** (`select`, `confirm`, `input`, `questions`, `editor`): emit an `extension_ui_request` on stdout and block until the client sends back an `extension_ui_response` on stdin with the matching `id`.
 - **Fire-and-forget methods** (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`): emit an `extension_ui_request` on stdout but do not expect a response. The client can display the information or ignore it.
 
 If a dialog method includes a `timeout` field, the agent-side will auto-resolve with a default value when the timeout expires. The client does not need to track timeouts.
@@ -78,6 +78,25 @@ Prompt the user for free-form text.
 
 Expected response: `extension_ui_response` with `value` (the entered text) or `cancelled: true`.
 
+### questions
+
+Ask several questions at once (`ctx.ui.questions()`), for example as one card the user pages through. Each question has suggested `options`, or none for a free-text question; the user may always type an answer instead of picking one. `title` summarizes the dialog: the question itself for one, `"<n> questions"` for several.
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-10",
+  "method": "questions",
+  "title": "2 questions",
+  "questions": [
+    { "title": "Which area first?", "options": ["Limitation", "Contracts"] },
+    { "title": "Anything else to consider?" }
+  ]
+}
+```
+
+Expected response: `extension_ui_response` with `values` (one answer per question, in order; `null` for one left unanswered) or `cancelled: true` for the whole dialog.
+
 ### editor
 
 Open a multi-line text editor with optional prefilled content.
@@ -96,7 +115,7 @@ Expected response: `extension_ui_response` with `value` (the edited text) or `ca
 
 ### dismiss
 
-Pi closed an open `select`, `confirm` or `input` dialog itself, because the extension's abort signal fired or its `timeout` passed. The `id` is the dialog's. Take the dialog down; it expects no response, and a late one is ignored.
+Pi closed an open `select`, `confirm`, `input` or `questions` dialog itself, because the extension's abort signal fired or its `timeout` passed. The `id` is the dialog's. Take the dialog down; it expects no response, and a late one is ignored.
 
 ```json
 {
@@ -185,12 +204,18 @@ Set the text in the input editor. Fire-and-forget.
 
 ## Responses to Pi
 
-Responses are sent for dialog methods only (`select`, `confirm`, `input`, `editor`). The `id` must match the request.
+Responses are sent for dialog methods only (`select`, `confirm`, `input`, `questions`, `editor`). The `id` must match the request.
 
 ### Value response (select, input, editor)
 
 ```json
 {"type": "extension_ui_response", "id": "uuid-1", "value": "Allow"}
+```
+
+### Values response (questions)
+
+```json
+{"type": "extension_ui_response", "id": "uuid-10", "values": ["Contracts", null]}
 ```
 
 ### Confirmation response (confirm)
@@ -201,7 +226,7 @@ Responses are sent for dialog methods only (`select`, `confirm`, `input`, `edito
 
 ### Cancellation response (any dialog)
 
-Dismiss any dialog method. The extension receives `undefined` (for select/input/editor) or `false` (for confirm).
+Dismiss any dialog method. The extension receives `undefined` (for select/input/questions/editor) or `false` (for confirm).
 
 ```json
 {"type": "extension_ui_response", "id": "uuid-3", "cancelled": true}

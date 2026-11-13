@@ -333,6 +333,7 @@ const noOpUIContext: ExtensionUIContext = {
 	select: async () => undefined,
 	confirm: async () => false,
 	input: async () => undefined,
+	questions: async () => undefined,
 	notify: () => {},
 	onTerminalInput: () => () => {},
 	setStatus: () => {},
@@ -584,6 +585,8 @@ export class ExtensionRunner {
 			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
 			input: (title, placeholder, opts) =>
 				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
+			questions: (questions, opts) =>
+				this.withUIPrompt("questions", questions[0]?.title, () => ui.questions(questions, opts)),
 			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
 			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
 		};

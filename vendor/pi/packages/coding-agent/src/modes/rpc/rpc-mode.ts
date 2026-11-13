@@ -153,6 +153,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
 			),
 
+		questions: (questions, opts) =>
+			createDialogPromise<(string | undefined)[] | undefined>(
+				opts,
+				undefined,
+				{
+					method: "questions",
+					title: questions.length === 1 ? questions[0]!.title : `${questions.length} questions`,
+					questions: questions.map(({ title, options }) => (options ? { title, options } : { title })),
+					timeout: opts?.timeout,
+				},
+				(r) => ("values" in r ? questions.map((_, i) => r.values[i] ?? undefined) : undefined),
+			),
+
 		notify(message: string, type?: "info" | "warning" | "error"): void {
 			// Fire and forget - no response needed
 			output({

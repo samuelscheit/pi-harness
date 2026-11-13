@@ -77,6 +77,7 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
 		select: async () => undefined,
 		confirm: async () => false,
 		input: async () => undefined,
+		questions: async () => undefined,
 		notify: () => {},
 		onTerminalInput: () => () => {},
 		setStatus: () => {},

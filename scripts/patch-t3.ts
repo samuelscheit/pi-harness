@@ -24,6 +24,10 @@
 //   when it ends, so the session must outlive t3's 30-minute idle unload and the run must not
 //   settle early (a delegated child would report done while its build still runs). Pi (vendor/pi)
 //   emits `background_work` with the pending count (`pi.setBackgroundWork`).
+// - questions (same branch, "feat(provider-pi): show a Pi questions dialog as one card"): Pi's
+//   dialogs carried one question each, so an `ask_user` call with four questions became four cards
+//   shown one after another. Pi (vendor/pi) now has a `questions` dialog (`ctx.ui.questions`): one
+//   card holding every question, each with its options or free text, answered as `values` in order.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -97,6 +101,43 @@ export const PATCHES: Patch[] = [
 			[
 				"cacheWarmingPending && threadState?.providerThread.id === providerThread.id",
 				"(cacheWarmingPending || backgroundWorkPending) && threadState?.providerThread.id === providerThread.id",
+			],
+		],
+	},
+	{
+		name: "questions",
+		marker: "piQuestions",
+		edits: [
+			[
+				'if (method !== "select" && method !== "confirm" && method !== "input" && method !== "editor") {',
+				'if (method !== "select" && method !== "confirm" && method !== "input" && method !== "editor" && method !== "questions") {',
+			],
+			[
+				"questions: [piQuestion(nativeRequestId, method, title, event)]",
+				'questions: method === "questions" ? piQuestions(nativeRequestId, event) : [piQuestion(nativeRequestId, method, title, event)]',
+			],
+			['"dismiss"\n\t\t\t\t].includes(String(event["method"]));', '"dismiss",\n\t\t\t\t\t"questions"\n\t\t\t\t].includes(String(event["method"]));'],
+			[
+				"function piUiResponse(pending, decision, answers) {",
+				[
+					"function piQuestions(nativeRequestId, event) {",
+					'\tconst questions = piRecordField(event, "questions");',
+					"\treturn (Array.isArray(questions) ? questions : []).map((question, index) => {",
+					'\t\tconst options = piRecordField(question, "options");',
+					"\t\treturn {",
+					"\t\t\tid: `${nativeRequestId}:${index}`,",
+					'\t\t\theader: "Question",',
+					'\t\t\tquestion: piRecordString(question, "title")?.trim() || "Question",',
+					'\t\t\toptions: Array.isArray(options) ? options.filter((option) => typeof option === "string").map((option) => ({ label: option || "Empty value", description: option || "Empty value", value: option })) : []',
+					"\t\t};",
+					"\t});",
+					"}",
+					"function piUiResponse(pending, decision, answers) {",
+					'\tif (pending.method === "questions") {',
+					'\t\tif (answers === void 0 || pending.turnItem.type !== "user_input_request") return { cancelled: true };',
+					'\t\treturn { values: pending.turnItem.questions.map((question) => typeof answers[question.id] === "string" ? answers[question.id] : null) };',
+					"\t}",
+				].join("\n"),
 			],
 		],
 	},

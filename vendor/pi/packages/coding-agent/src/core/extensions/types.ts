@@ -121,6 +121,13 @@ export interface ExtensionUIDialogOptions {
 	timeout?: number;
 }
 
+/** One question of a {@link ExtensionUIContext.questions} dialog. */
+export interface ExtensionUIQuestion {
+	title: string;
+	/** Suggested answers; the user can always type another. Omit for a free-text question. */
+	options?: string[];
+}
+
 /** Placement for extension widgets. */
 export type WidgetPlacement = "aboveEditor" | "belowEditor";
 
@@ -171,6 +178,16 @@ export interface ExtensionUIContext {
 
 	/** Show a text input dialog. */
 	input(title: string, placeholder?: string, opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
+
+	/**
+	 * Ask several questions in one dialog. Resolves to one answer per question, in order (undefined for
+	 * one the user skipped), or to undefined when the dialog was dismissed as a whole. A client that
+	 * shows dialogs as cards shows the questions as one card; the terminal asks them one after another.
+	 */
+	questions(
+		questions: ExtensionUIQuestion[],
+		opts?: ExtensionUIDialogOptions,
+	): Promise<(string | undefined)[] | undefined>;
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -1066,7 +1083,7 @@ export interface AgentSettledEvent {
 	aborted: boolean;
 }
 
-export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
+export type UIPromptKind = "select" | "confirm" | "input" | "questions" | "editor" | "custom";
 
 /** Fired when Pi starts waiting on a blocking user-facing extension UI prompt. */
 export interface UIPromptStartEvent {

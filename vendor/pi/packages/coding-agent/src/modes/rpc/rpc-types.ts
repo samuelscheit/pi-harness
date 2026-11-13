@@ -260,6 +260,15 @@ export type RpcExtensionUIRequest =
 			placeholder?: string;
 			timeout?: number;
 	  }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "questions";
+			/** A summary for the dialog: the question for one, "<n> questions" for several. */
+			title: string;
+			questions: { title: string; options?: string[] }[];
+			timeout?: number;
+	  }
 	| { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string }
 	/** Pi closed the dialog with this id itself (abort signal or timeout); it takes no response. */
 	| { type: "extension_ui_request"; id: string; method: "dismiss" }
@@ -296,6 +305,8 @@ export type RpcExtensionUIRequest =
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	/** Answers to a questions dialog, one per question in order; null for one left unanswered. */
+	| { type: "extension_ui_response"; id: string; values: (string | null)[] }
 	| { type: "extension_ui_response"; id: string; cancelled: true };
 
 // ============================================================================
