@@ -23,6 +23,7 @@ import { convertToLlm } from "../../src/core/messages.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
+import type { SharedPrefixCache } from "../../src/core/shared-prefix.ts";
 import type { InlineExtension, ResourceLoader } from "../../src/index.ts";
 import { theme } from "../../src/modes/interactive/theme/theme.ts";
 import {
@@ -123,6 +124,8 @@ export interface HarnessOptions {
 	modelsJson?: Record<string, unknown>;
 	/** Session to continue, for example to test a resume. Default: a new in-memory session. */
 	sessionManager?: SessionManager;
+	/** Prompt cache registry and fork bases shared with other sessions. Default: none. */
+	sharedPrefixCache?: SharedPrefixCache;
 }
 
 export interface Harness {
@@ -196,10 +199,12 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const agent = new Agent({
 		getApiKey: () => (withConfiguredAuth ? "faux-key" : undefined),
 		streamFn: streamSimple,
+		// Like createAgentSession: a continued session starts with its context.
 		initialState: {
 			model,
 			systemPrompt: "",
 			tools: [],
+			messages: options.sessionManager ? sessionManager.buildSessionContext().messages : [],
 		},
 		convertToLlm,
 		onPayload: async (payload) => {
@@ -238,6 +243,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		settingsManager,
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
+		sharedPrefixCache: options.sharedPrefixCache,
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,

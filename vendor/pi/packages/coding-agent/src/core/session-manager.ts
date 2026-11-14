@@ -29,9 +29,9 @@ import { readdir, stat } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
-import type { CompactionModel } from "./compaction/compaction.ts";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, pathsEqual, resolvePath } from "../utils/paths.ts";
+import type { CompactionModel } from "./compaction/compaction.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -48,6 +48,19 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/** Set by `forkFrom`: where the fork was taken and how its context started. */
+	fork?: SessionFork;
+}
+
+/**
+ * A fork's start. `base` is decided before the fork's first run, against the shared prefix cache
+ * registry at that time: "full" when the fork kept the source's whole history (its prefix was warm,
+ * or compacting did not pay), else the key of the fork base whose compaction it took (see fork-base.ts).
+ */
+export interface SessionFork {
+	/** The source's last entry when the fork was taken. */
+	leafId: string | null;
+	base?: string;
 }
 
 export interface NewSessionOptions {
@@ -1317,6 +1330,24 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Append a compaction entry taken from a fork base as child of the current leaf, keeping its id,
+	 * timestamp and system message, so the context is the base's byte for byte.
+	 */
+	appendBaseCompaction(compaction: CompactionEntry): string {
+		if (this.byId.has(compaction.id)) throw new Error(`Entry ${compaction.id} already exists in this session`);
+		this._appendEntry({ ...compaction, parentId: this.leafId });
+		return compaction.id;
+	}
+
+	/** Record how a fork started (see `SessionFork.base`); only the first decision counts. */
+	setForkBase(base: string): void {
+		const header = this.getHeader();
+		if (!header?.fork || header.fork.base !== undefined) return;
+		header.fork = { ...header.fork, base };
+		if (this.flushed) this._rewriteFile();
+	}
+
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
 		const entry: CustomEntry = {
@@ -1876,6 +1907,7 @@ export class SessionManager {
 		const newSessionFile = join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);
 
 		// Write new header pointing to source as parent, with updated cwd
+		const sourceLeaf = sourceEntries.findLast((entry) => entry.type !== "session") as SessionEntry | undefined;
 		const newHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1883,6 +1915,7 @@ export class SessionManager {
 			timestamp,
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
+			fork: { leafId: sourceLeaf?.id ?? null },
 		};
 		// Write the header and all non-header entries through one fd. Reopening the file per entry
 		// is slow where open/close is expensive (e.g. filesystem security monitors).

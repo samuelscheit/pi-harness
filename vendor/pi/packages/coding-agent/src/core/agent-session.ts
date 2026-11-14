@@ -123,7 +123,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
-
+import type { ForkBaseMeta } from "./fork-base.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -149,7 +149,7 @@ import {
 	DEFAULT_TOOL_NAMES,
 	type SettingsManager,
 } from "./settings-manager.ts";
-import type { SharedPrefixCache } from "./shared-prefix.ts";
+import { keptEntries, primeProjection, type SharedPrefixCache, sendCachePrime } from "./shared-prefix.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
@@ -308,8 +308,9 @@ export interface AgentSessionConfig {
 		"cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "sharedTouchedAt" | "setHold"
 	>;
 	/**
-	 * Prompt cache state shared with the other pi processes of the agent directory: coldness
-	 * checks consult it and every request is recorded in it (see prefix-cache.ts).
+	 * Prompt cache state and fork bases shared with the other pi processes of the agent directory:
+	 * coldness checks consult it, every request is recorded in it, and cold economic compactions
+	 * reuse or store a fork base (see shared-prefix.ts).
 	 */
 	sharedPrefixCache?: SharedPrefixCache;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
@@ -926,7 +927,7 @@ export class AgentSession {
 		const prefixRequest = this._prefixRequest(model);
 		const shared = prefixRequest && this._sharedPrefix?.check(prefixRequest);
 		const cold = isPromptCacheCold(branch, getPromptCacheTtlMs(model, streamOptions), Date.now(), shared);
-		return { economic, summaryModel, cold, branch, streamOptions };
+		return { economic, summaryModel, cold, branch, streamOptions, prefixRequest };
 	}
 
 	/** A request of `model` sending `projection` (default: the branch), for the shared prefix registry. */
@@ -938,6 +939,11 @@ export class AgentSession {
 		const ttlMs = getPromptCacheTtlMs(model, { cacheRetention: this.settingsManager.getCacheRetention() });
 		if (ttlMs === undefined) return undefined;
 		return this._sharedPrefix.request(model, ttlMs, projection ?? this.sessionManager.buildSessionProjection());
+	}
+
+	/** Record how a fork started, once (see `SessionFork.base`). */
+	private _settleFork(base: string): void {
+		this.sessionManager.setForkBase(base);
 	}
 
 	/**
@@ -953,8 +959,19 @@ export class AgentSession {
 		const model = this.model;
 		const plan = model && this._economicSummary(model);
 		if (!model || !plan) return;
-		const { economic, summaryModel, cold, branch, streamOptions } = plan;
-		if (!cold && !economic.warm) return;
+		const { economic, summaryModel, cold, branch, streamOptions, prefixRequest } = plan;
+		if (!cold && !economic.warm) return this._settleFork("full");
+		// A cold prefix compacts into a fork base shared by every session that reaches it cold.
+		const base =
+			cold && prefixRequest
+				? this._sharedPrefix?.baseKey(
+						prefixRequest,
+						summaryModel,
+						this.settingsManager.getCompactionSettings(model),
+					)
+				: undefined;
+		// Taking an existing base costs no summary.
+		const summarised = !base || !this._sharedPrefix?.bases.load(base.key);
 		// Anthropic bills a one-hour cache write at twice the input price (see calculateCost).
 		const writePerMillion =
 			resolvePromptCacheRetention(streamOptions) === "long" ? model.cost.input * 2 : model.cost.cacheWrite;
@@ -965,12 +982,91 @@ export class AgentSession {
 			prices: {
 				read: model.cost.cacheRead / 1e6,
 				write: writePerMillion / 1e6,
-				summaryInput: summaryModel.cost.input / 1e6,
-				summaryOutput: summaryModel.cost.output / 1e6,
+				summaryInput: summarised ? summaryModel.cost.input / 1e6 : 0,
+				summaryOutput: summarised ? summaryModel.cost.output / 1e6 : 0,
 			},
 		});
-		if (saving < economic.minSaving) return;
+		if (saving < economic.minSaving) return this._settleFork("full");
+		if (base) return this._compactWithBase(model, base, summaryModel);
 		await this._runAutoCompaction(cold ? "cold" : "economic", false, summaryModel);
+		this._settleFork("full");
+	}
+
+	/**
+	 * Compact a cold prefix through its fork base, holding the base's lock: take the base's
+	 * compaction verbatim when it exists, else compact and store the result as the base. Then, when
+	 * other forks wait for the base or took it within the last hour and its prefix is cold, write the
+	 * prefix's cache entry once (`_primeBase`) so they read it instead of each writing it.
+	 */
+	private async _compactWithBase(
+		model: Model<any>,
+		base: NonNullable<ReturnType<SharedPrefixCache["baseKey"]>>,
+		summaryModel: Model<any>,
+	): Promise<void> {
+		const shared = this._sharedPrefix!;
+		const session = this.sessionManager.getSessionFile();
+		await shared.bases.withLock(base.key, async (self) => {
+			const before = getLatestCompactionEntry(this.sessionManager.getBranch())?.id;
+			const existing = shared.bases.load(base.key);
+			if (existing && this.sessionManager.getEntry(existing.compaction.id)) return;
+			await this._runAutoCompaction("cold", false, summaryModel, existing?.compaction);
+			const branch = this.sessionManager.getBranch();
+			const compaction = getLatestCompactionEntry(branch);
+			if (!compaction || compaction.id === before) return;
+			const stored =
+				existing ??
+				shared.bases.save(base.parts, keptEntries(branch, compaction), compaction, Date.now(), {
+					cwd: this._cwd,
+					file: session,
+				});
+			const now = Date.now();
+			const others =
+				shared.bases.waiters(base.key, self) > 0 ||
+				stored.meta.forks.some((fork) => fork.session !== session && now - fork.at < 60 * 60_000);
+			const prime = others ? await this._primeBase(model) : undefined;
+			shared.bases.update(base.key, (meta) => {
+				meta.lastUsedAt = now;
+				meta.forks.push({ at: now, ...(session ? { session } : {}) });
+				if (prime) meta.primes.push(prime);
+			});
+			this._settleFork(base.key);
+		});
+	}
+
+	/**
+	 * Write the cache entry every fork of the current (just compacted) context reads first, unless
+	 * the registry knows a live one. Recorded in the registry and as a "cache_prime" usage entry.
+	 */
+	private async _primeBase(model: Model<any>): Promise<ForkBaseMeta["primes"][number] | undefined> {
+		const shared = this._sharedPrefix!;
+		const projection = primeProjection(this.sessionManager.buildSessionProjection());
+		const request = this._prefixRequest(model, projection);
+		const point = request?.prefix.points.at(-1);
+		if (!request || !point) return undefined;
+		const sentAt = Date.now();
+		if ((shared.registry.get(request.model, request.prefix.promptHash, point)?.expiresAt ?? 0) > sentAt)
+			return undefined;
+		let result: Awaited<ReturnType<typeof sendCachePrime>>;
+		try {
+			result = await sendCachePrime(this.agent, model, projection.messages, {
+				cacheRetention: this.settingsManager.getCacheRetention(),
+			});
+		} catch {
+			// Priming is an optimisation: each fork's first request writes the entry otherwise.
+			return undefined;
+		}
+		if (!result) return undefined;
+		shared.registry.recordRequest(request, result.usage, sentAt);
+		const entry = this.sessionManager.appendUsage("cache_prime", result.provider, result.model, result.usage);
+		this._emit({ type: "entry_appended", entry });
+		const session = this.sessionManager.getSessionFile();
+		return {
+			at: sentAt,
+			...(session ? { session } : {}),
+			tokens: result.usage.input + result.usage.cacheRead + result.usage.cacheWrite,
+			cost: result.usage.cost.total,
+			usage: result.usage,
+		};
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -3456,12 +3552,15 @@ export class AgentSession {
 	 *
 	 * @param reason Automatic trigger selected by `_checkCompaction()`
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
+	 * @param base A fork base's compaction of this branch: appended verbatim, without summarising
+	 *   or asking extensions (they shaped it when the base was made)
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
 	private async _runAutoCompaction(
 		reason: Exclude<CompactionReason, "manual">,
 		willRetry: boolean,
 		summaryModel?: Model<any>,
+		base?: CompactionEntry,
 	): Promise<boolean> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
@@ -3476,8 +3575,8 @@ export class AgentSession {
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
+			const preparation = base ? undefined : prepareCompaction(pathEntries, settings);
+			if (!base && !preparation) {
 				return false;
 			}
 
@@ -3488,8 +3587,17 @@ export class AgentSession {
 			abortController.signal.throwIfAborted();
 
 			let extensionCompaction: CompactionResult | undefined;
-
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+			if (base) {
+				fromExtension = base.fromHook === true;
+				extensionCompaction = {
+					summary: base.summary,
+					firstKeptEntryId: base.firstKeptEntryId,
+					tokensBefore: base.tokensBefore,
+					usage: base.usage,
+					details: base.details,
+					...(base.provider && base.model ? { generatedBy: { provider: base.provider, model: base.model } } : {}),
+				};
+			} else if (preparation && this._extensionRunner.hasHandlers("session_before_compact")) {
 				const extensionResult = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
@@ -3512,11 +3620,11 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			// Extension provided compaction content, else the shared default summary generator, also used by manual compaction.
+			// A base or extension provided compaction content, else the shared default summary generator, also used by manual compaction.
 			const compacted =
 				extensionCompaction ??
 				(await this._runDefaultCompaction(
-					preparation,
+					preparation!,
 					summaryModel ?? model,
 					undefined,
 					abortController.signal,
@@ -3525,16 +3633,19 @@ export class AgentSession {
 			const { summary, firstKeptEntryId, tokensBefore, usage, details, generatedBy } = compacted;
 			abortController.signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				fromExtension,
-				usage,
-				reason,
-				generatedBy,
-			);
+			if (base) this.sessionManager.appendBaseCompaction(base);
+			else {
+				this.sessionManager.appendCompaction(
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					usage,
+					reason,
+					generatedBy,
+				);
+			}
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
