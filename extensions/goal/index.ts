@@ -20,6 +20,14 @@
 //   each turn: once reached, the goal becomes budget-limited and the agent writes a summary.
 // Marking it achieved runs its check (exit 0 required). Blocked needs a reason; a user message
 // makes a blocked goal active again (it was blocked on them).
+//
+// Without an active goal the turn may end, but not silently while background jobs run: the same
+// coordinator ended its turns "waiting" for builds although independent work remained, also with no
+// goal set (2026-11-14, the user had to ask "can't you work in parallel assuming they are green").
+// A run that would settle with jobs pending the agent was not yet told about continues once with
+// `pendingText`: continue with the independent steps, or end with one line naming what it waits for.
+// The jobs it was told about (`memory.told`, also by the goal's strict continue and `wait`) never
+// trigger it again, so a server started on purpose costs one request, not one per turn.
 
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
@@ -40,6 +48,7 @@ import {
 	overBudget,
 	type PendingJob,
 	parseFlags,
+	pendingText,
 	sectionText,
 	spendText,
 	statusLine,
@@ -105,12 +114,16 @@ interface SessionMemory {
 	notified: boolean;
 	/** A valid `wait` of the current run: the job keys it named. */
 	waiting: string[] | undefined;
+	/** The keys of the pending jobs the agent was last told about; kept across runs. */
+	told: string[];
 }
+
+const freshMemory = (): SessionMemory => ({ idle: 0, notified: false, waiting: undefined, told: [] });
 
 const tail = (text: string, max: number) => (text.length > max ? `[…]\n${text.slice(-max)}` : text);
 
 export default function goal(pi: ExtensionAPI) {
-	let memory: SessionMemory = { idle: 0, notified: false, waiting: undefined };
+	let memory = freshMemory();
 	const state = (ctx: ExtensionContext) => goalState(ctx.sessionManager.getBranch());
 	const refresh = (ctx: ExtensionContext) => {
 		const { goal, spent } = state(ctx);
@@ -126,7 +139,7 @@ export default function goal(pi: ExtensionAPI) {
 	const tellAgent = (content: string) => pi.sendMessage({ customType: MESSAGE_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "steer" });
 
 	const reset = (ctx: ExtensionContext) => {
-		memory = { idle: 0, notified: false, waiting: undefined };
+		memory = freshMemory();
 		refresh(ctx);
 	};
 	pi.on("session_start", (_event, ctx) => reset(ctx));
@@ -180,16 +193,23 @@ export default function goal(pi: ExtensionAPI) {
 			return { entries: [...event.entries, ...limited], continue: true };
 		}
 		const { goal, spent } = state(ctx);
-		if (goal?.status !== "active") return;
 		const jobs = pendingJobs(ctx.sessionManager.getSessionId());
-		const keys = new Set(jobs.map((job) => job.key));
-		if (memory.waiting?.every((key) => keys.has(key))) return;
+		const keys = jobs.map((job) => job.key);
+		if (goal?.status !== "active") {
+			const told = new Set(memory.told);
+			// Ended jobs drop out, so the memory holds only what still runs.
+			memory.told = keys;
+			if (keys.every((key) => told.has(key))) return;
+			return { entries: [...event.entries, message(pendingText(jobs, Date.now()))], continue: true };
+		}
+		if (memory.waiting?.every((key) => keys.includes(key))) return;
 		if (memory.idle >= MAX_IDLE_CONTINUES) {
 			if (!memory.notified && ctx.hasUI) ctx.ui.notify(`Goal: the agent stopped ${MAX_IDLE_CONTINUES + 1} times in a row without a tool call, so its turn ended. The goal stays active: send a message to go on, or /goal pause.`, "warning");
 			memory.notified = true;
 			return;
 		}
 		memory.idle++;
+		if (keys.length > 0) memory.told = keys;
 		return { entries: [...event.entries, message(continueText(goal, spent, jobs, Date.now()))], continue: true };
 	});
 
@@ -272,6 +292,7 @@ export default function goal(pi: ExtensionAPI) {
 					].join("\n"),
 				);
 			memory.waiting = [...new Set(resolved.map((s) => s.found!.key))];
+			memory.told = jobs.map((job) => job.key);
 			return done(`Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}). End your turn now; the job's end wakes you with its result.`);
 		},
 	});

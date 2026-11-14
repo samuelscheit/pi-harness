@@ -174,6 +174,21 @@ export function continueText(goal: Goal, spent: Spend, jobs: readonly PendingJob
 	].join("\n");
 }
 
+/**
+ * The message that continues a run once when it would settle without a goal while background jobs
+ * the agent was not yet told about run: ending the turn to wait for them is right only when every
+ * remaining step depends on them.
+ */
+export function pendingText(jobs: readonly PendingJob[], now: number): string {
+	return [
+		"Your turn is about to end while background work runs; its end wakes you with its result:",
+		...jobLines(jobs, now),
+		"",
+		"Do not end your turn to wait for it. Continue now with the remaining steps that do not depend on these jobs; where it is safe, assume they succeed and let their result correct you.",
+		"Only if every remaining step depends on them, or a job is a server you keep running on purpose, end your turn with one line naming what you wait for.",
+	].join("\n");
+}
+
 /** The message when the budget is reached: wrap up. */
 export function budgetLimitText(goal: Goal, spent: Spend): string {
 	return [

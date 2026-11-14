@@ -77,7 +77,7 @@ export class SessionEnded extends Error {
 }
 
 export const BACKGROUND_GUIDELINE = (detachAfterMs: number) =>
-	`No tool call except a waiting \`ask_user\` blocks you for more than ${detachAfterMs / 60_000} minutes: a call still running then, or when the user sends a message, moves to the background and keeps running, and its result reaches you as a new message when it ends, also after your turn. \`workflow\` always starts in the background. To start other work in the background at once: \`cmd > log 2>&1 &\` in bash, \`tool <name> … > out 2>&1 &\` in bash for any tool, or \`delegate_task\` in async mode. Never wait for background work with sleep or poll loops (\`until grep …; do sleep …; done\`): its end wakes you.`;
+	`No tool call except a waiting \`ask_user\` blocks you for more than ${detachAfterMs / 60_000} minutes: a call still running then, or when the user sends a message, moves to the background and keeps running, and its result reaches you as a new message when it ends, also after your turn. \`workflow\` always starts in the background. To start other work in the background at once: \`cmd > log 2>&1 &\` in bash, \`tool <name> … > out 2>&1 &\` in bash for any tool, or \`delegate_task\` in async mode. Never wait for background work with sleep or poll loops (\`until grep …; do sleep …; done\`): its end wakes you. While it runs, continue with the steps that do not depend on it, assuming it succeeds where that is safe; end your turn only when every remaining step depends on it, with one line naming what you wait for.`;
 
 export interface BackgroundOptions {
 	/** Foreground time before a call moves to the background. */

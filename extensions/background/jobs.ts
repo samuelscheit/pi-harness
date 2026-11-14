@@ -127,7 +127,7 @@ export const callLabel = (toolName: string, input: Record<string, unknown>): str
 export function detachedText(job: Job, reason: DetachReason, output: string, now: number): string {
 	const stop = job.pgid === undefined ? "" : ` (process group ${job.pgid}; stop it with \`kill -- -${job.pgid}\`)`;
 	const where = `Its latest output is in ${job.log}.`;
-	const after = "When it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Do the work that does not depend on it, or end your turn.";
+	const after = "When it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Continue with the work that does not depend on it; end your turn only when every remaining step depends on it.";
 	if (reason === "start") return [`\`${job.toolName}\` always runs in the background: the call started and keeps running${stop}. ${where}`, after, ...(output.trim() ? [tail(output, TAIL_LINES)] : [])].join("\n\n");
 	const why = reason === "time" ? `It still ran after ${minutes(now - job.startedAt)}, so the call` : "A new message arrived while it ran, so the call";
 	return [

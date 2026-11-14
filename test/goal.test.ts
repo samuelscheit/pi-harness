@@ -24,6 +24,7 @@ import {
 	type PendingJob,
 	parseBudget,
 	parseFlags,
+	pendingText,
 	sectionText,
 	statusLine,
 } from "../extensions/goal/goal.ts";
@@ -102,6 +103,19 @@ describe("goal state", () => {
 		assert.match(strict, /Background work is still running; its end wakes you with its result:\n- pid 7: `sleep 100` \(running 3 min\)\n\nDo not stop to wait for it\./);
 		assert.match(strict, /List the remaining steps of the goal that do not depend on these jobs, and do them now\./);
 		assert.match(strict, /action `wait`, naming for each remaining step the job it waits for/);
+		const pending = pendingText([{ key: "call c1", command: "npm run build", ids: ["c1"], startedAt: 0 }, { key: "pid 7", command: "npm test", ids: ["7"] }], 61_000);
+		assert.equal(
+			pending,
+			[
+				"Your turn is about to end while background work runs; its end wakes you with its result:",
+				"- call c1: `npm run build` (running 1 min)",
+				"- pid 7: `npm test`",
+				"",
+				"Do not end your turn to wait for it. Continue now with the remaining steps that do not depend on these jobs; where it is safe, assume they succeed and let their result correct you.",
+				"Only if every remaining step depends on them, or a job is a server you keep running on purpose, end your turn with one line naming what you wait for.",
+			].join("\n"),
+		);
+		assert.doesNotMatch(pending, /goal/i, "no goal is involved");
 	});
 
 	test("the prompt extension puts other extensions' sections (the goal) after its own", () => {
@@ -212,6 +226,7 @@ const bash = (command: string) => fauxAssistantMessage([fauxToolCall("bash", { c
 const textOf = (content: string | readonly { type: string; text?: string }[]) => (typeof content === "string" ? content : content.map((c) => c.text ?? "").join(""));
 const goalMessages = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "custom" && m.customType === MESSAGE_TYPE ? [textOf(m.content)] : []));
 const continues = (s: AgentSession) => goalMessages(s).filter((t) => t.startsWith("Your goal is still active"));
+const nudges = (s: AgentSession) => goalMessages(s).filter((t) => t.startsWith("Your turn is about to end while background work runs"));
 const toolTexts = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "toolResult" ? [`${m.isError ? "error: " : ""}${textOf(m.content)}`] : []));
 const lastText = (context: { messages: readonly unknown[] }) => JSON.stringify(context.messages.at(-1));
 const current = (s: AgentSession) => goalState(s.sessionManager.getBranch()).goal;
@@ -540,19 +555,103 @@ describe("strict mode: background work pending", () => {
 });
 
 describe("without a goal", () => {
-	test("nothing changes: no section, no status, the run ends with background work pending", async () => {
+	test("no background work: no section, no status, no message; the run ends", async () => {
 		const { s, ui } = await newSession();
 		const prompts: string[] = [];
-		respond(bash("sleep 0.5 > /dev/null 2>&1 &"), () => {
+		respond(bash("true"), () => {
 			prompts.push(s.systemPrompt);
-			return say("Started it.");
-		}, say("It ended."));
-		await s.prompt("start it");
-		assert.ok(settled(s, "Started it.")());
+			return say("Done.");
+		});
+		await s.prompt("do it");
+		assert.ok(settled(s, "Done.")());
 		assert.doesNotMatch(prompts[0]!, /<goal>/);
 		assert.equal(goalMessages(s).length, 0);
 		assert.equal(ui.statuses.get("goal"), undefined);
-		await until("the wake", settled(s, "It ended."));
-		assert.equal(goalMessages(s).length, 0);
+		assert.equal(faux.getPendingResponseCount(), 0);
+	});
+
+	test("a new job continues the run once; the same jobs never again, across runs and wakes; a job added continues it once more", async () => {
+		const { s } = await newSession();
+		const seen: string[] = [];
+		respond(bash("sleep 2.5 > /dev/null 2>&1 &"), say("Started the long job."), (context) => {
+			seen.push(lastText(context));
+			return say("Every remaining step needs it; I wait for the sleep 2.5 job.");
+		});
+		await s.prompt("start it");
+		await until("the first run", settled(s, "I wait for the sleep 2.5 job."));
+		assert.equal(nudges(s).length, 1);
+		assert.match(seen[0]!, /Your turn is about to end while background work runs; its end wakes you with its result:\\n- pid \d+: `sleep 2\.5` \(running \d+ s\)\\n\\nDo not end your turn to wait for it\./);
+		assert.equal(continues(s).length, 0, "not the goal's message");
+		assert.equal(faux.getPendingResponseCount(), 0, "the reply naming what it waits for ends the turn");
+
+		// The same job in a new run (a server kept on purpose): no request is spent on it again.
+		respond(say("It still runs."));
+		await s.prompt("status?");
+		assert.ok(settled(s, "It still runs.")());
+		assert.equal(nudges(s).length, 1);
+
+		// A job added: told once more, with every job that runs.
+		respond(bash("sleep 1 > /dev/null 2>&1 &"), say("Started the short job."), (context) => {
+			seen.push(lastText(context));
+			return say("Both run; I wait for them.");
+		}, say("The short one ended."), say("The long one ended."));
+		await s.prompt("start another");
+		await until("the second run", settled(s, "Both run; I wait for them."));
+		assert.equal(nudges(s).length, 2);
+		assert.match(seen[1]!, /- pid \d+: `sleep 2\.5` \(running \d+ s\)\\n- pid \d+: `sleep 1` \(running \d+ s\)/);
+
+		// Wakes by the jobs' ends: fewer jobs, or none, is nothing new.
+		await until("both ends wake the session", settled(s, "The long one ended."));
+		assert.equal(nudges(s).length, 2);
+		assert.equal(faux.getPendingResponseCount(), 0);
+	});
+
+	test("an aborted or failed run is not continued; the next completed one is", async () => {
+		const { s } = await newSession();
+		respond(bash("sleep 3 > /dev/null 2>&1 &"), fauxAssistantMessage("Stopped.", { stopReason: "aborted", errorMessage: "Request was aborted" }));
+		await s.prompt("start it");
+		await until("the aborted run", () => !s.isStreaming && s.messages.at(-1)?.role === "assistant");
+		assert.equal(nudges(s).length, 0);
+
+		respond(fauxAssistantMessage("Broken.", { stopReason: "error", errorMessage: "invalid request body" }));
+		await s.prompt("go on");
+		await until("the failed run", () => !s.isStreaming && JSON.stringify(s.messages.at(-1)).includes("invalid request body"));
+		assert.equal(nudges(s).length, 0);
+
+		respond(say("Fine now."), say("Waiting for the sleep."));
+		await s.prompt("again");
+		await until("the completed run", settled(s, "Waiting for the sleep."));
+		assert.equal(nudges(s).length, 1, "the job was never named to the agent before");
+	});
+
+	test("jobs the goal's strict continue or a wait named do not continue the run again once the goal is finished; jobs it did not name do", async () => {
+		const { s } = await newSession();
+		respond(
+			goalCall({ action: "set", objective: "Build and test." }),
+			bash("sleep 3 > /dev/null 2>&1 &"),
+			say("Started the build."),
+			goalCall({ action: "achieved" }),
+			say("Achieved; the build runs on."),
+		);
+		await s.prompt("keep going");
+		await until("the goal run", settled(s, "Achieved; the build runs on."));
+		assert.equal(continues(s).length, 1, "the goal's strict continue named the job");
+		assert.match(continues(s)[0]!, /Background work is still running/);
+		assert.equal(nudges(s).length, 0);
+
+		respond(
+			goalCall({ action: "set", objective: "Test again." }),
+			bash("sleep 3 > /dev/null 2>&1 &"),
+			goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep 3" }] }),
+			bash("sleep 3.1 > /dev/null 2>&1 &"),
+			goalCall({ action: "blocked", reason: "needs the user" }),
+			say("Blocked."),
+			say("Carrying on with the docs."),
+		);
+		await s.prompt("once more");
+		await until("the blocked run", settled(s, "Carrying on with the docs."));
+		assert.equal(nudges(s).length, 1, "the job started after the wait was never named");
+		assert.match(nudges(s)[0]!, /`sleep 3\.1`/);
+		assert.equal(faux.getPendingResponseCount(), 0);
 	});
 });
