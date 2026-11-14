@@ -72,7 +72,8 @@ const until = async (what: string, ok: () => boolean, ms = 10_000) => {
 };
 
 /** A session with fake t3 view tools; `t3: false` leaves them out (a session outside t3). */
-async function newSession(options: { t3?: boolean } = {}) {
+async function newSession(options: { t3?: boolean; refuseRenders?: number } = {}) {
+	let refusals = options.refuseRenders ?? 0;
 	let session: AgentSession | undefined;
 	const fakeT3 = (pi: ExtensionAPI) => {
 		for (const name of ["html_render", "preview_open"]) {
@@ -83,6 +84,10 @@ async function newSession(options: { t3?: boolean } = {}) {
 				parameters: Type.Object({}, { additionalProperties: true }),
 				async execute(_id, params) {
 					calls.push({ name, args: params as Record<string, unknown>, active: session?.isStreaming ?? false });
+					// As t3 answers before it adopted a woken run.
+					if (name === "html_render" && String((params as { title?: unknown }).title).endsWith("ended") && refusals-- > 0) {
+						throw new Error('{"_tag":"OrchestratorMcpFailure","code":"parent_not_active","message":"The calling provider no longer owns an active thread run."}');
+					}
 					return { content: [{ type: "text" as const, text: '{"htmlRender":{"attachmentId":"a"}}' }], details: undefined };
 				},
 			});
@@ -174,6 +179,19 @@ describe("the run's page in the thread", () => {
 		assert.match(result, /interrupted: the harness reloaded/);
 		assert.match(result, /Show this run's page in the thread before you reply: call mcp__t3-code__html_render with path ".*\/page\.html", height \d+ and title "workflow \S+ · ended"\./);
 		assert.equal(renders().length, 1, "only the start page; the harness could not render the end");
+	});
+
+	test("an end page t3 refuses before it adopted the woken run is tried again at the next message", async () => {
+		const told = model("return 'done';", (text) => (text.includes("Workflow completed") ? call("read", { path: "README.md" }) : undefined));
+		const session = await newSession({ refuseRenders: 1 });
+		await session.prompt("go");
+		await until("the second try", () => renders().filter((c) => String(c.args.title).endsWith("ended")).length === 2);
+		const ends = renders().filter((c) => String(c.args.title).endsWith("ended"));
+		assert.equal(ends[1]!.args.html, ends[0]!.args.html);
+		assert.ok(ends.every((c) => c.active));
+		await new Promise((r) => setTimeout(r, 300));
+		assert.equal(renders().filter((c) => String(c.args.title).endsWith("ended")).length, 2, "not again once shown");
+		assert.ok(told.length > 0);
 	});
 
 	test("outside t3 nothing is rendered or opened", async () => {

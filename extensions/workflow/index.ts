@@ -218,7 +218,9 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		offerInterrupted(pi, ctx, agentDir);
 	});
 	// The run a finished workflow's message wakes shows its end page (t3 takes a page only while a run is active).
-	pi.on("turn_start", (_event, ctx) => flushEndRenders(ctx.sessionManager.getSessionId()));
+	pi.on("message_end", (event, ctx) => {
+		if (event.message.role === "assistant") flushEndRenders(ctx.sessionManager.getSessionId());
+	});
 	pi.on("before_agent_start", (event, ctx) => {
 		event.systemPromptOptions.selectedTools = switched(ctx, event.systemPromptOptions.selectedTools);
 	});

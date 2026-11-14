@@ -7,8 +7,10 @@
 //   call has, so the agent resumes it with `workflow { resume }`.
 // - The thread shows the run's page (render.ts) through t3's html_render, called by the harness as
 //   a nested call of the workflow's own tool call: at the start, in the run that called it, and at
-//   the end in the run its result message wakes (`turn_start`), since t3 takes a page only while a
-//   run of the thread is active ("parent_not_active" otherwise, tested 2026-11-14). When the
+//   the end in the run its result message wakes (at its first finished assistant message), since t3
+//   takes a page only while a run of the thread is active ("parent_not_active" otherwise, tested
+//   2026-11-14; at the woken run's turn_start t3 had not adopted it yet, so a refused page waits for
+//   the next message, up to END_RENDER_ATTEMPTS times). When the
 //   call's context went stale (a harness reload), the result asks the agent to show the page.
 // - The dashboard serves the same page live at /workflows/<id> (dashboard/server/workflows.ts); in
 //   t3 it opens in the preview panel at the start.
@@ -28,6 +30,8 @@ export const HTML_RENDER = "mcp__t3-code__html_render";
 export const PREVIEW_OPEN = "mcp__t3-code__preview_open";
 export const PAGE_FILE = "page.html";
 const RENDER_TIMEOUT_MS = 60_000;
+/** How often an end page refused for lack of an active run is tried again, at later messages. */
+const END_RENDER_ATTEMPTS = 3;
 
 export type Executor = (name: string, args: unknown, signal: AbortSignal) => Promise<ToolOutcome>;
 
@@ -38,7 +42,13 @@ export interface RunEntryData {
 }
 
 // Process state: it outlives the extension instance (a harness reload) a run started in.
-const state = globalThis as { __harnessWorkflowApis?: Map<string, ExtensionAPI>; __harnessWorkflowRenders?: Map<string, (() => Promise<unknown>)[]> };
+const state = globalThis as { __harnessWorkflowApis?: Map<string, ExtensionAPI>; __harnessWorkflowRenders?: Map<string, EndRender[]> };
+
+/** An end page waiting for an active run: its render resolves to the problem, if any. */
+interface EndRender {
+	render: () => Promise<string | undefined>;
+	attempts: number;
+}
 const apis = () => (state.__harnessWorkflowApis ??= new Map());
 const endRenders = () => (state.__harnessWorkflowRenders ??= new Map());
 
@@ -114,7 +124,7 @@ export function startViews({ agentDir, id, toolNames, execute, dashboardUrl }: V
 }
 
 /**
- * At a run's end: the page goes to the thread in the run the result wakes (at its turn_start), or,
+ * At a run's end: the page goes to the thread in the run the result wakes (flushEndRenders), or,
  * when the call's context is stale, the result asks the agent to show it. Returns the result text.
  */
 export function renderEnd(target: Omit<ViewTarget, "dashboardUrl"> & { sessionId: string; live: () => boolean; text: string }): string {
@@ -128,19 +138,24 @@ export function renderEnd(target: Omit<ViewTarget, "dashboardUrl"> & { sessionId
 	if (!toolNames.includes(HTML_RENDER)) return text;
 	if (target.live()) {
 		const queue = endRenders().get(sessionId) ?? [];
-		queue.push(() => renderPage(agentDir, id, execute, titleOf(agentDir, id, "ended")));
+		queue.push({ render: () => renderPage(agentDir, id, execute, titleOf(agentDir, id, "ended")), attempts: 0 });
 		endRenders().set(sessionId, queue);
 		return text;
 	}
 	return `${text}\n\nShow this run's page in the thread before you reply: call ${HTML_RENDER} with path "${page.path}", height ${page.height} and title "${titleOf(agentDir, id, "ended")}".`;
 }
 
-/** Show the end pages waiting for an active run of the session. */
+/** Show the end pages waiting for an active run of the session; one t3 refused for lack of an active run waits for the next message. */
 export function flushEndRenders(sessionId: string): void {
 	const queue = endRenders().get(sessionId);
 	if (!queue?.length) return;
 	endRenders().delete(sessionId);
-	for (const render of queue) void render();
+	for (const page of queue) {
+		void page.render().then((problem) => {
+			if (!problem?.includes("parent_not_active") || ++page.attempts >= END_RENDER_ATTEMPTS) return;
+			endRenders().set(sessionId, [...(endRenders().get(sessionId) ?? []), page]);
+		});
+	}
 }
 
 /** `workflow { show }`: the run's page in the thread now; returns the tool's text. */
