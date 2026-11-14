@@ -456,20 +456,25 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		tools: new Proxy(
 			{},
 			{
-				get: (_target, name) =>
-					typeof name !== "string"
-						? undefined
-						: async (args: unknown = {}, options?: unknown) => {
+				get: (_target, name) => {
+					if (typeof name !== "string") return undefined;
+					// t3's delegate_task is delegate() itself: awaited, with a handle.
+					if (name === T3_DELEGATE) return globals.delegate;
+					return async (args: unknown = {}, options?: unknown) => {
 								live();
 								if (!executeTool) throw new Error("tools are only available in a session");
-								const idempotent = idempotentOption(options, `tools.${name}()`);
+								// ask_user resolves to the answers, waiting until they exist; asking again after a crash only shows the questions again.
+								const asking = name === "ask_user";
+								const idempotent = asking || idempotentOption(options, `tools.${name}()`);
 								return durable.call({ kind: "tool", args: { name, args }, label: `${name} ${firstLine(JSON.stringify(args) ?? "", 100)}`, idempotent }, async (call) => {
+									if (asking) return { value: await askUser(((args ?? {}) as { questions?: { title: string; options?: string[] }[] }).questions ?? [], call.signal) };
 									const outcome = await executeTool(name, args, call.signal);
 									live();
 									if (outcome.isError && !outcome.structured) throw new Error(outcome.text || `tool ${name} failed`);
 									return { value: outcome.value };
 								});
-							},
+							};
+				},
 			},
 		),
 		shell: async (command: unknown, options: unknown) => {

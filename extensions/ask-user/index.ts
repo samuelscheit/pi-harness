@@ -20,7 +20,9 @@
 // there yet; the dialog stays open and its answers arrive later as a message that steers the
 // running turn or starts a new one.
 //
-// extensions/background exempts the tool (WAITING_TOOLS) from moving to the background.
+// extensions/background exempts the tool (WAITING_TOOLS) from moving to the background. It is a
+// direct tool, so workflow scripts (tools.ask_user, which waits until answered) and `tool ask_user`
+// in bash can call it too.
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionUIQuestion } from "@earendil-works/pi-coding-agent";
@@ -113,7 +115,7 @@ export default function askUser(pi: ExtensionAPI) {
 		description: DESCRIPTION,
 		promptSnippet: "Ask the user (or your parent, as a delegated child) questions and wait for the answers",
 		parameters,
-		exposure: "model-only",
+		exposure: "direct",
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
 			const problem = invalidQuestions(params.questions);
 			if (problem) throw new Error(problem);

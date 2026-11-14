@@ -82,13 +82,34 @@ export async function answerPending(call: T3Call, threadId: string, handled: Set
 	return answered;
 }
 
-/** The in-process side: a headless UI whose questions dialogs `ask` answers; everything else does nothing. */
+/** UI methods a headless child session may call: they do nothing. */
+const SILENT = ["notify", "setStatus", "setWorkingMessage", "setWorkingVisible", "setWorkingIndicator", "setHiddenThinkingLabel", "setWidget", "setFooter", "setHeader", "setTitle", "pasteToEditor", "setEditorText", "addAutocompleteProvider", "setEditorComponent", "setToolsExpanded"];
+
+/**
+ * The in-process side: a headless UI whose questions dialogs `ask` answers; other dialogs are
+ * dismissed and everything else does nothing. A plain object, since Pi copies it (a Proxy's
+ * fallbacks would be lost).
+ */
 export function questionsUi(ask: Ask): ExtensionUIContext {
-	const questions = async (asked: ExtensionUIQuestion[], opts?: { signal?: AbortSignal }) =>
-		ask(
-			asked.map((q, i) => ({ id: String(i), title: q.title, ...(q.options ? { options: q.options } : {}) })),
-			opts?.signal ?? new AbortController().signal,
-		);
-	const methods: Partial<ExtensionUIContext> = { questions, select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined };
-	return new Proxy(methods, { get: (target, name) => (name in target ? target[name as keyof typeof target] : () => undefined) }) as ExtensionUIContext;
+	const ui = {
+		...Object.fromEntries(SILENT.map((name) => [name, () => undefined])),
+		questions: async (asked: ExtensionUIQuestion[], opts?: { signal?: AbortSignal }) =>
+			ask(
+				asked.map((q, i) => ({ id: String(i), title: q.title, ...(q.options ? { options: q.options } : {}) })),
+				opts?.signal ?? new AbortController().signal,
+			),
+		select: async () => undefined,
+		confirm: async () => false,
+		input: async () => undefined,
+		editor: async () => undefined,
+		custom: async () => undefined,
+		onTerminalInput: () => () => undefined,
+		getEditorText: () => "",
+		getEditorComponent: () => undefined,
+		getAllThemes: () => [],
+		getTheme: () => undefined,
+		setTheme: () => ({ success: false, error: "no user interface" }),
+		getToolsExpanded: () => false,
+	};
+	return ui as unknown as ExtensionUIContext;
 }

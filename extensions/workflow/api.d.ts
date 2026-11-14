@@ -14,11 +14,16 @@
  */
 
 /**
- * The session's tools, called as you call them (same validation, hooks, permissions). A tool with a
- * structured result resolves to it, also when it fails (bash: `{ output, exit_code }`); others
- * resolve to their text and reject with their error.
+ * The session's tools, called as you call them (same validation, hooks, permissions), each awaited
+ * until its answer exists. A tool with a structured result resolves to it, also when it fails
+ * (bash: `{ output, exit_code }`); others resolve to their text and reject with their error.
+ * `ask_user` resolves to the answers (it waits until answered or the run stops); t3's
+ * `delegate_task` is `delegate`.
  */
-declare const tools: Record<string, (args: Record<string, unknown>, options?: { idempotent?: boolean }) => Promise<any>>;
+declare const tools: Record<string, (args: Record<string, unknown>, options?: { idempotent?: boolean }) => Promise<any>> & {
+	ask_user(args: { questions: { title: string; options?: string[] }[] }, options?: { idempotent?: boolean }): Promise<(string | undefined)[]>;
+	"mcp__t3-code__delegate_task": typeof delegate;
+};
 
 /** Run a bash command in `cwd`; resolves also for non-zero exits. Output is stdout and stderr interleaved. Build commands from values with `sh`. */
 declare function shell(command: string, options?: { cwd?: string; timeoutSeconds?: number; idempotent?: boolean }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
@@ -46,7 +51,8 @@ declare function llm(prompt: string, options?: { model?: string; system?: string
  * an object): the child must submit a matching object, returned as `result`. The child starts on
  * its first run(); later runs continue its conversation; each resolves once it stops, with `text`
  * (its final message), `changed` (files the working tree changed meanwhile, other agents' too) and
- * `cost`. `compact` is Pi's /compact; `fork` starts a new child from this one's conversation.
+ * `cost`. `compact` is Pi's /compact, `warm` the harness's /warm ("2h", "until 18:00", "off": hold
+ * the child's prompt cache warm until its next run); `fork` starts a new child from this one's conversation.
  * `onAsk` gets the child's ask_user questions: return answers (in order, or by question id), which
  * the child receives as its tool result, or undefined to pass them up to whoever runs you; throw to
  * stop the run. Answers are journaled and replayed on resume.
@@ -76,6 +82,7 @@ interface DelegateRun {
 interface Delegate {
 	run(message: string): Promise<DelegateRun>;
 	compact(instructions?: string): Promise<void>;
+	warm(duration: string): Promise<void>;
 	steer(text: string): Promise<void>;
 	stop(): Promise<void>;
 	fork(message: string): Promise<DelegateRun & { handle: Delegate }>;

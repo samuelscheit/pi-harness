@@ -72,13 +72,19 @@ Why: agents edited files with inline Python scripts almost twice as often as wit
 
 | Global | Purpose |
 | --- | --- |
-| `tools.<name>(args)` | call any session tool |
+| `tools.<name>(args)` | call any session tool, awaited until its answer exists; typed from the session's tool schemas |
 | `shell(cmd)`, `` sh`…` `` | run shell commands, with values quoted safely |
 | `llm(prompt, { schema })` | one model request; JSON answers validated against a schema; cached per session |
 | `delegate(params)` | t3's `delegate_task`, awaited: a child agent (in T3 Code a delegated task with its own thread) with `run`, `compact`, `steer`, `stop`, `fork`; with `schema` it returns a validated `result` |
 | `map(items, fn)` | bounded concurrency |
 | `changes()` | the files and diff changed during the run |
 | `budget` | the run's USD limit and what it has spent |
+
+### Every tool as a typed, awaitable function
+
+The workflow tool's description declares `tools` with a TypeScript signature for every tool a script can call ([`signatures.ts`](../extensions/workflow/signatures.ts)), generated from the session's tool schemas whenever its tools change (the tool's `prepareLoadout`, Pi's hook for describing a loadout). It is kept compact, since the description goes with every request: parameter names and types, objects three levels deep, then `object`, and a tool's first sentence only when it is short and says more than its name. api.d.ts keeps a generic declaration for saved workflows' type checks.
+
+Each call resolves once its answer exists. `tools.ask_user` resolves to the answers: it waits until they exist or the run stops (whatever `wait_minutes` says), and a resume may ask again. `tools["mcp__t3-code__delegate_task"]` is `delegate` itself. There is no separate `ask()`.
 
 ### delegate_task, extended by the harness
 
@@ -104,14 +110,15 @@ With a `schema`, the child gets a `submit_result` tool whose parameters are the 
 | --- | --- |
 | `h.run(message)` | the first run delegates (`delegate_task`), later runs resume the same thread (`t3_thread_send`) |
 | `h.compact(instructions?)` | sends `/compact <instructions>`, Pi's own command (t3 maps it to Pi's compaction) |
+| `h.warm(duration)` | sends `/warm <duration>` (`2h`, `until 18:00`, `off`), the harness's [`/warm`](#warm-and-keep_warm): holds the child's prompt cache warm, e.g. while the workflow does other work before its next run |
 | `h.steer(text)` | steers the running turn (`t3_thread_send` in steer mode) |
 | `h.stop()` | stops the child's work (`task_cancel`); its running `run` fails |
 | `h.fork(message)` | a new child forked from this one's thread (`fork: true`, `forkThreadId`), running `message`; resolves to the run and its `handle` |
 | `h.cost`, `h.threadId` | |
 
-Runs and compactions of one child go one after the other; steer and stop act at once. Each is a journaled call, so a resume does not repeat it. The first run is `delegate_task` in wait mode for at most 5 s, so the task, thread and run ids reach the workflow's journal at once, and the wait continues in code with `t3_thread_wait`. Without `target` the child has the caller's provider and model; without `system` and `tools` it keeps the default prompt and tools. Parallel delegates are parallel tasks.
+Runs, compactions and warm holds of one child go one after the other; steer and stop act at once. Each is a journaled call, so a resume does not repeat it. The first run is `delegate_task` in wait mode for at most 5 s, so the task, thread and run ids reach the workflow's journal at once, and the wait continues in code with `t3_thread_wait`. Without `target` the child has the caller's provider and model; without `system` and `tools` it keeps the default prompt and tools. Parallel delegates are parallel tasks.
 
-Outside T3 (terminal, tests) each child is an in-process Pi session with the same semantics: the same spec, messages and child extension, `/compact` is Pi's compaction (`session.compact`), steer and stop reach the session, and a fork is Pi's session fork (`SessionManager.forkFrom`). The model is `target.model`, else the caller's.
+Outside T3 (terminal, tests) each child is an in-process Pi session with the same semantics: the same spec, messages and child extension (plus `ask_user` and `/warm`), `/compact` is Pi's compaction (`session.compact`), `/warm` the same command, steer and stop reach the session, and a fork is Pi's session fork (`SessionManager.forkFrom`). The model is `target.model`, else the caller's.
 
 ### Questions go to the parent
 
@@ -174,7 +181,7 @@ The call blocks until it is answered, up to `wait_minutes` (default 15), and the
 - a user message arrives: a reply in the chat instead of on the card. Its text answers every question (the result notes that it was a chat reply), the dialog closes (Pi's `dismiss`, so the T3 card disappears), and the message is consumed, so the conversation does not get it a second time. Any user message during the wait counts: while the agent is blocked on its questions a message is almost always the reply, and an unrelated instruction still reaches the agent in full;
 - the turn is aborted: the dialog closes and the call fails.
 
-When the time runs out, or at once with `wait_minutes: 0`, the call returns that no answer is there yet. The dialog stays open and its answers arrive later as a message that steers the running turn or starts a new one. Calls do not queue behind each other. A waiting `ask_user` is the one tool call that never moves to the background (`WAITING_TOOLS` in [`extensions/background`](../extensions/background/index.ts)): after two minutes it would cut every wait short, and on the user's message it would detach before the message could answer it.
+When the time runs out, or at once with `wait_minutes: 0`, the call returns that no answer is there yet. The dialog stays open and its answers arrive later as a message that steers the running turn or starts a new one. Calls do not queue behind each other. It is a direct tool, so tools can call it too: a workflow's `tools.ask_user` (which waits until answered) and `tool ask_user` in bash. A waiting `ask_user` is the one tool call that never moves to the background (`WAITING_TOOLS` in [`extensions/background`](../extensions/background/index.ts)): after two minutes it would cut every wait short, and on the user's message it would detach before the message could answer it.
 
 Why it blocks: until 2026-11 it followed Codex's asynchronous `request_user_input` contract and returned `{"accepted":true}` at once. Agents then went on guessing or ended their turn instead of waiting, and a reply typed in the chat left the card open. Parts of the tool description are taken from Codex CLI (Apache-2.0, see [NOTICE](../NOTICE)). In T3 it needs the [patches](install.md#t3-code-integration).
 

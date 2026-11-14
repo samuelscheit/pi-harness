@@ -14,6 +14,7 @@ import type { AssistantMessage, Context, JsonObject } from "@earendil-works/pi-a
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, type ExtensionUIContext, type ExtensionUIQuestion, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import askUser from "../extensions/ask-user/index.ts";
+import warm from "../extensions/warm/index.ts";
 import { Type } from "typebox";
 import { MAX_REMINDERS, REMINDER_TYPE, RESULT_HEADING } from "../extensions/workflow/child.ts";
 import {
@@ -41,6 +42,8 @@ import { INLINE_FILE, resumeWorkflow, runWorkflow, type WorkflowDetails } from "
 import { lockHeld, STOP_FILE } from "../extensions/workflow/stop.ts";
 import { livePage } from "../dashboard/server/workflows.ts";
 import { T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
+import { questionsUi } from "../extensions/workflow/ask.ts";
+import { toolsDeclaration, tsType } from "../extensions/workflow/signatures.ts";
 import { parseCompact } from "../extensions/workflow/delegate.ts";
 import { priced } from "./priced.ts";
 
@@ -192,7 +195,7 @@ function newThread(): { thread: Omit<Thread, "session">; ui: ExtensionUIContext 
 		thread.asked = new Promise((r) => (thread.signalAsked = r));
 	};
 	arm();
-	const questions = (asked: ExtensionUIQuestion[]) =>
+	const questions = (asked: { title: string; options?: string[] }[]) =>
 		new Promise<(string | undefined)[] | undefined>((resolve) => {
 			const id = `request-${++requests}`;
 			// Answered by respond or by the user on the card: no longer pending.
@@ -200,8 +203,7 @@ function newThread(): { thread: Omit<Thread, "session">; ui: ExtensionUIContext 
 			thread.signalAsked();
 			arm();
 		});
-	const ui = new Proxy({ questions } as Partial<ExtensionUIContext>, { get: (target, name) => (name in target ? target[name as keyof typeof target] : () => undefined) }) as ExtensionUIContext;
-	return { thread, ui };
+	return { thread, ui: questionsUi((asked) => questions(asked)) };
 }
 
 interface Fixture {
@@ -301,7 +303,7 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 					manager = SessionManager.forkFrom(source, fx.repo, fx.sessionsDir);
 				}
 				const { thread, ui } = newThread();
-				const session = await newSession([workflowExtension(childRuntime), askUser], manager, childRuntime, ui);
+				const session = await newSession([workflowExtension(childRuntime), askUser, warm], manager, childRuntime, ui);
 				// The same object: its question promise is replaced on every question.
 				fx.threads.set(threadId, Object.assign(thread, { session }));
 				// t3 sends a one-line role preamble, a blank line, then the task.
@@ -647,6 +649,7 @@ describe("the handle", () => {
 		"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
 		"const one = await a.run('first');",
 		"await a.compact('keep the verdict');",
+		"await a.warm('2h');",
 		"const slow = a.run('slow');",
 		"await new Promise((r) => setTimeout(r, 300));",
 		"await a.steer('also check the tests');",
@@ -665,9 +668,10 @@ describe("the handle", () => {
 		const { details, text } = await runInT3(script, childAnswers(log), { budget: 5 });
 		assert.equal(details.status, "completed", details.error);
 		const out = value(text);
-		assert.deepEqual(out, { one: "first done", two: "steered done", error: "delegate 1: the run was stopped", fork: "forked done", forkThread: "thread-6", sameThread: false });
+		assert.deepEqual(out, { one: "first done", two: "steered done", error: "delegate 1: the run was stopped", fork: "forked done", forkThread: "thread-7", sameThread: false });
 		const sends = callsOf("t3_thread_send").map((c) => [c.args.message, c.args.mode]);
 		assert.deepEqual(sends[0], ["/compact keep the verdict", "queue"]);
+		assert.deepEqual(sends[1], ["/warm 2h", "queue"], "Pi's /warm, as a message");
 		assert.deepEqual(sends.find(([, mode]) => mode === "steer"), ["also check the tests", "steer"]);
 		const source = fx.threads.get("thread-1")!.session;
 		assert.match(compacted(source)?.summary ?? "", /Summary: the verdict was ok\./, "the child compacted");
@@ -676,10 +680,11 @@ describe("the handle", () => {
 		assert.equal(forkCall.args.fork, true);
 		assert.equal(forkCall.args.forkThreadId, "thread-1");
 		assert.equal("target" in forkCall.args, false, "a fork takes its source's target");
-		const forked = fx.threads.get("thread-6")!.session;
+		const forked = fx.threads.get("thread-7")!.session;
 		assert.match(JSON.stringify(forked.messages), /also check the tests/, "the fork has the source's conversation");
 		const journal = readJournal(details.journal);
-		assert.deepEqual(journal.flatMap((e) => (e.t === "start" ? [e.label] : [])), ["#1: first", "#1 compact: keep the verdict", "#1 run 2: slow", "#1 steer: also check the tests", "#1 run 3: wait forever", "#1 stop", "#2: forked"]);
+		assert.ok(source.sessionManager.getEntries().some((e) => e.type === "custom" && e.customType === "harness-warm"), "the child holds its cache warm");
+		assert.deepEqual(journal.flatMap((e) => (e.t === "start" ? [e.label] : [])), ["#1: first", "#1 compact: keep the verdict", "#1 warm: 2h", "#1 run 2: slow", "#1 steer: also check the tests", "#1 run 3: wait forever", "#1 stop", "#2: forked"]);
 	});
 
 	test("in-process: compact is Pi's compaction, steer and stop reach the session, fork is Pi's session fork", async () => {
@@ -700,6 +705,7 @@ describe("the handle", () => {
 		const files = readdirSync(fx.sessionsDir).map((f) => readFileSync(join(fx.sessionsDir, f), "utf8"));
 		const source = files.find((f) => f.includes(details.childSessions[0]!) && f.includes('"type":"compaction"'));
 		assert.ok(source?.includes("Summary: the verdict was ok."), "the child compacted with the instructions");
+		assert.ok(source?.includes('"customType":"harness-warm"'), "the child holds its cache warm");
 		const forked = files.find((f) => f.split("\n")[0]!.includes(details.childSessions[1]!))!;
 		assert.match(forked, /also check the tests/, "the fork has the source's conversation");
 		assert.match(forked, /forked/);
@@ -821,6 +827,95 @@ describe("questions go to the parent (onAsk)", () => {
 		assert.equal(text.split("\n\n").at(-1), "got: from the user (error: false)");
 		assert.equal(asked.length, 1);
 		assert.deepEqual(asked[0], { name: "ask_user", args: { questions: [QUESTION], wait_minutes: 35_000 } });
+	});
+});
+
+describe("every tool as a typed, awaitable function", () => {
+	test("signatures: compact types from JSON Schema, short descriptions only, ask_user and delegate_task special", () => {
+		assert.equal(tsType({ type: "object", properties: { a: { type: "string" }, b: { type: "integer" }, c: { type: "array", items: { enum: ["x", "y"] } } }, required: ["a"] }), '{ a: string; b?: number; c?: ("x" | "y")[] }');
+		assert.equal(tsType({ anyOf: [{ type: "string" }, { type: "null" }] }), "string | null");
+		assert.equal(tsType({ type: ["string", "number"] }), "string | number");
+		assert.equal(tsType({ const: "go" }), '"go"');
+		assert.equal(tsType({ type: "object", properties: { deep: { type: "object", properties: { deeper: { type: "object", properties: { deepest: { type: "object", properties: { x: { type: "string" } } } } } } } } }), "{ deep?: { deeper?: { deepest?: object } } }", "three levels deep, then object");
+		assert.equal(tsType({ type: "object" }), "Record<string, unknown>");
+		assert.equal(tsType({ type: "object", properties: { "a-b": { type: "boolean" } }, required: ["a-b"] }), '{ "a-b": boolean }');
+		const declaration = toolsDeclaration([
+			{ name: "read", description: "Read a file.", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+			{ name: "mcp__t3-code__task_status", description: `${"A long description ".repeat(10)}.`, parameters: { type: "object", properties: { taskId: { type: "string" } }, required: ["taskId"] }, outputSchema: { type: "object" } },
+			{ name: "ask_user", description: "Ask.", parameters: { type: "object" } },
+			{ name: `${T3_PREFIX}delegate_task`, description: "x", parameters: { type: "object" } },
+		]);
+		assert.equal(
+			declaration,
+			[
+				"type CallOptions = { idempotent?: boolean };",
+				"declare const tools: {",
+				"\t/** Ask. */",
+				"\task_user(args: Record<string, unknown>, options?: CallOptions): Promise<(string | undefined)[]>;",
+				'\t"mcp__t3-code__delegate_task": typeof delegate;',
+				'\t"mcp__t3-code__task_status"(args: { taskId: string }, options?: CallOptions): Promise<any>;',
+				"\t/** Read a file. */",
+				"\tread(args: { path: string }, options?: CallOptions): Promise<string>;",
+				"};",
+			].join("\n"),
+		);
+	});
+
+	test("the workflow tool's description lists the session's tools with their signatures", async () => {
+		let described = "";
+		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime)]);
+		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
+		faux.setResponses([
+			(context: Context) => {
+				const tools = context.messages.flatMap((m) => (m.role === "system" ? (m.toolsAdded ?? []) : []));
+				described = tools.find((t) => t.name === "workflow")?.description ?? "";
+				return say("ok");
+			},
+		]);
+		await parent.prompt("go");
+		assert.match(described, /\t\/\*\* Read the contents of a file\. \*\/\n\tread\(args: \{ path: string; offset\?: number; limit\?: number \}, options\?: CallOptions\): Promise<any>;/);
+		assert.match(described, /\tedit\(args: \{ path: string; edits: \{ oldText: string; newText: string \}\[\] \}, options\?: CallOptions\): Promise<string>;/);
+		assert.match(described, /\t"mcp__t3-code__delegate_task": typeof delegate;/);
+		assert.match(described, /\n\t"mcp__t3-code__t3_pending_request"\(args: Record<string, unknown>/, "no description that only repeats the name");
+		assert.doesNotMatch(described, /\tworkflow\(/, "not the workflow tool itself");
+		assert.doesNotMatch(described, /declare const tools: Record<string/, "the generic declaration is replaced");
+		assert.ok(described.length < 12_000, `compact: ${described.length} chars`);
+	});
+
+	test("tools.ask_user resolves to the answers once they exist; t3's delegate_task is delegate()", async () => {
+		const shown: { questions: ExtensionUIQuestion[] }[] = [];
+		const ui = new Proxy(
+			{
+				questions: (questions: ExtensionUIQuestion[]) => {
+					shown.push({ questions });
+					return new Promise<(string | undefined)[]>((r) => setTimeout(() => r(["no", undefined]), 300));
+				},
+			} as Partial<ExtensionUIContext>,
+			{ get: (target, name) => (name in target ? target[name as keyof typeof target] : () => undefined) },
+		) as ExtensionUIContext;
+		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime), askUser], SessionManager.create(fx.repo, fx.sessionsDir), runtime, ui);
+		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
+		const code = [
+			"const answers = await tools.ask_user({ questions: [{ title: 'Go on?', options: ['yes', 'no'] }, { title: 'Why?' }], wait_minutes: 0 });",
+			"const handle = tools['mcp__t3-code__delegate_task']({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
+			"const run = await handle.run('say hi');",
+			"return JSON.stringify({ answers, same: tools['mcp__t3-code__delegate_task'] === delegate, text: run.text, thread: handle.threadId });",
+		].join("\n");
+		faux.setResponses(
+			Array.from({ length: 10 }, () => (context: Context) => {
+				if (isChild(context)) return say("hi");
+				return lastMessage(context).role === "toolResult" ? say("parent done") : call("workflow", { code, budget: 1 });
+			}),
+		);
+		await parent.prompt("go");
+		const result = parent.messages.find((m) => m.role === "toolResult" && m.toolName === "workflow");
+		assert.ok(result?.role === "toolResult");
+		const details = result.details as unknown as WorkflowDetails;
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(value(textOf(result.content)), { answers: ["no", null], same: true, text: "hi", thread: "thread-1" });
+		assert.deepEqual(shown, [{ questions: [{ title: "Go on?", options: ["yes", "no"] }, { title: "Why?" }] }], "one dialog; wait_minutes 0 does not stop the wait");
+		const asked = readJournal(details.journal).find((e) => e.t === "start" && e.kind === "tool");
+		assert.equal(asked?.t === "start" && asked.idempotent, true, "a resume may ask again");
 	});
 });
 

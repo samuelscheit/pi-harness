@@ -321,6 +321,11 @@ describe("ask_user waits for the answers", () => {
 		assert.match(results(s).find((r) => r.tool === "slow")!.text, /moved to the background/);
 	});
 
+	test("tools can call it (a workflow's tools.ask_user, `tool ask_user` in bash): it is a direct tool", async () => {
+		const { s } = await newSession();
+		assert.ok(s.getCallableToolNames().includes("ask_user"));
+	});
+
 	test("refuses a session without a user interface", async () => {
 		const cwd = mkdtempSync(join(dir, "noui-"));
 		const settingsManager = SettingsManager.inMemory({});

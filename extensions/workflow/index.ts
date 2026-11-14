@@ -32,12 +32,25 @@ import { sweepRuns } from "./journal.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
 import { INLINE_FILE, type ResumeRequest, type RunEnv, resumeWorkflow, runWorkflow, type ToolOutcome, type WorkflowDetails, type WorkflowResult } from "./run.ts";
 import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, offerInterrupted, recordRun, renderEnd, runHeadline, setLatestApi, showRun, startViews } from "./runs.ts";
+import { type SignatureTool, toolsDeclaration } from "./signatures.ts";
 import { stopRun } from "./stop.ts";
 
 export const WORKFLOW_TOOL = "workflow";
 
 /** The script API as the model reads it: api.d.ts below its header. */
 const API = readFileSync(new URL("./api.d.ts", import.meta.url), "utf8").split("// ---\n")[1]!.trim();
+/** api.d.ts's generic `tools` declaration, which the description replaces with the session's tools. */
+const TOOLS_DECLARATION = /declare const tools: [^\n]*\n(?:\t[^\n]*\n)*\};/;
+
+/** The workflow tool's description; with the tools a script can call, their signatures. */
+function describe(tools?: readonly SignatureTool[]): string {
+	const api = tools ? API.replace(TOOLS_DECLARATION, toolsDeclaration(tools)) : API;
+	return [
+		"Run a TypeScript script that does a procedure with code and calls a model only where a judgment is needed. `code` is the body of an async function: top-level await and `return` work; only the returned value (a string, or data shown as YAML) reaches you, plus cost and changed files. An object with `ok: false` marks the goal as missed.",
+		"Globals:",
+		api,
+	].join("\n\n");
+}
 
 export interface WorkflowExtensionOptions {
 	experimentsDir?: string;
@@ -137,11 +150,9 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		...common,
 		name: WORKFLOW_TOOL,
 		label: "Workflow",
-		description: [
-			"Run a TypeScript script that does a procedure with code and calls a model only where a judgment is needed. `code` is the body of an async function: top-level await and `return` work; only the returned value (a string, or data shown as YAML) reaches you, plus cost and changed files. An object with `ok: false` marks the goal as missed.",
-			"Globals:",
-			API,
-		].join("\n\n"),
+		description: describe(),
+		// The signatures of the tools scripts can call (not workflows: those are workflows.*).
+		prepareLoadout: (loadout) => ({ descriptions: { [WORKFLOW_TOOL]: describe(loadout.callable.filter((tool) => tool.name !== WORKFLOW_TOOL && !library.has(tool.name))) } }),
 		promptSnippet: "Run a TypeScript workflow script: deterministic code with llm() and delegate() calls only where judgment is needed",
 		promptGuidelines: [
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",

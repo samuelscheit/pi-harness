@@ -4,6 +4,8 @@
 // workflow, not of the tool). It returns a handle:
 // - run(message): the first run delegates, later ones resume the same conversation;
 // - compact(instructions?): Pi's `/compact`, sent as a message (t3 maps it to Pi's compaction);
+// - warm(duration): the harness's `/warm` (extensions/warm), sent as a message: hold the child's
+//   prompt cache warm, e.g. while the workflow works on something else before its next run;
 // - steer(text): steers the running turn; stop(): stops the child's work;
 // - fork(message): a new child forked from this one's conversation, running `message`;
 // - cost, threadId.
@@ -12,7 +14,7 @@
 // under the calling thread (t3.ts), where the user can watch, steer and stop it. Elsewhere it is an
 // in-process Pi session, a session file of its own next to the parent's naming it, with the same
 // semantics: the same spec and messages (delegation.ts), the same child extension (child.ts),
-// `/compact` is Pi's compaction, and a fork is Pi's session fork.
+// `/compact` is Pi's compaction, `/warm` the same command, and a fork is Pi's session fork.
 //
 // The child reports its session, cost and each run's text, result or error in its state file; the
 // parent counts the cost against the budget while the child runs, links the session to the calling
@@ -33,6 +35,7 @@ import { relative } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { canonical, changedPaths, type Snapshot, snapshot } from "../lib/workspace.ts";
 import askUser from "../ask-user/index.ts";
+import warm from "../warm/index.ts";
 import { type Ask, answerPending, answersInOrder, type Question, questionsUi } from "./ask.ts";
 import { delegatedChild, RUN_STOPPED } from "./child.ts";
 import { type DelegationSpec, type DelegationState, delegateProblem, delegationMessage, delegationsDir, HARNESS_KEYS, prepareDelegation, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
@@ -121,6 +124,7 @@ export interface DelegateRun {
 export interface DelegateHandle {
 	run(message: string): Promise<DelegateRun>;
 	compact(instructions?: string): Promise<void>;
+	warm(duration: string): Promise<void>;
 	steer(text: string): Promise<void>;
 	stop(): Promise<void>;
 	fork(message: string): Promise<DelegateRun & { handle: DelegateHandle }>;
@@ -200,8 +204,8 @@ interface Transport {
 	run(message: string, requestId: string, remember: (meta: RunMeta) => void, signal: AbortSignal): Promise<void>;
 	/** Continue a run that was in flight when the run stopped (`recorded`: what its journal knew): `message` may have been sent already, `continuation` asks to go on. */
 	reattach(message: string, continuation: string, requestId: string, recorded: RunMeta, remember: (meta: RunMeta) => void, signal: AbortSignal): Promise<void>;
-	/** Pi's /compact, as a message; resolves when the compaction is over. */
-	compact(instructions: string | undefined, requestId: string, signal: AbortSignal): Promise<void>;
+	/** A slash command as a message (`/compact`, `/warm`); resolves when it is done. */
+	command(text: string, requestId: string, signal: AbortSignal): Promise<void>;
 	steer(text: string, requestId: string, signal: AbortSignal): Promise<void>;
 	/** What identifies the child, for the journal. */
 	state(): Pick<HandleState, "t3" | "sessionFile">;
@@ -233,6 +237,8 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			extensionFactories: [
 				{ name: "workflow-delegate", factory: (pi) => void delegatedChild(pi, dir) },
 				{ name: "ask-user", factory: askUser },
+				// h.warm's /warm.
+				{ name: "warm", factory: warm },
 			],
 		});
 		await resourceLoader.reload();
@@ -280,7 +286,13 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 		run: (message, _requestId, remember, signal) => prompt(message, remember, signal),
 		// The child died with the parent's process or was stopped: reopen its session and ask it to go on; without one, nothing ran yet.
 		reattach: (message, continuation, _requestId, _recorded, remember, signal) => prompt(sessionFile && existsSync(sessionFile) ? continuation : message, remember, signal),
-		compact: async (instructions) => void (await (await session()).compact(instructions)),
+		// As t3 does: /compact is Pi's compaction; other commands are prompts Pi dispatches to their extension.
+		command: async (text) => {
+			const opened = await session();
+			const compact = parseCompact(text);
+			if (compact) await opened.compact(compact.instructions);
+			else await opened.prompt(text);
+		},
 		steer: async (text) => void (await (await session()).steer(text)),
 		state: () => (sessionFile ? { sessionFile } : {}),
 		restore: (state) => {
@@ -325,7 +337,7 @@ function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv,
 		run: (message, requestId, remember, signal) => titled(message).run(message, requestId, signal, started(titled(message).threadId, remember)),
 		// A run whose id the journal has is waited for; else t3 dedupes the repeated call on its request id.
 		reattach: (message, _continuation, requestId, recorded, remember, signal) => titled(message).reattach(message, requestId, recorded.runId, signal, started(titled(message).threadId, remember)),
-		compact: (instructions, requestId, signal) => existing().send(compactCommand(instructions), "queue", requestId, signal),
+		command: (text, requestId, signal) => existing().send(text, "queue", requestId, signal),
 		steer: (text, requestId, signal) => existing().send(text, "steer", requestId, signal),
 		state: () => {
 			const ids = task?.ids ?? restored;
@@ -577,7 +589,15 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		},
 		compact: (instructions?: unknown) => {
 			if (instructions !== undefined && typeof instructions !== "string") return Promise.reject(new TypeError("delegate().compact(instructions?): instructions must be a string"));
-			return queued(() => operate("compact", instructions as string | undefined, (requestId, signal) => transport.compact(instructions as string | undefined, requestId, signal)));
+			return queued(() => operate("compact", instructions as string | undefined, (requestId, signal) => transport.command(compactCommand(instructions as string | undefined), requestId, signal)));
+		},
+		warm: (duration: unknown) => {
+			try {
+				const checked = nonEmpty(duration, "warm(duration)").trim();
+				return queued(() => operate("warm", checked, (requestId, signal) => transport.command(`/warm ${checked}`, requestId, signal)));
+			} catch (error) {
+				return Promise.reject(error);
+			}
 		},
 		steer: (text: unknown) => {
 			try {
