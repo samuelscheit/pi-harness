@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Patch the installed t3 app's bundled Pi adapter with fixes prepared in ../t3code that t3 has not
-// shipped yet. Each patch mirrors a t3code commit:
+// shipped yet. Each patch up to background-items-caller mirrors a t3code commit; the later ones are
+// written against the installed bundle only (../t3code's main has moved on, e.g. it already completes
+// a run whose turn was interrupted by a workspace move, which the installed build lacks):
 //
 // - cache-warming (branch pi-cache-warming-keeps-session, "fix(provider-pi): keep a Pi session loaded
 //   while its prompt cache warming is pending"): t3 unloads a provider session after 30 idle minutes
@@ -74,6 +76,28 @@
 //   (extensions/template). The orchestrator records the file on the child's pending `subagent_spawn`
 //   transfer (`sourcePoint.sessionFile`), and the child's first turn start runs the Pi adapter's
 //   existing native fork on it (`pi --fork <file>`, no source thread or turn).
+// - handoff-waits-for-run, handoff-ends-turn (a worktree handoff inside a turn lets its call return
+//   and the turn end): `t3_worktree_handoff` re-points the thread
+//   (`thread.metadata.update`), and t3 detached the provider session at once. That killed the Pi
+//   process still waiting for the call's answer: the call aborted, the run failed with "The provider
+//   event stream closed unexpectedly", the failure held the queue, and the queued continuation never
+//   started (2026-11-14, Myrodex). A move while the thread has an active run now leaves a
+//   single-thread session alone; the next turn start restarts a session whose checkout is not the
+//   thread's (`workspaceMovedSessionRestarts`), resuming the conversation in the new checkout. Pi ends
+//   its turn as soon as a top-level `t3_worktree_handoff` call returned successfully (abort, settled as
+//   completed), so the queue goes on and the continuation runs in the worktree.
+// - thread-identity-search (t3_thread_search resolves threads by id, task id and delegated title):
+//   the search ranked titles of top-level threads and message text only, so a
+//   coordinator holding part of a child's id found nothing and paged 11,714 activity items with
+//   t3_thread_read instead (2026-11-14). It now first matches any part of a thread id (also a
+//   `t3-thread://` link or an encoded id), a delegated task's `taskId`, and the titles of delegated
+//   children, as `source: "id"` or `"title"` matches ahead of the rest.
+// - connection-failure-resumable (a turn lost to the provider connection is interrupted, not
+//   failed): Pi gave up on "Request timed out." after its retries, and t3 marked the
+//   delegated child's run failed although its conversation could go on, so the coordinator started a
+//   second agent in the same worktree (2026-11-12). A turn ending on a transport failure (timeouts,
+//   connection and socket errors, gateway 502/504/52x; not a client, auth, quota or context error) is
+//   now interrupted with the cause as its reason, its error shown as a retryable `transport_error`.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -661,6 +685,196 @@ export const PATCHES: Patch[] = [
 			[
 				'(task) => task.kind === "subagent" && task.providerInstanceId === providerInstanceId',
 				"(task) => task.providerInstanceId === providerInstanceId /* providerOwnedWorkIsLive */",
+			],
+		],
+	},
+	{
+		name: "handoff-waits-for-run",
+		marker: "workspaceMoveWaitsForRun",
+		edits: [
+			[
+				"const detachSessionIds = new Set(",
+				'const workspaceMoveWaitsForRun = command.type === "thread.metadata.update" && command.worktreePath !== void 0 && command.worktreePath !== thread.worktreePath && (yield* loadProjectionForCommand(command, ["runs"], { turnItemTypes: [] })).runs.some(isActiveRun$1);\n\t\tconst detachSessionIds = new Set(',
+			],
+			[
+				"command.worktreePath !== thread.worktreePath ? (providerContext?.providerSessions ?? []).map((session) => session.id)",
+				"command.worktreePath !== thread.worktreePath ? (providerContext?.providerSessions ?? []).filter((session) => !workspaceMoveWaitsForRun || session.capabilities.sessions.supportsMultipleProviderThreadsPerSession).map((session) => session.id)",
+			],
+			[
+				"\t\tconst existingSessionProjection = projection.providerSessions.find((candidate) => candidate.id === providerSessionId);\n",
+				[
+					"\t\tconst existingSessionProjection = projection.providerSessions.find((candidate) => candidate.id === providerSessionId);",
+					"\t\tif (existingSessionProjection !== void 0 && !existingSessionProjection.capabilities.sessions.supportsMultipleProviderThreadsPerSession && existingSessionProjection.cwd !== resolvedRuntimePolicy.cwd) yield* providerSessions.detach({",
+					"\t\t\tproviderSessionId,",
+					"\t\t\tthreadId: projection.thread.id,",
+					'\t\t\tdetail: "Workspace changed."',
+					'\t\t}).pipe(ignoreCause({ log: true, message: "Failed to restart a provider session in its new workspace." })) /* workspaceMovedSessionRestarts */;',
+					"",
+				].join("\n"),
+			],
+		],
+	},
+	{
+		name: "handoff-ends-turn",
+		marker: "piHandoffEndsTurn",
+		edits: [
+			[
+				'const PI_INHERIT_MODEL_SLUG = "default";',
+				[
+					'const PI_INHERIT_MODEL_SLUG = "default";',
+					"/** A top-level tool call that moved this thread into a worktree and returned: its turn ends there, and the next one runs in the worktree. */",
+					"function piHandoffEndsTurn(event) {",
+					'\tconst toolName = event["toolName"];',
+					'\treturn typeof toolName === "string" && /(?:^|__)t3_worktree_handoff$/.test(toolName) && event["isError"] !== true && typeof event["parentToolCallId"] !== "string";',
+					"}",
+				].join("\n"),
+			],
+			[
+				'case "tool_execution_end":\n\t\t\t\t\t\tif (turn !== null) yield* emitToolItem(turn, event, "end");\n\t\t\t\t\t\treturn;',
+				[
+					'case "tool_execution_end":',
+					'\t\t\t\t\t\tif (turn !== null) yield* emitToolItem(turn, event, "end");',
+					"\t\t\t\t\t\tif (turn !== null && !turn.interrupted && piHandoffEndsTurn(event)) {",
+					"\t\t\t\t\t\t\tturn.endedByHandoff = true;",
+					'\t\t\t\t\t\t\tyield* request({ type: "abort" }).pipe(ignore, forkIn(scope$5));',
+					"\t\t\t\t\t\t}",
+					"\t\t\t\t\t\treturn;",
+				].join("\n"),
+			],
+			["const interrupted = turn.interrupted || turn.nativeAborted;", "const interrupted = (turn.interrupted || turn.nativeAborted) && turn.endedByHandoff !== true;"],
+		],
+	},
+	{
+		name: "thread-identity-search",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "threadIdentityMatches",
+		edits: [
+			[
+				"\tconst titleCandidates = findAll({",
+				[
+					"\tconst threadIdentityQuery = (query, projectId) => {",
+					"\t\tconst text = query.trim().toLowerCase();",
+					"\t\tconst linked = /t3-thread:\\/\\/v(?:1|2\\/[^/\\s)>]+)\\/([^\\s)>]+)/.exec(text)?.[1] ?? text;",
+					'\t\tconst needle = linked.replaceAll("%25", "%").replaceAll("%25", "%").replaceAll("%3a", ":");',
+					"\t\treturn {",
+					'\t\t\tneedle: needle.length >= 6 && /\\d/.test(needle) && !/\\s/.test(needle) ? needle : "",',
+					'\t\t\ttitle: text.length >= 3 ? text : "",',
+					"\t\t\tprojectId",
+					"\t\t};",
+					"\t};",
+					"\tconst threadIdentityMatches = findAll({",
+					"\t\tRequest: Struct({",
+					"\t\t\tneedle: String$1,",
+					"\t\t\ttitle: String$1,",
+					"\t\t\tprojectId: NullOr(ProjectId)",
+					"\t\t}),",
+					"\t\tResult: Struct({",
+					"\t\t\tthreadId: ThreadId,",
+					"\t\t\tprojectId: ProjectId,",
+					"\t\t\ttitle: String$1,",
+					"\t\t\tsource: String$1",
+					"\t\t}),",
+					"\t\texecute: ({ needle, title, projectId }) => sql`",
+					"      WITH tasks AS (",
+					"        SELECT child_thread_id AS thread_id FROM orchestration_v2_projection_subagents",
+					"        WHERE ${needle} <> '' AND child_thread_id IS NOT NULL",
+					"          AND instr(replace(replace(replace(lower(subagent_id), '%25', '%'), '%25', '%'), '%3a', ':'), ${needle}) > 0",
+					"      ), matched AS (",
+					"        SELECT threads.thread_id AS \"threadId\", threads.project_id AS \"projectId\", threads.title AS title, threads.updated_at AS \"updatedAt\",",
+					"          CASE WHEN threads.thread_id IN (SELECT thread_id FROM tasks)",
+					"            OR (${needle} <> '' AND instr(replace(replace(replace(lower(threads.thread_id), '%25', '%'), '%25', '%'), '%3a', ':'), ${needle}) > 0)",
+					"            THEN 'id' ELSE 'title' END AS source",
+					"        FROM orchestration_v2_projection_threads AS threads",
+					"        WHERE threads.deleted_at IS NULL",
+					"      )",
+					"      SELECT matched.\"threadId\", matched.\"projectId\", matched.title, matched.source",
+					"      FROM matched",
+					"      INNER JOIN orchestration_v2_projection_threads AS threads ON threads.thread_id = matched.\"threadId\"",
+					"      WHERE matched.source = 'id'",
+					"        OR (${title} <> ''",
+					"          AND json_extract(threads.payload_json, '$.lineage.relationshipToParent') = 'subagent'",
+					"          AND threads.archived_at IS NULL",
+					"          AND (${projectId} IS NULL OR threads.project_id = ${projectId})",
+					"          AND instr(lower(threads.title), ${title}) > 0)",
+					"      ORDER BY matched.source = 'id' DESC, matched.\"updatedAt\" DESC",
+					"      LIMIT 20",
+					"    `",
+					"\t});",
+					"\tconst titleCandidates = findAll({",
+				].join("\n"),
+			],
+			[
+				"\t\tconst shown = new Set(titleHits.map((hit) => hit.threadId));",
+				[
+					"\t\tconst identity = threadIdentityQuery(input.query, input.projectId ?? null);",
+					'\t\tconst identityHits = identity.needle === "" && identity.title === "" ? [] : yield* read(threadIdentityMatches(identity));',
+					"\t\tconst identified = new Set(identityHits.map((hit) => hit.threadId));",
+					"\t\tconst shown = new Set([...identified, ...titleHits.map((hit) => hit.threadId)]);",
+				].join("\n"),
+			],
+			[
+				"\t\treturn { matches: [...titleHits.slice(0, limit - messageSlots), ...messageHits].slice(0, limit) };",
+				[
+					"\t\treturn { matches: [",
+					'\t\t\t...identityHits.filter((hit) => hit.source === "id"),',
+					"\t\t\t...titleHits.filter((hit) => !identified.has(hit.threadId)).slice(0, limit - messageSlots),",
+					'\t\t\t...identityHits.filter((hit) => hit.source !== "id"),',
+					"\t\t\t...messageHits",
+					"\t\t].slice(0, limit) };",
+				].join("\n"),
+			],
+			[
+				'source: Literals([\n\t\t\t"title",\n\t\t\t"user",\n\t\t\t"assistant"\n\t\t]),',
+				'source: Literals([\n\t\t\t"id",\n\t\t\t"title",\n\t\t\t"user",\n\t\t\t"assistant"\n\t\t]),',
+			],
+			[
+				'description: "Search active threads by title, branch, PR, project, then message text. Skips subagent threads. ',
+				'description: "Find threads by any part of their id (e.g. 8 characters of it, or a thread link), a delegated `taskId`, or a delegated child\'s title (`source:\'id\'` or `\'title\'`), then search active threads by title, branch, PR, project, then message text. ',
+			],
+		],
+	},
+	{
+		name: "connection-failure-resumable",
+		marker: "piConnectionFailure",
+		edits: [
+			[
+				'const PI_INHERIT_MODEL_SLUG = "default";',
+				[
+					'const PI_INHERIT_MODEL_SLUG = "default";',
+					"/** A failure of the connection to the model provider (Pi already retried it): the conversation is intact and can go on. */",
+					"function piConnectionFailure(message) {",
+					"\treturn /timed? ?out|timeout|\\bE(?:TIMEDOUT|CONNRESET|CONNREFUSED|CONNABORTED|PIPE|NOTFOUND|AI_AGAIN|NETUNREACH|HOSTUNREACH|NETDOWN)\\b|UND_ERR_|socket hang up|other side closed|fetch failed|connection (?:error|refused|reset|closed|lost)|network (?:error|connection)|\\bterminated\\b|stream (?:was interrupted|disconnected)|ended without|upstream connect|reset before headers|bad gateway|gateway time-?out|(?<![\\w.])(?:502|504|52[0-4])(?![\\w.])/i.test(message) && !/(?<![\\w.])(?:400|401|402|403|404|413|422)(?![\\w.])|invalid.request|authenticat|unauthori[sz]ed|forbidden|permission|quota|billing|usage limit|context (?:window|length)|too long|safeguard/i.test(message);",
+					"}",
+				].join("\n"),
+			],
+			[
+				"const failure = interrupted ? null : turn.rejectedPromptFailure ?? turn.failure;",
+				[
+					"const reportedFailure = interrupted ? null : turn.rejectedPromptFailure ?? turn.failure;",
+					"\t\t\t\tconst connectionFailure = reportedFailure !== null && reportedFailure === turn.failure && piConnectionFailure(reportedFailure.message) ? {",
+					"\t\t\t\t\t...reportedFailure,",
+					'\t\t\t\t\tclass: "transport_error",',
+					"\t\t\t\t\tretryable: true",
+					"\t\t\t\t} : null;",
+					"\t\t\t\tconst failure = connectionFailure === null ? reportedFailure : null;",
+					"\t\t\t\tconst shownFailure = failure ?? connectionFailure;",
+				].join("\n"),
+			],
+			[
+				'status: interrupted ? "interrupted" : failure !== null ? "failed" : "completed",',
+				'status: interrupted || connectionFailure !== null ? "interrupted" : failure !== null ? "failed" : "completed",',
+			],
+			[
+				'yield* updateProviderSession(failure !== null ? "error" : "ready", failure?.message ?? null);\n\t\t\t\tif (failure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tif (turn.activeProviderRetry !== null) yield* emitProviderRetry(turn, {\n\t\t\t\t\t\t...turn.activeProviderRetry,\n\t\t\t\t\t\tfailure\n\t\t\t\t\t}, "failed", completedAt);',
+				'yield* updateProviderSession(failure !== null ? "error" : "ready", failure?.message ?? null);\n\t\t\t\tif (shownFailure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tif (turn.activeProviderRetry !== null) yield* emitProviderRetry(turn, {\n\t\t\t\t\t\t...turn.activeProviderRetry,\n\t\t\t\t\t\tfailure: shownFailure\n\t\t\t\t\t}, "failed", completedAt);',
+			],
+			[
+				'\t\t\t\t\t\t\ttype: "error",\n\t\t\t\t\t\t\tfailure\n\t\t\t\t\t\t}\n\t\t\t\t\t});\n\t\t\t\t\tyield* emit({\n\t\t\t\t\t\ttype: "turn.terminal",',
+				'\t\t\t\t\t\t\ttype: "error",\n\t\t\t\t\t\t\tfailure: shownFailure\n\t\t\t\t\t\t}\n\t\t\t\t\t});\n\t\t\t\t}\n\t\t\t\tif (failure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tyield* emit({\n\t\t\t\t\t\ttype: "turn.terminal",',
+			],
+			[
+				'\t\t\t\t\tstatus: interrupted ? "interrupted" : "completed",\n\t\t\t\t\tfailure: null,\n\t\t\t\t\tthreadDisposition: "reusable"\n\t\t\t\t});\n\t\t\t});',
+				'\t\t\t\t\tstatus: interrupted || connectionFailure !== null ? "interrupted" : "completed",\n\t\t\t\t\tfailure: null,\n\t\t\t\t\t...connectionFailure === null ? {} : { reason: `The connection to the model provider failed (${connectionFailure.message}). The conversation is intact: send a message to continue.` },\n\t\t\t\t\tthreadDisposition: "reusable"\n\t\t\t\t});\n\t\t\t});',
 			],
 		],
 	},

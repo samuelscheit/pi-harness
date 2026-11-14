@@ -4,6 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
 import { withHugePs } from "./fixtures/huge-ps.ts";
@@ -146,6 +147,10 @@ describe("patchBundle", () => {
 		"background-items",
 		"background-items-contract",
 		"background-items-caller",
+		"handoff-waits-for-run",
+		"handoff-ends-turn",
+		"thread-identity-search",
+		"connection-failure-resumable",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -189,6 +194,19 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('status: forkSource === void 0 && forkSessionFile === void 0 ? "consumed" : "pending",'), "a fork's or a template's spawn waits for its turn start");
 		assert.ok(text.includes("const templateFile = nativeForkTransfer?.sourcePoint.sessionFile;\n\t\t\tif (templateFile !== void 0) return yield* loadFromProvider(session.forkThread({"));
 		assert.ok(text.includes("No parent history, unless `fork:true` starts it from a copy of this conversation, or `forkSessionFile` from a Pi session template (Pi only)."));
+		// A worktree handoff: the move leaves a running turn's session, the next turn start restarts it there.
+		assert.ok(text.includes("runs.some(isActiveRun$1);\n\t\tconst detachSessionIds = new Set("), "the move checks for an active run before choosing what to detach");
+		assert.ok(text.includes(".filter((session) => !workspaceMoveWaitsForRun || session.capabilities.sessions.supportsMultipleProviderThreadsPerSession).map((session) => session.id)"));
+		assert.ok(text.includes("existingSessionProjection.cwd !== resolvedRuntimePolicy.cwd) yield* providerSessions.detach({"));
+		assert.ok(text.includes("if (turn !== null && !turn.interrupted && piHandoffEndsTurn(event)) {\n\t\t\t\t\t\t\tturn.endedByHandoff = true;"), "Pi stops after the handoff call");
+		assert.ok(text.includes("const interrupted = (turn.interrupted || turn.nativeAborted) && turn.endedByHandoff !== true;"), "the handoff's own abort settles as completed");
+		// t3_thread_search: identity matches first, the tool reports them.
+		assert.ok(text.includes("const identityHits = identity.needle === \"\" && identity.title === \"\" ? [] : yield* read(threadIdentityMatches(identity));"));
+		assert.ok(text.includes('source: Literals([\n\t\t\t"id",\n\t\t\t"title",'));
+		assert.ok(!text.includes("Skips subagent threads."), "the tool no longer says it skips delegated children");
+		// A lost provider connection interrupts the turn instead of failing it.
+		assert.ok(text.includes("const failure = connectionFailure === null ? reportedFailure : null;"));
+		assert.ok(text.includes("}\n\t\t\t\tif (failure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tyield* emit({\n\t\t\t\t\t\ttype: \"turn.terminal\","), "only a real failure fails the turn");
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -353,6 +371,195 @@ describe("patchBundle", () => {
 		assert.deepEqual(args, ["--mode", "rpc", "--model", "anthropic/claude-opus", "--thinking", "high", "--offline", "--no-extensions", "--no-tools", "--fork", sessionFile]);
 		assert.deepEqual(forkLaunch.env, { HOME: "/home/u", PI_RPC_DIALOGS: "questions" });
 
+		// The handoff and connection checks, run as bundled.
+		const fnSource = (name: string) => {
+			const start = text.indexOf(`function ${name}(`);
+			return text.slice(start, text.indexOf("\n}\n", start) + 2);
+		};
+		const piHandoffEndsTurn = new Function(`${fnSource("piHandoffEndsTurn")}\nreturn piHandoffEndsTurn;`)();
+		const handoff = { toolName: "mcp__t3-code__t3_worktree_handoff", toolCallId: "call_1" };
+		assert.equal(piHandoffEndsTurn(handoff), true);
+		assert.equal(piHandoffEndsTurn({ ...handoff, toolName: "t3_worktree_handoff" }), true);
+		assert.equal(piHandoffEndsTurn({ ...handoff, isError: true }), false, "a refused handoff leaves the thread where it is");
+		assert.equal(piHandoffEndsTurn({ ...handoff, parentToolCallId: "call_0" }), false, "a script's call (a workflow) is not the turn's last step");
+		for (const toolName of ["mcp__t3-code__t3_worktree_status", "mcp__t3-code__t3_worktree_handoff_v2", "bash", undefined]) {
+			assert.equal(piHandoffEndsTurn({ ...handoff, toolName }), false, String(toolName));
+		}
+		const piConnectionFailure = new Function(`${fnSource("piConnectionFailure")}\nreturn piConnectionFailure;`)();
+		// The final errors of Pi turns that failed in November 2026, as t3 stored them.
+		for (const lost of [
+			"Request timed out.",
+			"Connection error.: write EPIPE",
+			"terminated: other side closed (UND_ERR_SOCKET)",
+			"terminated: read ETIMEDOUT",
+			"fetch failed",
+			"getaddrinfo ENOTFOUND api.anthropic.com",
+			"socket hang up",
+			'502 {"type":"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-502/","title":"Error 502: Bad gateway"}',
+			"API Error: 524 A timeout occurred",
+		]) {
+			assert.equal(piConnectionFailure(lost), true, lost);
+		}
+		for (const real of [
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 27."}}',
+			"Claude API rate limit reached. Try again later.",
+			'429 {"type":"error","error":{"type":"rate_limit_error","message":"all adapters are in cooldown; retry in 33s"}}',
+			'503 {"type":"error","error":{"type":"api_error","message":"all adapters failed: credential validation failed"}}',
+			"You’ve hit your usage limit. Upgrade to Pro",
+			"401 authentication failed after timeout",
+			"the prompt exceeds the model's context window (timed out compacting)",
+			"Pi reported a model error.",
+			"request req_5021abc failed validation",
+			"tool output took 504ms and was rejected",
+		]) {
+			assert.equal(piConnectionFailure(real), false, real);
+		}
+
+		// Pi's turn end, run as bundled with recording stand-ins for its collaborators.
+		const finalizeSource = source("const finalizeTurn = fnUntraced(function* (state, readUsage = true)", "const scheduleSettleProbe").replace("const finalizeTurn = ", "").trimEnd().replace(/;$/, "");
+		const done = (value?: unknown) => ({ *[Symbol.iterator]() { return value; } });
+		type Recorded = { events: Record<string, any>[]; retries: { status: string; failure: unknown }[]; sessions: unknown[][] };
+		const endTurn = (fields: Record<string, unknown>): Recorded => {
+			const seen: Recorded = { events: [], retries: [], sessions: [] };
+			const step = (record: (...args: any[]) => void) => (...args: any[]) => (record(...args), done());
+			const finalizeTurn = new Function("deps", `with (deps) { return ${finalizeSource}; }`)({
+				fnUntraced: (body: unknown) => body,
+				now: done("now"),
+				PI_PROVIDER: "pi",
+				piConnectionFailure,
+				completeOpenStreamItems: step(() => {}),
+				emitCompaction: step(() => {}),
+				emitProviderRetry: step((_turn, retry, status) => seen.retries.push({ status, failure: retry.failure })),
+				captureTurnTreeRefs: () => done(null),
+				readTokenUsage: () => done(undefined),
+				emit: step((event) => seen.events.push(event)),
+				updateProviderThread: step(() => {}),
+				providerRef: String,
+				updateProviderSession: step((...args) => seen.sessions.push(args)),
+				baseItemFields: (_turn: unknown, id: string) => ({ id }),
+				itemOrdinal: () => 7,
+			});
+			const turn = { interrupted: false, nativeAborted: false, activeCompaction: null, activeProviderRetry: null, rejectedPromptFailure: null, failure: null, providerTurn: { id: "turn-1" }, turnInput: { threadId: "thread-1", runOrdinal: 3 }, ...fields };
+			const state = { activeTurn: turn, providerThread: { id: "provider-thread-1" } };
+			assert.equal(finalizeTurn(state, false).next().done, true);
+			assert.equal(state.activeTurn, null);
+			return seen;
+		};
+		const ofType = (seen: Recorded, type: string) => seen.events.filter((event) => event.type === type);
+		const outcome = (seen: Recorded) => ({ turn: ofType(seen, "provider_turn.updated")[0]!.providerTurn.status, terminal: ofType(seen, "turn.terminal")[0] });
+		const timedOut = { class: "provider_error", message: "Request timed out.", code: null, retryable: false };
+
+		const lost = endTurn({ failure: timedOut });
+		assert.equal(outcome(lost).turn, "interrupted");
+		assert.deepEqual(outcome(lost).terminal, {
+			type: "turn.terminal",
+			driver: "pi",
+			providerThreadId: "provider-thread-1",
+			providerTurnId: "turn-1",
+			runOrdinal: 3,
+			status: "interrupted",
+			failure: null,
+			reason: "The connection to the model provider failed (Request timed out.). The conversation is intact: send a message to continue.",
+			threadDisposition: "reusable",
+		});
+		assert.deepEqual(
+			ofType(lost, "turn_item.updated").map((event) => event.turnItem),
+			[{ id: "terminal-failure:turn-1", status: "failed", title: null, completedAt: "now", type: "error", failure: { ...timedOut, class: "transport_error", retryable: true } }],
+			"the cause stays visible, as a retryable transport error",
+		);
+		assert.deepEqual(lost.sessions, [["ready", null]], "the session is not in error");
+
+		const afterRetries = endTurn({ failure: { ...timedOut, message: "terminated: other side closed (UND_ERR_SOCKET)" }, activeProviderRetry: { retry: { attempt: 3, maxAttempts: 3, retryDelayMs: 8000 }, startedAt: "then" } });
+		assert.equal(outcome(afterRetries).terminal.status, "interrupted");
+		assert.equal(outcome(afterRetries).terminal.retry, undefined);
+		assert.deepEqual(afterRetries.retries, [{ status: "failed", failure: { ...timedOut, message: "terminated: other side closed (UND_ERR_SOCKET)", class: "transport_error", retryable: true } }], "Pi's exhausted retries show on their card");
+		assert.deepEqual(ofType(afterRetries, "turn_item.updated"), []);
+
+		const invalid = { class: "provider_error", message: '400 {"type":"error","error":{"type":"invalid_request_error"}}', code: null, retryable: false };
+		const real = endTurn({ failure: invalid });
+		assert.equal(outcome(real).turn, "failed");
+		assert.deepEqual(
+			{ ...outcome(real).terminal, providerThreadId: undefined },
+			{ type: "turn.terminal", driver: "pi", providerThreadId: undefined, providerTurnId: "turn-1", runOrdinal: 3, failureItemOrdinal: 7, status: "failed", failure: invalid, threadDisposition: "reusable" },
+		);
+		assert.deepEqual(ofType(real, "turn_item.updated")[0]!.turnItem.failure, invalid);
+		assert.deepEqual(real.sessions, [["error", invalid.message]]);
+		const rejected = endTurn({ rejectedPromptFailure: { ...timedOut, message: "Prompt timed out waiting for the previous turn." } });
+		assert.equal(outcome(rejected).terminal.status, "failed", "t3's own refusal of a prompt is not a lost connection");
+
+		assert.deepEqual(outcome(endTurn({ nativeAborted: true, endedByHandoff: true })), outcome(endTurn({})), "the abort after a handoff ends the turn as completed");
+		assert.equal(outcome(endTurn({})).terminal.status, "completed");
+		const stopped = endTurn({ interrupted: true, failure: timedOut });
+		assert.equal(outcome(stopped).terminal.status, "interrupted");
+		assert.equal(outcome(stopped).terminal.reason, undefined, "a Stop names no connection failure");
+		assert.deepEqual(ofType(stopped, "turn_item.updated"), []);
+
+		// The handoff's turn start: the stale session goes before the thread's session opens.
+		const turnStart = source("const resolvedRuntimePolicy = resolvedPolicy.success;", "const sessionResult = ");
+		assert.ok(turnStart.includes("/* workspaceMovedSessionRestarts */"), "the restart precedes providerSessions.open");
+		assert.match(text, /const workspaceMoveWaitsForRun = [^\n]+\n\t\tconst detachSessionIds = new Set\([^\n]*thread\.worktreePath \? \(providerContext\?\.providerSessions \?\? \[\]\)\.filter\(\(session\) => !workspaceMoveWaitsForRun/);
+
+		// t3_thread_search's identity matches: its query run as bundled on SQLite with t3's tables.
+		const identity = new Function("findAll", "Struct", "NullOr", "String$1", "ThreadId", "ProjectId", "sql", `${between(server, "\tconst threadIdentityQuery = ", "\tconst titleCandidates = findAll({")}\nreturn { threadIdentityQuery, threadIdentityMatches };`)(
+			(spec: { execute: (request: unknown) => unknown }) => (request: unknown) => spec.execute(request),
+			(fields: unknown) => fields,
+			(schema: unknown) => schema,
+			"String",
+			"ThreadId",
+			"ProjectId",
+			(strings: TemplateStringsArray, ...values: unknown[]) => ({ text: strings.join("?"), values }),
+		);
+		const db = new DatabaseSync(":memory:");
+		db.exec(`
+			CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT, deleted_at TEXT, payload_json TEXT NOT NULL);
+			CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, child_thread_id TEXT, origin TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+		`);
+		const child = (uuid: string) => `thread:delegated-task:command%3Amcp%3A6cfe3118-00b2-411e-82e1-18f74c3f6773%3Adelegate-task%3A${uuid}`;
+		const coordinator = "thread:project:p1:aaaa1111-0000-4000-8000-000000000001";
+		const handoffChild = child("ffba61bd-d2aa-45f5-a9b8-eff026715971");
+		const lensChild = child("7dedfc9f-eee1-4c73-bc29-1b85931bb2e8");
+		const rows: [id: string, project: string, title: string, updated: string, subagent: boolean, archived?: boolean, deleted?: boolean][] = [
+			[coordinator, "p1", "Dream run", "2026-11-14T09:00:00Z", false],
+			[handoffChild, "p1", "t3 patches: worktree handoff mid-turn", "2026-11-14T10:00:00Z", true],
+			[lensChild, "p1", "pi-lens: knip purge", "2026-11-14T11:00:00Z", true],
+			[child("0ld0ld00-0000-4000-8000-000000000003"), "p1", "worktree handoff (old try)", "2026-11-13T10:00:00Z", true, true],
+			[child("e15e0000-0000-4000-8000-000000000004"), "p2", "worktree handoff elsewhere", "2026-11-14T12:00:00Z", true],
+			[child("deadbeef-0000-4000-8000-000000000005"), "p1", "deleted child", "2026-11-14T13:00:00Z", true, false, true],
+			["thread:project:p1:bbbb2222-0000-4000-8000-000000000006", "p1", "worktree handoff design", "2026-11-14T14:00:00Z", false],
+			[child("9a9a9a9a-0000-4000-8000-000000000007"), "p1", "notes on ffba61bd", "2026-11-14T15:00:00Z", true],
+		];
+		const insertThread = db.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+		for (const [id, project, title, updated, subagent, archived, deleted] of rows) {
+			const lineage = subagent ? { relationshipToParent: "subagent", parentThreadId: coordinator } : { relationshipToParent: null, parentThreadId: null };
+			insertThread.run(id, project, title, updated, updated, archived ? updated : null, deleted ? updated : null, JSON.stringify({ id, title, lineage }));
+		}
+		const insertTask = db.prepare("INSERT INTO orchestration_v2_projection_subagents VALUES (?, ?, ?, 'app_owned', 'running', '2026-11-14T10:00:00Z', '{}')");
+		insertTask.run("node:delegated-task:2f81460e-866e-45bc-82e0-f090d023f14f", coordinator, lensChild);
+		insertTask.run("node:delegated-task:command%3Amcp%3A6cfe3118%3Adelegate-task%3Affba61bd-d2aa-45f5-a9b8-eff026715971", coordinator, handoffChild);
+		insertTask.run("node:native:pending-0000-4000-8000-000000000009", coordinator, null);
+		const find = (query: string, projectId: string | null = null) => {
+			const { text: statement, values } = identity.threadIdentityMatches(identity.threadIdentityQuery(query, projectId));
+			return db.prepare(statement).all(...values).map((row: Record<string, unknown>) => [row.threadId, row.source]);
+		};
+		assert.deepEqual(find("ffba61bd"), [[handoffChild, "id"], [child("9a9a9a9a-0000-4000-8000-000000000007"), "title"]], "8 characters of a child's id, then a newer child naming them in its title");
+		assert.deepEqual(find(" FFBA61BD-D2AA "), [[handoffChild, "id"]], "in any case, trimmed");
+		assert.deepEqual(find("2f81460e"), [[lensChild, "id"]], "part of a task id that differs from its child's");
+		assert.deepEqual(find("node:delegated-task:2f81460e-866e-45bc-82e0-f090d023f14f"), [[lensChild, "id"]], "a whole taskId");
+		assert.deepEqual(find(`[pi-lens](t3-thread://v2/env-1/${lensChild})`), [[lensChild, "id"]], "a thread link");
+		assert.deepEqual(find(`t3-thread://v1/${handoffChild}`), [[handoffChild, "id"]], "a v1 thread link");
+		assert.deepEqual(find("thread:delegated-task:command:mcp:6cfe3118-00b2"), [[child("9a9a9a9a-0000-4000-8000-000000000007"), "id"], [child("e15e0000-0000-4000-8000-000000000004"), "id"], [lensChild, "id"], [handoffChild, "id"], [child("0ld0ld00-0000-4000-8000-000000000003"), "id"]], "a decoded id, newest first, archived included, deleted not");
+		assert.deepEqual(find("worktree handoff", "p1"), [[handoffChild, "title"]], "a delegated child's title in the project; not an archived child, not a top-level thread (the title search ranks those)");
+		assert.deepEqual(find("Worktree Handoff"), [[child("e15e0000-0000-4000-8000-000000000004"), "title"], [handoffChild, "title"]], "without a project, every project's children");
+		assert.deepEqual(find("ffba61bd", "p1"), [[handoffChild, "id"], [child("9a9a9a9a-0000-4000-8000-000000000007"), "title"]], "an id match ranks above a newer title match");
+		assert.deepEqual(find("deadbeef"), [], "a deleted thread is gone, even by id");
+		assert.deepEqual(find("handoff").map(([, source]) => source), ["title", "title"], "a word without a digit is not taken for an id");
+		assert.deepEqual(find("delegate-task"), [], "nor a fragment every delegated id shares");
+		assert.deepEqual(identity.threadIdentityQuery("ab", null), { needle: "", title: "", projectId: null }, "too short for either");
+		assert.equal(identity.threadIdentityQuery("ffba 61bd", "p1").needle, "", "words are not an id");
+		assert.equal(identity.threadIdentityQuery("thread%253Aproject%3Ap1", null).needle, "thread:project:p1", "encoded ids are compared decoded");
+		// The tool lists them: ids first, then the title search, then delegated titles, then messages.
+		assert.ok(server.includes('...identityHits.filter((hit) => hit.source === "id"),\n\t\t\t...titleHits.filter((hit) => !identified.has(hit.threadId)).slice(0, limit - messageSlots),\n\t\t\t...identityHits.filter((hit) => hit.source !== "id"),\n\t\t\t...messageHits'));
+
 		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
 		try {
 			for (const [path, patchedText] of patched) {
@@ -442,7 +649,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -466,7 +673,7 @@ describe("keeping t3 patched", () => {
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller;/);
+			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 
