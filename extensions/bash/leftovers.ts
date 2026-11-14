@@ -7,13 +7,22 @@
 // adopts what they leave behind.
 //
 // Pi runs each bash command as the leader of its own process group, and index.ts records the
-// group of every call. When a call ends, `ps` lists the live processes of its group whose
-// parent is no longer in the group: the jobs the command's shell started and left (their own
-// children are part of them). Each is adopted with the command that started it and listed in the
-// call's result. A poll per session checks them each second; when one has ended, a message names
-// it and wakes the session (as a background call's end does, ../background). Children it left in turn
-// are adopted then. A process outside the group (`setsid`, a daemon that forks into its own
-// session) is not seen: `setsid` is refused (detach.ts).
+// group of every call and the jobs its shell started (`&`, also when disowned). When a call ends,
+// `ps` lists the live processes of its group whose parent is no longer in the group (their own
+// children are part of them). Those that are the shell's jobs, or `tool` commands, are adopted with
+// the command that started them and listed in the call's result. A poll per session checks them
+// each second; when one has ended, a message names it and wakes the session (as a background call's
+// end does, ../background). Children it left in turn are adopted then.
+//
+// The others were started by programs on their own: helper daemons such as git's fsmonitor
+// (`core.fsmonitor`), gpg-agent or an ssh ControlMaster, or the jobs of a nested shell
+// (`bash -c 'x &'`, a script that starts a server). After the shell exits they look the same as its
+// jobs (parent 1, same group), but a daemon never ends: adopted, it kept the session reporting
+// background work forever (a thread "waiting" 2 h 20 min on git's fsmonitor). They are named once
+// in the call's result, not tracked, and not stopped with the session. Without a record of the
+// shell's jobs (the command replaced the shell with `exec`), every process left counts as a job.
+// A process outside the group (`setsid`, a daemon that forks into its own session) is not seen:
+// `setsid` is refused (detach.ts).
 //
 // `ps` lists every process with numbers only (pid, parent, group, state), and command lines only
 // for the processes adopted: command lines run to hundreds of kilobytes each (test runners, browsers),
@@ -114,19 +123,38 @@ export function endedText(ended: Leftover, orphans: readonly Leftover[], now: nu
 /** A session's leftovers, by pid. */
 export type Leftovers = Map<number, Leftover>;
 
+/** A process left in a call's group that was not one of its jobs. */
+export interface Untracked {
+	pid: number;
+	command: string;
+}
+
+/** The note a call's result gets when programs it ran left processes running. */
+export function untrackedText(processes: readonly Untracked[]): string {
+	return [
+		`Left running by programs this command ran, not by its own \`&\` jobs, so not tracked (their end is not reported, and they outlive the session):`,
+		...list(processes),
+		"Stop one with `kill <pid>` if it is not wanted.",
+	].join("\n");
+}
+
+/** How a process is told apart from a reused pid: its pid and group. */
+const key = (p: { pid: number; pgid: number }) => `${p.pid}:${p.pgid}`;
+
 /** The roots of groups `pgids` not tracked yet: the processes {@link adopt} needs the command lines of. */
 export const untrackedRoots = (leftovers: Leftovers, rows: readonly PsRow[], pgids: readonly number[]): number[] =>
 	[...new Set(pgids)].flatMap((pgid) => rootsOf(rows, pgid).filter((row) => !leftovers.has(row.pid)).map((row) => row.pid));
 
 /**
- * Adopt the jobs left in group `pgid` (those not tracked yet) by `startedBy`; returns the new ones.
- * `commands` has the command lines of {@link untrackedRoots}; a root without one has exited since.
+ * Adopt the jobs left in group `pgid` (those not tracked yet, nor `skipped`, by `pid:pgid`) by
+ * `startedBy`; returns the new ones. `commands` has the command lines of {@link untrackedRoots}; a
+ * root without one has exited since.
  */
-export function adopt(leftovers: Leftovers, rows: readonly PsRow[], pgid: number, startedBy: string, now: number, commands: ReadonlyMap<number, string>): Leftover[] {
+export function adopt(leftovers: Leftovers, rows: readonly PsRow[], pgid: number, startedBy: string, now: number, commands: ReadonlyMap<number, string>, skipped: ReadonlySet<string> = new Set()): Leftover[] {
 	const adopted: Leftover[] = [];
 	for (const row of rootsOf(rows, pgid)) {
 		const command = commands.get(row.pid);
-		if (leftovers.has(row.pid) || command === undefined) continue;
+		if (leftovers.has(row.pid) || command === undefined || skipped.has(key(row))) continue;
 		const leftover = { pid: row.pid, pgid, command, startedBy, adoptedAt: now };
 		leftovers.set(row.pid, leftover);
 		adopted.push(leftover);
@@ -136,18 +164,25 @@ export function adopt(leftovers: Leftovers, rows: readonly PsRow[], pgid: number
 
 /** The leftovers that ended: no live process has their pid in their group (a reused pid elsewhere does not count). */
 export function endedOf(leftovers: Leftovers, rows: readonly PsRow[]): Leftover[] {
-	const live = new Set(rows.map((r) => `${r.pid}:${r.pgid}`));
-	return [...leftovers.values()].filter((l) => !live.has(`${l.pid}:${l.pgid}`));
+	const live = new Set(rows.map(key));
+	return [...leftovers.values()].filter((l) => !live.has(key(l)));
 }
 
 /**
  * The leftovers that ended, each with the processes it left (adopted here, with their command lines
- * in `commands`: those of {@link untrackedRoots} of the ended ones' groups).
+ * in `commands`: those of {@link untrackedRoots} of the ended ones' groups; `skipped` processes,
+ * by `pid:pgid`, are not adopted).
  */
-export function sweep(leftovers: Leftovers, rows: readonly PsRow[], now: number, commands: ReadonlyMap<number, string>): { ended: Leftover; orphans: Leftover[] }[] {
+export function sweep(leftovers: Leftovers, rows: readonly PsRow[], now: number, commands: ReadonlyMap<number, string>, skipped: ReadonlySet<string> = new Set()): { ended: Leftover; orphans: Leftover[] }[] {
 	const ended = endedOf(leftovers, rows);
 	for (const l of ended) leftovers.delete(l.pid);
-	return ended.map((l) => ({ ended: l, orphans: adopt(leftovers, rows, l.pgid, l.startedBy, now, commands) }));
+	return ended.map((l) => ({ ended: l, orphans: adopt(leftovers, rows, l.pgid, l.startedBy, now, commands, skipped) }));
+}
+
+/** Forget the untracked processes that exited, so their pids may be adopted when reused. */
+function forgetExited(untracked: Set<string>, rows: readonly PsRow[]): void {
+	const live = new Set(rows.map(key));
+	for (const k of untracked) if (!live.has(k)) untracked.delete(k);
 }
 
 const execFileAsync = promisify(execFile);
@@ -192,18 +227,36 @@ export function release(jobs: SessionJobs, pid: number, pgid: number): boolean {
 /** One check of the session's leftovers: each one that ended wakes the session with its own message. */
 async function checkLeftovers(jobs: SessionJobs, ps: Ps): Promise<void> {
 	const { rows, commands } = await snapshot(ps, jobs.leftovers, (rows) => endedOf(jobs.leftovers, rows).map((l) => l.pgid));
-	const ended = sweep(jobs.leftovers, rows, Date.now(), commands);
+	forgetExited(jobs.untracked, rows);
+	const ended = sweep(jobs.leftovers, rows, Date.now(), commands, jobs.untracked);
 	if (ended.length === 0) return;
 	stopPollWhenEmpty(jobs);
 	reportWork(jobs);
 	for (const { ended: leftover, orphans } of ended) wake(jobs, endedText(leftover, orphans, Date.now()), `the end of pid ${leftover.pid}`);
 }
 
-/** Adopt what a call left running in group `pgid`, and check the session's leftovers while there are any. */
-export async function adoptLeftovers(jobs: SessionJobs, pgid: number, command: string, ps: Ps, pollMs: number): Promise<Leftover[]> {
+/**
+ * Adopt the jobs a call left running in group `pgid` (`isJob`: by default every process left), and
+ * check the session's leftovers while there are any. The other processes left are returned as
+ * `untracked`, and never adopted later.
+ */
+export async function adoptLeftovers(
+	jobs: SessionJobs,
+	pgid: number,
+	command: string,
+	ps: Ps,
+	pollMs: number,
+	isJob: (pid: number, command: string) => boolean = () => true,
+): Promise<{ left: Leftover[]; untracked: Untracked[] }> {
 	const { rows, commands } = await snapshot(ps, jobs.leftovers, () => [pgid]);
-	const adopted = adopt(jobs.leftovers, rows, pgid, command, Date.now(), commands);
-	if (adopted.length === 0) return adopted;
+	forgetExited(jobs.untracked, rows);
+	const untracked = rootsOf(rows, pgid).flatMap((row) => {
+		const command = commands.get(row.pid);
+		return command === undefined || jobs.leftovers.has(row.pid) || jobs.untracked.has(key(row)) || isJob(row.pid, command) ? [] : [{ pid: row.pid, command }];
+	});
+	for (const left of untracked) jobs.untracked.add(key({ pid: left.pid, pgid }));
+	const adopted = adopt(jobs.leftovers, rows, pgid, command, Date.now(), commands, jobs.untracked);
+	if (adopted.length === 0) return { left: adopted, untracked };
 	if (jobs.poll === undefined) {
 		let busy = false;
 		jobs.poll = setInterval(() => {
@@ -216,5 +269,5 @@ export async function adoptLeftovers(jobs: SessionJobs, pgid: number, command: s
 		jobs.poll.unref?.();
 	}
 	reportWork(jobs);
-	return adopted;
+	return { left: adopted, untracked };
 }

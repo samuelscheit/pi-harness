@@ -14,9 +14,11 @@
 //
 // Both rely on the process group: Pi runs every bash command as the leader of its own group
 // (detached spawn), and what the command starts stays in it. Before each bash call this extension
-// prefixes the command with a line that writes the shell's `$$` (its pid, the group id) to a file
-// named after the call; the transcript keeps the original command (Pi hands tool_call handlers a
-// copy).
+// prefixes the command with lines that write the shell's `$$` (its pid, the group id) to a file
+// named after the call, and the shell's jobs (`jobs -l`: every `&` job, each process of a
+// pipeline) to `<file>.jobs` when the shell exits and before a `disown`. A command's own EXIT trap
+// runs as well (`trap` is wrapped to chain it, with the exit status in `$?`). The transcript keeps
+// the original command (Pi hands tool_call handlers a copy).
 
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,12 +26,55 @@ import { join } from "node:path";
 import { createBashToolDefinition, type ExtensionAPI, type ExtensionToolContext, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { BACKGROUND_GUIDELINE, DETACH_AFTER_MS } from "../background/index.ts";
 import { sessionJobs, setStopHint } from "../background/jobs.ts";
-import { openBridge, TOOL_GUIDELINE, toolBinDir, withImages } from "./bridge.ts";
+import { shellQuote as quote } from "../lib/process.ts";
+import { clientCommand, openBridge, TOOL_GUIDELINE, toolBinDir, withImages } from "./bridge.ts";
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
-import { adoptLeftovers, defaultPs, leftText, type Ps } from "./leftovers.ts";
+import { adoptLeftovers, defaultPs, leftText, type Ps, type Untracked, untrackedText } from "./leftovers.ts";
 
-/** The line put before a bash command: the shell's pid (its process group) into `file`. */
-export const recordLine = (file: string) => `printf '%s' "$$" > '${file.replaceAll("'", "'\\''")}' 2>/dev/null\n`;
+/** The file the shell's jobs are written to, next to the group file. */
+export const jobsFile = (file: string) => `${file}.jobs`;
+
+/**
+ * The lines put before a bash command: the shell's pid (its process group) into `file`, and its jobs
+ * into {@link jobsFile} on exit and before `disown` (which drops jobs from the table). `trap … EXIT`
+ * in the command sets the handler run after the jobs are written, with the exit status as `$?`
+ * (`&& :` keeps `set -e` from ending the handler there).
+ */
+export const recordLine = (file: string) =>
+	[
+		`printf '%s' "$$" > ${quote(file)} 2>/dev/null`,
+		`__pi_jobs() { jobs -l >> ${quote(jobsFile(file))} 2>/dev/null; }`,
+		'__pi_status() { return "$1"; }',
+		"__pi_exit_trap=",
+		'__pi_exit() { local status=$?; __pi_jobs; __pi_status "$status" && :; eval "$__pi_exit_trap"; }',
+		"builtin trap __pi_exit EXIT",
+		"trap() {",
+		"\tcase \"${1-}\" in -l | -p | '') builtin trap \"$@\"; return ;; --) shift ;; esac",
+		'\tif [ "$#" -lt 2 ]; then case "${1-}" in EXIT | exit | 0 | SIGEXIT) __pi_exit_trap= ;; *) builtin trap "$@" ;; esac; return; fi',
+		"\tlocal action=$1 signal status=0",
+		"\tshift",
+		'\tfor signal; do case "$signal" in EXIT | exit | 0 | SIGEXIT) if [ "$action" = - ]; then __pi_exit_trap=; else __pi_exit_trap=$action; fi ;; *) builtin trap -- "$action" "$signal" || status=$? ;; esac; done',
+		'\treturn "$status"',
+		"}",
+		'disown() { __pi_jobs; builtin disown "$@"; }',
+		"",
+	].join("\n");
+
+/** The pids of the jobs a jobs file lists (`jobs -l`), or undefined without one (the shell never wrote it: `exec`). */
+export function readJobs(file: string): Set<number> | undefined {
+	let text: string;
+	try {
+		text = readFileSync(file, "utf8");
+	} catch {
+		return undefined;
+	}
+	const pids = new Set<number>();
+	for (const line of text.split("\n")) {
+		const match = /^(?:\[\d+\][+-]?)?\s*(\d+)\s/.exec(line);
+		if (match) pids.add(Number(match[1]));
+	}
+	return pids;
+}
 
 /** The process group a group file holds, if any. */
 export function readGroup(file: string): number | undefined {
@@ -87,13 +132,20 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 		rmSync(sessionDir(ctx.sessionManager.getSessionId()), { recursive: true, force: true });
 	});
 
-	/** The call has ended: adopt what it left running in its process group (and forget the group file). */
+	/**
+	 * The call has ended: adopt the jobs it left running in its process group, its shell's and
+	 * `tool` commands (and forget the group's files). The other processes left are `untracked`.
+	 */
 	const leave = async (sessionId: string, callId: string, command: string) => {
 		const file = groupFile(sessionId, callId);
 		const pgid = readGroup(file);
+		const shellJobs = readJobs(jobsFile(file));
 		rmSync(file, { force: true });
-		const left = pgid === undefined ? [] : await adoptLeftovers(sessionJobs(sessionId), pgid, command, ps, pollMs).catch(() => []);
-		return { pgid, left };
+		rmSync(jobsFile(file), { force: true });
+		const isJob = (pid: number, line: string) => shellJobs === undefined || shellJobs.has(pid) || clientCommand(line) !== undefined;
+		const none = { left: [], untracked: [] as Untracked[] };
+		const adopted = pgid === undefined ? none : await adoptLeftovers(sessionJobs(sessionId), pgid, command, ps, pollMs, isJob).catch(() => none);
+		return { pgid, ...adopted };
 	};
 
 	pi.registerTool({
@@ -103,7 +155,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 			systemGuideline(),
 			TOOL_GUIDELINE,
 			BACKGROUND_GUIDELINE(options.detachAfterMs ?? DETACH_AFTER_MS),
-			"Jobs a command starts with `&` (a server for a test, parallel jobs) may keep running after it: the tool tracks each one and its end reaches you as a new message. Redirect their output to a file (`./server > server.log 2>&1 &`): output to the tool's pipe is lost once the command returns. `setsid` is refused.",
+			"Jobs a command starts with `&` (a server for a test, parallel jobs) may keep running after it: the tool tracks each one and its end reaches you as a new message. Redirect their output to a file (`./server > server.log 2>&1 &`): output to the tool's pipe is lost once the command returns. Processes that programs start on their own (a daemon such as git's fsmonitor, the `&` jobs of a script or `bash -c`) are named in the result but not tracked: to be told when a script's job ends, run the script itself with `&`. `setsid` is refused.",
 		],
 		// Run the built-in call with `tool` on its PATH and adopt what it left; the result (or error) names the leftovers.
 		async execute(callId, params, signal, onUpdate, ctx) {
@@ -119,8 +171,14 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 			} catch (error) {
 				outcome = { error };
 			}
-			const { images, left } = await bridge.ended(() => leave(sessionId, callId, command));
-			const note = left.length ? leftText(left) : undefined;
+			let untracked: Untracked[] = [];
+			const { images, left } = await bridge.ended(async () => {
+				const adopted = await leave(sessionId, callId, command);
+				untracked = adopted.untracked;
+				return adopted;
+			});
+			const notes = [...(left.length ? [leftText(left)] : []), ...(untracked.length ? [untrackedText(untracked)] : [])];
+			const note = notes.length ? notes.join("\n\n") : undefined;
 			if ("error" in outcome) {
 				if (!note) throw outcome.error;
 				throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}\n\n${note}`);

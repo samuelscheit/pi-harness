@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
 import { sessionJobs } from "../extensions/background/jobs.ts";
-import { adopt, adoptLeftovers, commandArgs, commandsOf, defaultPs, endedText, type Leftovers, leftText, parseCommands, parseTable, type Ps, rootsOf, sweep, TABLE_ARGS, untrackedRoots } from "../extensions/bash/leftovers.ts";
+import { adopt, adoptLeftovers, commandArgs, commandsOf, defaultPs, endedText, type Leftovers, leftText, parseCommands, parseTable, type Ps, rootsOf, sweep, TABLE_ARGS, untrackedRoots, untrackedText } from "../extensions/bash/leftovers.ts";
 import { withHugePs } from "./fixtures/huge-ps.ts";
 
 // Group 100: the shell (100) has exited; it left `sleep 30` (101, reparented to 1) and a subshell
@@ -47,10 +47,10 @@ describe("reading ps", () => {
 		const jobs = sessionJobs(`asked-${process.pid}`);
 		const adopted = await adoptLeftovers(jobs, 100, "cmd", ps, 60_000);
 		clearInterval(jobs.poll);
-		assert.deepEqual(adopted.map((l) => [l.pid, l.command]), [[101, "sleep 30"], [102, "bash -c make"]]);
+		assert.deepEqual(adopted.left.map((l) => [l.pid, l.command]), [[101, "sleep 30"], [102, "bash -c make"]]);
 		assert.deepEqual(asked, [TABLE_ARGS, commandArgs([101, 102])]);
 		asked.length = 0;
-		assert.deepEqual(await adoptLeftovers(jobs, 100, "again", ps, 60_000), []);
+		assert.deepEqual(await adoptLeftovers(jobs, 100, "again", ps, 60_000), { left: [], untracked: [] });
 		assert.deepEqual(asked, [TABLE_ARGS], "nothing new: no command lines asked for");
 		assert.deepEqual(await commandsOf(ps, []), new Map());
 		assert.deepEqual(asked, [TABLE_ARGS], "no pids: ps does not run");
@@ -71,7 +71,7 @@ describe("reading ps", () => {
 				const jobs = sessionJobs(`huge-${process.pid}`);
 				const adopted = await adoptLeftovers(jobs, pgid, "sleep 30 &", defaultPs, 60_000);
 				clearInterval(jobs.poll);
-				assert.deepEqual(adopted.map((l) => [l.pid, l.pgid, l.command]), [[sleep, pgid, "sleep 30"]]);
+				assert.deepEqual(adopted.left.map((l) => [l.pid, l.pgid, l.command]), [[sleep, pgid, "sleep 30"]]);
 				// A pid that exited meanwhile has no command line; ps's exit code 1 when none is left is not an error.
 				const exited = spawnSync("true").pid!;
 				assert.deepEqual(await commandsOf(defaultPs, [sleep, exited]), new Map([[sleep, "sleep 30"]]));
@@ -128,6 +128,32 @@ describe("adopting and sweeping", () => {
 		assert.equal(leftovers.size, 0);
 	});
 
+	test("processes that are not the call's jobs are named once, never adopted, and forgotten when they exit", async () => {
+		let table = TABLE;
+		const ps: Ps = async (args) =>
+			args === TABLE_ARGS ? table : [...COMMANDS].filter(([pid]) => args[3]!.split(",").includes(String(pid))).map(([pid, c]) => `${pid} ${c}`).join("\n");
+		const jobs = sessionJobs(`untracked-${process.pid}`);
+		// 101 (`sleep 30`) is the shell's job; 102 (`bash -c make`) was started by a program.
+		const first = await adoptLeftovers(jobs, 100, "sleep 30 & make", ps, 60_000, (pid) => pid === 101);
+		clearInterval(jobs.poll);
+		jobs.poll = undefined;
+		assert.deepEqual(first.left.map((l) => l.pid), [101]);
+		assert.deepEqual(first.untracked, [{ pid: 102, command: "bash -c make" }]);
+		assert.deepEqual([...jobs.untracked], ["102:100"]);
+		assert.deepEqual(await adoptLeftovers(jobs, 100, "again", ps, 60_000, () => false), { left: [], untracked: [] }, "named once");
+		// The job ends while 102 still runs: 102 is no orphan to adopt.
+		const rows = parseTable(["  102     1   100 S", "  103   102   100 R"].join("\n"));
+		assert.deepEqual(sweep(jobs.leftovers, rows, 1, COMMANDS, jobs.untracked).map((e) => [e.ended.pid, e.orphans.length]), [[101, 0]]);
+		// Once 102 exits, its pid may be adopted again (reused by a job of a later call).
+		table = "  102     1   100 S\n";
+		await adoptLeftovers(jobs, 999, "other", ps, 60_000);
+		assert.deepEqual([...jobs.untracked], ["102:100"], "still running");
+		table = "";
+		await adoptLeftovers(jobs, 999, "other", ps, 60_000);
+		assert.deepEqual([...jobs.untracked], [], "exited: forgotten");
+		clearInterval(jobs.poll);
+	});
+
 	test("a pid reused by a process in another group counts as ended", () => {
 		const leftovers: Leftovers = new Map();
 		adopt(leftovers, rows, 100, "cmd", 0, COMMANDS);
@@ -154,5 +180,12 @@ describe("texts", () => {
 			"Background process pid 101 `sleep 30` ended (running at least 2 min 5 s since your command `sleep 30 > /dev/null & echo started` returned). Its exit code is not known; its output is wherever that command sent it.",
 		);
 		assert.match(endedText(leftover, [{ ...leftover, pid: 103, command: "make" }], 3000), /\nIt left running, now tracked as well:\n- pid 103: `make`$/);
+	});
+
+	test("the note on processes programs left names each one and how to stop it", () => {
+		assert.equal(
+			untrackedText([{ pid: 7, command: "git fsmonitor--daemon run --detach" }]),
+			"Left running by programs this command ran, not by its own `&` jobs, so not tracked (their end is not reported, and they outlive the session):\n- pid 7: `git fsmonitor--daemon run --detach`\nStop one with `kill <pid>` if it is not wanted.",
+		);
 	});
 });

@@ -15,7 +15,7 @@ import { type AgentSession, createAgentSession, DefaultResourceLoader, type Exte
 import { Type } from "typebox";
 import background from "../extensions/background/index.ts";
 import { JOB_MESSAGE_TYPE, type Job, sessionJobs } from "../extensions/background/jobs.ts";
-import bashExtension, { readGroup, recordLine } from "../extensions/bash/index.ts";
+import bashExtension, { jobsFile, readGroup, readJobs, recordLine } from "../extensions/bash/index.ts";
 
 describe("record line", () => {
 	test("the record line writes the shell's pid, also into a path with quotes", () => {
@@ -26,6 +26,31 @@ describe("record line", () => {
 			assert.equal(execFileSync("cat", [file], { encoding: "utf8" }), out);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the jobs file lists the shell's jobs at exit, each process of a pipeline and disowned ones; the command's own EXIT trap runs with its status, also under set -e", () => {
+		const d = mkdtempSync(join(tmpdir(), "bg-jobs-"));
+		try {
+			const file = join(d, "it's here");
+			const script = 'set -euo pipefail; trap "echo trap saw \\$?" EXIT INT; sleep 0.3 | sleep 0.3 & echo "pipe $!"; sleep 0.3 & echo "disowned $!"; disown; bash -c "sleep 0.3 &"; false';
+			const run = spawnSync("bash", ["-c", `${recordLine(file)}${script}`], { encoding: "utf8" });
+			assert.equal(run.status, 1, "the command's exit status");
+			assert.match(run.stdout, /trap saw 1\n$/);
+			const pipe = Number(/pipe (\d+)/.exec(run.stdout)![1]);
+			const disowned = Number(/disowned (\d+)/.exec(run.stdout)![1]);
+			const jobs = readJobs(jobsFile(file))!;
+			assert.ok(jobs.has(pipe) && jobs.has(disowned), [...jobs].join(","));
+			assert.equal(jobs.size, 3, "both pipeline processes and the disowned job; the nested shell's job is not the shell's");
+			// `trap - EXIT` drops only the command's handler; other signals reach the builtin.
+			const reset = spawnSync("bash", ["-c", `${recordLine(file)}trap "echo no" EXIT; trap - EXIT; trap "echo int" INT; trap -p INT; exit 4`], { encoding: "utf8" });
+			assert.deepEqual([reset.status, reset.stdout], [4, "trap -- 'echo int' SIGINT\n"]);
+			rmSync(jobsFile(file));
+			spawnSync("bash", ["-c", `${recordLine(file)}exec true`]);
+			assert.equal(readJobs(jobsFile(file)), undefined, "a shell replaced by exec writes nothing");
+			assert.deepEqual(readJobs(join(d, "none")), undefined);
+		} finally {
+			rmSync(d, { recursive: true, force: true });
 		}
 	});
 
@@ -260,6 +285,66 @@ describe("processes a command leaves running", () => {
 				return true;
 			}
 		}, 3000);
+	});
+});
+
+describe("processes programs leave running", () => {
+	/** Whether a process runs. */
+	const alive = (pid: number) => spawnSync("kill", ["-0", String(pid)]).status === 0;
+
+	test("a program's own process (a nested shell's job) is named once, not tracked, not reported as work, and outlives the session; the command's job is tracked", async () => {
+		const s = await newSession();
+		const work = workEvents(s);
+		respond(
+			bash("bash -c 'sleep 30 > /dev/null 2>&1 &'\nsleep 0.4 > /dev/null 2>&1 &\necho started"),
+			fauxAssistantMessage("Started."),
+			fauxAssistantMessage("The job ended."),
+		);
+		await s.prompt("go");
+		const [text] = toolTexts(s);
+		assert.match(text!, /^started\n\n\nStill running in the background, left by this command \(1 process\):\n- pid \d+: `sleep 0\.4`\n/);
+		const daemon = Number(/\n\nLeft running by programs this command ran, not by its own `&` jobs, so not tracked \(their end is not reported, and they outlive the session\):\n- pid (\d+): `sleep 30`\nStop one with `kill <pid>` if it is not wanted\.$/.exec(text!)?.[1]);
+		assert.ok(daemon > 0, text);
+		try {
+			assert.deepEqual([...leftoversOf(s).values()].map((l) => l.command), ["sleep 0.4"]);
+			await until("the job's end", () => jobMessages(s).length === 1 && settled(s, "The job ended.")());
+			assert.match(jobMessages(s)[0]!, /`sleep 0\.4` ended/);
+			assert.doesNotMatch(jobMessages(s)[0]!, /It left running/, "the program's process is no orphan of the job");
+			assert.equal(leftoversOf(s).size, 0);
+			assert.deepEqual(work, [1, 0], "only the job counted as background work");
+			assert.deepEqual(groupFiles(), [], "the group and jobs files are gone");
+			await s.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+			assert.ok(alive(daemon), "not stopped with the session");
+		} finally {
+			kill(daemon);
+		}
+	});
+
+	test("git's fsmonitor daemon, started by `git status`, is not a job", async () => {
+		const repo = join(dir, "repo", "fsmonitor");
+		mkdirSync(repo);
+		execFileSync("git", ["-C", repo, "init", "-q"]);
+		writeFileSync(join(repo, "a"), "a\n");
+		const s = await newSession();
+		respond(bash("cd fsmonitor && git -c core.fsmonitor=true status --short"), fauxAssistantMessage("Done."));
+		try {
+			await s.prompt("go");
+			const [text] = toolTexts(s);
+			assert.match(text!, /^\?\? a\n\n\nLeft running by programs this command ran, not by its own `&` jobs, so not tracked[^\n]*\n- pid \d+: `[^`]*git fsmonitor--daemon run --detach[^`]*`\n/);
+			assert.doesNotMatch(text!, /Still running in the background/);
+			assert.equal(leftoversOf(s).size, 0);
+			assert.equal(sessionJobs(s.sessionManager.getSessionId()).poll, undefined, "nothing to watch");
+		} finally {
+			spawnSync("git", ["-C", repo, "fsmonitor--daemon", "stop"]);
+		}
+	});
+
+	test("a command with its own EXIT trap: the trap runs, and its jobs are still tracked", async () => {
+		const s = await newSession();
+		respond(bash("trap 'echo cleaned up' EXIT\nsleep 0.3 > /dev/null 2>&1 &\necho started"), fauxAssistantMessage("Started."), fauxAssistantMessage("Ended."));
+		await s.prompt("go");
+		assert.match(toolTexts(s)[0]!, /^started\ncleaned up\n\n\nStill running in the background, left by this command \(1 process\):\n- pid \d+: `sleep 0\.3`\n/);
+		await until("the job's end", () => jobMessages(s).length === 1 && settled(s, "Ended.")());
 	});
 });
 

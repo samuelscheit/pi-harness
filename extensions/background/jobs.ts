@@ -40,6 +40,8 @@ export interface SessionJobs {
 	jobs: Map<string, Job>;
 	/** Processes ended bash calls left running (../bash/leftovers.ts). */
 	leftovers: Leftovers;
+	/** Processes left in a call's group that were not its jobs (`pid:pgid`): named once, never adopted (../bash/leftovers.ts). */
+	untracked: Set<string>;
 	/** The check for the leftovers' end, while there are any. */
 	poll: NodeJS.Timeout | undefined;
 	/** The API of the extension instance loaded last: the one a job's end reports through (none during a reload). */
@@ -57,7 +59,7 @@ const state = globalThis as { __harnessJobs?: Map<string, SessionJobs>; __harnes
  */
 export function sessionJobs(sessionId: string): SessionJobs {
 	const all = (state.__harnessJobs ??= new Map());
-	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), poll: undefined, api: undefined };
+	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), untracked: new Set(), poll: undefined, api: undefined };
 	const jobs = all.get(sessionId);
 	if (!jobs) {
 		all.set(sessionId, fresh);
