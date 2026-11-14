@@ -69,6 +69,12 @@ export function precedingAgentText(sessionFile: string): Map<string, string> {
 	return before;
 }
 
+/** Every repository a Pi session ever worked in, distinct and sorted. */
+export function repositories(db: DatabaseSync): string[] {
+	const rows = db.prepare("SELECT DISTINCT cwd FROM sessions WHERE source = 'pi'").all() as { cwd: string }[];
+	return [...new Set(rows.map((row) => repositoryRoot(row.cwd)))].sort();
+}
+
 /** The user's messages after `since` (ms), oldest first. */
 export function collect(db: DatabaseSync, since: number): Observation[] {
 	const rows = db

@@ -13,7 +13,8 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { repositoryRoot, SOURCE_ROOT } from "../lib/repository.ts";
-const BACKLOG = join(".agents", "improvements.md");
+/** A backlog's path relative to its repository. */
+export const BACKLOG = join(".agents", "improvements.md");
 const HEADER = "# Improvement backlog\n\nNoted by agents with note_improvement; consumed by dreaming and /improve.\n";
 
 const DESCRIPTION =

@@ -101,8 +101,18 @@ export interface RunSummary {
 	messages: number;
 	labelled: Record<string, number>;
 	records: readonly LedgerRecord[];
-	/** New improvement notes (headings and first lines) since the last run. */
-	notes: readonly string[];
+	/** Every open improvement note, per backlog. */
+	notes: readonly OpenNote[];
+}
+
+/** A note still in a backlog: fixing it removes it there, so every note listed is open. */
+export interface OpenNote {
+	backlog: string;
+	/** `YYYY-MM-DD HH:MM` (UTC), the note's heading. */
+	at: string;
+	observation: string;
+	/** Written after the run's start position. */
+	new: boolean;
 }
 
 /** The run's report in Markdown. */
@@ -153,24 +163,34 @@ export function report(summary: RunSummary, ledger: readonly LedgerRecord[]): st
 		"|---|---|---|",
 		...[...runs].map(([run, records]) => `| ${run.slice(0, 16).replace("T", " ")} | ${records.length} | ${rate(records)} |`),
 		"",
-		"## New improvement notes",
+		"## Open improvement notes",
 		"",
-		...(summary.notes.length ? summary.notes.map((n) => `- ${n}`) : ["None."]),
+		"Friction agents noted (`note_improvement`). Each one stays here until a fix removes it from its backlog.",
+		"",
+		...(summary.notes.length
+			? [...Map.groupBy(summary.notes, (n) => n.backlog)].flatMap(([backlog, notes]) => [
+					`### ${backlog} (${notes.length} open, ${notes.filter((n) => n.new).length} new)`,
+					"",
+					...notes.map((n) => `- ${n.at}${n.new ? " (new)" : ""}: ${clip(n.observation, 200)}`),
+					"",
+				])
+			: ["None."]),
 		"",
 	]
 		.filter((line, i, all) => !(line === "" && all[i - 1] === ""))
 		.join("\n");
 }
 
-/** Improvement notes (`.agents/improvements.md`) written after `since`: heading time and observation. */
-export function notesSince(file: string, since: number): string[] {
-	if (!existsSync(file)) return [];
-	return readFileSync(file, "utf8")
-		.split(/\n(?=## \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC)/)
-		.flatMap((block) => {
-			const when = /^## (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) UTC/.exec(block);
-			if (!when || Date.parse(`${when[1]}T${when[2]}:00Z`) <= since) return [];
-			const observation = /\*\*Observation:\*\* (.*)/.exec(block)?.[1] ?? "";
-			return [`${when[1]} ${when[2]}: ${clip(observation, 200)}`];
-		});
+/** The notes in improvement backlogs (`.agents/improvements.md`), oldest first per backlog; missing files have none. */
+export function openNotes(backlogs: readonly string[], since: number): OpenNote[] {
+	return backlogs.filter((file) => existsSync(file)).flatMap((backlog) =>
+		readFileSync(backlog, "utf8")
+			.split(/\n(?=## \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC)/)
+			.flatMap((block) => {
+				const when = /^## (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) UTC/.exec(block);
+				if (!when) return [];
+				const observation = /\*\*Observation:\*\* (.*)/.exec(block)?.[1] ?? "";
+				return [{ backlog, at: `${when[1]} ${when[2]}`, observation, new: Date.parse(`${when[1]}T${when[2]}:00Z`) > since }];
+			}),
+	);
 }

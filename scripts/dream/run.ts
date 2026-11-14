@@ -15,14 +15,15 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
+import { BACKLOG } from "../../extensions/improvements/index.ts";
 import { SOURCE_ROOT } from "../../extensions/lib/repository.ts";
 import { indexAll, metricsPath } from "../../extensions/metrics/stats.ts";
 import { openStore } from "../../extensions/metrics/store.ts";
 import { type Ask, askJson, isNegative, labelMessages } from "../lib/labels.ts";
 import { type Applied, applyDelta } from "./apply.ts";
-import { collect } from "./collect.ts";
+import { collect, repositories } from "./collect.ts";
 import { type Candidate, curate, type Delta } from "./curate.ts";
-import { appendLedger, dreamsDir, type LedgerRecord, ledgerFile, notesSince, readLedger, readSince, report, stateFile, writeSince } from "./ledger.ts";
+import { appendLedger, dreamsDir, type LedgerRecord, ledgerFile, openNotes, readLedger, readSince, report, stateFile, writeSince } from "./ledger.ts";
 import { globalRules, type KnownRule, projectRules } from "./rules.ts";
 
 export const LABEL_MODEL = "claude-sonnet-5-5";
@@ -103,7 +104,7 @@ export async function dream({ source, db, now = new Date(), since = readSince(so
 			};
 		}),
 	);
-	const summary = { run: now, since, until, messages: observations.length, labelled, records, notes: notesSince(join(source, ".agents", "improvements.md"), since) };
+	const summary = { run: now, since, until, messages: observations.length, labelled, records, notes: openNotes([...new Set([source, ...repositories(db)])].map((repo) => join(repo, BACKLOG)), since) };
 	if (dryRun) return { deltas, applied, records, text: report(summary, [...readLedger(source), ...records]) };
 
 	appendLedger(source, records);
