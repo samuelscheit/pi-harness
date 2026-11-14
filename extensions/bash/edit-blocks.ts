@@ -12,6 +12,7 @@
 // block that does not match changes nothing. Then each file is one `edit` call through the
 // session's tool pipeline: pi-lens checks it and the metrics count it as an edit.
 
+import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { computeEditsDiff, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { ToolResponse } from "./bridge.ts";
@@ -35,6 +36,20 @@ export const EDIT_BLOCKS_HELP = `Several files from stdin: \`tool edit - <<'EOF'
   new text
   >>>>>>> REPLACE
 Relative paths resolve against the shell's current directory. Every file is checked before any is written: if a block does not match, nothing changes. Quote the delimiter ('EOF') so the shell leaves $ and backticks alone.`;
+
+/**
+ * The path a path line names. Models often write it the way diffs and Markdown do: `--- a/x.py`,
+ * `+++ b/x.py`, `*** x.py`, `## x.py`, `File: x.py`, `` `x.py` ``, `x.py:` (2026-11-14: `--- tools/kernel/mutation.py`
+ * was taken as the path, nothing was edited, and the check after it ran on the old code).
+ */
+export function pathOf(line: string): string {
+	let path = line.trim();
+	const diff = /^(?:---|\+\+\+)\s+(?:[ab]\/)?(.+)$/.exec(path);
+	if (diff) path = diff[1]!;
+	path = path.replace(/^(?:\*\*\*|#{1,6})\s+/, "").replace(/^(?:file|path):\s*/i, "");
+	path = path.replace(/^(["'`])(.*)\1$/, "$2").replace(/:$/, "");
+	return path.trim();
+}
 
 /** The files and their edits, in the order the paths first appear; blocks of a repeated path join it. */
 export function parseEditBlocks(text: string): FileEdits[] {
@@ -70,7 +85,7 @@ export function parseEditBlocks(text: string): FileEdits[] {
 			throw new EditBlocksError(`line ${i + 1}: \`${line.trim()}\` outside a block`);
 		} else if (line.trim() !== "" && !line.startsWith("```")) {
 			endPath();
-			path = line.trim();
+			path = pathOf(line);
 			blocksOfPath = 0;
 		}
 	}
@@ -99,7 +114,12 @@ export async function runEditBlocks(
 		return { stdout: "", stderr: `tool edit: ${error.message}\n`, code: 2 };
 	}
 	const checks = await Promise.all(files.map((file) => computeEditsDiff(file.path, file.edits, cwd)));
-	const failures = checks.flatMap((check, index) => ("error" in check ? [`${files[index]!.path}: ${check.error}`] : []));
+	const failures = checks.flatMap((check, index) => {
+		if (!("error" in check)) return [];
+		const path = files[index]!.path;
+		const missing = !existsSync(path) ? " (no such file: a path line holds only the file's path, relative to the shell's current directory)" : "";
+		return [`${path}: ${check.error}${missing}`];
+	});
 	if (failures.length > 0) {
 		return { stdout: "", stderr: `tool edit: nothing changed, ${failures.length} of ${files.length} files do not match:\n${failures.join("\n")}\n`, code: 1 };
 	}

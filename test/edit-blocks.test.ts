@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, test } from "node:test";
 import { createEditTool } from "@earendil-works/pi-coding-agent";
-import { EditBlocksError, parseEditBlocks, runEditBlocks } from "../extensions/bash/edit-blocks.ts";
+import { EditBlocksError, parseEditBlocks, pathOf, runEditBlocks } from "../extensions/bash/edit-blocks.ts";
 
 const block = (search: string, replace: string) => `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
 
@@ -32,6 +32,30 @@ describe("parseEditBlocks", () => {
 		assert.deepEqual(parseEditBlocks(["md.md", block("Title", "Title\n=======\nbody"), "x.ts", "<<<<<<< SEARCH\ngone\n=======\n>>>>>>> REPLACE"].join("\n")), [
 			{ path: "md.md", edits: [{ oldText: "Title", newText: "Title\n=======\nbody" }] },
 			{ path: "x.ts", edits: [{ oldText: "gone", newText: "" }] },
+		]);
+	});
+
+	test("path lines written as in diffs or Markdown name the file", () => {
+		for (const [line, path] of [
+			["tools/kernel/mutation.py", "tools/kernel/mutation.py"],
+			["--- tools/kernel/mutation.py", "tools/kernel/mutation.py"],
+			["--- a/src/x.ts", "src/x.ts"],
+			["+++ b/src/x.ts", "src/x.ts"],
+			["*** src/x.ts", "src/x.ts"],
+			["## src/x.ts", "src/x.ts"],
+			["File: src/x.ts", "src/x.ts"],
+			["path: src/x.ts", "src/x.ts"],
+			["`src/x.ts`", "src/x.ts"],
+			["\"src/my file.ts\"", "src/my file.ts"],
+			["src/x.ts:", "src/x.ts"],
+			["  /abs/x.ts  ", "/abs/x.ts"],
+			["a/b.ts", "a/b.ts"],
+			["---a.ts", "---a.ts"],
+		] as const) {
+			assert.equal(pathOf(line), path, line);
+		}
+		assert.deepEqual(parseEditBlocks(["--- tools/kernel/mutation.py", block("old", "new"), "", block("two", "2")].join("\n")), [
+			{ path: "tools/kernel/mutation.py", edits: [{ oldText: "old", newText: "new" }, { oldText: "two", newText: "2" }] },
 		]);
 	});
 
@@ -91,8 +115,16 @@ describe("runEditBlocks", () => {
 		const response = await runEditBlocks(ctx(), stdin, dir, signal);
 		assert.equal(response.code, 1);
 		assert.match(response.stderr, /^tool edit: nothing changed, 2 of 3 files do not match:\n.*b\.ts: .*\n.*missing\.ts: Could not edit file/);
+		assert.match(response.stderr, /missing\.ts: .*\(no such file: a path line holds only the file's path, relative to the shell's current directory\)\n$/);
+		assert.doesNotMatch(response.stderr, /b\.ts: [^\n]*no such file/, "an existing file that does not match gets no path hint");
 		assert.equal(readFileSync(file("a.ts"), "utf8"), "const a = 1;\nconst b = 2;\n");
 		assert.deepEqual(calls, []);
+	});
+
+	test("a diff-style path line edits the file it names", async () => {
+		const response = await runEditBlocks(ctx(), ["--- a/a.ts", block("const a = 1;", "const a = 10;")].join("\n"), dir, signal);
+		assert.equal(response.code, 0, response.stderr);
+		assert.equal(readFileSync(file("a.ts"), "utf8"), "const a = 10;\nconst b = 2;\n");
 	});
 
 	test("an old text occurring twice is refused like the edit tool refuses it", async () => {
