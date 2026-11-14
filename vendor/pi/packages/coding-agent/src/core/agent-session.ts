@@ -123,11 +123,13 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
+
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
+import type { PrefixRequest } from "./prefix-cache.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
@@ -147,6 +149,7 @@ import {
 	DEFAULT_TOOL_NAMES,
 	type SettingsManager,
 } from "./settings-manager.ts";
+import type { SharedPrefixCache } from "./shared-prefix.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
@@ -300,7 +303,15 @@ export interface AgentSessionConfig {
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
 	/** Keeps the prompt cache entry of the last session request warm. */
-	cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "setHold">;
+	cacheWarmer?: Pick<
+		CacheWarmer,
+		"cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "sharedTouchedAt" | "setHold"
+	>;
+	/**
+	 * Prompt cache state shared with the other pi processes of the agent directory: coldness
+	 * checks consult it and every request is recorded in it (see prefix-cache.ts).
+	 */
+	sharedPrefixCache?: SharedPrefixCache;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
 	/**
@@ -534,8 +545,20 @@ export class AgentSession {
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<
 		CacheWarmer,
-		"cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "onStatusChanged" | "setHold"
+		| "cancel"
+		| "status"
+		| "onAgentSettled"
+		| "onModeChanged"
+		| "onWarmed"
+		| "onStatusChanged"
+		| "sharedTouchedAt"
+		| "setHold"
 	>;
+	private _sharedPrefix?: SharedPrefixCache;
+	/** The request being prepared, recorded in the shared registry when its response ends. */
+	private _pendingPrefixRequest?: { request: PrefixRequest; sentAt: number };
+	/** The last recorded request: the one the cache warmer refreshes. */
+	private _lastPrefixRequest?: PrefixRequest;
 	/** The last cache warming state emitted, to emit changes only. */
 	private _cacheWarmingEmitted?: string;
 	/** Pending background work by extension key (`pi.setBackgroundWork`); kept across reloads. */
@@ -565,9 +588,21 @@ export class AgentSession {
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
+		this._sharedPrefix = config.sharedPrefixCache;
 		if (this._cacheWarmer) {
-			this._cacheWarmer.onWarmed = (entry) => this._emit({ type: "entry_appended", entry });
+			this._cacheWarmer.onWarmed = (entry, sentAt) => {
+				const last = this._lastPrefixRequest;
+				if (last) this._sharedPrefix?.registry.recordRequest(last, entry.usage, sentAt);
+				this._emit({ type: "entry_appended", entry });
+			};
 			this._cacheWarmer.onStatusChanged = () => this._emitCacheWarmingStatus();
+			this._cacheWarmer.sharedTouchedAt = () => {
+				const last = this._lastPrefixRequest;
+				const point = last?.prefix.points.at(-1);
+				return last && point
+					? this._sharedPrefix?.registry.get(last.model, last.prefix.promptHash, point)?.at
+					: undefined;
+			};
 		}
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -888,8 +923,21 @@ export class AgentSession {
 		if (!summaryModel) return undefined;
 		const branch = this.sessionManager.getBranch();
 		const streamOptions = { cacheRetention: this.settingsManager.getCacheRetention() };
-		const cold = isPromptCacheCold(branch, getPromptCacheTtlMs(model, streamOptions), Date.now());
+		const prefixRequest = this._prefixRequest(model);
+		const shared = prefixRequest && this._sharedPrefix?.check(prefixRequest);
+		const cold = isPromptCacheCold(branch, getPromptCacheTtlMs(model, streamOptions), Date.now(), shared);
 		return { economic, summaryModel, cold, branch, streamOptions };
+	}
+
+	/** A request of `model` sending `projection` (default: the branch), for the shared prefix registry. */
+	private _prefixRequest(
+		model: Model<any>,
+		projection?: Pick<SessionProjection, "entries" | "messages">,
+	): PrefixRequest | undefined {
+		if (!this._sharedPrefix) return undefined;
+		const ttlMs = getPromptCacheTtlMs(model, { cacheRetention: this.settingsManager.getCacheRetention() });
+		if (ttlMs === undefined) return undefined;
+		return this._sharedPrefix.request(model, ttlMs, projection ?? this.sessionManager.buildSessionProjection());
 	}
 
 	/**
@@ -939,6 +987,16 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
+			const { update, projection } = await prepareRouted(request, signal);
+			const sentAt = Date.now();
+			const prefixRequest = this._prefixRequest(update.model, projection);
+			this._pendingPrefixRequest = prefixRequest && { request: prefixRequest, sentAt };
+			return update;
+		};
+		const prepareRouted = async (
+			request: Parameters<NonNullable<Agent["prepareRequest"]>>[0],
+			signal: AbortSignal | undefined,
+		) => {
 			const failed = this._failedResponse;
 			this._failedResponse = undefined;
 			const prepare = async () => {
@@ -963,7 +1021,7 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			if (!isVirtualModel(model)) return { update: { ...previous, context, model, thinkingLevel }, projection };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -989,9 +1047,12 @@ export class AgentSession {
 			// the projection.
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
 				await this._runAutoCompaction("threshold", false);
-				({ previous, context } = await prepare());
+				({ previous, context, projection } = await prepare());
 			}
-			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
+			return {
+				update: { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel },
+				projection,
+			};
 		};
 	}
 
@@ -1329,6 +1390,12 @@ export class AgentSession {
 			if (event.message.role === "assistant") {
 				const assistantMsg = event.message as AssistantMessage;
 				this._lastAssistantMessage = assistantMsg;
+				const pending = this._pendingPrefixRequest;
+				this._pendingPrefixRequest = undefined;
+				if (pending) {
+					this._sharedPrefix?.registry.recordRequest(pending.request, assistantMsg.usage, pending.sentAt);
+					this._lastPrefixRequest = pending.request;
+				}
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
 					this._overflowRecoveryAttempted = false;
 				}
@@ -1586,6 +1653,7 @@ export class AgentSession {
 		this._eventListeners = [];
 		if (this._cacheWarmer) {
 			this._cacheWarmer.onWarmed = undefined;
+			this._cacheWarmer.sharedTouchedAt = undefined;
 			this._cacheWarmer.onStatusChanged = undefined;
 			this._cacheWarmer.cancel();
 		}

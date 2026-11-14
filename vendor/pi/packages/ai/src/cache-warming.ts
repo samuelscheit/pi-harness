@@ -47,6 +47,13 @@ export const CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS = 0.05;
  */
 export const CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY = 0.15;
 
+/**
+ * Positions before a cache breakpoint, the breakpoint itself counted first, at which Anthropic looks for an entry an
+ * earlier request wrote. A run of consecutive tool_use blocks counts as one position, as does a run of tool_result
+ * blocks. Writes happen only at breakpoints. (docs.claude.com, "Prompt caching", lookback window.)
+ */
+export const PROMPT_CACHE_LOOKBACK_BLOCKS = 20;
+
 /** Refresh at 90% of the TTL while preserving at least ten seconds of margin. */
 export function getCacheWarmingDelayMs(ttlMs: number): number | undefined {
 	if (ttlMs <= 10_000) return undefined;

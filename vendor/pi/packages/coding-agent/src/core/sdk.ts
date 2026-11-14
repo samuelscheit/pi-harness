@@ -24,6 +24,7 @@ import {
 	isToolModifier,
 	SettingsManager,
 } from "./settings-manager.ts";
+import { SharedPrefixCache } from "./shared-prefix.ts";
 import { time } from "./timings.ts";
 import {
 	createBashTool,
@@ -50,6 +51,8 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Global config directory. Default: ~/.pi/agent */
 	agentDir?: string;
+	/** Prompt cache registry and fork bases shared across processes. Default: under agentDir. */
+	sharedPrefixCache?: SharedPrefixCache;
 
 	/** Canonical model/auth runtime. Defaults to a runtime using agentDir/auth.json and models.json. */
 	modelRuntime?: ModelRuntime;
@@ -464,6 +467,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		customTools: options.customTools,
 		modelRuntime,
 		cacheWarmer,
+		sharedPrefixCache: options.sharedPrefixCache ?? SharedPrefixCache.forAgentDir(agentDir),
 		initialActiveToolNames,
 		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
 		defaultToolModifiers: toolModifiers,

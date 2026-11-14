@@ -10,6 +10,7 @@ import type {
 	BetaRawMessageStreamEvent as RawMessageStreamEvent,
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
+import { PROMPT_CACHE_LOOKBACK_BLOCKS } from "../cache-warming.ts";
 import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
 	ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
@@ -1597,8 +1598,6 @@ function buildParams(
 	return { params, hasPreferredStrictTools, providerThinkingLevel: effortMessages ? activeEffort : undefined };
 }
 
-/** How many blocks before a cache breakpoint Anthropic checks for an earlier cache entry. */
-const CACHE_LOOKBACK_BLOCKS = 20;
 const MAX_CACHE_BREAKPOINTS = 4;
 const BREAKPOINT_BLOCK_TYPES = new Set(["text", "image", "tool_result", "tool_addition", "tool_removal"]);
 
@@ -1609,7 +1608,7 @@ const countCacheBreakpoints = (blocks: unknown): number =>
  * Keep the previous request's cache entry within reach of the lookback.
  *
  * The breakpoint on the newest message only finds a cached prefix up to
- * {@link CACHE_LOOKBACK_BLOCKS} blocks back. The previous request's entry ends right before the
+ * {@link PROMPT_CACHE_LOOKBACK_BLOCKS} blocks back. The previous request's entry ends right before the
  * last assistant reply; when a turn adds more blocks than that (a tool search loading many tools
  * as `tool_addition` blocks, many parallel tool results), the lookback misses it and the whole
  * conversation is written to the cache again. A breakpoint on the first block after the reply is
@@ -1624,20 +1623,22 @@ function bridgeCacheLookback(params: MessageCreateParamsStreaming, cacheControl:
 	const blocks = (message: MessageParam) => (Array.isArray(message.content) ? message.content : [message.content]);
 	const replyBlocks = blocks(messages[lastAssistant]!).length;
 	const sincePrevious = messages.slice(lastAssistant).reduce((sum, message) => sum + blocks(message).length, 0);
-	if (sincePrevious < CACHE_LOOKBACK_BLOCKS) return;
+	if (sincePrevious < PROMPT_CACHE_LOOKBACK_BLOCKS) return;
 	const used =
 		countCacheBreakpoints(params.system) +
 		countCacheBreakpoints(params.tools) +
 		messages.reduce((sum, message) => sum + countCacheBreakpoints(message.content), 0);
 	if (used >= MAX_CACHE_BREAKPOINTS) return;
 	// Nearest eligible block after the reply, or, for a long reply, nearest before it.
-	const afterReply = replyBlocks + 1 < CACHE_LOOKBACK_BLOCKS;
+	const afterReply = replyBlocks + 1 < PROMPT_CACHE_LOOKBACK_BLOCKS;
 	const order = afterReply ? messages.slice(lastAssistant + 1) : messages.slice(0, lastAssistant).reverse();
 	for (const message of order) {
 		// Cache markers attach to blocks; an earlier user prompt is sent as a string.
 		if (typeof message.content === "string") message.content = [{ type: "text", text: message.content }];
 		const content = afterReply ? message.content : [...message.content].reverse();
-		const target = content.find((block) => BREAKPOINT_BLOCK_TYPES.has(block.type)) as { cache_control?: unknown } | undefined;
+		const target = content.find((block) => BREAKPOINT_BLOCK_TYPES.has(block.type)) as
+			| { cache_control?: unknown }
+			| undefined;
 		if (!target) continue;
 		target.cache_control ??= cacheControl;
 		return;

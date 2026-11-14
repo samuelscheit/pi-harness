@@ -40,6 +40,15 @@ A provider context-overflow error or an early final `stopReason: "length"` can s
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary. The session model writes the summary, reading the context from its prompt cache. When that cache expired, every model would read the whole context uncached, so the cheaper [`compaction.economic.model`](settings.md#compaction) writes it instead when set; the result's `summaryModelReason` and the notice say so ("cache expired: summary by claude-haiku-5-5").
 
+### Shared Prompt Cache
+
+A fork (`pi --fork`) shares its source's conversation up to the fork point, and the fork copies the entries with their ids. Every pi process of one agent directory therefore tracks prompt cache entries in one registry, `~/.pi/agent/prefix-cache/`:
+
+- **Key:** a prefix is named by the model, a hash of the leading system message (system prompt and tools), and a hash chained over the ids of the projected entries up to its end, including the context edit applied to each. The last entry's id alone is not enough: a compaction keeps entries, so the same entry ends one prefix before the compaction and another after it.
+- **Records:** after every request and every cache warm, the session records the prefix at its final breakpoint (written or read), plus the earlier prefix that a partial read covered, found by its recorded token count. Each record holds the time and the lifetime of the request's retention. There is one small JSON file per key, replaced atomically, and expired files are pruned.
+- **Coldness:** a branch's cache counts as cold only if the session's own timestamps say so and no live record lies within reach of its next request. Anthropic writes cache entries only at breakpoints and looks back 20 positions from each breakpoint, counting the breakpoint first. A run of tool_use or tool_result blocks counts as one position. Pi sets a breakpoint on the last block. Its lookback bridge sets another on the first block after the last assistant reply when at least 20 blocks follow the reply's start. So a record counts when its prefix ends within 20 positions of one of those breakpoints, with the next prompt counted as one position. On Anthropic that always includes the prefix ending right before the last reply. For other providers only the final breakpoint's lookback counts, which is a lower bound.
+- **Effect:** a fork's first request reads its source's prefix and refreshes it, so the source stays warm and later forks of the same point see it warm. The cache warmer postpones a refresh that another session's read made unnecessary.
+
 ### How It Works
 
 1. **Find cut point**: Walk backwards through the finalized session projection, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached

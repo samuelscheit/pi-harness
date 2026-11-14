@@ -17,6 +17,7 @@ import {
 	resolvePromptCacheRetention,
 } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "./model-runtime.ts";
+import type { BranchPrefix, ModelRef, PrefixCacheRegistry } from "./prefix-cache.ts";
 import type { SessionEntry, SessionManager, UsageEntry } from "./session-manager.ts";
 import type { CacheWarmingMode } from "./settings-manager.ts";
 
@@ -34,13 +35,34 @@ function lastPromptTokens(entries: SessionEntry[]): number {
 	return 0;
 }
 
+/** The shared prefix cache registry and what the branch's next request would send, for `isPromptCacheCold`. */
+export interface SharedPrefixCheck {
+	registry: PrefixCacheRegistry;
+	model: ModelRef;
+	/** Anthropic: Pi's lookback bridge breakpoint applies. */
+	bridge: boolean;
+	prefix: BranchPrefix;
+}
+
 /**
  * Whether the prompt cache entry the branch's next request would read has expired: neither the
- * last request nor a warm refresh after it touched the entry within `ttlMs`. A branch that ends in
- * a compaction has no entry for its new context yet, so there is nothing to lose.
+ * last request nor a warm refresh after it touched the entry within `ttlMs`, and no request of any
+ * session (a fork reading the shared prefix, the source itself) left a live entry within reach in
+ * the shared registry. A branch that ends in a compaction has no entry for its new context yet, so
+ * there is nothing to lose.
  */
-export function isPromptCacheCold(branch: SessionEntry[], ttlMs: number | undefined, now: number): boolean {
+export function isPromptCacheCold(
+	branch: SessionEntry[],
+	ttlMs: number | undefined,
+	now: number,
+	shared?: SharedPrefixCheck,
+): boolean {
 	if (ttlMs === undefined) return false;
+	if (!isOwnCacheCold(branch, ttlMs, now)) return false;
+	return !shared?.registry.findWarm(shared.model, shared.prefix, shared.bridge, now);
+}
+
+function isOwnCacheCold(branch: SessionEntry[], ttlMs: number, now: number): boolean {
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry.type === "compaction") return false;
@@ -128,8 +150,13 @@ export class CacheWarmer {
 	private readonly decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
 	/** How long after a request idle refreshes may still be sent. */
 	private readonly getIdleMaxAgeMs: () => number;
-	/** Called with the persisted usage entry after each successful refresh. */
-	onWarmed?: (entry: UsageEntry) => void;
+	/** Called with the persisted usage entry and the time the refresh was sent, after each successful refresh. */
+	onWarmed?: (entry: UsageEntry, sentAt: number) => void;
+	/**
+	 * When another request (another session reading the shared prefix) last touched the entry being
+	 * warmed, from the shared prefix registry. A refresh is postponed past that touch instead of sent.
+	 */
+	sharedTouchedAt?: () => number | undefined;
 	/**
 	 * Called whenever warming is scheduled, starts a refresh or stops, so a host that unloads idle
 	 * sessions (t3) can keep this one while a refresh is pending.
@@ -352,6 +379,12 @@ export class CacheWarmer {
 		this.onStatusChanged?.();
 		if (!this.validateRun(run)) return;
 		if (this.refreshDeadlineMissed(run)) return;
+		const shared = this.sharedTouchedAt?.();
+		if (shared !== undefined && shared > run.touchedAt) {
+			run.touchedAt = shared;
+			this.schedule(run);
+			return;
+		}
 		const decision = this.evaluate(run);
 		const { warmCost, missCost, continuationProbability, held } = decision;
 		let action = decision.action;
@@ -381,6 +414,7 @@ export class CacheWarmer {
 
 		run.extensionOverride = extensionOverride;
 		let warmed = false;
+		const sentAt = Date.now();
 		try {
 			const message = await this.models
 				.streamSimple(run.model, run.context, getCacheWarmingRequestOptions(run.options, run.controller.signal))
@@ -395,7 +429,7 @@ export class CacheWarmer {
 					extensionOverride ? "extension override" : undefined,
 				);
 				warmed = true;
-				this.onWarmed?.(entry);
+				this.onWarmed?.(entry, sentAt);
 			}
 		} catch {
 			// Cache warming is best-effort and must not affect the active agent run.
@@ -509,4 +543,3 @@ export function formatCacheWarmingUsage(totalCost: number, note?: string): strin
 	const cost = totalCost.toFixed(6).replace(/(\.\d{3}\d*?)0+$/, "$1");
 	return `Cache warmed${noteText}: $${cost}`;
 }
-
