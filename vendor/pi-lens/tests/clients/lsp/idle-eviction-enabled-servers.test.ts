@@ -73,8 +73,9 @@ const ENABLED_IDS = [
 ] as const;
 
 /**
- * A server that must stay resident (excluded-default witness). Taken from
- * #3952's HOLD_INDEXER class, which the nightly promotion (#3989) never
+ * An `unmeasured` catalog server (the policy-gate witness): released on the
+ * shared idle window like a `transparent` one. Taken from #3952's
+ * HOLD_INDEXER class, which the nightly promotion (#3989) never
  * auto-promotes: a hard-coded `docker` here went red the moment the promotion
  * PR flipped it (#3994 r3).
  */
@@ -271,7 +272,7 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 		});
 	}
 
-	it("keeps an unmeasured registry server resident (policy-gate witness)", async () => {
+	it("releases an unmeasured registry server after the idle window (policy-gate witness)", async () => {
 		vi.useFakeTimers();
 		process.env.PI_LENS_LSP_IDLE_EVICT_MS = String(IDLE_WINDOW_MS);
 		doubleSpawnBoundary(RESIDENT_WITNESS_ID, () => nextPid);
@@ -290,9 +291,9 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 		await vi.advanceTimersByTimeAsync(IDLE_WINDOW_MS * 5);
 		expect(
 			entry!.client.shutdown,
-			`${RESIDENT_WITNESS_ID} stays resident`,
-		).not.toHaveBeenCalled();
-		expect(service.getAliveClientCount()).toBe(1);
+			`${RESIDENT_WITNESS_ID} released when idle`,
+		).toHaveBeenCalledWith({ reason: "idle_eviction" });
+		expect(service.getAliveClientCount()).toBe(0);
 
 		await service.shutdown();
 	});

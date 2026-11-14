@@ -180,7 +180,7 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("evicts an unmeasured server through the service's own timer once armed, then keeps it resident once restored", async () => {
+	it("evicts an unmeasured server through the service's own timer once armed, then on the shared window once restored", async () => {
 		const server = registryServer();
 		const { service, driver } = await harness(server, () => [
 			finding(1),
@@ -189,8 +189,9 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 		await driver.touch();
 		expect(driver.isTargetAlive()).toBe(true);
 
-		// Unarmed, an unmeasured server is never evicted, however long it idles.
-		await vi.advanceTimersByTimeAsync(3 * 60_000);
+		// Unarmed, an unmeasured server idles on the shared window (60 s at the
+		// shortest, for an ephemeral root), not the probe's 20 ms.
+		await vi.advanceTimersByTimeAsync(50_000);
 		expect(driver.isTargetAlive()).toBe(true);
 
 		const restore = await driver.armEviction();
@@ -208,8 +209,11 @@ describe("idle-eviction probe driver over the real LSPService (#3645)", () => {
 		await driver.touch();
 		expect(driver.isTargetAlive()).toBe(true);
 		expect(createLSPClient).toHaveBeenCalledTimes(2);
-		await vi.advanceTimersByTimeAsync(25 * 60_000);
+		await vi.advanceTimersByTimeAsync(50_000);
 		expect(driver.isTargetAlive()).toBe(true);
+		// Restored to unmeasured, it is released on the shared 20-minute window.
+		await vi.advanceTimersByTimeAsync(25 * 60_000);
+		expect(driver.isTargetAlive()).toBe(false);
 		await service.shutdown();
 	});
 

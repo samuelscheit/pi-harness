@@ -610,11 +610,11 @@ export interface LSPServerInfo {
 	name: string;
 	extensions: readonly string[];
 	/**
-	 * Idle-eviction policy for this server's clients. `transparent` = the client
-	 * may be released after the shared idle window and rebuilds on the next
-	 * request; it requires measured per-server evidence. `resident` = deliberately
-	 * kept resident. `unmeasured` = no evidence yet; treated as resident so an
-	 * unmeasured server is never evicted by omission.
+	 * Idle-eviction policy for this server's clients. `transparent` = measured
+	 * to rebuild every finding on the next request after its release.
+	 * `unmeasured` = no measurement yet; released like `transparent`, since a
+	 * respawn is the same cold start as the first spawn. `resident` = measured
+	 * to lose findings across a respawn, so never released when idle.
 	 */
 	idleEviction: "transparent" | "resident" | "unmeasured";
 	/** True for entries supplied through `lsp.servers.*`, not the built-in table. */
@@ -4161,7 +4161,7 @@ function createTreeBinaryServer(spec: {
 	/** Path to the executable inside the extracted bundle, e.g. "bin/clangd". */
 	binRelPath: string;
 	args?: string[];
-	/** Idle-eviction policy override; defaults to `unmeasured` (resident). */
+	/** Idle-eviction policy override; defaults to `unmeasured` (released when idle). */
 	idleEviction?: "transparent" | "resident" | "unmeasured";
 }): LSPServerInfo {
 	return {

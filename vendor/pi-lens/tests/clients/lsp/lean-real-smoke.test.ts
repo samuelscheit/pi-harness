@@ -1,5 +1,4 @@
 // flake-shape: real-process-spawn — real Lean elaboration and its diagnostic publication are the behavior under test; mocks cannot reproduce the Lake/elan process boundary.
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,23 +6,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
 import { removeTempDirSync } from "../test-utils.js";
+import { installedLeanToolchain } from "./lean-toolchain.js";
 
-// Bound optional toolchain discovery; this smoke must never trigger a download
-// or hang when elan/Lake is unavailable on the host.
-const elanShow = spawnSync("elan", ["show"], {
-	encoding: "utf8",
-	timeout: 5_000,
-});
-const installedDefault =
-	elanShow.status === 0
-		? elanShow.stdout.match(/^\s*(leanprover\/lean4:\S+)\s+\(default\)$/m)?.[1]
-		: undefined;
-const lakeAvailable =
-	spawnSync("lake", ["--version"], {
-		encoding: "utf8",
-		timeout: 5_000,
-	}).status === 0;
-const canRunLeanSmoke = Boolean(installedDefault && lakeAvailable);
+const lean = installedLeanToolchain();
+const canRunLeanSmoke = lean !== undefined;
 
 let root: string | undefined;
 let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
@@ -55,7 +41,7 @@ describe("Lean LSP real-process smoke", () => {
 			root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lean-smoke-"));
 			fs.writeFileSync(
 				path.join(root, "lean-toolchain"),
-				`${installedDefault}\n`,
+				`${lean?.toolchain}\n`,
 			);
 			fs.writeFileSync(
 				path.join(root, "lakefile.lean"),
@@ -65,7 +51,10 @@ describe("Lean LSP real-process smoke", () => {
 			const source = 'def wrong : Nat := "not a natural number"\n';
 			fs.writeFileSync(file, source);
 
-			serverProcess = await launchLSP("lake", ["serve"], { cwd: root });
+			serverProcess = await launchLSP("lake", ["serve"], {
+				cwd: root,
+				env: lean?.env,
+			});
 			client = await createLSPClient({
 				serverId: "lean",
 				process: serverProcess,

@@ -80,6 +80,11 @@ import { exceedsLspSyncLimits } from "./content-limits.js";
 import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import { getStrategy } from "./wait-policy/index.js";
 import {
+	DEFAULT_OPEN_DOCUMENT_LIMIT,
+	type OpenDocumentUse,
+	selectOpenDocumentEvictions,
+} from "./open-document-limit.js";
+import {
 	isAuxiliary,
 	type LspLaunchVariant,
 	type LspServerRole,
@@ -1416,6 +1421,14 @@ export interface LSPClientState {
 	fenceSkipRecorded?: boolean;
 	/** Paths explicitly closed during this client lifetime; late publishes are dropped. */
 	readonly closedDocuments?: Set<string>;
+	/** When each open document was last sent and read (`open-document-limit.ts`). */
+	documentUse?: Map<string, OpenDocumentUse>;
+	/** Diagnostics waits running per path; such a document is never closed. */
+	runningDiagnosticWaits?: Map<string, number>;
+	/** Open documents whose limit close is queued or running; no longer counted as open. */
+	closingForLimit?: Set<string>;
+	/** The next open-document limit check, while a held document keeps the client over it. */
+	openDocumentTrimTimer?: ReturnType<typeof setTimeout> | undefined;
 	/** Original URI spelling for each open document; path keys are normalized. */
 	readonly openDocumentUris?: Map<string, string>;
 	readonly pendingOpens: Set<string>;
@@ -2529,6 +2542,8 @@ function recordSentContent(
 	 */
 	contentHash?: string,
 ): void {
+	const use = state.documentUse ?? (state.documentUse = new Map());
+	use.set(normalizedPath, { sentAt: Date.now() });
 	const scan = scanDocumentContent(content);
 	const previous = state.documentContentHashes.get(normalizedPath);
 	if (previous && previous.version > version) {
@@ -5846,13 +5861,108 @@ function enqueueDocumentNotify(
 				) {
 					state.notifyChangeQueues.delete(normalizedPath);
 				}
+				trimOpenDocuments(state);
 			}
 		});
 	});
 }
 
+/**
+ * Close the documents that keep this client over its server's open-document
+ * limit (`open-document-limit.ts`). Runs after every document send and every
+ * diagnostics wait; while only held documents keep it over the limit, a timer
+ * runs it again when the first one becomes closable.
+ *
+ * A close is an ordinary entry on the path's notify queue, queued only while
+ * the path has none: a touch arriving before it runs replaces it, so the
+ * document stays open, and one arriving after it re-opens the document.
+ */
+function trimOpenDocuments(state: LSPClientState): void {
+	if (state.openDocumentTrimTimer !== undefined) {
+		clearTimeout(state.openDocumentTrimTimer);
+		state.openDocumentTrimTimer = undefined;
+	}
+	if (!isClientAlive(state)) return;
+	const closing = state.closingForLimit ?? (state.closingForLimit = new Set());
+	const { evict, retryAt } = selectOpenDocumentEvictions({
+		open: new Set([...state.openDocuments].filter((p) => !closing.has(p))),
+		use: state.documentUse ?? new Map(),
+		limit:
+			getStrategy(state.serverId, state.launchVariant).openDocumentLimit ??
+			DEFAULT_OPEN_DOCUMENT_LIMIT,
+		busy: (path) =>
+			state.notifyChangeQueues.has(path) ||
+			state.pendingOpens.has(path) ||
+			(state.runningDiagnosticWaits?.get(path) ?? 0) > 0,
+		now: Date.now(),
+	});
+	for (const normalizedPath of evict) {
+		closing.add(normalizedPath);
+		// Settles when the close ran or the touch that replaced it did.
+		void enqueueDocumentNotify(state, normalizedPath, async () => {
+			if ((state.runningDiagnosticWaits?.get(normalizedPath) ?? 0) > 0)
+				return false;
+			await closeDocumentOnce(state, normalizedPath, normalizedPath);
+			logExtension({
+				subsystem: "lsp-open-limit",
+				level: "debug",
+				message: `server=${state.serverId} closed a read document over its open-document limit`,
+				metadata: { path: normalizedPath },
+			});
+			return true;
+		})
+			.catch((error: unknown) =>
+				logExtension({
+					subsystem: "lsp-open-limit",
+					message: `server=${state.serverId} open-document limit close failed: ${String(error)}`,
+					metadata: { path: normalizedPath },
+				}),
+			)
+			.finally(() => closing.delete(normalizedPath));
+	}
+	if (retryAt !== undefined) {
+		const timer = setTimeout(
+			() => {
+				state.openDocumentTrimTimer = undefined;
+				trimOpenDocuments(state);
+			},
+			Math.max(0, retryAt - Date.now()),
+		);
+		timer.unref?.();
+		state.openDocumentTrimTimer = timer;
+	}
+}
+
+/** Count a running diagnostics wait for `filePath`, so its document stays open. */
+async function withDiagnosticsRead<T>(
+	state: LSPClientState,
+	filePath: string,
+	read: () => Promise<T>,
+): Promise<T> {
+	const normalizedPath = normalizeMapKey(filePath);
+	const waits =
+		state.runningDiagnosticWaits ?? (state.runningDiagnosticWaits = new Map());
+	waits.set(normalizedPath, (waits.get(normalizedPath) ?? 0) + 1);
+	const startedAt = Date.now();
+	try {
+		return await read();
+	} finally {
+		const remaining = (waits.get(normalizedPath) ?? 1) - 1;
+		if (remaining > 0) waits.set(normalizedPath, remaining);
+		else waits.delete(normalizedPath);
+		const use = state.documentUse?.get(normalizedPath);
+		// A send during the wait is not read by it.
+		if (use && use.sentAt <= startedAt) use.readAt = Date.now();
+		trimOpenDocuments(state);
+	}
+}
+
 /** Drop unwritten document notifications when a client is torn down. */
 function cancelDocumentNotifyQueues(state: LSPClientState): void {
+	if (state.openDocumentTrimTimer !== undefined) {
+		clearTimeout(state.openDocumentTrimTimer);
+		state.openDocumentTrimTimer = undefined;
+	}
 	for (const queue of state.notifyChangeQueues.values()) {
 		// Never sent: not a landed write, so `touchFile` records nothing for it.
 		for (const waiter of queue.pending?.waiters ?? []) waiter.resolve(false);
@@ -6142,6 +6252,7 @@ async function closeDocumentOnce(
 	state.openDocuments.delete(normalizedPath);
 	state.closedDocuments?.add(normalizedPath);
 	state.openDocumentUris?.delete(normalizedPath);
+	state.documentUse?.delete(normalizedPath);
 	// #3482: the scans this lifetime expected still publish, after the close
 	// (counted as they are dropped) or after a reopen, so the counts span it.
 	state.expectedPublicationsBeyondSends?.set(
@@ -7855,7 +7966,9 @@ export async function createLSPClient(options: {
 			timeoutMs = DIAGNOSTICS_WAIT_TIMEOUT_MS,
 			options,
 		) {
-			return clientWaitForDiagnostics(state, filePath, timeoutMs, options);
+			return withDiagnosticsRead(state, filePath, () =>
+				clientWaitForDiagnostics(state, filePath, timeoutMs, options),
+			);
 		},
 
 		async definition(filePath, line, character) {

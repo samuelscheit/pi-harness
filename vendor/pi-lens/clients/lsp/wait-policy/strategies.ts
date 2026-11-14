@@ -269,6 +269,13 @@ export interface DiagnosticStrategy {
 	 * wait, it never changes the confirmed/unconfirmed contract.
 	 */
 	workspaceIndexingWarmWaitMs?: number;
+	/**
+	 * How many documents this server's client keeps open; the least recently
+	 * sent beyond it are closed once read (`clients/lsp/open-document-limit.ts`).
+	 * Unset = `DEFAULT_OPEN_DOCUMENT_LIMIT`. Set lower for a server that pays a
+	 * process or a large heap per open document.
+	 */
+	openDocumentLimit?: number;
 }
 
 /** @public — loaded by scripts/probe-clean-signal.mjs through a dynamic import wrapper knip cannot see. */
@@ -658,6 +665,20 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			expectSemanticSecondPush: false,
 			reopenOnResync: false,
 		},
+		// `lake serve` runs one `lean --worker` per open document: 576-708 MB each
+		// on a Lake project with batteries (Lean 4.34.1, measured 2026-11-14), in
+		// its own process group. A didClose ends it within 500 ms; a re-open costs
+		// 1.6-1.8 s to the first full answer against 0.3 s for a didChange to an
+		// open one. Close each document once it is read: parallel agents each
+		// holding workers reached 50 GB, and 1.5 s per touch is the cheaper side.
+		lean: {
+			seedFirstPush: false,
+			pullRetryBudgetMs: 250,
+			debounceMs: 150,
+			aggregateWaitMs: 1500,
+			expectSemanticSecondPush: false,
+			openDocumentLimit: 0,
+		},
 		// lua-language-server is push-only and was silent on clean transitions in
 		// the repaired probe (run 35914033696). Keep the marker on the measured
 		// server id so the cascade can skip its in-lane wait safely.
@@ -783,6 +804,10 @@ export const OVERRIDE_STRATEGY_FIELDS: {
 	workspaceIndexingWarmWaitMs: {
 		keep: "reset",
 		why: "Read only with workspaceIndexing, so it resets with it.",
+	},
+	openDocumentLimit: {
+		keep: "inherit",
+		why: "A lower limit only closes read documents sooner; the default keeps more per-document workers resident.",
 	},
 };
 

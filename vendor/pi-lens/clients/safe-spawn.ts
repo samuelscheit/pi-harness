@@ -558,13 +558,15 @@ function sweepHeldOwnPids(): void {
  * LSP child, spawned with `nodeSpawn`, the first offer of verification was also
  * the last, and on the `processExiting` path the leader could already be dead
  * by then (`/proc` gone, nothing on record, signal refused, grandchildren
- * orphaned).
+ * orphaned). A held child is also coupled to this process's life
+ * ({@link coupleToHostLifetime}); `releaseOwnChildPid` ends both.
  */
 export function holdOwnChildPid(
 	pid: number | undefined,
 	site: string,
 ): boolean {
 	const owned = isOwnLiveChild(pid, site);
+	if (owned && typeof pid === "number") coupleToHostLifetime(pid);
 	if (!owned || !PROC_PPID_READABLE || typeof pid !== "number") return owned;
 	// Exactly one home: the verification above filed the verdict in the
 	// age-bounded FIFO, and leaving a copy there would make BOTH the held set
@@ -588,7 +590,39 @@ export function holdOwnChildPid(
  * shutdown ladder. Idempotent.
  */
 export function releaseOwnChildPid(pid: number | undefined): void {
-	if (typeof pid === "number") heldOwnPids.delete(pid);
+	if (typeof pid !== "number") return;
+	heldOwnPids.delete(pid);
+	lifetimeState.pids.delete(pid);
+}
+
+/**
+ * Whether `pid` is this process's parent-verified child where there is no
+ * `/proc` (macOS): `ps` answers. Never the best-effort `true`
+ * {@link isOwnLiveChild} gives there, because a pid this admits is SIGKILLed
+ * as a group at host exit, and a test double's invented pid is somebody
+ * else's process (#2042). A `ps` that cannot answer admits nothing.
+ */
+function psSaysOwnChild(pid: number): boolean {
+	const ps = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], {
+		encoding: "utf8",
+		timeout: 2_000,
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	return ps.status === 0 && Number(ps.stdout?.trim()) === process.pid;
+}
+
+/**
+ * Couple a held child to this process's life: its process group is SIGKILLed
+ * when this process exits or takes SIGINT/SIGTERM/SIGHUP, so a language
+ * server never outlives pi when the session's own shutdown does not run.
+ * Detached spawning cut servers off from the terminal's signals, and one that
+ * ignores stdin EOF kept running. POSIX only: Windows keeps its own tree kill.
+ */
+function coupleToHostLifetime(pid: number): void {
+	if (process.platform === "win32") return;
+	if (!PROC_PPID_READABLE && !psSaysOwnChild(pid)) return;
+	installLifetimeCleanup();
+	lifetimeState.pids.add(pid);
 }
 
 /** Once per session: a Linux host whose `/proc` cannot answer the question. */

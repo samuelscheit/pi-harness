@@ -353,10 +353,11 @@ complete field definitions are in
 
 ### `PI_LENS_LSP_IDLE_EVICT_MS`
 
-Shared idle window (ms) after which every language-service client whose registry
-`idleEviction` is `transparent` releases its hydrated program and shuts down,
-rebuilding transparently on the next request. Servers declared `resident` or
-`unmeasured` are never evicted. Which servers are declared which way, and the
+Shared idle window (ms) after which every language-service client releases its
+hydrated program and shuts down, rebuilding on the next request. Only servers
+declared `resident` (measured to lose findings across a respawn) are never
+evicted; `unmeasured` ones are released like `transparent` ones. Which servers
+are declared which way, and the
 nightly measurement behind each declaration, is in
 [`lsp-idle-eviction.md`](lsp-idle-eviction.md).
 When unset or invalid, `PI_LENS_TS_IDLE_EVICT_MS` (below) is read.

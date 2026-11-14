@@ -1157,10 +1157,10 @@ export type DegradationKind =
 	| "lsp-idle-eviction"
 	/**
 	 * `lsp-idle-eviction-declined`: #3952: `scheduleIdleEviction` was asked to arm a client and DECLINED,
-	 * because the server object the service holds does not declare
-	 * `idleEviction: "transparent"` and the client is not an adopted-root one.
+	 * because the server object the service holds declares
+	 * `idleEviction: "resident"` and the client is not an adopted-root one.
 	 * The pair this row separates is `resident-by-declaration` (a policy answer:
-	 * `unmeasured`/`resident` servers are meant to stay) from
+	 * `resident` servers are meant to stay) from
 	 * `not-evicted` (a measurement whose arm never reached the policy), and
 	 * before it both read as "the timer did not fire". Subject is the server id,
 	 * recorded ONCE per server per session: the declaration is the same every
@@ -2885,9 +2885,9 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// #3952: both are the idle-eviction POLICY answering, not a timer that
 	// failed. `lsp-idle-eviction` is the memory bound releasing a client that
 	// respawns on the next request; `lsp-idle-eviction-declined` is the
-	// declaration `unmeasured`/`resident` doing its job, once per server, so a
-	// nominal session writes up to one row per non-`transparent` server (32 of
-	// the 49 built-ins today). A `⚠` per server on every healthy session is
+	// declaration `resident` doing its job, once per server, so a nominal
+	// session writes up to one row per `resident` server. A `⚠` per server on
+	// every healthy session is
 	// the cry-wolf shape #2505 rejected; the sibling that DOES stand out is a
 	// measurement whose arm never reached the policy, and that one reads as a
 	// missing row, not as a warning here.

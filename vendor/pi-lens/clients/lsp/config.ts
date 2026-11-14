@@ -1309,7 +1309,7 @@ export const OVERRIDE_COPY_TRAITS: {
 	},
 	idleEviction: {
 		keep: false,
-		why: "Reset to unmeasured (never evicted): 'transparent' needs per-server evidence.",
+		why: "Reset to unmeasured: 'transparent' records per-server evidence the override's binary has not earned (both are released when idle).",
 	},
 	replyOrdering: {
 		keep: false,

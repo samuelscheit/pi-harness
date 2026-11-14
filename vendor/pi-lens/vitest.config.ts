@@ -642,6 +642,10 @@ export const wallClockBudgetInclude = [
 	// real LSP child inside itself, so it wants the same quiet, serialized phase
 	// its lsp-spawn-heavy siblings get.
 	"tests/clients/lsp/headless-tool-call-keepalive.test.ts",
+	// Real host Node children each launch a detached stand-in server through
+	// launchLSP; the assertion is that server's death after its host's
+	// (flake-shape admission).
+	"tests/clients/lsp/host-lifetime-coupling.test.ts",
 	"tests/clients/lsp/initialize-timeout-backstop.test.ts",
 	"tests/clients/lsp/integration.test.ts",
 	// #2042/#3091 F2: a real, live direct child is the only pid whose /proc PPid
@@ -651,8 +655,14 @@ export const wallClockBudgetInclude = [
 	// #4119: real Lake/elan process plus a pushed Lean diagnostic; phase after
 	// lsp-spawn-heavy to satisfy the flake-shape serialized-wall-clock admission.
 	"tests/clients/lsp/lean-real-smoke.test.ts",
+	// Real `lake serve`: per-document `lean --worker` processes start on
+	// didOpen and must exit after the read hold (flake-shape admission).
+	"tests/clients/lsp/lean-worker-lifecycle.test.ts",
 	"tests/clients/lsp/liveness-probe-capability-gate.test.ts",
 	"tests/clients/lsp/navigation-timeout.integration.test.ts",
+	// A real `createLSPClient` over stdio fake-server children; the
+	// open-document limit's closes follow real reads (flake-shape admission).
+	"tests/clients/lsp/open-document-limit.test.ts",
 	// #4786: a real `createLSPClient` over stdio fake-server children that publish
 	// a finding then an unversioned empty; waits on real handshakes and debounce
 	// windows, the same #1022/#2332 contention class as its siblings.

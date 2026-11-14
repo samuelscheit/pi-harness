@@ -200,6 +200,12 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"POSIX-only real-child initialize-timeout backstop; waits on a 50ms timeout firing then sleeps past kill escalation — deterministic and short",
 	"tests/clients/lsp/lean-real-smoke.test.ts":
 		"real Lean child is routed through the serialized wall-clock-budget lane after the LSP spawn lane; no overlapping spawn window or competing fork storm",
+	"tests/clients/lsp/lean-worker-lifecycle.test.ts":
+		"real Lean children are routed through the serialized wall-clock-budget lane (the flake-shape admission gate requires it); a file cannot sit in both lanes",
+	"tests/clients/lsp/host-lifetime-coupling.test.ts":
+		"the real child is a stand-in that ignores stdin EOF and SIGTERM, launched by a host Node child through `launchLSP`; no language server, handshake or diagnostics wait. Phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires",
+	"tests/clients/lsp/open-document-limit.test.ts":
+		"fake-server clients against the instantly-answering fixture with 100 ms reads; phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes",
 	"tests/clients/lsp/launch.test.ts":
 		"unit-tests the launchLSP seam itself over real binaries; asserts spawn/exit/failure shapes, never an LSP handshake under a timing budget",
 	"tests/clients/lsp/lifecycle.test.ts":

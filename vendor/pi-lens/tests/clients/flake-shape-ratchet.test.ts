@@ -221,6 +221,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the defect is wall-clock only (super-linear ast-grep rule YAML language extraction); a fake clock measures nothing",
 	},
+	"elapsed-time-assertion:clients/lsp/lean-worker-lifecycle.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the read hold is the behavior: a real `lean --worker` must outlive its read by the hold and no longer; a fake clock cannot time another process's exit",
+	},
 	"elapsed-time-assertion:clients/lsp/partial-message-timer.test.ts": {
 		detector: "elapsed-time-assertion",
 		reason:
@@ -607,6 +612,16 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the abort must land while a real child is mid-run; a fake clock cannot stop a spawned process, and no double reproduces a child killed mid-run",
 	},
+	"raw-timer-wait:clients/lsp/host-lifetime-coupling.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"polls a real detached child's liveness after its host process died; only the OS can say when a SIGKILLed group is gone",
+	},
+	"raw-timer-wait:clients/lsp/open-document-limit.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"one 50 ms real tick lets the queued didClose reach the real JSON-RPC wire to the fake-server child; the timer layer itself runs on fake timers",
+	},
 	// 2026-09-07 (#2703 review r1): an unhandled derived-promise rejection is
 	// only observable through Node's `unhandledRejection` event, which fires
 	// on a real macrotask; the file drains one real `setImmediate` tick.
@@ -922,6 +937,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real child's exit code is the observation; no in-process double can watch an event loop decide to drain",
 	},
+	"real-process-spawn:clients/lsp/host-lifetime-coupling.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a real host process must die and take its real detached language-server child with it; no double stands in for the OS process group",
+	},
 	"real-process-spawn:clients/lsp/initialize-timeout-backstop.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -937,10 +957,10 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real, live direct child is the only pid whose /proc PPid is this process, so the Linux ownership arm of the kill-by-pid predicate cannot be observed through any double",
 	},
-	"real-process-spawn:clients/lsp/lean-real-smoke.test.ts": {
+	"real-process-spawn:clients/lsp/lean-worker-lifecycle.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"real Lean elaboration and diagnostic publication require Lake and elan across the child-process boundary; the serialized wall-clock lane isolates the handshake and diagnostic wait",
+			"the per-document `lean --worker` processes Lake starts and stops are the behavior under test; no double reproduces the Lake/elan process tree",
 	},
 	"real-process-spawn:clients/lsp/liveness-probe-capability-gate.test.ts": {
 		detector: "real-process-spawn",
@@ -951,6 +971,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/open-document-limit.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the closes under test are real didClose notifications on a real JSON-RPC wire to the fake-server child",
 	},
 	"real-process-spawn:clients/lsp/opengrep-late-empty-4786.test.ts": {
 		detector: "real-process-spawn",

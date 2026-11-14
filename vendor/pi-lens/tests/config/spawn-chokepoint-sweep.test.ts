@@ -94,8 +94,8 @@ const ADMITTED: Readonly<Record<string, Admission>> = {
 	},
 	"clients/safe-spawn.ts#spawnSync": {
 		reason:
-			"the chokepoint's own synchronous start (safeSpawn runs admitSpawn first) plus its taskkill and chcp teardowns, whose System32 paths now resolve through `windowsExe`",
-		sites: 4,
+			"the chokepoint's own synchronous start (safeSpawn runs admitSpawn first) plus its taskkill and chcp teardowns, whose System32 paths now resolve through `windowsExe`, and the `ps -o ppid=` ownership read that admits a held language server to the host-exit group kill on a host without `/proc`",
+		sites: 5,
 		evidence: "admitSpawn(",
 	},
 	"clients/lsp/launch.ts#nodeSpawn": {

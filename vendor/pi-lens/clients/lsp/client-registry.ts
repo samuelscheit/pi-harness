@@ -744,23 +744,21 @@ export class ClientRegistry {
 	}
 
 	scheduleIdleEviction(key: string, server: LSPServerInfo): void {
-		// The registry owns this policy. Unmeasured and resident servers stay resident.
+		// The registry owns this policy. Every idle client is released after the
+		// idle window, an unmeasured one too: a server held for the session's
+		// whole life is what let parallel agents' Lean servers reach 50 GB.
+		// Only a server measured to lose findings across a respawn is declared
+		// `resident` and stays.
 		if (
-			server.idleEviction !== "transparent" &&
+			server.idleEviction === "resident" &&
 			!this.adoptedClientKeys.has(key)
 		) {
-			// #3952: say why no timer was scheduled. Without this row a caller
-			// that ARMS an `unmeasured` server and waits for the eviction (the
-			// nightly probe's whole protocol) sees the same "nothing happened" as
-			// a server whose timer is merely slow, and the two are opposite
-			// verdicts: `not-evicted` here means the policy was never read off the
-			// object the service holds, which is a pi-lens defect, not a slow
-			// server. Once per server per session: the policy is a declaration, so
-			// one row per (server, session) carries every occurrence's verdict.
+			// #3952: say why no timer was scheduled, once per server per session:
+			// the policy is a declaration, so one row carries every occurrence.
 			recordDegradationOnce({
 				kind: "lsp-idle-eviction-declined",
 				subject: server.id,
-				reason: `no idle-eviction timer: declared ${server.idleEviction ?? "unmeasured"}`,
+				reason: "no idle-eviction timer: declared resident",
 			});
 			return;
 		}

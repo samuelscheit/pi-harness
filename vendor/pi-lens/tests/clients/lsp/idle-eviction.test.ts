@@ -231,11 +231,28 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		await service.shutdown();
 	});
 
-	it("keeps an unmeasured server resident", async () => {
+	// An unmeasured server held for the session's life is what let parallel
+	// agents' Lean servers reach 50 GB: it is released like a transparent one.
+	it("releases an unmeasured server after the idle window", async () => {
 		vi.useFakeTimers();
 		const client = fakeClient("unmeasured");
 		createLSPClient.mockResolvedValue(client);
 		configureServer("go", "unmeasured");
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		await service.getClientForFile("/repo/main.ts");
+		await vi.advanceTimersByTimeAsync(20);
+		expect(client.shutdown).toHaveBeenCalledWith({ reason: "idle_eviction" });
+		expect(service.getAliveClientCount()).toBe(0);
+		await service.shutdown();
+	});
+
+	it("keeps a resident server resident", async () => {
+		vi.useFakeTimers();
+		const client = fakeClient("resident");
+		createLSPClient.mockResolvedValue(client);
+		configureServer("go", "resident");
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
