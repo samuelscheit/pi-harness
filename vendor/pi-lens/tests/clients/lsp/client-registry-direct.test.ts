@@ -47,7 +47,10 @@ import {
 	registerSessionRoot,
 	resetSessionRootsForTests,
 } from "../../../clients/lsp/session-roots.js";
-import { normalizeMapKey } from "../../../clients/path-utils.js";
+import {
+	normalizeFilePath,
+	normalizeMapKey,
+} from "../../../clients/path-utils.js";
 import {
 	_clearSuccessfulLspSpawnHistoryForTests,
 	getSuccessfulLspSpawnDurationMs,
@@ -2706,10 +2709,10 @@ describe("ClientRegistry shutdown (#4449)", () => {
 describe("client-registry environment limits (#4449)", () => {
 	// Recurrence (#3645): the idle window has a generic spelling and a legacy
 	// TypeScript one. The generic wins; an unset, zero, negative, fractional-only
-	// or unsafe value is ignored and the next spelling, then the 20 minute default,
+	// or unsafe value is ignored and the next spelling, then the 5 minute default,
 	// answers. A `>= 0` comparison let a zero window evict every client at once.
-	it("reads the idle window from the generic spelling, then the legacy one, else 20 minutes", () => {
-		expect(getLspIdleEvictMs()).toBe(20 * MIN);
+	it("reads the idle window from the generic spelling, then the legacy one, else 5 minutes", () => {
+		expect(getLspIdleEvictMs()).toBe(5 * MIN);
 		process.env.PI_LENS_TS_IDLE_EVICT_MS = "30000";
 		expect(getLspIdleEvictMs()).toBe(30_000);
 		process.env.PI_LENS_LSP_IDLE_EVICT_MS = "45000";
@@ -2719,7 +2722,7 @@ describe("client-registry environment limits (#4449)", () => {
 			expect(getLspIdleEvictMs()).toBe(30_000);
 		}
 		process.env.PI_LENS_TS_IDLE_EVICT_MS = "0";
-		expect(getLspIdleEvictMs()).toBe(20 * MIN);
+		expect(getLspIdleEvictMs()).toBe(5 * MIN);
 	});
 
 	// Recurrence (#1129 F6): only a git checkout inside the host temp directory
@@ -2966,5 +2969,125 @@ describe("mergeInitializationOptions (#4449)", () => {
 		expect(mergeInitializationOptions(undefined, undefined)).toBeUndefined();
 		expect(mergeInitializationOptions(side, undefined)).toBe(side);
 		expect(mergeInitializationOptions(undefined, side)).toBe(side);
+	});
+});
+
+/**
+ * 2026-11-14: eight agents on one worktree held 51 tsserver processes (about
+ * 10.9 GB). Each pi process asked only itself whether to start a server; the
+ * per-root cap (`clients/lsp-budget.ts`) makes a primary spawn ask the
+ * machine's instance registry, and the idle window frees a slot in minutes.
+ */
+describe("ClientRegistry per-root server cap and idle window", () => {
+	let home: string;
+	const previousHome = process.env.PI_LENS_HOME;
+	const previousCap = process.env.PI_LENS_LSP_SERVERS_PER_ROOT;
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.setSystemTime(T0);
+		home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-reg-cap-"));
+		process.env.PI_LENS_HOME = home;
+		process.env.PI_LENS_LSP_SERVERS_PER_ROOT = "1";
+	});
+
+	afterEach(() => {
+		if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+		else process.env.PI_LENS_HOME = previousHome;
+		if (previousCap === undefined)
+			delete process.env.PI_LENS_LSP_SERVERS_PER_ROOT;
+		else process.env.PI_LENS_LSP_SERVERS_PER_ROOT = previousCap;
+		removeTempDirSync(home);
+	});
+
+	/** Another live pi process (our parent, the test runner) serving `root`. */
+	function plantPeer(serverId: string, root: string | undefined): void {
+		const children =
+			root === undefined
+				? []
+				: [
+						{
+							pid: process.ppid,
+							serverId,
+							command: "typescript-language-server",
+							spawnedAt: new Date(T0).toISOString(),
+							root: normalizeFilePath(root),
+						},
+					];
+		fs.writeFileSync(
+			path.join(home, "instances.json"),
+			JSON.stringify({
+				instances: [
+					{
+						pid: process.ppid,
+						startedAt: new Date(T0).toISOString(),
+						projectRoot: root ?? "/elsewhere",
+						lspChildren: children,
+						lspChildCount: children.length,
+						rssBytes: 0,
+						heartbeatAt: new Date(T0).toISOString(),
+					},
+				],
+			}),
+		);
+	}
+
+	it("declines a primary spawn while another process holds the root's slot, and spawns once it is released", async () => {
+		const f = ensureFixture();
+		plantPeer("ts", f.root);
+		const outcomes: string[] = [];
+
+		expect(await f.ensure((o) => outcomes.push(o))).toBeUndefined();
+		expect(outcomes).toEqual(["declined"]);
+		expect(f.spawn).not.toHaveBeenCalled();
+		// A policy decline: no breaker, no failure ladder.
+		expect(f.registry.broken.has(f.key)).toBe(false);
+		expect(priv(f.registry).failureCounts.has(f.key)).toBe(false);
+		expect(ledger("lsp-root-server-cap")?.latestReasons[0]?.subject).toBe(
+			f.key,
+		);
+
+		// The peer's session ends. Inside the retry window the key does not
+		// read the registry again…
+		plantPeer("ts", undefined);
+		expect(await f.ensure()).toBeUndefined();
+		expect(f.spawn).not.toHaveBeenCalled();
+
+		// …and after it the free slot is taken.
+		vi.setSystemTime(T0 + 30_000);
+		expect(await f.ensure()).toBeDefined();
+		expect(f.spawn).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not count a peer's server of another id at the same root", async () => {
+		const f = ensureFixture();
+		plantPeer("deno", f.root);
+		expect(await f.ensure()).toBeDefined();
+		expect(f.spawn).toHaveBeenCalledTimes(1);
+	});
+
+	it("leaves auxiliary servers to the machine-wide budget", async () => {
+		const f = ensureFixture();
+		(f.info as { role?: string }).role = "auxiliary";
+		plantPeer("ts", f.root);
+		expect(await f.ensure()).toBeDefined();
+		expect(f.spawn).toHaveBeenCalledTimes(1);
+	});
+
+	it("shuts an idle primary down after five minutes by default", async () => {
+		delete process.env.PI_LENS_LSP_IDLE_EVICT_MS;
+		delete process.env.PI_LENS_TS_IDLE_EVICT_MS;
+		const root = tempProject("idle-default");
+		const { registry, key, info, client } = registryWithClient("ts", root);
+		internals(registry).clientLastUsedAt.set(key, Date.now());
+		registry.scheduleIdleEviction(key, info);
+
+		await vi.advanceTimersByTimeAsync(5 * MIN - 1);
+		expect(client.shutdown).not.toHaveBeenCalled();
+		expect(registry.clients.has(key)).toBe(true);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(client.shutdown).toHaveBeenCalledWith({ reason: "idle_eviction" });
+		expect(registry.clients.has(key)).toBe(false);
 	});
 });

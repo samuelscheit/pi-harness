@@ -31,6 +31,17 @@ describe("isToolchainEnvironmentFailure", () => {
 			"missing toolchain",
 			"error: toolchain 'leanprover/lean4:v4.35.0' is not installed",
 		],
+		[
+			// The 2026-11-12 law-formalization row, verbatim apart from the paths:
+			// the project builds through its own wrapper, so lake's `.lake` held a
+			// shared library without the module's initializer.
+			"a plugin whose initializer is missing",
+			"✖ [62/85] Building Kernel (155ms)\ntrace: .> LEAN_PATH=/repo/.lake/build/lib/lean lean /repo/src/Kernel.lean -o /repo/.lake/build/lib/lean/Kernel.olean --json\nerror: src/Kernel.lean:1:0: error loading plugin, initializer not found 'initialize_lawkernel_Kernel_Profile'\nSome required targets logged failures:\n- Kernel",
+		],
+		[
+			"a dynlib that does not load",
+			"error: src/A.lean:1:0: error loading library, dlopen(/repo/.lake/build/lib/libA.dylib, 0x0009): image not found",
+		],
 	])("admits a setup-file failure on %s", (_label, stderr) => {
 		expect(isToolchainEnvironmentFailure(setupFile(stderr))).toBe(true);
 	});
@@ -58,6 +69,28 @@ describe("isToolchainEnvironmentFailure", () => {
 				"unknown constant 'permission denied (error code: 13)'",
 			),
 		).toBe(false);
+	});
+
+	it("refuses a plugin load failure that lake setup-file did not report", () => {
+		// The same words in an elaboration error of the file itself (a
+		// `#eval` of a string, a doc comment) are code, not lake's stderr.
+		expect(
+			isToolchainEnvironmentFailure(
+				"error loading plugin, initializer not found 'initialize_A'",
+			),
+		).toBe(false);
+	});
+
+	it("names the plugin line as the cause", () => {
+		expect(
+			toolchainFailureCause(
+				setupFile(
+					"✖ [62/85] Building Kernel (155ms)\nerror: src/Kernel.lean:1:0: error loading plugin, initializer not found 'initialize_lawkernel_Kernel_Profile'",
+				),
+			),
+		).toBe(
+			"error: src/Kernel.lean:1:0: error loading plugin, initializer not found 'initialize_lawkernel_Kernel_Profile'",
+		);
 	});
 
 	it("names the failing line as the cause", () => {

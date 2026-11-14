@@ -47,9 +47,11 @@ import {
 	type InstanceEntry,
 	isInstanceRegistryEnabled,
 	readInstanceRegistry,
+	readInstanceRegistrySync,
 } from "./instance-registry.js";
 import { realIsPidAlive, STALE_HEARTBEAT_MS } from "./instance-reaper.js";
 import { logLatency } from "./latency-logger.js";
+import { normalizeFilePath } from "./path-utils.js";
 import { isInPidNamespace, ownPidNamespace } from "./process-snapshot.js";
 
 /** See the module docstring for the derivation. */
@@ -129,16 +131,13 @@ export function decideLspBudget(
 	now = Date.now(),
 	ownNamespace?: string,
 ): LspBudgetDecision {
-	const hasFreshHeartbeat = (instance: InstanceEntry) => {
-		const heartbeatMs = Date.parse(instance.heartbeatAt);
-		return (
-			Number.isFinite(heartbeatMs) && now - heartbeatMs <= STALE_HEARTBEAT_MS
-		);
-	};
-	const liveInstances = registry.filter((instance) =>
-		isInPidNamespace(instance, ownNamespace)
-			? isPidAlive(instance.pid)
-			: hasFreshHeartbeat(instance),
+	const hasFreshHeartbeat = (instance: InstanceEntry) =>
+		heartbeatIsFresh(instance, now);
+	const liveInstances = liveRegistryInstances(
+		registry,
+		isPidAlive,
+		now,
+		ownNamespace,
 	);
 	const totalLiveLspServers = liveInstances.reduce(
 		(sum, instance) => sum + instance.lspChildren.length,
@@ -182,6 +181,148 @@ export function decideLspBudget(
 		shortenIdleTimeout: overBudget,
 		preferPullOnly: overBudget,
 	};
+}
+
+function heartbeatIsFresh(instance: InstanceEntry, now: number): boolean {
+	const heartbeatMs = Date.parse(instance.heartbeatAt);
+	return (
+		Number.isFinite(heartbeatMs) && now - heartbeatMs <= STALE_HEARTBEAT_MS
+	);
+}
+
+/**
+ * The registry entries whose host is alive: by pid in this pid namespace, by a
+ * fresh heartbeat in another one (#3539 review F1). A dead host's children are
+ * the orphan reaper's, never live load.
+ */
+function liveRegistryInstances(
+	registry: readonly InstanceEntry[],
+	isPidAlive: (pid: number) => boolean,
+	now: number,
+	ownNamespace: string | undefined,
+): InstanceEntry[] {
+	return registry.filter((instance) =>
+		isInPidNamespace(instance, ownNamespace)
+			? isPidAlive(instance.pid)
+			: heartbeatIsFresh(instance, now),
+	);
+}
+
+// --- Per-root server cap -----------------------------------------------------
+//
+// 2026-11-14: eight delegated agents edited ONE worktree, each its own pi
+// process with its own LSP service, and every one spawned its own TypeScript
+// server for the same root: 51 tsserver processes, about 10.9 GB RSS. The
+// machine-wide ceiling above sheds only auxiliaries, so it never bounded a
+// primary. A primary server for a root another process already serves is the
+// same index built again; past the cap a session declines the spawn, its files
+// at that root report no language-server verdict (the runner's coverage notice
+// says so), and the idle eviction of the other sessions' servers frees a slot
+// within minutes.
+
+/** Live primary servers of one `(serverId, root)` across the machine. */
+export const DEFAULT_LSP_SERVERS_PER_ROOT = 2;
+
+/** `PI_LENS_LSP_SERVERS_PER_ROOT` overrides the default; invalid reads as unset. */
+export function getLspServersPerRoot(): number {
+	const raw = Number(process.env.PI_LENS_LSP_SERVERS_PER_ROOT);
+	return Number.isSafeInteger(raw) && raw > 0
+		? raw
+		: DEFAULT_LSP_SERVERS_PER_ROOT;
+}
+
+export interface RootServerAdmission {
+	admitted: boolean;
+	/** Live servers of this `(serverId, root)` held by OTHER processes. */
+	live: number;
+	cap: number;
+	/** Their host pids, for the record. */
+	holders: number[];
+}
+
+/**
+ * PURE: may this process spawn a `serverId` server rooted at `root`? Counts
+ * the recorded children of every OTHER live host with the same server id and
+ * root identity. This process's own children are not counted: it holds at
+ * most one client per key and asks only when it holds none.
+ */
+export function decideRootServerAdmission(
+	registry: readonly InstanceEntry[],
+	request: { serverId: string; root: string; selfPid: number },
+	isPidAlive: (pid: number) => boolean,
+	cap: number,
+	now = Date.now(),
+	ownNamespace?: string,
+): RootServerAdmission {
+	const root = normalizeFilePath(request.root);
+	const holders: number[] = [];
+	for (const instance of liveRegistryInstances(
+		registry,
+		isPidAlive,
+		now,
+		ownNamespace,
+	)) {
+		if (
+			instance.pid === request.selfPid &&
+			isInPidNamespace(instance, ownNamespace)
+		)
+			continue;
+		for (const child of instance.lspChildren)
+			if (child.serverId === request.serverId && child.root === root)
+				holders.push(instance.pid);
+	}
+	return { admitted: holders.length < cap, live: holders.length, cap, holders };
+}
+
+/**
+ * The spawn-time gate for a primary server (`ClientRegistry.spawnClient`).
+ * Reads the registry once, synchronously, and decides through
+ * {@link decideRootServerAdmission}. Fails open: a disabled budget, a disabled
+ * registry or a failed read admits, because a missing server is a lost check
+ * and the cap is a memory bound, not a correctness one. A refusal writes one
+ * `lsp_root_server_cap_reached` row.
+ */
+export function admitRootServerSpawn(
+	serverId: string,
+	root: string,
+	testOverrides: {
+		registry?: readonly InstanceEntry[];
+		isPidAlive?: (pid: number) => boolean;
+	} = {},
+): RootServerAdmission {
+	const cap = getLspServersPerRoot();
+	const open: RootServerAdmission = {
+		admitted: true,
+		live: 0,
+		cap,
+		holders: [],
+	};
+	if (!isCrossProcessBudgetEnabled() || !isInstanceRegistryEnabled())
+		return open;
+	// A failed read answers an empty registry (and records a corrupt file), so
+	// it admits.
+	const admission = decideRootServerAdmission(
+		testOverrides.registry ?? readInstanceRegistrySync(),
+		{ serverId, root, selfPid: process.pid },
+		testOverrides.isPidAlive ?? realIsPidAlive,
+		cap,
+		Date.now(),
+		ownPidNamespace(),
+	);
+	if (!admission.admitted)
+		logLatency({
+			type: "phase",
+			phase: "lsp_root_server_cap_reached",
+			filePath: root,
+			durationMs: 0,
+			metadata: {
+				serverId,
+				live: admission.live,
+				cap: admission.cap,
+				holders: admission.holders,
+			},
+		});
+	return admission;
 }
 
 // --- Module-scope decision cache, read by clients/dispatch/auxiliary-lsp.ts ---

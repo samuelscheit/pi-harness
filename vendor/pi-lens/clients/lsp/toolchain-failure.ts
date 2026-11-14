@@ -13,9 +13,17 @@
  * run as reaching no verdict (the coverage notice says the file was not
  * checked), and records the cause once per session.
  *
+ * The same holds when lake cannot load a native plugin its build produced:
+ * `error loading plugin, initializer not found 'initialize_<pkg>_<Module>'`
+ * (2026-11-12, a project that builds through its own wrapper into a separate
+ * build directory, so `repo/.lake` held a stale shared library). Lean prints
+ * that line only when `dlopen`/`dlsym` of a `--plugin`/`--load-dynlib` library
+ * fails, never for a source error, and it named every file of the project.
+ *
  * Fail closed: only a `lake setup-file` failure whose stderr names a
- * filesystem permission or capacity errno, or a missing toolchain, is
- * admitted. A setup-file failure for any other reason — a bad import, a
+ * filesystem permission or capacity errno, a missing toolchain, or a native
+ * plugin that failed to load is admitted. A setup-file failure for any other
+ * reason — a bad import, a
  * missing source file (`no such file or directory (error code: 2)`), a
  * dependency that does not compile — stays a code diagnostic.
  */
@@ -28,6 +36,16 @@ const ENVIRONMENT_ERRNO =
 
 const MISSING_TOOLCHAIN = /\btoolchain '[^']+' is not installed\b/i;
 
+/** Lean's `loadPlugin`/`loadDynlib` failure: the library or its initializer. */
+const PLUGIN_LOAD_FAILURE = /\berror loading (?:plugin|library)\b/i;
+
+/** Each admitted cause; the record's cause is the first line one matches. */
+const ENVIRONMENT_CAUSES = [
+	ENVIRONMENT_ERRNO,
+	MISSING_TOOLCHAIN,
+	PLUGIN_LOAD_FAILURE,
+] as const;
+
 export const TOOLCHAIN_FAILURE_NOTICE =
 	"[toolchain or filesystem failure, not a code finding: the file was not checked]";
 
@@ -35,7 +53,7 @@ export const TOOLCHAIN_FAILURE_NOTICE =
 export function isToolchainEnvironmentFailure(message: string): boolean {
 	return (
 		LAKE_SETUP_FILE_FAILED.test(message) &&
-		(ENVIRONMENT_ERRNO.test(message) || MISSING_TOOLCHAIN.test(message))
+		ENVIRONMENT_CAUSES.some((cause) => cause.test(message))
 	);
 }
 
@@ -44,7 +62,7 @@ export function toolchainFailureCause(message: string): string {
 	const line =
 		message
 			.split("\n")
-			.find((l) => ENVIRONMENT_ERRNO.test(l) || MISSING_TOOLCHAIN.test(l)) ??
+			.find((l) => ENVIRONMENT_CAUSES.some((cause) => cause.test(l))) ??
 		message;
 	return line.trim().slice(0, 200);
 }

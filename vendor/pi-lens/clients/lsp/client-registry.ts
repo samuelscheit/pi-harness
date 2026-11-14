@@ -38,6 +38,7 @@ import {
 } from "../project-trust.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { recordLsp } from "../widget-state.js";
+import { admitRootServerSpawn } from "../lsp-budget.js";
 import {
 	resolveAnalysisRoot,
 	resolveAnalysisRootPath,
@@ -180,7 +181,16 @@ const OPTIONAL_LSP_RETRY_COOLDOWN_MS = 5 * 60_000;
 const OPTIONAL_LSP_SERVER_IDS = new Set<string>();
 
 const DEFAULT_LSP_CLIENT_CEILING = 24;
-const DEFAULT_IDLE_EVICT_MS = 20 * 60_000;
+/**
+ * The idle window of a primary server. Twenty minutes held every parallel
+ * agent's servers through a whole task (2026-11-14: 51 tsserver processes for
+ * one root, about 10.9 GB); five minutes releases a session's servers while it
+ * waits on a delegate or the user, and frees a per-root slot
+ * (`clients/lsp-budget.ts`) for a session that needs it.
+ */
+const DEFAULT_IDLE_EVICT_MS = 5 * 60_000;
+/** How long a key the per-root cap declined waits before it asks again. */
+const ROOT_CAP_RETRY_MS = 30_000;
 const DEFAULT_EPHEMERAL_IDLE_EVICT_MS = 60_000;
 
 /**
@@ -390,6 +400,12 @@ export class ClientRegistry {
 	 * entered the client. Eviction skips any key with an outstanding lease.
 	 */
 	private readonly clientLeases = new Map<string, number>();
+	/**
+	 * Keys whose spawn the per-root cap declined, and when to ask the registry
+	 * again: without it every touch of a file there re-read the registry and
+	 * wrote a cap row. One entry per declined key, cleared at service reset.
+	 */
+	private readonly rootCapRetryAt = new Map<string, number>();
 	/**
 	 * Per-root idle eviction for servers whose registry policy is `transparent`.
 	 * Timers are unref'd so an idle language service cannot keep a one-shot host
@@ -764,7 +780,7 @@ export class ClientRegistry {
 		}
 		// Pressure-gating these timers would require a separate reconciliation pass
 		// when the manager crosses the threshold; keep ownership simple and use the
-		// warm-LSP-friendly 20-minute default instead.
+		// warm-LSP-friendly default (`DEFAULT_IDLE_EVICT_MS`) instead.
 		this.clearIdleEvictionTimer(key);
 		const lastUsedAt = this.clientLastUsedAt.get(key) ?? Date.now();
 		const { root } = parseClientKey(key);
@@ -1446,6 +1462,8 @@ export class ClientRegistry {
 			this.noteSpawnVerdict(key, "declined");
 			return undefined;
 		}
+		if (!isAuxiliary(server) && !this.admitAtRootCap(server, root, key))
+			return undefined;
 		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 		const startedAt = Date.now();
 		logSessionStart(
@@ -1918,10 +1936,46 @@ export class ClientRegistry {
 		return aliveClients;
 	}
 
+	/**
+	 * The per-root cap (`clients/lsp-budget.ts`): other pi-lens processes
+	 * already run `getLspServersPerRoot()` primaries of this server at this
+	 * root, so this one declines its own, on the policy path (no failure
+	 * ladder, no breaker) and asks again after {@link ROOT_CAP_RETRY_MS}, by
+	 * which time another session's idle server may have been released.
+	 */
+	private admitAtRootCap(
+		server: LSPServerInfo,
+		root: string,
+		key: string,
+	): boolean {
+		const retryAt = this.rootCapRetryAt.get(key);
+		if (retryAt !== undefined && retryAt > Date.now()) {
+			this.noteSpawnVerdict(key, "declined");
+			return false;
+		}
+		const admission = admitRootServerSpawn(server.id, root);
+		if (admission.admitted) {
+			this.rootCapRetryAt.delete(key);
+			return true;
+		}
+		this.rootCapRetryAt.set(key, Date.now() + ROOT_CAP_RETRY_MS);
+		recordDegradationOnce({
+			kind: "lsp-root-server-cap",
+			subject: key,
+			reason: `${server.id} not started at ${root}: ${admission.live} other pi sessions already run it there (cap ${admission.cap}, PI_LENS_LSP_SERVERS_PER_ROOT); files there get no language-server verdict until one is released`,
+		});
+		logSessionStart(
+			`lsp spawn ${server.id}: declined — per-root cap ${admission.cap} reached at ${root} (holders ${admission.holders.join(",")})`,
+		);
+		this.noteSpawnVerdict(key, "declined");
+		return false;
+	}
+
 	/** After `lsp_service_reset`: every client generation is gone. */
 	clearAfterShutdown(): void {
 		this.clients.clear();
 		this.broken.clear();
+		this.rootCapRetryAt.clear();
 		// #1934 review F1: map hygiene alongside the breaker it sits next to.
 		// Not load-bearing — every read follows its own attempt's write — but a
 		// verdict for a client generation that no longer exists is dead weight.

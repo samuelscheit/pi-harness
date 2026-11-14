@@ -311,7 +311,8 @@ highest-degree ones and render a visible truncation note.
 
 Several in-memory caches release their contents after a period of inactivity so a
 long-running session does not retain hydrated state indefinitely. Each has an
-env-tunable window; all default to 20 minutes (`1200000` ms).
+env-tunable window; the language-server window defaults to 5 minutes
+(`300000` ms), the others to 20 minutes (`1200000` ms).
 
 ### V8 heap ceiling for long pi sessions
 
@@ -361,7 +362,18 @@ are declared which way, and the
 nightly measurement behind each declaration, is in
 [`lsp-idle-eviction.md`](lsp-idle-eviction.md).
 When unset or invalid, `PI_LENS_TS_IDLE_EVICT_MS` (below) is read.
-**Default:** 20 minutes (`1200000`).
+**Default:** 5 minutes (`300000`).
+
+### `PI_LENS_LSP_SERVERS_PER_ROOT`
+
+Live primary language servers of one server id at one workspace root across
+every pi process on the machine (read from `~/.pi-lens/instances.json`). A
+session that would start one more declines it; its files at that root report
+no language-server verdict, and it asks again after 30 seconds, by which time
+another session's idle server may have been released. Auxiliary servers are
+bounded by the machine-wide budget instead. `PI_LENS_CROSS_PROCESS_BUDGET=0`
+or `PI_LENS_INSTANCE_REGISTRY=0` disables the cap. Positive integers only.
+**Default:** 2.
 
 ### `PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS`
 
@@ -376,7 +388,7 @@ The nightly idle-eviction measurement temporarily sets this variable alongside
 The original, TypeScript-named spelling of the same window, retained for
 compatibility with existing configuration. It has exactly the semantics above
 and is ignored when `PI_LENS_LSP_IDLE_EVICT_MS` holds a valid value.
-**Default:** 20 minutes (`1200000`).
+**Default:** 5 minutes (`300000`).
 
 ### `PI_LENS_WORD_INDEX_IDLE_EVICT_MS`
 

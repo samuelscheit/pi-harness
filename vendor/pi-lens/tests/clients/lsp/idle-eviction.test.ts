@@ -74,15 +74,16 @@ describe("LSP idle eviction (#1332 b2)", () => {
 	// #3645 recurrence: the window was named for one server family
 	// (`PI_LENS_TS_IDLE_EVICT_MS`) although it governs every transparent server.
 	// The generic spelling must win, the legacy one must keep its meaning, and
-	// the 20-minute default must not move.
+	// the default must not move. It is 5 minutes since 2026-11-14, when parallel
+	// agents' servers, held 20 minutes each, reached 51 tsserver processes.
 	describe("idle window env spellings (#3645)", () => {
-		const twentyMinutes = 20 * 60_000;
+		const fiveMinutes = 5 * 60_000;
 
-		it("keeps the 20-minute default when neither spelling is set", async () => {
+		it("keeps the 5-minute default when neither spelling is set", async () => {
 			delete process.env.PI_LENS_TS_IDLE_EVICT_MS;
 			const { getLspIdleEvictMs } =
 				await import("../../../clients/lsp/index.js");
-			expect(getLspIdleEvictMs()).toBe(twentyMinutes);
+			expect(getLspIdleEvictMs()).toBe(fiveMinutes);
 		});
 
 		it("still honors the legacy PI_LENS_TS_IDLE_EVICT_MS on its own", async () => {
@@ -107,7 +108,7 @@ describe("LSP idle eviction (#1332 b2)", () => {
 				await import("../../../clients/lsp/index.js");
 			expect(getLspIdleEvictMs()).toBe(1500);
 			process.env.PI_LENS_TS_IDLE_EVICT_MS = "-4";
-			expect(getLspIdleEvictMs()).toBe(twentyMinutes);
+			expect(getLspIdleEvictMs()).toBe(fiveMinutes);
 		});
 
 		it("evicts on the generic window through the service timer", async () => {

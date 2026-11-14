@@ -91,6 +91,14 @@ export interface LspChildEntry {
 	 * killed by pid.
 	 */
 	processStart?: string;
+	/**
+	 * The server's workspace root, through `normalizeFilePath`. The per-root
+	 * cap (`clients/lsp-budget.ts` `decideRootServerAdmission`) counts the live
+	 * servers of one `(serverId, root)` across every pi-lens process on the
+	 * machine. Absent on records written before the cap; such a child counts
+	 * toward the machine-wide budget only.
+	 */
+	root?: string;
 }
 
 /**
@@ -315,6 +323,16 @@ async function readRegistryAsync(): Promise<RegistryFile> {
 		if (code !== "ENOENT") recordCorruptRegistryRead(code ?? "invalid");
 		return { instances: [] };
 	}
+}
+
+/**
+ * Read-only snapshot, synchronously: the per-root spawn gate
+ * (`clients/lsp-budget.ts` `admitRootServerSpawn`) reads one small file right
+ * before it starts a process, and an await there would let a concurrent touch
+ * interleave with the spawn it is deciding.
+ */
+export function readInstanceRegistrySync(): InstanceEntry[] {
+	return readRegistrySync().instances;
 }
 
 /** Read-only snapshot of the whole registry (used by the reaper). */
@@ -786,6 +804,8 @@ export interface RecordLspChildInput {
 	serverId: string;
 	command: string;
 	marker?: string;
+	/** The server's workspace root, see {@link LspChildEntry.root}. */
+	root?: string;
 	/** Session identity used if this child arrives before host registration. */
 	sessionIdentity?: {
 		projectRoot: string;
@@ -899,6 +919,9 @@ async function recordLspChildNow(
 		marker: entry.marker,
 		spawnedAt: now,
 		...(childStart === undefined ? {} : { processStart: childStart }),
+		...(entry.root === undefined
+			? {}
+			: { root: normalizeFilePath(entry.root) }),
 	};
 	const hostIdentity = getSubagentIdentity();
 	await writeRegistryWithRetry(

@@ -36,7 +36,7 @@ memory growth:
   excluding the surrounding turn.
 - idle is false on the periodic sample. It is true on the one sample written
   at a session's first turn start after its own turn end, when that gap is
-  longer than the TS idle-evict window (`getLspIdleEvictMs()`, 20 minutes by
+  longer than the TS idle-evict window (`getLspIdleEvictMs()`, 5 minutes by
   default). That record also carries idleMs, the measured gap. The heap
   reading is process-wide; the gap belongs to the session whose turn started.
 

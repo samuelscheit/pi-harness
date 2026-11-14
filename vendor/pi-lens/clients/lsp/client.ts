@@ -7349,6 +7349,7 @@ export async function createLSPClient(options: {
 		serverId,
 		command: lspProcess.command,
 		marker: extractSpawnMarker(lspProcess.args),
+		root,
 		sessionIdentity: {
 			projectRoot: sessionCwd ?? process.cwd(),
 			rootSource: sessionCwd ? "service-cwd" : "lsp-fallback",

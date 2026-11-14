@@ -1293,6 +1293,13 @@ export type DegradationKind =
 	| "lsp-registry-decision"
 	/** `lsp-root-declined`: A host-created pi-agent staging root was declined as an LSP root. */
 	| "lsp-root-declined"
+	/**
+	 * `lsp-root-server-cap`: a primary server was not started because other pi
+	 * processes already run the per-root cap of it at that root
+	 * (`clients/lsp-budget.ts` `decideRootServerAdmission`); files there get no
+	 * language-server verdict until one is released. Once per server and root.
+	 */
+	| "lsp-root-server-cap"
 	| "lsp-scanner-coverage-gap"
 	/**
 	 * `lsp-server-config-load-failed`: #4764: a server reported over `window/showMessage` that its own config or

@@ -111,6 +111,14 @@ export const BASH_RECOVERY_DRIFT_SOURCE = "recovered-drift";
 export const SAME_HEAD_DISCARD_SOURCE = "same-head-discard";
 
 /**
+ * An out-of-band look's label for a changed declaration file inside a linked
+ * dependency package (`clients/out-of-band-changes.ts`): a rebuild of a
+ * package built in place, which moves no install stamp. It is a dependency
+ * change, so the LSP consumer restarts the root's primaries as for an install.
+ */
+export const LINKED_DEPENDENCY_SOURCE = "linked-dependency";
+
+/**
  * Primaries one held-document pass sends to. A pass that reaches the cap
  * leaves the remaining stale documents to the next look, and the detector's
  * row still reports every target it found.
@@ -381,9 +389,11 @@ function driftRecoveredFiles(change: DiskChange): HeldDocumentsAnswer {
 }
 
 /**
- * The out-of-band consumer: an install restarts the root's live primary
- * clients (a server that registered client watchers re-reads a closed file
- * only on an exact-URI event or a restart), and a declaration file changed
+ * The out-of-band consumer: an install, or a rebuilt linked dependency,
+ * restarts the root's live primary clients (a server that registered client
+ * watchers re-reads a closed file only on an exact-URI event or a restart, and
+ * a server that watches files itself may not watch a dependency reached through
+ * a link), and a declaration file changed
  * outside pi-lens goes out as that exact-URI watched-files event now, not after
  * the debounce window. A look can hold both, and both are delivered: the
  * install restarts the clients of that root, while a live client of the same
@@ -398,7 +408,10 @@ async function outOfBandLsp(
 	const service = peekLSPService();
 	if (!service) return { restarted: 0 };
 	let restarted = 0;
-	if (change.sources.includes("install"))
+	if (
+		change.sources.includes("install") ||
+		change.sources.includes(LINKED_DEPENDENCY_SOURCE)
+	)
 		restarted = (await service.restartPrimaryClientsUnder(change.root)) ?? 0;
 	const events = change.pathChanges ?? [];
 	if (events.length === 0) return { restarted };

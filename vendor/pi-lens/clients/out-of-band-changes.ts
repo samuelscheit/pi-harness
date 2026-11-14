@@ -23,6 +23,17 @@
  * diagnostics-cache clock so the entries whose scope holds a changed path or
  * an install are refused. This module names no consumer.
  *
+ * The walk also reads the root's LINKED dependency packages (a `node_modules`
+ * entry that is a symbolic link to a package directory outside every
+ * `node_modules`: a workspace package, `npm link`, a vendored checkout), whose
+ * build output the shared exclusions would skip. Rebuilding one rewrites its
+ * `dist/*.d.ts` without moving any install stamp: on 2026-11-12 a rebuild of a
+ * vendored dependency left the TypeScript server reporting a property the new
+ * declarations had, as a blocker, for the server's whole life, while
+ * `tsc --noEmit` passed. A changed linked declaration is a dependency change,
+ * published as `LINKED_DEPENDENCY_SOURCE`: the root's primary clients restart,
+ * as after an install, and every cached entry scanned before it is refused.
+ *
  * The same look compares the config files a server reads once and keeps
  * (`pyrightconfig.json`, `pyproject.toml`: the closed list in
  * `clients/lsp/server-config-files.ts`) at the root only (a config below it is
@@ -55,6 +66,7 @@ import {
 } from "./disk-changes.js";
 import {
 	ensureDiskChangeSubscribers,
+	LINKED_DEPENDENCY_SOURCE,
 	LSP_CONSUMER,
 } from "./disk-change-subscribers.js";
 import { untilAborted } from "./deadline-utils.js";
@@ -64,8 +76,10 @@ import { logLatency } from "./latency-logger.js";
 import {
 	isAtOrAboveHomeDir,
 	isUnderDir,
+	isWithinForm,
 	normalizeMapKey,
 	realpathOrResolve,
+	realpathOrResolveAsync,
 } from "./path-utils.js";
 import { SERVER_CONFIG_FILE_NAMES } from "./lsp/server-config-files.js";
 import { PROJECT_VENV_DIR_NAMES } from "./python-environment.js";
@@ -119,6 +133,13 @@ const VENV_INTERPRETER_DIRS_MAX = 4;
 const DECLARATION_WALK_MAX_DIRS = 4096;
 /** Declaration files one walk records before it stops (degraded). */
 const DECLARATION_WALK_MAX_FILES = 2048;
+
+/**
+ * Linked packages one look reads under `<root>/node_modules`. A workspace holds
+ * one per package of its own; past the cap a package is not walked, which is
+ * recorded, rather than one look listing and walking an unbounded set.
+ */
+const LINKED_PACKAGES_MAX = 64;
 /** Directory reads in flight during one walk. */
 const DECLARATION_WALK_CONCURRENCY = 16;
 /**
@@ -141,6 +162,8 @@ interface RootRecord {
 	configs: Map<string, string> | undefined;
 	/** path -> `ino:size:mtimeMs`; undefined until a walk completes uncapped. */
 	declarations: Map<string, string> | undefined;
+	/** The linked package directories the last walk read (see the module doc). */
+	linkedRoots: readonly string[];
 	walkedAt: number;
 }
 
@@ -448,10 +471,91 @@ interface DeclarationWalk {
 	unreadableFiles: string[];
 }
 
+/** A root's walk: its own tree plus its linked packages' trees. */
+interface RootDeclarationWalk extends DeclarationWalk {
+	/** The linked package directories walked, spelled as the map spells them. */
+	linkedRoots: string[];
+}
+
+/**
+ * Inside a linked package only its own dependencies and dot-directories are
+ * skipped: its `dist`, `build` or `out` directory is where the declarations an
+ * importer reads live, and the shared exclusions would skip exactly those.
+ */
+const isLinkedPackageExcludedDir = (name: string): boolean =>
+	name === "node_modules" || name.startsWith(".");
+
+/**
+ * `root`'s linked dependency packages: the entries of `<root>/node_modules`
+ * and of its `@scope` directories that are symbolic links to a directory with
+ * no `node_modules` segment in its real path. A link into a package store
+ * (pnpm's `node_modules/.pnpm`) is an installed package, which the install
+ * stamp covers; a link out of every `node_modules` is a package built in place,
+ * which no install stamp sees.
+ *
+ * Each is spelled under `root` when its real path lies inside the root's real
+ * path, so a file the root's own walk also reaches carries one key, and by its
+ * real path otherwise: the path the server resolved the import to.
+ */
+async function findLinkedPackages(root: string): Promise<string[]> {
+	const modules = join(root, "node_modules");
+	const listing = async (dir: string) => {
+		try {
+			return await fsp.readdir(dir, { withFileTypes: true });
+		} catch {
+			// none: no `node_modules` (or no scope directory), so no linked package.
+			return [];
+		}
+	};
+	const candidates: string[] = [];
+	for (const entry of await listing(modules)) {
+		if (entry.name.startsWith("@") && entry.isDirectory()) {
+			for (const scoped of await listing(join(modules, entry.name)))
+				if (scoped.isSymbolicLink())
+					candidates.push(join(modules, entry.name, scoped.name));
+		} else if (entry.isSymbolicLink()) {
+			candidates.push(join(modules, entry.name));
+		}
+	}
+	candidates.sort(compareOrdinal);
+	if (candidates.length > LINKED_PACKAGES_MAX)
+		recordDegradationOnce({
+			kind: "lsp-declaration-look-capped",
+			subject: `linked:${normalizeMapKey(root)}`,
+			reason: `${candidates.length} linked packages under node_modules, past the ${LINKED_PACKAGES_MAX} a look reads; a rebuild of one past the cap restarts no language server`,
+		});
+	const realRoot = await realpathOrResolveAsync(root);
+	const linked = new Set<string>();
+	for (const candidate of candidates.slice(0, LINKED_PACKAGES_MAX)) {
+		let real: string;
+		try {
+			real = await fsp.realpath(candidate);
+			if (!(await fsp.stat(real)).isDirectory()) continue;
+		} catch {
+			// none: a dangling link names no package to walk.
+			continue;
+		}
+		// A link to the root or above it is no dependency: walking it without
+		// the shared exclusions would read the whole project.
+		if (
+			real.split(/[\\/]/).includes("node_modules") ||
+			isWithinForm(realRoot, real)
+		)
+			continue;
+		linked.add(
+			isWithinForm(real, realRoot)
+				? join(root, real.slice(realRoot.length))
+				: real,
+		);
+	}
+	return [...linked];
+}
+
 /**
  * The declaration files under `root`, outside the shared excluded directories
- * (gitignored ones included: codegen writes there), in a deterministic order;
- * `undefined` when the walk hit a cap.
+ * (gitignored ones included: codegen writes there), plus those of its linked
+ * packages (`findLinkedPackages`), in a deterministic order; `undefined` when
+ * the root's walk hit a cap.
  *
  * #4596: a directory that cannot be listed is REPORTED, not skipped. Skipping
  * it left the walk's map looking complete, so the diff below read every
@@ -471,11 +575,55 @@ interface DeclarationWalk {
  */
 async function walkDeclarations(
 	root: string,
+): Promise<RootDeclarationWalk | undefined> {
+	const [tree, linkedRoots] = await Promise.all([
+		walkDeclarationTree([root], isExcludedDirName),
+		findLinkedPackages(root),
+	]);
+	if (!tree) return undefined;
+	if (linkedRoots.length === 0) return { ...tree, linkedRoots };
+	const linked = await walkDeclarationTree(
+		linkedRoots,
+		isLinkedPackageExcludedDir,
+	);
+	if (!linked) {
+		// A capped linked walk keeps every linked file's previous fingerprint
+		// (`carryUnreadable`), so the root's own walk still counts and no linked
+		// file reads as deleted.
+		recordDegradationOnce({
+			kind: "lsp-declaration-look-capped",
+			subject: `linked:${normalizeMapKey(root)}`,
+			reason: `the linked packages' declaration walk passed ${DECLARATION_WALK_MAX_DIRS} directories or ${DECLARATION_WALK_MAX_FILES} files; a rebuild of a linked dependency restarts no language server`,
+		});
+		return {
+			...tree,
+			unreadable: [...tree.unreadable, ...linkedRoots],
+			linkedRoots,
+		};
+	}
+	const declarations = new Map(tree.declarations);
+	for (const [filePath, print] of linked.declarations)
+		declarations.set(filePath, print);
+	return {
+		declarations,
+		unreadable: [...tree.unreadable, ...linked.unreadable],
+		unreadableFiles: [...tree.unreadableFiles, ...linked.unreadableFiles],
+		linkedRoots,
+	};
+}
+
+/**
+ * The declaration files under `seeds`, skipping each directory `skipDir`
+ * names; `undefined` when the walk hit a cap.
+ */
+async function walkDeclarationTree(
+	seeds: readonly string[],
+	skipDir: (name: string) => boolean,
 ): Promise<DeclarationWalk | undefined> {
 	const found: string[] = [];
 	const unreadable: string[] = [];
 	const unreadableFiles: string[] = [];
-	const queue = [root];
+	const queue = [...seeds];
 	let next = 0;
 	let capped = false;
 	const worker = async () => {
@@ -494,7 +642,7 @@ async function walkDeclarations(
 			}
 			for (const entry of entries) {
 				if (entry.isDirectory()) {
-					if (!isExcludedDirName(entry.name)) queue.push(join(dir, entry.name));
+					if (!skipDir(entry.name)) queue.push(join(dir, entry.name));
 				} else if (entry.isFile() && DECLARATION_FILE.test(entry.name)) {
 					found.push(join(dir, entry.name));
 				}
@@ -561,8 +709,10 @@ async function walkDeclarations(
  * The carried set is bounded by the walk's own file cap: entries that would
  * take the map past it are counted in `dropped` and not added, and the caller
  * then keeps the previous map whole instead of storing a partial one (#4603
- * F5). Neither the map nor the diff can exceed the cap, and no entry the diff
- * would read as deleted leaves the record.
+ * F5). A carry never takes the map past the cap, and no entry the diff would
+ * read as deleted leaves the record. A walk's own map is at most twice the cap
+ * (the root's walk plus its linked packages' walk, each capped); such a map
+ * carries nothing, so an unreadable entry there keeps the previous map whole.
  */
 function carryUnreadable(
 	declarations: Map<string, string> | undefined,
@@ -730,16 +880,11 @@ const CHANGE_TYPE = {
  */
 function outOfBandChange(
 	root: string,
-	installed: boolean,
+	sources: readonly string[],
 	changes: ReadonlyArray<{ filePath: string; type: number }>,
 	configChanges: ReadonlyArray<{ filePath: string; type: number }>,
 	at: number,
 ): DiskChangeInput {
-	const sources = [
-		...(installed ? ["install"] : []),
-		...(changes.length > 0 ? ["declarations"] : []),
-		...(configChanges.length > 0 ? [CONFIG_SOURCE] : []),
-	];
 	const pathChanges = [...changes, ...configChanges].map((change) => ({
 		filePath: change.filePath,
 		type: CHANGE_TYPE[change.type as 1 | 2 | 3],
@@ -751,15 +896,17 @@ function outOfBandChange(
 		// A stat fingerprint, not the bytes: an `inferred` change may never by
 		// itself confirm that a finding was not reproduced.
 		kind: "inferred",
-		// A config file changes the analysis of every file under its root, so it
-		// cannot be enumerated any more than an install can: the cache refuses
-		// everything scanned before it (`"unknown"`), never just the config path.
+		// A config file changes the analysis of every file under its root, and a
+		// linked dependency's declarations that of every importer, so neither can
+		// be enumerated any more than an install can: the cache refuses
+		// everything scanned before it (`"unknown"`), never just the named paths.
 		paths:
-			configChanges.length > 0
+			sources.includes(CONFIG_SOURCE) ||
+			sources.includes(LINKED_DEPENDENCY_SOURCE)
 				? "unknown"
 				: changes.length > 0
 					? changes.map((change) => normalizeMapKey(change.filePath))
-					: installed
+					: sources.includes("install")
 						? "unknown"
 						: [],
 		...(pathChanges.length > 0 ? { pathChanges } : {}),
@@ -817,6 +964,7 @@ async function lookOnce(
 		// config files" would publish every one as created on the next look.
 		configs: install.configs ?? prior?.configs,
 		declarations,
+		linkedRoots: walked?.linkedRoots ?? prior?.linkedRoots ?? [],
 		walkedAt: walkDue && !incomplete ? started : (prior?.walkedAt ?? started),
 	});
 	if (walkDue && walked === undefined)
@@ -866,11 +1014,28 @@ async function lookOnce(
 			? diffServerConfigs(root, prior.configs, install.configs)
 			: [];
 	if (!installed && changes.length === 0 && configChanges.length === 0) return;
+	// A package linked now or at the previous walk: a deleted link's files are
+	// a dependency change too.
+	const linkedRoots = new Set([
+		...(prior?.linkedRoots ?? []),
+		...(walked?.linkedRoots ?? []),
+	]);
+	const linkedChanged = changes.some((change) =>
+		[...linkedRoots].some((linkedRoot) =>
+			isWithinForm(change.filePath, linkedRoot),
+		),
+	);
+	const sources = [
+		...(installed ? ["install"] : []),
+		...(changes.length > 0 ? ["declarations"] : []),
+		...(linkedChanged ? [LINKED_DEPENDENCY_SOURCE] : []),
+		...(configChanges.length > 0 ? [CONFIG_SOURCE] : []),
+	];
 	const at = Date.now();
 	// I1: the per-root record is committed above, before any consumer runs.
 	ensureDiskChangeSubscribers();
 	const { results, failedSubscribers } = await publishDiskChange(
-		outOfBandChange(root, installed, changes, configChanges, at),
+		outOfBandChange(root, sources, changes, configChanges, at),
 		runtime,
 	);
 	// The restart count belongs to the LSP subscriber's own answer; the row
@@ -891,11 +1056,7 @@ async function lookOnce(
 		phase: "lsp_out_of_band_change",
 		filePath: root,
 		durationMs: Date.now() - started,
-		result: [
-			...(installed ? ["install"] : []),
-			...(changes.length > 0 ? ["declarations"] : []),
-			...(configChanges.length > 0 ? [CONFIG_SOURCE] : []),
-		].join("+"),
+		result: sources.join("+"),
 		metadata: {
 			trigger,
 			restarted,
