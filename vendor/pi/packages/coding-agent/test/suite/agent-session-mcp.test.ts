@@ -47,7 +47,8 @@ const SERVER_TOOLS = [
 
 /**
  * Minimal MCP server over an in-memory transport. Records the tool calls it receives.
- * `initializeDelayMs` delays the answer to `initialize`; `Infinity` never answers.
+ * `initializeDelayMs` delays the answer to `initialize`; `Infinity` never answers. `onToolsListed` runs
+ * when it sent its answer to `tools/list`.
  */
 function createFakeServer(
 	calls: string[],
@@ -56,9 +57,16 @@ function createFakeServer(
 		resources?: boolean;
 		instructions?: string;
 		initializeDelayMs?: number;
+		onToolsListed?: () => void;
 	} = {},
 ) {
-	const { listTools = () => SERVER_TOOLS, resources = false, instructions, initializeDelayMs = 0 } = options;
+	const {
+		listTools = () => SERVER_TOOLS,
+		resources = false,
+		instructions,
+		initializeDelayMs = 0,
+		onToolsListed,
+	} = options;
 	const pair = createInMemoryTransportPair();
 	const respond = (request: JsonRpcRequest): unknown => {
 		switch (request.method) {
@@ -109,7 +117,10 @@ function createFakeServer(
 	pair.server.onMessage((message) => {
 		if (!("id" in message) || !("method" in message)) return;
 		const request = message as JsonRpcRequest;
-		const send = () => void pair.server.send({ jsonrpc: "2.0", id: request.id, result: respond(request) });
+		const send = () => {
+			void pair.server.send({ jsonrpc: "2.0", id: request.id, result: respond(request) });
+			if (request.method === "tools/list") onToolsListed?.();
+		};
 		if (request.method !== "initialize" || initializeDelayMs === 0) queueMicrotask(send);
 		else if (Number.isFinite(initializeDelayMs)) setTimeout(send, initializeDelayMs);
 	});
@@ -161,6 +172,10 @@ describe("AgentSession MCP integration", () => {
 		const calls: string[] = [];
 		const notifications: string[] = [];
 		const servers: ReturnType<typeof createFakeServer>["server"][] = [];
+		let onToolsListed!: () => void;
+		const toolsListed = new Promise<void>((resolve) => {
+			onToolsListed = resolve;
+		});
 		const entry: McpServerEntry = {
 			name: "docs",
 			config: {
@@ -185,7 +200,7 @@ describe("AgentSession MCP integration", () => {
 				createMcpExtension({
 					loadConfig: () => ({ servers: [entry], errors: [], ...configOptions }),
 					createTransport: () => {
-						const pair = createFakeServer(calls, { listTools, resources, instructions });
+						const pair = createFakeServer(calls, { listTools, resources, instructions, onToolsListed });
 						servers.push(pair.server);
 						void pair.server.start();
 						return pair.client;
@@ -197,11 +212,14 @@ describe("AgentSession MCP integration", () => {
 		await harness.session.bindExtensions({
 			uiContext: createTestUiContext({ notify: (message) => notifications.push(message) }),
 		});
-		// The first prompt waits only for servers with direct tools; wait for the others here.
+		// The first prompt waits only for servers with direct tools; wait for the others here. Wait for the
+		// server's answer to `tools/list`, however long connecting takes (the first connection loads the MCP
+		// runtime, slow under load): from there to the registered tools runs only promise callbacks (the
+		// in-memory transport delivers in microtasks), all done before the next macrotask.
 		if (waitForTools) {
-			await vi.waitFor(() =>
-				expect(harness.session.getAllTools().some((tool) => tool.name === "mcp__docs__search")).toBe(true),
-			);
+			await toolsListed;
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(harness.session.getAllTools().some((tool) => tool.name === "mcp__docs__search")).toBe(true);
 		}
 		return { harness, calls, servers, notifications };
 	}
@@ -245,9 +263,8 @@ describe("AgentSession MCP integration", () => {
 			allowedToolNames: ["codemode"],
 			toolExposure: { fail: "direct" },
 		});
-		await vi.waitFor(() =>
-			expect(harness.session.getAllTools().map((tool) => tool.name)).toContain("mcp__docs__fail"),
-		);
+		// Registered with the server's other tools, which setup waited for.
+		expect(harness.session.getAllTools().map((tool) => tool.name)).toContain("mcp__docs__fail");
 		expect(harness.session.getActiveToolNames()).toEqual(["codemode"]);
 	});
 
