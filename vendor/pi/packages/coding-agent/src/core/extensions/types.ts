@@ -1913,13 +1913,14 @@ export interface ExtensionAPI {
 	requestReload(): void;
 
 	/**
-	 * Report how much work `key` keeps running for this session outside any agent run (jobs that will
-	 * wake the session when they end, for example). The session emits `background_work` events with
-	 * the total over all keys, so a host that unloads idle sessions keeps this one while any is
-	 * pending. Set 0 when the work is done. The count survives reloads; a reloaded extension sets it
-	 * again.
+	 * Report the work `key` keeps running for this session outside any agent run (jobs that will
+	 * wake the session when they end, for example), one item each, replacing what `key` reported
+	 * before. The session emits `background_work` events with the items of all keys whenever they
+	 * change, so a host that unloads idle sessions keeps this one while any is pending and can show
+	 * each. Set `[]` when the work is done. The items survive reloads; a reloaded extension sets
+	 * them again.
 	 */
-	setBackgroundWork(key: string, pending: number): void;
+	setBackgroundWork(key: string, items: readonly BackgroundWorkItem[]): void;
 
 	/**
 	 * Hold this session's prompt cache warm until `untilMs` (epoch milliseconds), or end the hold
@@ -2299,7 +2300,31 @@ export type RefreshToolsHandler = () => void;
 
 export type RequestReloadHandler = () => void;
 
-export type SetBackgroundWorkHandler = (key: string, pending: number) => void;
+/** One piece of work an extension keeps running for the session outside any agent run (`pi.setBackgroundWork`). */
+export interface BackgroundWorkItem {
+	/** Stable while the work runs, unique within the session (over all keys). */
+	id: string;
+	/** What it is, in the extension's terms (e.g. `call`, `process`, `workflow`). */
+	kind: string;
+	/** A short line naming it for a person. */
+	label: string;
+	/** The shell command it runs, when it is one. */
+	command?: string;
+	/** When it started, epoch milliseconds. */
+	startedAt: number;
+	/** Its process, when it is one. */
+	pid?: number;
+	/** Its process group, when stopping the group stops it. */
+	processGroup?: number;
+	/** A file with its latest output. */
+	logPath?: string;
+	/** A page showing it live. */
+	url?: string;
+	/** The tool call that started it. */
+	toolCallId?: string;
+}
+
+export type SetBackgroundWorkHandler = (key: string, items: readonly BackgroundWorkItem[]) => void;
 
 export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
 

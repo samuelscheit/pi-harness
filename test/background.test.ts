@@ -19,7 +19,6 @@ const job = (overrides: Partial<Job> = {}): Job => ({
 	toolName: "workflow",
 	input: { code: "return 1", budget: 1 },
 	startedAt: 0,
-	stop: undefined,
 	log: "/tmp/c1.log",
 	controller: new AbortController(),
 	...overrides,
@@ -34,9 +33,9 @@ describe("messages and state", () => {
 		assert.ok(long.length < 220 && long.endsWith("…`"), long);
 	});
 
-	test("a detached call names why, how to stop it when the tool says, its log and the tail of its output", () => {
+	test("a detached call names why, its process group and how to stop it when it has one, its log and the tail of its output", () => {
 		const lines = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
-		const byTime = detachedText(job({ stop: "process group 42; stop it with `kill -- -42`" }), "time", lines, 125_000);
+		const byTime = detachedText(job({ pgid: 42 }), "time", lines, 125_000);
 		assert.match(byTime, /^It still ran after 2 min 5 s, so the call moved to the background and keeps running \(process group 42; stop it with `kill -- -42`\)\. Its latest output is in \/tmp\/c1\.log\./);
 		assert.match(byTime, /do not wait or poll for it/);
 		assert.match(byTime, /\[… 10 earlier lines in the log\]\nline 11\n/);

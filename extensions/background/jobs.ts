@@ -1,5 +1,6 @@
-// Background jobs: the session state, messages and reports of tool calls that moved to the
-// background (index.ts) and of processes bash calls left running (../bash/leftovers.ts).
+// Background jobs: the session state and messages of tool calls that moved to the background
+// (index.ts), of processes bash calls left running (../bash/leftovers.ts) and of workflow runs
+// (../workflow); work.ts reports them to the host as items and stops them (/jobs).
 //
 // The state lives in process state, not in an extension instance: a harness release reloads the
 // extensions while jobs run, and a job's end must reach the reloaded instance's API.
@@ -8,10 +9,9 @@ import { writeFileSync } from "node:fs";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Leftovers } from "../bash/leftovers.ts";
+import type { Leftovers, Named } from "../bash/leftovers.ts";
 
 export const JOB_MESSAGE_TYPE = "background-job";
-export const BACKGROUND_WORK_KEY = "background-jobs";
 /** Lines of output so far shown when a call moves to the background; the log has the rest. */
 const TAIL_LINES = 20;
 /** Least time between two writes of a job's log. */
@@ -26,11 +26,24 @@ export interface Job {
 	/** The arguments as the model wrote them. */
 	input: Record<string, unknown>;
 	startedAt: number;
-	/** How to stop it, from the tool's {@link StopHint} (bash: its process group). */
-	stop: string | undefined;
+	/** Its process group, when its tool runs one ({@link setProcessGroupOf}: bash). */
+	pgid?: number;
 	log: string;
-	/** Stops the call: at the session's end. */
+	/** Stops the call: at the session's end, or with /jobs stop. */
 	controller: AbortController;
+}
+
+/** A workflow run of the session, while it runs (../workflow). */
+export interface Run {
+	id: string;
+	/** The saved workflow's name, or `inline`. */
+	name: string;
+	/** The tool call that runs it: the model's, or a nested one. */
+	callId: string;
+	startedAt: number;
+	url: string;
+	/** Stops it through `workflow { stop }`; resolves to what happened. */
+	stop: () => Promise<string>;
 }
 
 export interface SessionJobs {
@@ -40,18 +53,20 @@ export interface SessionJobs {
 	jobs: Map<string, Job>;
 	/** Processes ended bash calls left running (../bash/leftovers.ts). */
 	leftovers: Leftovers;
-	/** Processes left in a call's group that were not its jobs (`pid:pgid`): named once, never adopted (../bash/leftovers.ts). */
-	untracked: Set<string>;
+	/** Processes left in a call's group that were not its jobs, by `pid:pgid`: named once, never adopted (../bash/leftovers.ts). */
+	named: Map<string, Named>;
+	/** Workflow runs, by id. */
+	runs: Map<string, Run>;
 	/** The check for the leftovers' end, while there are any. */
 	poll: NodeJS.Timeout | undefined;
 	/** The API of the extension instance loaded last: the one a job's end reports through (none during a reload). */
 	api: ExtensionAPI | undefined;
 }
 
-/** How to stop a call of one tool that moved to the background, as a clause; undefined: nothing to add. */
-export type StopHint = (sessionId: string, callId: string) => string | undefined;
+/** The process group a call of one tool runs in, if any. */
+export type ProcessGroupOf = (sessionId: string, callId: string) => number | undefined;
 
-const state = globalThis as { __harnessJobs?: Map<string, SessionJobs>; __harnessStopHints?: Map<string, StopHint> };
+const state = globalThis as { __harnessJobs?: Map<string, SessionJobs>; __harnessProcessGroups?: Map<string, ProcessGroupOf> };
 
 /**
  * A session's jobs. The state outlives the extension instance that made it (a harness release
@@ -59,7 +74,7 @@ const state = globalThis as { __harnessJobs?: Map<string, SessionJobs>; __harnes
  */
 export function sessionJobs(sessionId: string): SessionJobs {
 	const all = (state.__harnessJobs ??= new Map());
-	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), untracked: new Set(), poll: undefined, api: undefined };
+	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), named: new Map(), runs: new Map(), poll: undefined, api: undefined };
 	const jobs = all.get(sessionId);
 	if (!jobs) {
 		all.set(sessionId, fresh);
@@ -74,12 +89,12 @@ export function dropSession(sessionId: string): void {
 	state.__harnessJobs?.delete(sessionId);
 }
 
-/** Set how calls of `toolName` that moved to the background are stopped (the extension loaded last wins). */
-export function setStopHint(toolName: string, hint: StopHint): void {
-	(state.__harnessStopHints ??= new Map()).set(toolName, hint);
+/** Set how the process group of a call of `toolName` is found (the extension loaded last wins). */
+export function setProcessGroupOf(toolName: string, find: ProcessGroupOf): void {
+	(state.__harnessProcessGroups ??= new Map()).set(toolName, find);
 }
 
-export const stopHintOf = (toolName: string): StopHint | undefined => state.__harnessStopHints?.get(toolName);
+export const processGroupOf = (toolName: string, sessionId: string, callId: string): number | undefined => state.__harnessProcessGroups?.get(toolName)?.(sessionId, callId);
 
 export const textOf = (result: Pick<AgentToolResult<unknown>, "content"> | undefined) =>
 	(result?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
@@ -99,16 +114,18 @@ export const clip = (text: string, max: number) => {
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 };
 
-/** A call in a line: the tool and its arguments (a lone string argument as is, e.g. bash's command). */
-export function callLabel(toolName: string, input: Record<string, unknown>): string {
+/** A call's arguments in a line: a lone string argument as is (e.g. bash's command), else JSON. */
+export function argsText(input: Record<string, unknown>): string {
 	const values = Object.values(input);
-	const args = values.length === 1 && typeof values[0] === "string" ? values[0] : JSON.stringify(input);
-	return `\`${toolName}\` call \`${clip(args, 200)}\``;
+	return values.length === 1 && typeof values[0] === "string" ? values[0] : JSON.stringify(input);
 }
+
+/** A call in a line: the tool and its arguments. */
+export const callLabel = (toolName: string, input: Record<string, unknown>): string => `\`${toolName}\` call \`${clip(argsText(input), 200)}\``;
 
 /** The tool result of a call that moved to the background. */
 export function detachedText(job: Job, reason: DetachReason, output: string, now: number): string {
-	const stop = job.stop === undefined ? "" : ` (${job.stop})`;
+	const stop = job.pgid === undefined ? "" : ` (process group ${job.pgid}; stop it with \`kill -- -${job.pgid}\`)`;
 	const where = `Its latest output is in ${job.log}.`;
 	const after = "When it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Do the work that does not depend on it, or end your turn.";
 	if (reason === "start") return [`\`${job.toolName}\` always runs in the background: the call started and keeps running${stop}. ${where}`, after, ...(output.trim() ? [tail(output, TAIL_LINES)] : [])].join("\n\n");
@@ -176,18 +193,6 @@ export class OutputLog {
 	}
 }
 
-/**
- * Report the session's background work (jobs and leftovers) to the host. Never throws: it also runs
- * outside any call, where a throw would be an unhandled rejection in Pi's process (the API is stale
- * once the session ended).
- */
-export function reportWork(jobs: SessionJobs): void {
-	try {
-		jobs.api?.setBackgroundWork(BACKGROUND_WORK_KEY, jobs.jobs.size + jobs.leftovers.size);
-	} catch (error) {
-		console.error("[background] cannot report background work:", error);
-	}
-}
 
 /** Send `content` to the session as a message that wakes it. Never throws: it runs outside any call. */
 export function wake(jobs: SessionJobs, content: string | (ImageContent | { type: "text"; text: string })[], what: string): void {

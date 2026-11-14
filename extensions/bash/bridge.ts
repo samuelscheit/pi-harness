@@ -32,6 +32,7 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { clip, minutes, type SessionJobs, wake } from "../background/jobs.ts";
+import { reportWork } from "../background/work.ts";
 import { EDIT_BLOCKS_HELP, runEditBlocks } from "./edit-blocks.ts";
 import { type Leftover, release } from "./leftovers.ts";
 
@@ -525,6 +526,8 @@ export async function openBridge(
 				if (command !== undefined) Object.assign(leftover, { command, tool: true });
 				return true;
 			});
+			// The `tool` commands among them are items of their own kind.
+			if (left.some((leftover) => leftover.tool)) reportWork(jobs);
 			phase = "ended";
 			adopted();
 			// Late clients (`tool x &` as the last command still starting) connect while the group lives.

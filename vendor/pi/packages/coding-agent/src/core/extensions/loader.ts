@@ -22,6 +22,7 @@ import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } fr
 import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
+	BackgroundWorkItem,
 	EntryRenderer,
 	Extension,
 	ExtensionAPI,
@@ -461,9 +462,9 @@ function createExtensionAPI(
 			runtime.requestReload();
 		},
 
-		setBackgroundWork(key: string, pending: number): void {
+		setBackgroundWork(key: string, items: readonly BackgroundWorkItem[]): void {
 			assertActive();
-			runtime.setBackgroundWork(key, pending);
+			runtime.setBackgroundWork(key, items);
 		},
 
 		setCacheWarmingHold(untilMs: number | undefined): void {

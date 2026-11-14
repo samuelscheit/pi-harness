@@ -31,7 +31,9 @@ import { delegationsDir, sweepDelegations } from "./delegation.ts";
 
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
 import { INLINE_FILE, type ResumeRequest, type RunEnv, resumeWorkflow, runWorkflow, type ToolOutcome, type WorkflowDetails, type WorkflowResult } from "./run.ts";
-import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, offerInterrupted, recordRun, renderEnd, runHeadline, setLatestApi, showRun, startViews } from "./runs.ts";
+import { sessionJobs } from "../background/jobs.ts";
+import { reportWork } from "../background/work.ts";
+import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, liveUrl, offerInterrupted, recordRun, renderEnd, runHeadline, runName, setLatestApi, showRun, startViews } from "./runs.ts";
 import { type SignatureTool, toolsDeclaration } from "./signatures.ts";
 import { stopRun } from "./stop.ts";
 import { phaseStatus } from "./render.ts";
@@ -105,9 +107,12 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	};
 
 	type Start = { kind: "new"; entry: Parameters<typeof runWorkflow>[0]; budget: number } | { kind: "resume"; request: ResumeRequest };
-	const run = async (start: Start, signal: AbortSignal | undefined, onUpdate: ((r: { content: { type: "text"; text: string }[]; details: WorkflowDetails }) => void) | undefined, ctx: ExtensionToolContext) => {
+	const run = async (callId: string, start: Start, signal: AbortSignal | undefined, onUpdate: ((r: { content: { type: "text"; text: string }[]; details: WorkflowDetails }) => void) | undefined, ctx: ExtensionToolContext) => {
 		const session = ctx.sessionManager;
 		const sessionId = session.getSessionId();
+		// While it runs, the run is background work of the session (../background/work.ts).
+		const jobs = sessionJobs(sessionId);
+		let runId: string | undefined;
 		const llmCache = caches.get(sessionId) ?? caches.set(sessionId, new Map()).get(sessionId)!;
 		const parentSessionFile = session.getSessionFile();
 		const execute = executor(ctx);
@@ -129,11 +134,19 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			onStart: ({ id, attempt }) => {
 				headline = runHeadline(id, attempt, dashboardUrl);
 				recordRun(pi, sessionId, { id, state: "started" });
+				runId = id;
+				jobs.runs.set(id, { id, name: runName(agentDir, id) ?? "inline", callId, startedAt: Date.now(), url: liveUrl(dashboardUrl, id), stop: () => stopRun(agentDir, id, false) });
+				reportWork(jobs);
 				startViews({ agentDir, id, toolNames, execute, dashboardUrl });
 			},
 			onUpdate: (details) => onUpdate?.({ content: [{ type: "text", text: [headline, ...details.log].filter(Boolean).join("\n") }], details }),
 		};
-		const result: WorkflowResult = start.kind === "new" ? await runWorkflow(start.entry, start.budget, env) : await resumeWorkflow(start.request, env);
+		let result: WorkflowResult;
+		try {
+			result = start.kind === "new" ? await runWorkflow(start.entry, start.budget, env) : await resumeWorkflow(start.request, env);
+		} finally {
+			if (runId !== undefined && jobs.runs.delete(runId)) reportWork(jobs);
+		}
 		const { details, usage } = result;
 		recordRun(pi, sessionId, { id: details.id, state: "ended", status: details.status });
 		const text = renderEnd({ agentDir, id: details.id, sessionId, toolNames, execute, live: () => contextLive(ctx), text: result.text });
@@ -180,7 +193,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			stop: Type.Optional(Type.String({ description: "The id of a running run: stop it, keeping its journal for a resume." })),
 			stopChildren: Type.Optional(Type.Boolean({ description: "With stop: cancel its agents too (default: they keep running and their results are recorded)." })),
 		}),
-		execute: async (_id, params, signal, onUpdate, ctx) => {
+		execute: async (callId, params, signal, onUpdate, ctx) => {
 			const modes = [params.code !== undefined && params.resume === undefined, params.resume !== undefined, params.show !== undefined, params.stop !== undefined, params.status !== undefined].filter(Boolean).length;
 			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume (optionally with code), show, status or stop");
 			const answer = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
@@ -194,10 +207,10 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 					...(params.budget !== undefined ? { budget: params.budget } : {}),
 					...(params.code !== undefined ? { code: params.code } : {}),
 				};
-				return run({ kind: "resume", request }, signal, onUpdate, ctx);
+				return run(callId, { kind: "resume", request }, signal, onUpdate, ctx);
 			}
 			if (params.budget === undefined) throw new Error("code needs a budget (USD)");
-			return run({ kind: "new", entry: { source: params.code!, filename: INLINE_FILE, inline: true }, budget: params.budget }, signal, onUpdate, ctx);
+			return run(callId, { kind: "new", entry: { source: params.code!, filename: INLINE_FILE, inline: true }, budget: params.budget }, signal, onUpdate, ctx);
 		},
 	});
 
@@ -212,8 +225,8 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			promptGuidelines: saved.meta.guidelines,
 			// SAFETY: Pi validates arguments against any JSON Schema (pi-schema), not only TypeBox values; metaProblem checked it is an object schema.
 			parameters: saved.meta.parameters as unknown as TSchema,
-			execute: (_id, params, signal, onUpdate, ctx) =>
-				run({ kind: "new", entry: { source: saved.source, filename: saved.file, inline: false, name: saved.name, input: params }, budget: saved.meta.budget }, signal, onUpdate, ctx),
+			execute: (callId, params, signal, onUpdate, ctx) =>
+				run(callId, { kind: "new", entry: { source: saved.source, filename: saved.file, inline: false, name: saved.name, input: params }, budget: saved.meta.budget }, signal, onUpdate, ctx),
 		});
 	};
 

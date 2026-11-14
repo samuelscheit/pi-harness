@@ -123,6 +123,8 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
+import type { BackgroundWorkItem } from "./extensions/types.ts";
+import { validBackgroundWork } from "./background-work.ts";
 import type { ForkBaseMeta } from "./fork-base.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
@@ -240,8 +242,11 @@ export type AgentSessionEvent =
 			/** End of the session's cache warming hold (`pi.setCacheWarmingHold`) while it runs. */
 			holdUntil?: number;
 	  }
-	/** Work extensions keep running outside any run changed (`pi.setBackgroundWork`): a host keeping sessions loaded keeps this one while `pending > 0`. */
-	| { type: "background_work"; pending: number }
+	/**
+	 * Work extensions keep running outside any run changed (`pi.setBackgroundWork`): every item of
+	 * every key, and their number. A host keeping sessions loaded keeps this one while `pending > 0`.
+	 */
+	| { type: "background_work"; pending: number; items: BackgroundWorkItem[] }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -568,7 +573,7 @@ export class AgentSession {
 	/** The last cache warming state emitted, to emit changes only. */
 	private _cacheWarmingEmitted?: string;
 	/** Pending background work by extension key (`pi.setBackgroundWork`); kept across reloads. */
-	private _backgroundWork = new Map<string, number>();
+	private _backgroundWork = new Map<string, readonly BackgroundWorkItem[]>();
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -3948,7 +3953,7 @@ export class AgentSession {
 				getSettings: () => this.settingsManager.getSettings(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				requestReload: () => this.requestReload(),
-				setBackgroundWork: (key, pending) => this.setBackgroundWork(key, pending),
+				setBackgroundWork: (key, items) => this.setBackgroundWork(key, items),
 				setCacheWarmingHold: (untilMs) => this.setCacheWarmingHold(untilMs),
 				getCacheWarmingStatus: () => this.cacheWarmingStatus,
 				refreshTools: () => this._refreshToolRegistry(),
@@ -4185,21 +4190,22 @@ export class AgentSession {
 		});
 	}
 
-	/** Pending background work over all keys (see ExtensionAPI.setBackgroundWork). */
-	get backgroundWork(): number {
-		let total = 0;
-		for (const pending of this._backgroundWork.values()) total += pending;
-		return total;
+	/** Pending background work over all keys, in the order the keys were first set (see ExtensionAPI.setBackgroundWork). */
+	get backgroundWork(): BackgroundWorkItem[] {
+		return [...this._backgroundWork.values()].flat();
 	}
 
-	/** Set `key`'s pending background work; emits `background_work` when the total changes. */
-	setBackgroundWork(key: string, pending: number): void {
-		if (!Number.isInteger(pending) || pending < 0) throw new Error(`Invalid background work: ${pending}`);
-		const before = this.backgroundWork;
-		if (pending === 0) this._backgroundWork.delete(key);
-		else this._backgroundWork.set(key, pending);
+	/** Set `key`'s pending background work; emits `background_work` when the items of all keys change. */
+	setBackgroundWork(key: string, items: readonly BackgroundWorkItem[]): void {
+		const checked = validBackgroundWork(items);
+		const others = new Set([...this._backgroundWork].flatMap(([k, work]) => (k === key ? [] : work.map((item) => item.id))));
+		const taken = checked.find((item) => others.has(item.id));
+		if (taken) throw new Error(`Invalid background work: id ${JSON.stringify(taken.id)} is another key's`);
+		const before = JSON.stringify(this.backgroundWork);
+		if (checked.length === 0) this._backgroundWork.delete(key);
+		else this._backgroundWork.set(key, checked);
 		const after = this.backgroundWork;
-		if (after !== before) this._emit({ type: "background_work", pending: after });
+		if (JSON.stringify(after) !== before) this._emit({ type: "background_work", pending: after.length, items: after });
 	}
 
 	/**

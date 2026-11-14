@@ -102,11 +102,13 @@ async function renderPage(agentDir: string, id: string, execute: Executor, title
 	}
 }
 
-const titleOf = (agentDir: string, id: string, when: string) => {
+/** The run's saved workflow; undefined for an inline script. */
+export const runName = (agentDir: string, id: string): string | undefined => {
 	const header = readJournal(journalPath(agentDir, id))[0];
-	const name = header?.t === "run" ? (header.entry.name ?? "workflow") : "workflow";
-	return `${name} ${id} · ${when}`;
+	return header?.t === "run" ? header.entry.name : undefined;
 };
+
+const titleOf = (agentDir: string, id: string, when: string) => `${runName(agentDir, id) ?? "workflow"} ${id} · ${when}`;
 
 export interface ViewTarget {
 	agentDir: string;

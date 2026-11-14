@@ -5,7 +5,8 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
 import { sessionJobs } from "../extensions/background/jobs.ts";
-import { adopt, adoptLeftovers, commandArgs, commandsOf, defaultPs, endedText, type Leftovers, leftText, parseCommands, parseTable, type Ps, rootsOf, sweep, TABLE_ARGS, untrackedRoots, untrackedText } from "../extensions/bash/leftovers.ts";
+import { adopt, adoptLeftovers, endedText, type Leftovers, leftText, rootsOf, sweep, untrackedRoots, untrackedText } from "../extensions/bash/leftovers.ts";
+import { commandArgs, commandsOf, defaultPs, parseCommands, parseTable, type Ps, TABLE_ARGS, treeOf } from "../extensions/lib/ps.ts";
 import { withHugePs } from "./fixtures/huge-ps.ts";
 
 // Group 100: the shell (100) has exited; it left `sleep 30` (101, reparented to 1) and a subshell
@@ -38,6 +39,13 @@ describe("reading ps", () => {
 		assert.deepEqual(rootsOf(running, 100).map((r) => r.pid), [100]);
 	});
 
+	test("treeOf: a process and every process below it, parents first, whatever their group", () => {
+		const rows = parseTable(["  10     1   10 S", "  11    10   10 S", "  12    11   12 S", "  13    12   10 S", "  14     1   10 S"].join("\n"));
+		assert.deepEqual(treeOf(rows, 10), [10, 11, 12, 13]);
+		assert.deepEqual(treeOf(rows, 14), [14]);
+		assert.deepEqual(treeOf(rows, 99), [99], "an unknown pid is itself");
+	});
+
 	test("command lines are asked for only for the untracked roots", async () => {
 		const asked: (readonly string[])[] = [];
 		const ps: Ps = async (args) => {
@@ -45,12 +53,12 @@ describe("reading ps", () => {
 			return args === TABLE_ARGS ? TABLE : [...COMMANDS].filter(([pid]) => args[3]!.split(",").includes(String(pid))).map(([pid, c]) => `${pid} ${c}`).join("\n");
 		};
 		const jobs = sessionJobs(`asked-${process.pid}`);
-		const adopted = await adoptLeftovers(jobs, 100, "cmd", ps, 60_000);
+		const adopted = await adoptLeftovers(jobs, 100, { startedBy: "cmd" }, ps, 60_000);
 		clearInterval(jobs.poll);
 		assert.deepEqual(adopted.left.map((l) => [l.pid, l.command]), [[101, "sleep 30"], [102, "bash -c make"]]);
 		assert.deepEqual(asked, [TABLE_ARGS, commandArgs([101, 102])]);
 		asked.length = 0;
-		assert.deepEqual(await adoptLeftovers(jobs, 100, "again", ps, 60_000), { left: [], untracked: [] });
+		assert.deepEqual(await adoptLeftovers(jobs, 100, { startedBy: "again" }, ps, 60_000), { left: [], untracked: [] });
 		assert.deepEqual(asked, [TABLE_ARGS], "nothing new: no command lines asked for");
 		assert.deepEqual(await commandsOf(ps, []), new Map());
 		assert.deepEqual(asked, [TABLE_ARGS], "no pids: ps does not run");
@@ -69,7 +77,7 @@ describe("reading ps", () => {
 			await withHugePs(async () => {
 				assert.ok((await defaultPs(TABLE_ARGS)).length > 1024 * 1024, "the fake ps lists more than 1 MB");
 				const jobs = sessionJobs(`huge-${process.pid}`);
-				const adopted = await adoptLeftovers(jobs, pgid, "sleep 30 &", defaultPs, 60_000);
+				const adopted = await adoptLeftovers(jobs, pgid, { startedBy: "sleep 30 &" }, defaultPs, 60_000);
 				clearInterval(jobs.poll);
 				assert.deepEqual(adopted.left.map((l) => [l.pid, l.pgid, l.command]), [[sleep, pgid, "sleep 30"]]);
 				// A pid that exited meanwhile has no command line; ps's exit code 1 when none is left is not an error.
@@ -97,31 +105,39 @@ describe("adopting and sweeping", () => {
 	test("adopt takes the group's roots once, with the command that left them", () => {
 		const leftovers: Leftovers = new Map();
 		assert.deepEqual(untrackedRoots(leftovers, rows, [100, 100]), [101, 102]);
-		const adopted = adopt(leftovers, rows, 100, "sleep 30 & make &", 1000, COMMANDS);
+		const adopted = adopt(leftovers, rows, 100, { startedBy: "sleep 30 & make &" }, 1000, COMMANDS);
 		assert.deepEqual(adopted, [
 			{ pid: 101, pgid: 100, command: "sleep 30", startedBy: "sleep 30 & make &", adoptedAt: 1000 },
 			{ pid: 102, pgid: 100, command: "bash -c make", startedBy: "sleep 30 & make &", adoptedAt: 1000 },
 		]);
 		assert.deepEqual(untrackedRoots(leftovers, rows, [100]), []);
-		assert.deepEqual(adopt(leftovers, rows, 100, "again", 2000, COMMANDS), [], "already tracked");
+		assert.deepEqual(adopt(leftovers, rows, 100, { startedBy: "again" }, 2000, COMMANDS), [], "already tracked");
 		assert.equal(leftovers.size, 2);
+	});
+
+	test("a leftover keeps the bash call that left it, and so do the processes it leaves in turn", () => {
+		const leftovers: Leftovers = new Map();
+		const [sleep] = adopt(leftovers, rows, 100, { startedBy: "cmd", callId: "toolu_1" }, 0, COMMANDS);
+		assert.deepEqual(sleep, { pid: 101, pgid: 100, command: "sleep 30", startedBy: "cmd", callId: "toolu_1", adoptedAt: 0 });
+		const [ended] = sweep(leftovers, parseTable(["  101     1   100 S", "  103     1   100 R"].join("\n")), 5, COMMANDS);
+		assert.deepEqual(ended!.orphans.map((o) => [o.pid, o.callId]), [[103, "toolu_1"]]);
 	});
 
 	test("a root without a command line exited after the listing: not adopted", () => {
 		const leftovers: Leftovers = new Map();
-		assert.deepEqual(adopt(leftovers, rows, 100, "cmd", 0, new Map([[102, "bash -c make"]])).map((l) => l.pid), [102]);
+		assert.deepEqual(adopt(leftovers, rows, 100, { startedBy: "cmd" }, 0, new Map([[102, "bash -c make"]])).map((l) => l.pid), [102]);
 	});
 
 	test("sweep reports each ended process once, and adopts what it left running", () => {
 		const leftovers: Leftovers = new Map();
-		adopt(leftovers, rows, 100, "cmd", 0, COMMANDS);
+		adopt(leftovers, rows, 100, { startedBy: "cmd" }, 0, COMMANDS);
 		assert.deepEqual(sweep(leftovers, rows, 10, COMMANDS), [], "nothing ended");
 		// 102 ended; its make (103) is now an orphan in the group.
 		const after = parseTable(["  101     1   100 S", "  103     1   100 R"].join("\n"));
 		const [first, ...rest] = sweep(leftovers, after, 5000, COMMANDS);
 		assert.equal(rest.length, 0);
 		assert.equal(first!.ended.pid, 102);
-		assert.deepEqual(first!.orphans.map((o) => [o.pid, o.command, o.startedBy]), [[103, "make", "cmd"]]);
+		assert.deepEqual(first!.orphans.map((o) => [o.pid, o.command, o.startedBy, o.callId]), [[103, "make", "cmd", undefined]]);
 		assert.deepEqual([...leftovers.keys()].sort(), [101, 103]);
 		// Both end in the same check: two reports.
 		assert.deepEqual(sweep(leftovers, [], 9000, new Map()).map((e) => e.ended.pid).sort(), [101, 103]);
@@ -134,29 +150,31 @@ describe("adopting and sweeping", () => {
 			args === TABLE_ARGS ? table : [...COMMANDS].filter(([pid]) => args[3]!.split(",").includes(String(pid))).map(([pid, c]) => `${pid} ${c}`).join("\n");
 		const jobs = sessionJobs(`untracked-${process.pid}`);
 		// 101 (`sleep 30`) is the shell's job; 102 (`bash -c make`) was started by a program.
-		const first = await adoptLeftovers(jobs, 100, "sleep 30 & make", ps, 60_000, (pid) => pid === 101);
+		const first = await adoptLeftovers(jobs, 100, { startedBy: "sleep 30 & make", callId: "toolu_2" }, ps, 60_000, (pid) => pid === 101);
 		clearInterval(jobs.poll);
 		jobs.poll = undefined;
 		assert.deepEqual(first.left.map((l) => l.pid), [101]);
 		assert.deepEqual(first.untracked, [{ pid: 102, command: "bash -c make" }]);
-		assert.deepEqual([...jobs.untracked], ["102:100"]);
-		assert.deepEqual(await adoptLeftovers(jobs, 100, "again", ps, 60_000, () => false), { left: [], untracked: [] }, "named once");
+		assert.deepEqual([...jobs.named.keys()], ["102:100"]);
+		const named = jobs.named.get("102:100")!;
+		assert.deepEqual({ ...named, namedAt: 0 }, { pid: 102, pgid: 100, command: "bash -c make", startedBy: "sleep 30 & make", callId: "toolu_2", namedAt: 0 }, "kept with what /jobs lists");
+		assert.deepEqual(await adoptLeftovers(jobs, 100, { startedBy: "again" }, ps, 60_000, () => false), { left: [], untracked: [] }, "named once");
 		// The job ends while 102 still runs: 102 is no orphan to adopt.
 		const rows = parseTable(["  102     1   100 S", "  103   102   100 R"].join("\n"));
-		assert.deepEqual(sweep(jobs.leftovers, rows, 1, COMMANDS, jobs.untracked).map((e) => [e.ended.pid, e.orphans.length]), [[101, 0]]);
+		assert.deepEqual(sweep(jobs.leftovers, rows, 1, COMMANDS, jobs.named).map((e) => [e.ended.pid, e.orphans.length]), [[101, 0]]);
 		// Once 102 exits, its pid may be adopted again (reused by a job of a later call).
 		table = "  102     1   100 S\n";
-		await adoptLeftovers(jobs, 999, "other", ps, 60_000);
-		assert.deepEqual([...jobs.untracked], ["102:100"], "still running");
+		await adoptLeftovers(jobs, 999, { startedBy: "other" }, ps, 60_000);
+		assert.deepEqual([...jobs.named.keys()], ["102:100"], "still running");
 		table = "";
-		await adoptLeftovers(jobs, 999, "other", ps, 60_000);
-		assert.deepEqual([...jobs.untracked], [], "exited: forgotten");
+		await adoptLeftovers(jobs, 999, { startedBy: "other" }, ps, 60_000);
+		assert.deepEqual([...jobs.named.keys()], [], "exited: forgotten");
 		clearInterval(jobs.poll);
 	});
 
 	test("a pid reused by a process in another group counts as ended", () => {
 		const leftovers: Leftovers = new Map();
-		adopt(leftovers, rows, 100, "cmd", 0, COMMANDS);
+		adopt(leftovers, rows, 100, { startedBy: "cmd" }, 0, COMMANDS);
 		const reused = parseTable(["  101     1   555 S", "  102     1   100 S", "  103   102   100 R"].join("\n"));
 		assert.deepEqual(sweep(leftovers, reused, 1, COMMANDS).map((e) => e.ended.pid), [101]);
 	});

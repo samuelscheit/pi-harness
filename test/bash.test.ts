@@ -378,8 +378,8 @@ const jobMessages = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "
 const toolTexts = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "toolResult" ? [m.content.map((c) => (c.type === "text" ? c.text : "")).join("")] : []));
 const lastText = (context: { messages: readonly unknown[] }) => JSON.stringify(context.messages.at(-1));
 const jobsOf = (s: AgentSession) => sessionJobs(s.sessionManager.getSessionId()).jobs;
-/** A bash job's process group, from how to stop it. */
-const pgidOf = (job: Job | undefined) => Number(/process group (\d+)/.exec(job?.stop ?? "")?.[1]);
+/** A bash job's process group. */
+const pgidOf = (job: Job | undefined) => job?.pgid ?? Number.NaN;
 const alive = (pgid: number) => {
 	try {
 		process.kill(-pgid, 0);

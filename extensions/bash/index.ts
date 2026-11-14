@@ -25,11 +25,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBashToolDefinition, type ExtensionAPI, type ExtensionToolContext, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { BACKGROUND_GUIDELINE, DETACH_AFTER_MS } from "../background/index.ts";
-import { sessionJobs, setStopHint } from "../background/jobs.ts";
+import { sessionJobs, setProcessGroupOf } from "../background/jobs.ts";
 import { shellQuote as quote } from "../lib/process.ts";
 import { clientCommand, openBridge, TOOL_GUIDELINE, toolBinDir, withImages } from "./bridge.ts";
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
-import { adoptLeftovers, defaultPs, leftText, type Ps, type Untracked, untrackedText } from "./leftovers.ts";
+import { defaultPs, type Ps } from "../lib/ps.ts";
+import { adoptLeftovers, leftText, type Untracked, untrackedText } from "./leftovers.ts";
 
 /** The file the shell's jobs are written to, next to the group file. */
 export const jobsFile = (file: string) => `${file}.jobs`;
@@ -110,10 +111,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 	const builtin = createBashToolDefinition(process.cwd());
 	const binDir = toolBinDir();
 
-	setStopHint("bash", (sessionId, callId) => {
-		const pgid = readGroup(groupFile(sessionId, callId));
-		return pgid === undefined ? undefined : `process group ${pgid}; stop it with \`kill -- -${pgid}\``;
-	});
+	setProcessGroupOf("bash", (sessionId, callId) => readGroup(groupFile(sessionId, callId)));
 
 	// A command using `setsid` is refused here (detach.ts); Pi then runs no later handler.
 	pi.on("tool_call", (event, ctx) => {
@@ -144,7 +142,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 		rmSync(jobsFile(file), { force: true });
 		const isJob = (pid: number, line: string) => shellJobs === undefined || shellJobs.has(pid) || clientCommand(line) !== undefined;
 		const none = { left: [], untracked: [] as Untracked[] };
-		const adopted = pgid === undefined ? none : await adoptLeftovers(sessionJobs(sessionId), pgid, command, ps, pollMs, isJob).catch(() => none);
+		const adopted = pgid === undefined ? none : await adoptLeftovers(sessionJobs(sessionId), pgid, { startedBy: command, callId }, ps, pollMs, isJob).catch(() => none);
 		return { pgid, ...adopted };
 	};
 

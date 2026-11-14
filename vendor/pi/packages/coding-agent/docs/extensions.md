@@ -1969,12 +1969,33 @@ const current = pi.getThinkingLevel();  // "off" | "minimal" | "low" | "medium" 
 pi.setThinkingLevel("high");
 ```
 
-### pi.setBackgroundWork(key, pending)
+### pi.setBackgroundWork(key, items)
 
-Report how much work your extension keeps running for the session outside any agent run, such as jobs that wake the session with `pi.sendMessage(..., { triggerTurn: true })` when they end. The session sums all keys and emits `{ type: "background_work", pending }` whenever the total changes; RPC mode forwards it, so a host that unloads idle sessions (t3) keeps this one loaded while `pending > 0`. Set `0` when the work is done. The count is kept across reloads, and a reloaded extension sets its key again.
+Report the work your extension keeps running for the session outside any agent run, such as jobs that wake the session with `pi.sendMessage(..., { triggerTurn: true })` when they end: one item per job, replacing what `key` reported before. The session emits `{ type: "background_work", pending, items }` with the items of all keys (and their number as `pending`) whenever they change; RPC mode forwards it, so a host that unloads idle sessions (t3) keeps this one loaded while `pending > 0`, and can show each job. Set `[]` when the work is done. The items are kept across reloads, and a reloaded extension sets its key again.
+
+| Field | | |
+|---|---|---|
+| `id` | required | Stable while the work runs, unique within the session over all keys (another key's id is refused). |
+| `kind` | required | What it is, in your extension's terms (the harness uses `call`, `tool`, `process`, `workflow`). |
+| `label` | required | A short line naming it for a person, e.g. `bash: pytest -x tests/`. |
+| `startedAt` | required | When it started, epoch milliseconds. |
+| `command` | optional | The shell command it runs. |
+| `pid`, `processGroup` | optional | Its process, and the group that stops it. |
+| `logPath` | optional | A file with its latest output. |
+| `url` | optional | A page showing it live. |
+| `toolCallId` | optional | The tool call that started it. |
+
+Malformed items throw `Invalid background work: …`; unknown fields are dropped.
 
 ```typescript
-pi.setBackgroundWork("my-jobs", jobs.size);
+pi.setBackgroundWork("my-jobs", [...jobs.values()].map((job) => ({
+	id: job.id,
+	kind: "process",
+	label: `server: ${job.name}`,
+	command: job.command,
+	startedAt: job.startedAt,
+	pid: job.pid,
+})));
 ```
 
 ### pi.setCacheWarmingHold(untilMs) and pi.getCacheWarmingStatus()

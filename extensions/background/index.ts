@@ -11,8 +11,9 @@
 // arrives while it runs. The tool returns at once with the output so far and a log of the latest
 // output. The call keeps running and, when it ends, its normal result (images included) reaches the
 // session as a message that starts a run if the session is idle. While jobs run, the session
-// reports background work (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated
-// child's run open.
+// reports background work (`pi.setBackgroundWork`, one item per job: work.ts), so t3 keeps it
+// loaded, keeps a delegated child's run open and lists each job. `/jobs` lists the same items and
+// `/jobs stop <n>` stops one.
 //
 // Some tools (`BACKGROUND_TOOLS`: `workflow`) run long as a rule and their caller rarely needs the
 // result before other work: a model's call of one moves to the background at its first progress
@@ -45,12 +46,12 @@ import {
 	type Job,
 	type Outcome,
 	OutputLog,
-	reportWork,
+	processGroupOf,
 	sessionJobs,
-	stopHintOf,
 	textOf,
 	wake,
 } from "./jobs.ts";
+import { jobsText, liveNamed, reportWork, stopItem, workItems } from "./work.ts";
 
 /** How long a call runs in the foreground before it moves to the background. */
 export const DETACH_AFTER_MS = 2 * 60_000;
@@ -104,6 +105,22 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 		return dir;
 	};
+
+	pi.registerCommand("jobs", {
+		description: "List this session's background work: /jobs; stop one: /jobs stop <number>",
+		getArgumentCompletions: (prefix) => ("stop".startsWith(prefix) ? [{ value: "stop", label: "stop" }] : null),
+		handler: async (args, ctx) => {
+			const jobs = sessionJobs(ctx.sessionManager.getSessionId());
+			const [action, which, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			try {
+				if (action === undefined) return ctx.ui.notify(jobsText(workItems(jobs), await liveNamed(jobs), Date.now()), "info");
+				if (action !== "stop" || which === undefined || rest.length) return ctx.ui.notify("Usage: /jobs (list) | /jobs stop <number>", "warning");
+				ctx.ui.notify(await stopItem(workItems(jobs), which), "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+			}
+		},
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		const jobs = sessionJobs(ctx.sessionManager.getSessionId());
@@ -177,7 +194,7 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 			toolName,
 			input,
 			startedAt,
-			stop: stopHintOf(toolName)?.(sessionId, callId),
+			pgid: processGroupOf(toolName, sessionId, callId),
 			log: join(logDir(sessionId), `${encodeURIComponent(callId)}.log`),
 			controller,
 		};

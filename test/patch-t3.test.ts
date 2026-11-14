@@ -143,6 +143,9 @@ describe("patchBundle", () => {
 		"delegate-template-tool",
 		"delegate-template-runtime",
 		"session-questions",
+		"background-items",
+		"background-items-contract",
+		"background-items-caller",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -153,15 +156,20 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('if (event["type"] === "cache_warming")'));
 		assert.ok(text.includes('if (method === "dismiss")'));
 		assert.ok(!text.includes("cancelPendingPrompts(completedAt)"), "turn end still cancels dialogs");
-		assert.ok(text.includes("cacheWarmingPending || backgroundWorkPending || pendingPrompts.size > 0"));
+		assert.ok(text.includes("cacheWarmingPending || backgroundWork.length > 0 || pendingPrompts.size > 0"));
 		assert.ok(text.includes('if (event["type"] === "background_work")'));
-		assert.ok(text.includes("(cacheWarmingPending || backgroundWorkPending) && threadState?.providerThread.id === providerThread.id"));
+		assert.ok(text.includes("(cacheWarmingPending || backgroundWork.length > 0) && threadState?.providerThread.id === providerThread.id"));
 		assert.ok(text.includes('method !== "editor" && method !== "questions") {'), "a questions dialog is still ignored");
 		assert.ok(text.includes('"dismiss",\n\t\t\t\t\t"questions"\n\t\t\t\t].includes'), "a questions dialog waits for a turn owner");
 		assert.ok(text.includes('questions: method === "questions" ? piQuestions(nativeRequestId, event)'));
 		assert.ok(text.includes('\t\t\t...environment,\n\t\t\tPI_RPC_DIALOGS: "questions",\n'), "Pi learns that t3 renders questions dialogs");
-		assert.ok(text.includes('pending > 0;\n\t\t\t\t\tyield* publishBackgroundWork();\n\t\t\t\t\treturn;'), "background work is published on the thread");
-		assert.ok(text.includes("pendingBackgroundTasks: backgroundWorkPending ? [PI_BACKGROUND_WORK_TASK] : []"), "a thread attached during background work lists it");
+		assert.ok(text.includes('backgroundWork = piBackgroundTasks(event["items"], turnItemOfToolCall);\n\t\t\t\t\tyield* publishBackgroundWork(previous);\n\t\t\t\t\treturn;'), "each item is published on the thread");
+		assert.ok(text.includes("forkedFrom: null,\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork,"), "a thread attached during background work lists its items");
+		assert.ok(text.includes('status: "idle",\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork,'), "an existing thread lists this process's items, not an earlier one's");
+		assert.ok(!text.includes("PI_BACKGROUND_WORK_TASK") && !text.includes("backgroundWorkPending"), "no fixed task, no count flag");
+		assert.ok(text.includes("\titemId: optional(TurnItemId),\n"), "the contract takes a task's turn item");
+		assert.ok(text.includes("...providerThread.providerInstanceId === void 0 ? {} : { providerInstanceId: providerThread.providerInstanceId },"), "every reported task carries its instance");
+		assert.ok(text.includes("(task) => task.providerInstanceId === providerInstanceId /* providerOwnedWorkIsLive */"), "any provider-reported task keeps the caller live");
 		assert.ok(text.indexOf("const publishBackgroundWork") < text.indexOf("const updateProviderThread"));
 		// delegate_task with fork: the tool, its command, the child's spawn transfer and its turn start.
 		assert.ok(text.includes("forkThreadId: optional(ThreadId.annotate("), "the tool takes forkThreadId");
@@ -190,6 +198,17 @@ describe("patchBundle", () => {
 		const { text, applied } = patchBundle(once.text);
 		assert.deepEqual(applied, ALL.slice(1));
 		assert.equal(text, patchBundle(bundle).text);
+	});
+
+	test("a bundle patched before background-items (the fixed task) gets only those, and loses the fixed task", () => {
+		const items = (patch: Patch) => patch.name.startsWith("background-items");
+		const before = patchBundle(bundle, PATCHES.filter((patch) => !items(patch)));
+		assert.ok(before.text.includes("PI_BACKGROUND_WORK_TASK"));
+		const { text, applied } = patchBundle(before.text);
+		assert.deepEqual(applied, ["background-items", "background-items-contract", "background-items-caller"]);
+		assert.equal(text, patchBundle(bundle).text);
+		assert.ok(!text.includes("PI_BACKGROUND_WORK_TASK") && !text.includes("pi-background-work"));
+		assert.deepEqual(patchBundle(text).applied, [], "the earlier patches' markers survive it");
 	});
 
 	test("refuses a bundle where an anchor is missing or ambiguous, naming the patch", () => {
@@ -236,6 +255,37 @@ describe("patchBundle", () => {
 		assert.deepEqual(piUiResponse(pending, undefined, { "r1:1": "typed", "r1:0": ["A"] }), { values: [null, "typed"] });
 		assert.deepEqual(piUiResponse(pending, undefined, undefined), { cancelled: true });
 		assert.deepEqual(piUiResponse({ method: "select", questionId: "q" }, undefined, { q: "A" }), { value: "A" });
+
+		// Each Pi background item as a pending task, run as bundled (with the bundle's record helpers).
+		const recordHelpers = source("function piRecordField(", "function parsePiModelSlug(");
+		const isNumber = /return ([\w$]+)\(value\) && Number\.isFinite/.exec(recordHelpers)![1]!;
+		const { piBackgroundTasks, piSameFlatRecords } = new Function(
+			isObject,
+			isString,
+			isNumber,
+			`${recordHelpers}\n${source("const piBackgroundClock", "const STREAM_FLUSH_MS")}\nreturn { piBackgroundTasks, piSameFlatRecords };`,
+		)((v: unknown) => typeof v === "object" && v !== null, (v: unknown) => typeof v === "string", (v: unknown) => typeof v === "number");
+		const startedAt = Date.UTC(2026, 10, 14, 13, 2, 11);
+		const clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(startedAt);
+		const tasks = piBackgroundTasks(
+			[
+				{ id: "toolu_1", kind: "call", label: "bash: pytest -x", command: "pytest -x", startedAt, processGroup: 42, logPath: "/tmp/j/toolu_1.log", toolCallId: "toolu_1" },
+				{ id: "process-7", kind: "process", label: "process: npm run dev", command: "npm run dev", startedAt, pid: 7, processGroup: 5, toolCallId: "toolu_2" },
+				{ id: "toolu_3", kind: "call", label: "workflow: inline run r1", startedAt, logPath: "/tmp/j/toolu_3.log", url: "http://127.0.0.1:4317/workflows/r1", toolCallId: "toolu_3" },
+				{ id: "", label: "no id" },
+				null,
+			],
+			(toolCallId: string) => `item:${toolCallId}`,
+		);
+		assert.deepEqual(tasks, [
+			{ taskId: "toolu_1", kind: "command", description: `bash: pytest -x · started ${clock} · process group 42 · log /tmp/j/toolu_1.log`, command: "pytest -x", itemId: "item:toolu_1", awaited: true },
+			{ taskId: "process-7", kind: "command", description: `process: npm run dev · started ${clock} · pid 7 (group 5)`, command: "npm run dev", itemId: "item:toolu_2", awaited: true },
+			{ taskId: "toolu_3", kind: "background_task", description: `workflow: inline run r1 · started ${clock} · log /tmp/j/toolu_3.log · http://127.0.0.1:4317/workflows/r1`, itemId: "item:toolu_3", awaited: true },
+		]);
+		assert.deepEqual(piBackgroundTasks(undefined, String), []);
+		assert.equal(piSameFlatRecords(tasks, tasks.map((task: object) => ({ ...task }))), true);
+		assert.equal(piSameFlatRecords(tasks, tasks.slice(1)), false);
+		assert.equal(piSameFlatRecords([{ a: 1 }], [{ a: 1, b: 2 }]), false);
 
 		// The forked task's first message, as the patched MCP service writes it.
 		const taskPrompt = new Function(`${between(server, "function taskPrompt(", "// src/mcp/")}\nreturn taskPrompt;`)();
@@ -392,7 +442,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -410,13 +460,13 @@ describe("keeping t3 patched", () => {
 			const app = join(dir, "T3 Test.app");
 			const archive = join(app, "Contents/Resources/app.asar");
 			mkdirSync(dirname(archive), { recursive: true });
-			// An archive patched before the delegate_task patches existed: only the adapter chunk is patched.
-			const fork = (patch: Patch) => patch.name.startsWith("delegate-");
+			// An archive patched before the delegate_task and background-items patches existed: only the adapter chunk is patched.
+			const fork = (patch: Patch) => patch.name.startsWith("delegate-") || patch.name.startsWith("background-items");
 			const adapterChunk = "apps/server/dist/chunk0.mjs";
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime;/);
+			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 

@@ -24,9 +24,8 @@
 // A process outside the group (`setsid`, a daemon that forks into its own session) is not seen:
 // `setsid` is refused (detach.ts).
 //
-// `ps` lists every process with numbers only (pid, parent, group, state), and command lines only
-// for the processes adopted: command lines run to hundreds of kilobytes each (test runners, browsers),
-// so listing them all exceeded child_process's output limit when many processes ran (ENOBUFS).
+// `ps` lists every process with numbers only, and command lines only for the processes adopted
+// (../lib/ps.ts).
 //
 // A non-child's exit code is unknown: the message says when it ended, and its output is wherever
 // the command redirected it. Leftovers stop with the session (not on a harness reload;
@@ -37,50 +36,9 @@
 // keeps every end reported once: whoever removes a leftover from the map reports it, the sweep
 // here when the process is gone, the bridge (`release`) when the call answers or its client dies.
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { clip, minutes, reportWork, type SessionJobs, wake } from "../background/jobs.ts";
-
-/** One live process: its pid, parent and group. */
-export interface PsRow {
-	pid: number;
-	ppid: number;
-	pgid: number;
-}
-
-/** Runs `ps` with `args`, resolving to its output. */
-export type Ps = (args: readonly string[]) => Promise<string>;
-
-/** Every process, numbers only: some 25 bytes a process. */
-export const TABLE_ARGS = ["-A", "-o", "pid=,ppid=,pgid=,stat="];
-/** The command lines of `pids`. */
-export const commandArgs = (pids: readonly number[]) => ["-o", "pid=,command=", "-p", pids.join(",")];
-
-/** The live processes (zombies excluded) in `ps` output with {@link TABLE_ARGS}. */
-export function parseTable(ps: string): PsRow[] {
-	const rows: PsRow[] = [];
-	for (const line of ps.split("\n")) {
-		const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
-		if (!match || match[4]!.startsWith("Z")) continue;
-		rows.push({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]) });
-	}
-	return rows;
-}
-
-/** Command line by pid in `ps` output with {@link commandArgs}. */
-export function parseCommands(ps: string): Map<number, string> {
-	const commands = new Map<number, string>();
-	for (const line of ps.split("\n")) {
-		const match = /^\s*(\d+)\s(.*)$/.exec(line);
-		if (match) commands.set(Number(match[1]), match[2]!.trim());
-	}
-	return commands;
-}
-
-/** The command lines of `pids`; a process that exited meanwhile has none. */
-export async function commandsOf(ps: Ps, pids: readonly number[]): Promise<Map<number, string>> {
-	return pids.length === 0 ? new Map() : parseCommands(await ps(commandArgs(pids)));
-}
+import { clip, minutes, type SessionJobs, wake } from "../background/jobs.ts";
+import { reportWork } from "../background/work.ts";
+import { commandsOf, type Ps, type PsRow, parseTable, TABLE_ARGS } from "../lib/ps.ts";
 
 /** The processes of group `pgid` whose parent is not a live process of the group: the jobs left in it. */
 export function rootsOf(rows: readonly PsRow[], pgid: number): PsRow[] {
@@ -89,12 +47,17 @@ export function rootsOf(rows: readonly PsRow[], pgid: number): PsRow[] {
 	return group.filter((r) => !pids.has(r.ppid));
 }
 
-export interface Leftover {
+/** What left a process running: the bash command as the agent wrote it, and its call. */
+export interface Origin {
+	startedBy: string;
+	/** The bash call (from an older release's state: unknown). */
+	callId?: string;
+}
+
+export interface Leftover extends Origin {
 	pid: number;
 	pgid: number;
 	command: string;
-	/** The bash command that left it, as the agent wrote it. */
-	startedBy: string;
 	adoptedAt: number;
 	/** A `tool` command: the bridge reports its end with its exit code and result. */
 	tool?: boolean;
@@ -129,6 +92,15 @@ export interface Untracked {
 	command: string;
 }
 
+/** An untracked process as the session keeps it (named once, listed by /jobs while it runs), by `pid:pgid`. */
+export interface Named extends Untracked, Origin {
+	pgid: number;
+	namedAt: number;
+}
+
+/** Keys of processes not to adopt, by `pid:pgid`. */
+type Skipped = Pick<ReadonlySet<string>, "has">;
+
 /** The note a call's result gets when programs it ran left processes running. */
 export function untrackedText(processes: readonly Untracked[]): string {
 	return [
@@ -146,16 +118,16 @@ export const untrackedRoots = (leftovers: Leftovers, rows: readonly PsRow[], pgi
 	[...new Set(pgids)].flatMap((pgid) => rootsOf(rows, pgid).filter((row) => !leftovers.has(row.pid)).map((row) => row.pid));
 
 /**
- * Adopt the jobs left in group `pgid` (those not tracked yet, nor `skipped`, by `pid:pgid`) by
- * `startedBy`; returns the new ones. `commands` has the command lines of {@link untrackedRoots}; a
+ * Adopt the jobs left in group `pgid` (those not tracked yet, nor `skipped`, by `pid:pgid`) by the
+ * command `by`; returns the new ones. `commands` has the command lines of {@link untrackedRoots}; a
  * root without one has exited since.
  */
-export function adopt(leftovers: Leftovers, rows: readonly PsRow[], pgid: number, startedBy: string, now: number, commands: ReadonlyMap<number, string>, skipped: ReadonlySet<string> = new Set()): Leftover[] {
+export function adopt(leftovers: Leftovers, rows: readonly PsRow[], pgid: number, by: Origin, now: number, commands: ReadonlyMap<number, string>, skipped: Skipped = new Set()): Leftover[] {
 	const adopted: Leftover[] = [];
 	for (const row of rootsOf(rows, pgid)) {
 		const command = commands.get(row.pid);
 		if (leftovers.has(row.pid) || command === undefined || skipped.has(key(row))) continue;
-		const leftover = { pid: row.pid, pgid, command, startedBy, adoptedAt: now };
+		const leftover: Leftover = { pid: row.pid, pgid, command, startedBy: by.startedBy, ...(by.callId === undefined ? {} : { callId: by.callId }), adoptedAt: now };
 		leftovers.set(row.pid, leftover);
 		adopted.push(leftover);
 	}
@@ -173,32 +145,17 @@ export function endedOf(leftovers: Leftovers, rows: readonly PsRow[]): Leftover[
  * in `commands`: those of {@link untrackedRoots} of the ended ones' groups; `skipped` processes,
  * by `pid:pgid`, are not adopted).
  */
-export function sweep(leftovers: Leftovers, rows: readonly PsRow[], now: number, commands: ReadonlyMap<number, string>, skipped: ReadonlySet<string> = new Set()): { ended: Leftover; orphans: Leftover[] }[] {
+export function sweep(leftovers: Leftovers, rows: readonly PsRow[], now: number, commands: ReadonlyMap<number, string>, skipped: Skipped = new Set()): { ended: Leftover; orphans: Leftover[] }[] {
 	const ended = endedOf(leftovers, rows);
 	for (const l of ended) leftovers.delete(l.pid);
-	return ended.map((l) => ({ ended: l, orphans: adopt(leftovers, rows, l.pgid, l.startedBy, now, commands, skipped) }));
+	return ended.map((l) => ({ ended: l, orphans: adopt(leftovers, rows, l.pgid, l, now, commands, skipped) }));
 }
 
 /** Forget the untracked processes that exited, so their pids may be adopted when reused. */
-function forgetExited(untracked: Set<string>, rows: readonly PsRow[]): void {
+function forgetExited(named: Map<string, Named>, rows: readonly PsRow[]): void {
 	const live = new Set(rows.map(key));
-	for (const k of untracked) if (!live.has(k)) untracked.delete(k);
+	for (const k of named.keys()) if (!live.has(k)) named.delete(k);
 }
-
-const execFileAsync = promisify(execFile);
-/**
- * `ps` itself. It exits 1 when a pid of `-p` is unknown and still lists the others. The listing
- * stays small (see the top), the limit only guards against a runaway output.
- */
-export const defaultPs: Ps = async (args) => {
-	try {
-		return (await execFileAsync("ps", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).stdout;
-	} catch (error) {
-		const e = error as { code?: unknown; stdout?: string };
-		if (e.code === 1 && typeof e.stdout === "string") return e.stdout;
-		throw error;
-	}
-};
 
 /** The live processes, and the command lines of the untracked roots of `pgids` (of those `pgids` returns given the rows). */
 async function snapshot(ps: Ps, leftovers: Leftovers, pgids: (rows: readonly PsRow[]) => number[]) {
@@ -227,8 +184,8 @@ export function release(jobs: SessionJobs, pid: number, pgid: number): boolean {
 /** One check of the session's leftovers: each one that ended wakes the session with its own message. */
 async function checkLeftovers(jobs: SessionJobs, ps: Ps): Promise<void> {
 	const { rows, commands } = await snapshot(ps, jobs.leftovers, (rows) => endedOf(jobs.leftovers, rows).map((l) => l.pgid));
-	forgetExited(jobs.untracked, rows);
-	const ended = sweep(jobs.leftovers, rows, Date.now(), commands, jobs.untracked);
+	forgetExited(jobs.named, rows);
+	const ended = sweep(jobs.leftovers, rows, Date.now(), commands, jobs.named);
 	if (ended.length === 0) return;
 	stopPollWhenEmpty(jobs);
 	reportWork(jobs);
@@ -236,26 +193,27 @@ async function checkLeftovers(jobs: SessionJobs, ps: Ps): Promise<void> {
 }
 
 /**
- * Adopt the jobs a call left running in group `pgid` (`isJob`: by default every process left), and
- * check the session's leftovers while there are any. The other processes left are returned as
- * `untracked`, and never adopted later.
+ * Adopt the jobs a call (`by`) left running in group `pgid` (`isJob`: by default every process
+ * left), and check the session's leftovers while there are any. The other processes left are
+ * returned as `untracked`, kept as `named` while they run, and never adopted.
  */
 export async function adoptLeftovers(
 	jobs: SessionJobs,
 	pgid: number,
-	command: string,
+	by: Origin,
 	ps: Ps,
 	pollMs: number,
 	isJob: (pid: number, command: string) => boolean = () => true,
 ): Promise<{ left: Leftover[]; untracked: Untracked[] }> {
 	const { rows, commands } = await snapshot(ps, jobs.leftovers, () => [pgid]);
-	forgetExited(jobs.untracked, rows);
+	forgetExited(jobs.named, rows);
+	const now = Date.now();
 	const untracked = rootsOf(rows, pgid).flatMap((row) => {
 		const command = commands.get(row.pid);
-		return command === undefined || jobs.leftovers.has(row.pid) || jobs.untracked.has(key(row)) || isJob(row.pid, command) ? [] : [{ pid: row.pid, command }];
+		return command === undefined || jobs.leftovers.has(row.pid) || jobs.named.has(key(row)) || isJob(row.pid, command) ? [] : [{ pid: row.pid, command }];
 	});
-	for (const left of untracked) jobs.untracked.add(key({ pid: left.pid, pgid }));
-	const adopted = adopt(jobs.leftovers, rows, pgid, command, Date.now(), commands, jobs.untracked);
+	for (const left of untracked) jobs.named.set(key({ pid: left.pid, pgid }), { ...left, pgid, startedBy: by.startedBy, ...(by.callId === undefined ? {} : { callId: by.callId }), namedAt: now });
+	const adopted = adopt(jobs.leftovers, rows, pgid, by, now, commands, jobs.named);
 	if (adopted.length === 0) return { left: adopted, untracked };
 	if (jobs.poll === undefined) {
 		let busy = false;

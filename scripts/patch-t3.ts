@@ -40,6 +40,19 @@
 //   ended, so its agent() calls (`delegate_task`, `t3_thread_wait`) and its page (`html_render`)
 //   failed with `parent_not_active` (2026-11-14, a real thread). While Pi reports background work,
 //   the thread now lists the pending subagent task `pi-background-work`.
+// - background-items, background-items-contract, background-items-caller (same branch,
+//   "feat(provider-pi): list each Pi background job as a pending task"): Pi reported only a count,
+//   so t3 showed one opaque "Pi background work" task, which hid a git fsmonitor daemon and a wait
+//   loop on a dead run that kept a coordinator waiting for hours (2026-11-14). Pi (vendor/pi) now
+//   sends the items of `background_work` (`pi.setBackgroundWork(key, items)`), and the adapter lists
+//   one awaited task per item instead of the fixed one: a `command` (with its shell command) or a
+//   `background_task`, described by its label, start, pid or process group, log and live view, with
+//   its tool call's turn item. The contract takes `command` and `itemId` (the installed build
+//   predates them) and `providerInstanceId` on every kind; derived pending work sets the instance on
+//   every task a provider thread reports, and a thread stays a live MCP caller while any such task
+//   runs, not only a subagent (a Pi command or workflow that calls t3 tools after its run). The patch
+//   edits background-caller's result, so the markers of background-work and background-caller name
+//   what survives it.
 // - delegate-fork-schema, delegate-fork-tool, delegate-fork-runtime (same branch, "feat(orchestrator):
 //   delegate_task can fork a Pi conversation into its child"): `delegate_task({ fork: true, task })`
 //   starts the child from a copy of the calling Pi thread's conversation so far, and with
@@ -132,7 +145,8 @@ export const PATCHES: Patch[] = [
 	},
 	{
 		name: "background-work",
-		marker: "backgroundWorkPending",
+		// What survives background-items, which replaces the pending flag.
+		marker: 'event["type"] === "background_work"',
 		edits: [
 			["let cacheWarmingPending = false;", "let cacheWarmingPending = false;\n\t\t\tlet backgroundWorkPending = false;"],
 			[
@@ -190,7 +204,8 @@ export const PATCHES: Patch[] = [
 	},
 	{
 		name: "background-caller",
-		marker: "pi-background-work",
+		// What survives background-items, which replaces the fixed task.
+		marker: "const publishBackgroundWork",
 		edits: [
 			[
 				'const PI_INHERIT_MODEL_SLUG = "default";',
@@ -522,6 +537,130 @@ export const PATCHES: Patch[] = [
 			[
 				'nodeId,\n\t\t\t\t\tproviderTurnId,\n\t\t\t\t\tnativeRequestRef: providerRef(nativeRequestId),\n\t\t\t\t\tkind: method === "confirm" ? "command" : "user_input",',
 				'nodeId,\n\t\t\t\t\tproviderTurnId: method === "confirm" ? providerTurnId : null /* questionOwnedBySession */,\n\t\t\t\t\tnativeRequestRef: providerRef(nativeRequestId),\n\t\t\t\t\tkind: method === "confirm" ? "command" : "user_input",',
+			],
+		],
+	},
+	{
+		name: "background-items",
+		marker: "piBackgroundTasks",
+		edits: [
+			[
+				'const PI_BACKGROUND_WORK_TASK = {\n\ttaskId: "pi-background-work",\n\tkind: "subagent",\n\tdescription: "Pi background work (a workflow or a command that moved to the background)"\n};',
+				[
+					'const piBackgroundClock = new Intl.DateTimeFormat(void 0, { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });',
+					"function piSameFlatRecords(left, right) {",
+					"\treturn left.length === right.length && left.every((record, index) => {",
+					"\t\tconst other = right[index];",
+					"\t\tconst entries = Object.entries(record);",
+					"\t\treturn other !== void 0 && entries.length === Object.keys(other).length && entries.every(([key, value]) => other[key] === value);",
+					"\t});",
+					"}",
+					"function piBackgroundTasks(items, itemIdOf) {",
+					"\tif (!Array.isArray(items)) return [];",
+					"\treturn items.flatMap((item) => {",
+					'\t\tconst taskId = piRecordString(item, "id")?.trim();',
+					'\t\tconst label = piRecordString(item, "label")?.trim();',
+					"\t\tif (!taskId || !label) return [];",
+					'\t\tconst command = piRecordString(item, "command")?.trim() || void 0;',
+					'\t\tconst startedAt = piRecordNumber(item, "startedAt");',
+					'\t\tconst pid = piRecordNumber(item, "pid");',
+					'\t\tconst group = piRecordNumber(item, "processGroup");',
+					'\t\tconst logPath = piRecordString(item, "logPath")?.trim();',
+					'\t\tconst url = piRecordString(item, "url")?.trim();',
+					'\t\tconst toolCallId = piRecordString(item, "toolCallId")?.trim();',
+					"\t\tconst details = [",
+					"\t\t\tstartedAt === void 0 || !Number.isFinite(startedAt) ? void 0 : `started ${piBackgroundClock.format(startedAt)}`,",
+					'\t\t\tpid === void 0 ? group === void 0 ? void 0 : `process group ${group}` : `pid ${pid}${group === void 0 ? "" : ` (group ${group})`}`,',
+					"\t\t\tlogPath ? `log ${logPath}` : void 0,",
+					"\t\t\turl || void 0",
+					"\t\t].filter((detail) => detail !== void 0);",
+					"\t\treturn [{",
+					"\t\t\ttaskId,",
+					'\t\t\tkind: command === void 0 ? "background_task" : "command",',
+					'\t\t\tdescription: [label, ...details].join(" · "),',
+					"\t\t\t...command === void 0 ? {} : { command },",
+					"\t\t\t...toolCallId ? { itemId: itemIdOf(toolCallId) } : {},",
+					"\t\t\tawaited: true",
+					"\t\t}];",
+					"\t});",
+					"}",
+				].join("\n"),
+			],
+			["let backgroundWorkPending = false;", "let backgroundWork = [];"],
+			[
+				[
+					"const publishBackgroundWork = fnUntraced(function* () {",
+					"\t\t\t\tif (threadState === null) return;",
+					"\t\t\t\tconst current = threadState.providerThread.pendingBackgroundTasks ?? [];",
+					"\t\t\t\tif (current.some((task) => task.taskId === PI_BACKGROUND_WORK_TASK.taskId) === backgroundWorkPending) return;",
+					"\t\t\t\tconst others = current.filter((task) => task.taskId !== PI_BACKGROUND_WORK_TASK.taskId);",
+					"\t\t\t\tyield* updateProviderThread(threadState, { pendingBackgroundTasks: backgroundWorkPending ? [...others, PI_BACKGROUND_WORK_TASK] : others });",
+					"\t\t\t});",
+				].join("\n"),
+				[
+					"const publishBackgroundWork = fnUntraced(function* (previous) {",
+					"\t\t\t\tif (threadState === null || piSameFlatRecords(previous, backgroundWork)) return;",
+					"\t\t\t\tconst replaced = new Set(previous.map((task) => task.taskId));",
+					"\t\t\t\tconst others = (threadState.providerThread.pendingBackgroundTasks ?? []).filter((task) => !replaced.has(task.taskId));",
+					"\t\t\t\tyield* updateProviderThread(threadState, { pendingBackgroundTasks: [...others, ...backgroundWork] });",
+					"\t\t\t});",
+					"\t\t\tconst turnItemOfToolCall = (toolCallId) => idAllocator.derive.turnItemFromProviderItem({",
+					"\t\t\t\tdriver: PI_PROVIDER,",
+					"\t\t\t\tnativeItemId: toolCallId",
+					"\t\t\t});",
+				].join("\n"),
+			],
+			[
+				// Within background-caller's own output (`const pending` above it stays, unused).
+				'backgroundWorkPending = typeof pending === "number" && pending > 0;\n\t\t\t\t\tyield* publishBackgroundWork();',
+				'const previous = backgroundWork;\n\t\t\t\t\tbackgroundWork = piBackgroundTasks(event["items"], turnItemOfToolCall);\n\t\t\t\t\tyield* publishBackgroundWork(previous);',
+			],
+			["pendingBackgroundTasks: backgroundWorkPending ? [PI_BACKGROUND_WORK_TASK] : [],", "pendingBackgroundTasks: backgroundWork,"],
+			[
+				'\t\t\t\t\tstatus: "idle",\n\t\t\t\t\tupdatedAt: createdAt\n\t\t\t\t} : {\n\t\t\t\t\tid: idAllocator.derive.providerThread({',
+				'\t\t\t\t\tstatus: "idle",\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork,\n\t\t\t\t\tupdatedAt: createdAt\n\t\t\t\t} : {\n\t\t\t\t\tid: idAllocator.derive.providerThread({',
+			],
+			["cacheWarmingPending || backgroundWorkPending || pendingPrompts.size > 0", "cacheWarmingPending || backgroundWork.length > 0 || pendingPrompts.size > 0"],
+			["(cacheWarmingPending || backgroundWorkPending) && threadState", "(cacheWarmingPending || backgroundWork.length > 0) && threadState"],
+		],
+	},
+	{
+		name: "background-items-contract",
+		file: "const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+		marker: "work a provider runs itself keeps its idle thread a live MCP caller",
+		edits: [
+			[
+				'\tawaited: optional(Literal(true))\n};\nconst OrchestrationV2PendingBackgroundTask = kindUnionWithFallback([\n\tStruct({\n\t\t...PendingBackgroundTaskFields,\n\t\tkind: Literal("subagent"),\n\t\t/** The owning provider thread\'s instance, populated in derived pending work. */\n\t\tproviderInstanceId: optional(ProviderInstanceId),\n',
+				[
+					"\tawaited: optional(Literal(true)),",
+					"\t/** The shell command the work runs, when it is one. */",
+					"\tcommand: optional(String$2),",
+					"\t/** The turn item that started the work. */",
+					"\titemId: optional(TurnItemId),",
+					"\t/** The instance of the provider thread that reports this work, populated in derived pending work: work a provider runs itself keeps its idle thread a live MCP caller. */",
+					"\tproviderInstanceId: optional(ProviderInstanceId)",
+					"};",
+					"const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback([",
+					"\tStruct({",
+					"\t\t...PendingBackgroundTaskFields,",
+					'\t\tkind: Literal("subagent"),',
+					"",
+				].join("\n"),
+			],
+			[
+				'...task.kind === "subagent" ? { providerInstanceId: providerThread.providerInstanceId } : {},',
+				"...providerThread.providerInstanceId === void 0 ? {} : { providerInstanceId: providerThread.providerInstanceId },",
+			],
+		],
+	},
+	{
+		name: "background-items-caller",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "providerOwnedWorkIsLive",
+		edits: [
+			[
+				'(task) => task.kind === "subagent" && task.providerInstanceId === providerInstanceId',
+				"(task) => task.providerInstanceId === providerInstanceId /* providerOwnedWorkIsLive */",
 			],
 		],
 	},

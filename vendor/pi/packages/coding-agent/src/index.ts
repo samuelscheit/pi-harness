@@ -79,6 +79,7 @@ export type {
 	BoundaryContextPreview,
 	BoundaryResult,
 	BoundaryState,
+	BackgroundWorkItem,
 	BuildSystemPromptOptions,
 	CacheWarmingDecisionEvent,
 	CacheWarmingDecisionEventResult,

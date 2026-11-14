@@ -17,6 +17,25 @@ The seam is Pi's `pi.wrapToolExecution` (added in `vendor/pi`): a wrapper around
 
 Why: agents sat 37 and 40 minutes in a single build command; on one day child agents sat in `workflow` calls of 233, 76 and 62 minutes, a 19-minute `fix_loop` and several 5-minute `delegate_task` waits, about 7 hours in which they could do nothing else and the user's messages could not reach them.
 
+### Background work, item by item, and /jobs
+
+[`work.ts`](../extensions/background/work.ts) reports every job as an item (`pi.setBackgroundWork(key, items)`), the same list T3 shows as pending background tasks (the "Details" dialog of "Waiting · …") and `/jobs` prints. Each item has a stable id, a kind, a short label, its start, and when known its command, pid, process group, log, live view URL and the tool call that started it:
+
+| Kind | What | Label | Details |
+|---|---|---|---|
+| `call` | a tool call of the model in the background, any tool | `bash: pytest -x tests/`, `fix_loop: {"goal":…}`, `workflow: <name or inline> run <id>` | its call id and log; bash: its command and process group; workflow: its live view |
+| `tool` | a `tool … &` command a bash call left running | `tool workflow --code …` | the command, pid and group, the bash call |
+| `process` | an `&` job a bash call left running | `process: npm run dev` | the command, pid and group, the bash call |
+| `workflow` | a workflow run no background call of the model runs (a call in its first seconds) | `workflow: inline run <id>` | its live view, its call |
+
+Items appear and disappear as jobs start and end. Processes programs left running (named, not tracked, see below) are no items, since nothing waits for them.
+
+`/jobs` lists the items, oldest first and numbered, with how long each has run, its pid or process group, its log and its live view, and after them the processes programs left that still run. `/jobs stop <number>` (or an item's id) stops one and says what it did: a bash call's process group is killed and its call aborted; a `tool … &` command's or an `&` job's process is killed with every process it started (not its whole group: the command that left it may have left other jobs in the same group); another tool's call is aborted ("stopped by the user with /jobs stop"); a workflow is stopped through `workflow { stop }`. Each end reaches the agent as its usual message.
+
+Why: T3 showed one opaque "Pi background work" entry, since Pi reported only a count. That hid a git fsmonitor daemon and a wait loop on a dead run that kept a coordinator "Waiting" for hours (2026-11-14).
+
+A Pi build from before items (a running process into which a harness release reloads the extensions) takes a count only and refuses items with its count message; the report then sends the count.
+
 ## bash
 
 [`extensions/bash`](../extensions/bash) owns the `bash` tool. Each feature was added after a measured failure in real sessions. A long command moves to the background as every tool call does (above); its message adds the command's process group (`kill -- -<pgid>`).
@@ -25,7 +44,7 @@ Why: agents sat 37 and 40 minutes in a single build command; on one day child ag
 
 [`index.ts`](../extensions/bash/index.ts) records each command's process group, and the shell's jobs (`jobs -l` when it exits and before a `disown`; a command's own `trap … EXIT` is chained, with the exit status in `$?`). When a call ends, [`leftovers.ts`](../extensions/bash/leftovers.ts) lists the live processes of that group whose parent is gone. Those that are the shell's jobs (`./server > server.log 2>&1 &`, parallel jobs, every process of a backgrounded pipeline) or `tool` commands are adopted, named in the call's result with their pid, and counted as background work. A check every second notices when each one ends and sends its own message that wakes the session, also after the turn. If it left children running in turn, they are adopted then. Leftovers stop when the session ends, not on a harness reload.
 
-The other processes left in the group were started by programs on their own: a helper daemon (git's fsmonitor with `core.fsmonitor`, gpg-agent, an ssh ControlMaster), or the `&` jobs of a nested shell (`bash -c 'x &'`, a script that starts a server). After the shell exits they look like its jobs (parent 1, same group), but a daemon never ends. Adopted, one kept a session reporting background work for over two hours. So they are named once in the result as not tracked: their end is not reported, they are not counted, and they outlive the session. A command that replaced its shell (`exec`) leaves no record of its jobs, so everything it left counts as a job.
+The other processes left in the group were started by programs on their own: a helper daemon (git's fsmonitor with `core.fsmonitor`, gpg-agent, an ssh ControlMaster), or the `&` jobs of a nested shell (`bash -c 'x &'`, a script that starts a server). After the shell exits they look like its jobs (parent 1, same group), but a daemon never ends. Adopted, one kept a session reporting background work for over two hours. So they are named once in the result as not tracked: their end is not reported, they are no background work, and they outlive the session. `/jobs` lists them apart while they run. A command that replaced its shell (`exec`) leaves no record of its jobs, so everything it left counts as a job.
 
 A plain `&` job is not the tool's child, so its exit code is unknown: the message says that it ended, and its output is wherever the command redirected it. Output a job writes to the tool's own pipe after the command returned is lost, so the tool guideline says to redirect it to a file.
 
