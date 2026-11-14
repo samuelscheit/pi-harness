@@ -24,7 +24,7 @@ export const SNAPSHOT_FILE = "snapshot.json";
 export const KEEP_DONE_MS = 24 * 60 * 60_000;
 export const KEEP_INTERRUPTED_MS = 7 * 24 * 60 * 60_000;
 
-export type CallKind = "shell" | "tool" | "llm" | "delegate" | "workflow" | "changes";
+export type CallKind = "shell" | "tool" | "llm" | "delegate" | "ask" | "workflow" | "changes";
 
 export interface SerializedError {
 	name: string;

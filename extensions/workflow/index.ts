@@ -54,10 +54,10 @@ export interface WorkflowExtensionOptions {
 let sharedRuntime: Promise<ModelRuntime> | undefined;
 
 /** What a nested call resolves to for the script: structured content when the tool declares an output schema, else its text. */
-function outcome(tool: AgentTool | undefined, result: { content: { type: string; text?: string }[]; structuredContent?: unknown }, isError: boolean): ToolOutcome {
+function outcome(tool: AgentTool | undefined, result: { content: { type: string; text?: string }[]; structuredContent?: unknown; details?: unknown }, isError: boolean): ToolOutcome {
 	const text = result.content.flatMap((block) => (block.type === "text" && block.text ? [block.text] : [])).join("\n");
 	const structured = Boolean(tool?.outputSchema) && result.structuredContent !== undefined;
-	return { value: structured ? result.structuredContent : text, structured, text, isError };
+	return { value: structured ? result.structuredContent : text, structured, text, isError, details: result.details };
 }
 
 export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOptions = {}) {

@@ -141,7 +141,8 @@ export class T3Child {
 	 */
 	async run(message: string, requestId: string, signal: AbortSignal, started: (ids: T3ChildIds) => void): Promise<void> {
 		if (!this.threadId) {
-			const task = await this.t3.call("delegate_task", { ...this.params, task: message, mode: "wait", timeoutMs: START_WAIT_MS, clientRequestId: requestId }, signal);
+			// Not aborted with the run: t3 creates the task anyway, and only its id lets a cancel reach it.
+			const task = await this.t3.call("delegate_task", { ...this.params, task: message, mode: "wait", timeoutMs: START_WAIT_MS, clientRequestId: requestId }, AbortSignal.timeout(START_WAIT_MS + 60_000));
 			this.taskId = str(task.taskId);
 			this.threadId = str(task.childThreadId);
 			this.link = str(task.link);
@@ -150,6 +151,7 @@ export class T3Child {
 			started(this.ids);
 			// Cancelled while t3 was starting it.
 			if (this.cancelled !== undefined) this.cancel(this.cancelled);
+			if (signal.aborted) throw signal.reason;
 			this.status = String(task.status);
 			const finished = ["completed", "failed", "cancelled", "interrupted"].includes(this.status) && task.waitTimedOut !== true;
 			if (!finished) await this.wait(this.runId, signal);

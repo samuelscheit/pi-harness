@@ -32,6 +32,8 @@ import { existsSync } from "node:fs";
 import { relative } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { canonical, changedPaths, type Snapshot, snapshot } from "../lib/workspace.ts";
+import askUser from "../ask-user/index.ts";
+import { type Ask, answerPending, answersInOrder, type Question, questionsUi } from "./ask.ts";
 import { delegatedChild, RUN_STOPPED } from "./child.ts";
 import { type DelegationSpec, type DelegationState, delegateProblem, delegationMessage, delegationsDir, HARNESS_KEYS, prepareDelegation, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
 import { type CallContext, type Durable, isInterruption } from "./durable.ts";
@@ -49,7 +51,7 @@ const STATE_WAIT_MS = 15_000;
 
 /** delegate_task's own parameters a workflow passes through to t3. */
 const T3_KEYS = ["target", "title", "role", "isolation", "runtimeMode", "interactionMode", "fork", "forkThreadId"] as const;
-const KNOWN = new Set<string>([...T3_KEYS, ...HARNESS_KEYS]);
+const KNOWN = new Set<string>([...T3_KEYS, ...HARNESS_KEYS, "onAsk"]);
 
 /** `/compact [instructions]`: Pi's compaction command, as t3 recognizes it in a message. */
 export const compactCommand = (instructions?: string) => (instructions?.trim() ? `/compact ${instructions.trim()}` : "/compact");
@@ -66,9 +68,13 @@ export interface DelegateOptions {
 	schema?: Record<string, unknown>;
 	system?: string;
 	tools?: string[];
+	/** Answers the child's questions; undefined passes them up. Not journaled with the options (a function). */
+	onAsk?: (questions: Question[]) => unknown;
 }
 
 export interface DelegateEnv {
+	/** Ask whoever runs the workflow (its session's ask_user): where an in-process child's questions go up. */
+	askUp?: (questions: Question[], signal: AbortSignal) => Promise<(string | undefined)[] | undefined>;
 	cwd: string;
 	/** The repository root; undefined outside a git repository. */
 	root: string | undefined;
@@ -151,9 +157,11 @@ export function delegateOptions(raw: unknown): DelegateOptions {
 	if (unknown) throw new TypeError(`delegate(): unknown parameter ${unknown} (use ${[...KNOWN].join(", ")}; the task is run()'s message)`);
 	const problem = delegateProblem(params);
 	if (problem) throw new TypeError(`delegate(): ${problem}`);
+	if (params.onAsk !== undefined && typeof params.onAsk !== "function") throw new TypeError("delegate(): onAsk must be a function (questions) => answers | undefined");
 	const t3 = Object.fromEntries(T3_KEYS.filter((key) => params[key] !== undefined).map((key) => [key, params[key]]));
 	return {
 		t3,
+		...(params.onAsk ? { onAsk: params.onAsk as (questions: Question[]) => unknown } : {}),
 		...(params.schema !== undefined ? { schema: params.schema as Record<string, unknown> } : {}),
 		...(params.system !== undefined ? { system: (params.system as string).trim() } : {}),
 		...(params.tools !== undefined ? { tools: params.tools as string[] } : {}),
@@ -206,7 +214,7 @@ interface Transport {
 	describe(): string;
 }
 
-function inProcess(options: DelegateOptions, dir: string, label: string, env: DelegateEnv, fork: ForkSource | undefined): Transport {
+function inProcess(options: DelegateOptions, dir: string, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask): Transport {
 	const { model, thinking } = inProcessModel(options, env);
 	let child: Promise<AgentSession> | undefined;
 	let sessionFile: string | undefined;
@@ -221,7 +229,11 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true,
-			extensionFactories: [{ name: "workflow-delegate", factory: (pi) => void delegatedChild(pi, dir) }],
+			// ask_user, whose questions the workflow answers (questionsUi below).
+			extensionFactories: [
+				{ name: "workflow-delegate", factory: (pi) => void delegatedChild(pi, dir) },
+				{ name: "ask-user", factory: askUser },
+			],
 		});
 		await resourceLoader.reload();
 		const tools = options.tools ?? fork?.spec.tools;
@@ -236,6 +248,7 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			sessionManager: manager,
 			settingsManager,
 		});
+		await session.bindExtensions({ uiContext: questionsUi(ask) });
 		session.subscribe((event) => {
 			if (event.type === "tool_execution_start") env.progress(`${label} · ${callLine(event.toolName, event.args)}`);
 		});
@@ -282,13 +295,16 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 	};
 }
 
-function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv, fork: ForkSource | undefined): Transport {
+function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask): Transport {
 	let task: T3Child | undefined;
 	let restored: T3ChildIds = {};
+	/** Pending requests answered or passed up: each is handled once. */
+	const handled = new Set<string>();
 	const child = (title: string) => {
 		if (task) return task;
 		const params = { title, ...options.t3, ...(fork ? { fork: true, forkThreadId: fork.threadId } : {}) };
-		task = new T3Child(t3, params);
+		// Without onAsk every question goes up, as t3 reports it: nothing to read.
+		task = new T3Child(t3, params, options.onAsk ? (current, signal) => answerPending(t3.call, current.threadId!, handled, ask, signal) : undefined);
 		task.restore(restored);
 		return task;
 	};
@@ -345,7 +361,17 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	/** In journal labels, which their kind (delegate) precedes. */
 	const tag = `#${number}`;
 	const dir = delegationsDir(env.agentDir);
-	const transport = env.t3 ? inT3(env.t3, options, label, env, fork) : inProcess(options, dir, label, env, fork);
+	/** The child's questions: onAsk answers or passes them up; journaled, so a resume replays the answers. */
+	const ask: Ask = async (questions, signal) => {
+		const value = (await env.durable.call({ kind: "ask", args: { delegate: firstKey ?? label, questions }, label: `${tag} asks: ${headline(questions[0]?.title ?? "").slice(0, 80)}` }, async () => {
+			const returned = options.onAsk ? await options.onAsk(questions) : undefined;
+			let answers = returned === undefined ? undefined : answersInOrder(questions, returned);
+			if (!answers && !env.t3 && env.askUp) answers = await env.askUp(questions, signal);
+			return { value: { answers: answers ?? null, by: returned !== undefined ? "onAsk" : answers ? "up" : "none" } };
+		})) as { answers: (string | null)[] | null };
+		return value.answers?.map((answer) => answer ?? undefined);
+	};
+	const transport = env.t3 ? inT3(env.t3, options, label, env, fork, ask) : inProcess(options, dir, label, env, fork, ask);
 	let spec: DelegationSpec | undefined;
 	let runs = 0;
 	let cost = 0;
@@ -476,6 +502,10 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 					if (!after || stoppedRun(after, n)) await transport.run(continuation, `${requestId}-continue`, remember, signal);
 				}
 			}
+		} catch (error) {
+			// The parent's side failed (t3, or onAsk threw): the child would wait for an answer or a reader forever.
+			if (!signal.aborted) transport.cancel();
+			throw error;
 		} finally {
 			running = false;
 			clearInterval(poll);

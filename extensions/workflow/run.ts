@@ -52,7 +52,12 @@ export interface ToolOutcome {
 	structured: boolean;
 	isError: boolean;
 	text: string;
+	/** The result's details (ask_user's answers). */
+	details?: unknown;
 }
+
+/** How long a workflow's ask_user waits: until answered or the run stops (setTimeout's limit is about 24.8 days). */
+const ASK_WAIT_MINUTES = 35_000;
 
 export interface RunEnv {
 	cwd: string;
@@ -436,6 +441,15 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				})
 			: undefined;
 	let delegates = 0;
+	/** Ask whoever runs the workflow with its session's ask_user; resolves to the answers in order. */
+	const askUser = async (questions: readonly { title: string; options?: string[] }[], callSignal: AbortSignal) => {
+		if (!executeTool) throw new Error("ask_user needs a session");
+		const outcome = await executeTool("ask_user", { questions: questions.map(({ title, options }) => ({ title, ...(options ? { options } : {}) })), wait_minutes: ASK_WAIT_MINUTES }, callSignal);
+		if (outcome.isError) throw new Error(outcome.text || "ask_user failed");
+		const answers = (outcome.details as { answers?: (string | undefined)[] } | undefined)?.answers;
+		if (!answers) throw new Error(`ask_user returned no answers: ${outcome.text}`);
+		return answers;
+	};
 
 	const globals: Record<string, unknown> = {
 		cwd: env.cwd,
@@ -504,6 +518,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				runtime: env.runtime,
 				agentDir: env.agentDir,
 				...(env.model ? { model: env.model } : {}),
+				...(executeTool ? { askUp: askUser } : {}),
 				sessionDir: env.sessionDir,
 				parentSessionFile: env.parentSessionFile,
 				callerSessionId: env.sessionId,

@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import type { AssistantMessage, Context, JsonObject } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, type ExtensionUIContext, type ExtensionUIQuestion, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import askUser from "../extensions/ask-user/index.ts";
 import { Type } from "typebox";
 import { MAX_REMINDERS, REMINDER_TYPE, RESULT_HEADING } from "../extensions/workflow/child.ts";
 import {
@@ -34,10 +35,10 @@ import {
 	writeState,
 } from "../extensions/workflow/delegation.ts";
 import workflow from "../extensions/workflow/index.ts";
-import { readJournal } from "../extensions/workflow/journal.ts";
+import { readJournal, runDir } from "../extensions/workflow/journal.ts";
 import { renderWorkflow, viewOf } from "../extensions/workflow/render.ts";
-import { INLINE_FILE, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
-import { lockHeld } from "../extensions/workflow/stop.ts";
+import { INLINE_FILE, resumeWorkflow, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
+import { lockHeld, STOP_FILE } from "../extensions/workflow/stop.ts";
 import { livePage } from "../dashboard/server/workflows.ts";
 import { T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
 import { parseCompact } from "../extensions/workflow/delegate.ts";
@@ -173,6 +174,36 @@ const systemOf = (context: Context) => {
 	return preamble;
 };
 
+/** A t3 child thread: its session, runs, and the questions pending in it (its ask_user cards). */
+interface Thread {
+	session: AgentSession;
+	runs: Map<string, Promise<void>>;
+	pending: Map<string, { questions: ExtensionUIQuestion[]; answer: (values: (string | undefined)[] | undefined) => void }>;
+	/** Resolves when the next question is asked. */
+	asked: Promise<void>;
+	signalAsked: () => void;
+}
+
+/** A thread record whose UI turns ask_user's questions into pending requests, as t3's Pi adapter does. */
+function newThread(): { thread: Omit<Thread, "session">; ui: ExtensionUIContext } {
+	let requests = 0;
+	const thread: Omit<Thread, "session"> = { runs: new Map(), pending: new Map(), asked: Promise.resolve(), signalAsked: () => undefined };
+	const arm = () => {
+		thread.asked = new Promise((r) => (thread.signalAsked = r));
+	};
+	arm();
+	const questions = (asked: ExtensionUIQuestion[]) =>
+		new Promise<(string | undefined)[] | undefined>((resolve) => {
+			const id = `request-${++requests}`;
+			// Answered by respond or by the user on the card: no longer pending.
+			thread.pending.set(id, { questions: asked, answer: (values) => (thread.pending.delete(id), resolve(values)) });
+			thread.signalAsked();
+			arm();
+		});
+	const ui = new Proxy({ questions } as Partial<ExtensionUIContext>, { get: (target, name) => (name in target ? target[name as keyof typeof target] : () => undefined) }) as ExtensionUIContext;
+	return { thread, ui };
+}
+
 interface Fixture {
 	repo: string;
 	agentDir: string;
@@ -182,7 +213,7 @@ interface Fixture {
 	/** Every fake t3 call: tool name and arguments. */
 	calls: { name: string; args: Record<string, unknown> }[];
 	/** The child sessions by thread. */
-	threads: Map<string, { session: AgentSession; runs: Map<string, Promise<void>> }>;
+	threads: Map<string, Thread>;
 	/** What t3 answered per clientRequestId: a repeated call gets the same task and run (t3 dedupes). */
 	requests: Map<string, { threadId: string; runId: string }>;
 }
@@ -207,12 +238,12 @@ afterEach(async () => {
 const workflowExtension = (childRuntime: ModelRuntime) => (pi: ExtensionAPI) =>
 	workflow(pi, { experimentsDir: join(dir, "experiments"), workflowDirs: () => [], modelRuntime: async () => childRuntime, agentDir: fx.agentDir });
 
-async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionManager = SessionManager.create(fx.repo, fx.sessionsDir), sessionRuntime = runtime): Promise<AgentSession> {
+async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionManager = SessionManager.create(fx.repo, fx.sessionsDir), sessionRuntime = runtime, uiContext?: ExtensionUIContext): Promise<AgentSession> {
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({ cwd: fx.repo, agentDir: fx.agentDir, settingsManager, noExtensions: true, noSkills: true, noContextFiles: true, extensionFactories: extensions });
 	await resourceLoader.reload();
 	const { session } = await createAgentSession({ cwd: fx.repo, agentDir: fx.agentDir, model: sessionRuntime.getModel("faux", "faux-1"), modelRuntime: sessionRuntime, resourceLoader, sessionManager, settingsManager });
-	await session.bindExtensions({ onError: (error) => fx.errors.push(`${error.event}: ${error.error}`) });
+	await session.bindExtensions({ ...(uiContext ? { uiContext } : {}), onError: (error) => fx.errors.push(`${error.event}: ${error.error}`) });
 	fx.sessions.push(session);
 	return session;
 }
@@ -269,8 +300,10 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 					if (!source) throw new Error("fake t3: fork needs the forkThreadId of a known thread");
 					manager = SessionManager.forkFrom(source, fx.repo, fx.sessionsDir);
 				}
-				const session = await newSession([workflowExtension(childRuntime)], manager, childRuntime);
-				fx.threads.set(threadId, { session, runs: new Map() });
+				const { thread, ui } = newThread();
+				const session = await newSession([workflowExtension(childRuntime), askUser], manager, childRuntime, ui);
+				// The same object: its question promise is replaced on every question.
+				fx.threads.set(threadId, Object.assign(thread, { session }));
 				// t3 sends a one-line role preamble, a blank line, then the task.
 				known = { threadId, runId: start(threadId, `You are a delegated ${String(args.role)} child.\n\n${String(args.task)}`) };
 				fx.requests.set(request, known);
@@ -292,8 +325,25 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 		});
 		tool("t3_thread_wait", async (args) => {
 			const thread = fx.threads.get(String(args.threadId))!;
-			const done = await finishedWithin(thread.runs.get(String(args.runId))!, waitMs);
-			return { threadId: args.threadId, runId: args.runId, status: done ? "completed" : "running", timedOut: !done };
+			// A pending question ends a wait, as in t3.
+			const run = thread.runs.get(String(args.runId))!;
+			const ended = thread.pending.size ? "asked" : await Promise.race([finishedWithin(run, waitMs), thread.asked.then(() => "asked" as const)]);
+			const done = ended === true;
+			return { threadId: args.threadId, runId: args.runId, status: done ? "completed" : "running", timedOut: ended === false };
+		});
+		tool("t3_pending_request", async (args) => {
+			const thread = fx.threads.get(String(args.threadId))!;
+			if (args.action === "list") return { requestIds: [...thread.pending.keys()] };
+			const requestId = String(args.requestId);
+			const pending = thread.pending.get(requestId);
+			if (!pending) throw new Error(`fake t3: no pending request ${requestId}`);
+			if (args.action === "read") {
+				return { requestId, questions: pending.questions.map((q, i) => ({ id: `${requestId}:${i}`, header: "Question", question: q.title, options: (q.options ?? []).map((label) => ({ label, description: "" })) })) };
+			}
+			// respond: one value per question, in order, as t3's adapter answers Pi.
+			const answers = args.answers as Record<string, unknown>;
+			pending.answer(pending.questions.map((_q, i) => (typeof answers[`${requestId}:${i}`] === "string" ? (answers[`${requestId}:${i}`] as string) : undefined)));
+			return { requestId, status: "answered" };
 		});
 		tool("task_status", async (args) => ({ taskId: args.taskId, status: "completed", summary: summaryOf(threadOf(args.taskId)) }));
 		tool("task_cancel", async (args) => {
@@ -653,6 +703,124 @@ describe("the handle", () => {
 		const forked = files.find((f) => f.split("\n")[0]!.includes(details.childSessions[1]!))!;
 		assert.match(forked, /also check the tests/, "the fork has the source's conversation");
 		assert.match(forked, /forked/);
+	});
+});
+
+describe("questions go to the parent (onAsk)", () => {
+	const QUESTION = { title: "The plan no longer fits: how do I go on?", options: ["continue", "replan", "stop"] };
+	/** A child that asks QUESTION on each new message, then reports the answer it got as its tool result. */
+	const asking: FauxResponseStep = (context) => {
+		const last = lastMessage(context);
+		if (last.role === "toolResult" && last.toolName === "ask_user") return say(`got: ${textOf(last.content).split("Answer: ")[1]} (error: ${last.isError})`);
+		return call("ask_user", { questions: [QUESTION] });
+	};
+	const askEntries = (journal: string) => readJournal(journal).filter((e) => (e.t === "start" && e.kind === "ask") || ((e.t === "done" || e.t === "failed") && e.key.startsWith("ask:")));
+
+	test("in t3: onAsk's answers reach the child's blocking ask_user as its tool result, in the same run, journaled", async () => {
+		const { details, text } = await runInT3(
+			"const asked = [];\nconst a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read', 'ask_user'], onAsk: async (questions) => { asked.push(questions); return [questions[0].options[1]]; } });\nconst r = await a.run('do the task');\nreturn JSON.stringify({ text: r.text, asked });",
+			asking,
+		);
+		assert.equal(details.status, "completed", details.error);
+		const out = value(text);
+		assert.equal(out.text, "got: replan (error: false)");
+		assert.deepEqual(out.asked, [[{ id: "request-1:0", title: QUESTION.title, options: QUESTION.options }]]);
+		assert.deepEqual(callsOf("t3_pending_request").map((c) => c.args.action), ["list", "read", "respond"]);
+		assert.deepEqual(callsOf("t3_pending_request").at(-1)!.args, { action: "respond", threadId: "thread-1", requestId: "request-1", answers: { "request-1:0": "replan" } });
+		assert.equal(callsOf("delegate_task").length, 1);
+		assert.equal(callsOf("t3_thread_send").length, 0, "answered within the same run");
+		const entries = askEntries(details.journal);
+		assert.equal(entries.length, 2);
+		assert.equal(entries[0]!.t === "start" && entries[0]!.label, `#1 asks: ${QUESTION.title}`);
+		assert.deepEqual(entries[1]!.t === "done" && entries[1]!.value, { answers: ["replan"], by: "onAsk" });
+	});
+
+	test("in t3: undefined passes the question up unchanged (whoever answers it, the workflow does not), and a throw stops the run", async () => {
+		let answered = false;
+		const passedUp = runInT3(
+			"let calls = 0;\nconst a = delegate({ target: { model: 'faux/faux-1' }, tools: ['ask_user'], onAsk: () => (calls++, undefined) });\nconst r = await a.run('do the task');\nreturn JSON.stringify({ text: r.text, calls });",
+			asking,
+		);
+		// The parent thread's user answers it on the card, once the workflow passed it up.
+		const until = async (ok: () => boolean) => {
+			while (!ok()) await new Promise((r) => setTimeout(r, 20));
+		};
+		await until(() => callsOf("t3_pending_request").some((c) => c.args.action === "read"));
+		await new Promise((r) => setTimeout(r, 200));
+		const pending = fx.threads.get("thread-1")!.pending;
+		assert.equal(pending.size, 1, "still pending");
+		pending.get("request-1")!.answer(["continue"]);
+		answered = true;
+		const { details, text } = await passedUp;
+		assert.ok(answered);
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(value(text), { text: "got: continue (error: false)", calls: 1 });
+		assert.equal(callsOf("t3_pending_request").filter((c) => c.args.action === "respond").length, 0);
+		const passed = askEntries(details.journal).at(-1)!;
+		assert.deepEqual(passed.t === "done" && passed.value, { answers: null, by: "none" });
+
+		fx.calls.length = 0;
+		const thrown = await runInT3("await delegate({ target: { model: 'faux/faux-1' }, tools: ['ask_user'], onAsk: async () => { throw new Error('no plan B'); } }).run('do the task');", asking);
+		assert.equal(thrown.details.status, "failed");
+		assert.match(thrown.details.error!, /no plan B/);
+		assert.ok(callsOf("task_cancel").length >= 1, "the child was stopped");
+		assert.equal(askEntries(thrown.details.journal).at(-1)!.t, "failed");
+	});
+
+	test("in-process: onAsk answers the child's ask_user; a resume replays the journaled answer instead of asking again", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		let asks = 0;
+		faux.setResponses(
+			Array.from({ length: 20 }, () => async (context: Context) => {
+				const last = lastMessage(context);
+				if (last.role === "toolResult" && last.toolName === "ask_user") {
+					// The first run waits here until the workflow is stopped with its child; the resumed one goes on.
+					if (++asks === 1) await gate;
+					return say(`got: ${textOf(last.content).split("Answer: ")[1]}`);
+				}
+				return call("ask_user", { questions: [QUESTION] });
+			}),
+		);
+		const env = { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map(), sessionDir: fx.sessionsDir, parentSessionFile: join(fx.sessionsDir, "parent.jsonl") };
+		const code = "const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['ask_user'], onAsk: async (questions) => { log('onAsk called'); return { [questions[0].id]: 'stop' }; } });\nreturn (await a.run('do the task')).text;";
+		let id = "";
+		const first = runWorkflow({ source: code, filename: INLINE_FILE, inline: true }, 1, { ...env, onStart: (run) => (id = run.id) });
+		while (asks === 0) await new Promise((r) => setTimeout(r, 20));
+		writeFileSync(join(runDir(fx.agentDir, id), STOP_FILE), JSON.stringify({ children: true }));
+		const stopped = await first;
+		release();
+		assert.equal(stopped.details.status, "stopped");
+		assert.match(stopped.details.log.join("\n"), /onAsk called/);
+		const resumed = await resumeWorkflow({ id }, env);
+		assert.equal(resumed.details.status, "completed", resumed.details.error);
+		assert.equal(resumed.text.split("\n\n").at(-1), "got: stop");
+		assert.doesNotMatch(resumed.details.log.join("\n"), /onAsk called/, "answered from the journal");
+		assert.equal(asks, 2, "the child asked again after the resume");
+		const entries = askEntries(resumed.details.journal);
+		assert.equal(entries.filter((e) => e.t === "start").length, 1, "one question recorded, replayed");
+	});
+
+	test("in-process: without an answer from onAsk the question goes up to the workflow session's ask_user", async () => {
+		faux.setResponses(Array.from({ length: 6 }, () => asking));
+		const asked: unknown[] = [];
+		const executeTool = async (name: string, args: unknown) => {
+			asked.push({ name, args });
+			return { value: "", structured: false, isError: false, text: "answered", details: { answers: ["from the user"] } };
+		};
+		const { details, text } = await runWorkflow({ source: "return (await delegate({ target: { model: 'faux/faux-1' }, tools: ['ask_user'] }).run('do the task')).text;", filename: INLINE_FILE, inline: true }, 1, {
+			cwd: fx.repo,
+			runtime,
+			agentDir: fx.agentDir,
+			llmCache: new Map(),
+			library: () => new Map(),
+			executeTool,
+			toolNames: ["ask_user"],
+		});
+		assert.equal(details.status, "completed", details.error);
+		assert.equal(text.split("\n\n").at(-1), "got: from the user (error: false)");
+		assert.equal(asked.length, 1);
+		assert.deepEqual(asked[0], { name: "ask_user", args: { questions: [QUESTION], wait_minutes: 35_000 } });
 	});
 });
 

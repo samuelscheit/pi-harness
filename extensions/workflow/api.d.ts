@@ -47,6 +47,9 @@ declare function llm(prompt: string, options?: { model?: string; system?: string
  * its first run(); later runs continue its conversation; each resolves once it stops, with `text`
  * (its final message), `changed` (files the working tree changed meanwhile, other agents' too) and
  * `cost`. `compact` is Pi's /compact; `fork` starts a new child from this one's conversation.
+ * `onAsk` gets the child's ask_user questions: return answers (in order, or by question id), which
+ * the child receives as its tool result, or undefined to pass them up to whoever runs you; throw to
+ * stop the run. Answers are journaled and replayed on resume.
  */
 declare function delegate(params?: {
 	target?: { model?: string; providerInstanceId?: string; options?: Record<string, unknown> };
@@ -58,6 +61,7 @@ declare function delegate(params?: {
 	schema?: object;
 	fork?: boolean;
 	forkThreadId?: string;
+	onAsk?: (questions: { id: string; title: string; options?: string[] }[]) => Promise<string[] | Record<string, string> | undefined>;
 }): Delegate;
 
 interface DelegateRun {
