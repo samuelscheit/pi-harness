@@ -9,7 +9,7 @@ import { Empty, KpiStrip, Panel, QueryState, tableClass } from "./ui";
 /** What to do about each cache-rebuild cause (attribution.ts names them). */
 const ADVICE: Record<string, string> = {
 	"cache expired after idle (5 min TTL)": "More than 5 minutes passed between requests on a 5-minute cache. Pi's one-hour retention and idle warming keep human-paced sessions cached.",
-	"cache expired after idle (1 h TTL)": "The session paused for over an hour. For a large context a cold compaction (compaction.coldCache) is cheaper than writing it all again.",
+	"cache expired after idle (1 h TTL)": "The session paused for over an hour. For a large context, compacting with a cheap model before the next run (compaction.economic) costs less than writing it all again.",
 	"model switched": "Switching models starts a new cache. Pick the model once per session.",
 	"thinking level changed": "Changing the thinking level mid-session invalidates the cached history.",
 	"tool definitions changed": "The initial tool set changed mid-session (an MCP server reconnected, an extension changed). Tools loaded through tool search append instead of rewriting.",
