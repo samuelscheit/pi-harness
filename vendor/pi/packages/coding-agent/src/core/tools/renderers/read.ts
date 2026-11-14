@@ -116,7 +116,9 @@ function formatReadResult(
 	isError: boolean,
 ): string {
 	if (!options.expanded && !isError) {
-		return "";
+		// Collapsed output is hidden, but a loss of image resolution must stay visible to the user.
+		const notice = result.details?.imageNotice;
+		return notice ? `\n${theme.fg("warning", notice)}` : "";
 	}
 
 	const rawPath = str(args?.file_path ?? args?.path);

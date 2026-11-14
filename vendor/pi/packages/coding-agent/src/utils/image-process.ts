@@ -1,5 +1,12 @@
 import { convertImageBytesToPng } from "./image-convert.ts";
-import { formatDimensionNote, type ImageResizeOptions, resizeImage } from "./image-resize.ts";
+import {
+	formatDimensionNote,
+	type ImageResizeOptions,
+	type ImageViewResult,
+	renderImageView,
+	resizeImage,
+} from "./image-resize.ts";
+import type { ImageView } from "./image-view.ts";
 
 export interface ProcessImageOptions {
 	/** Whether to resize images to inline provider limits. Default: true */
@@ -19,6 +26,11 @@ export type ProcessImageResult =
 			ok: false;
 			message: string;
 	  };
+
+/** A rendered image view with the hints that go with it, such as format conversion. */
+export type ProcessImageViewResult =
+	| (Extract<ImageViewResult, { ok: true }> & { hints: string[] })
+	| { ok: false; message: string };
 
 interface NormalizedImage {
 	bytes: Uint8Array;
@@ -67,6 +79,24 @@ async function normalizeImage(bytes: Uint8Array, mimeType: string): Promise<Norm
 function conversionHint(from: string | undefined, to: string): string | undefined {
 	if (!from || from === to) return undefined;
 	return `[Image converted from ${from} to ${to}.]`;
+}
+
+/**
+ * Convert an image to an inline format and render a view of it (whole, region, or tiles) within
+ * the resize limits. Unlike processImage, always decodes: a region or tile needs the pixels.
+ */
+export async function processImageView(
+	bytes: Uint8Array,
+	mimeType: string,
+	view: ImageView,
+	resizeOptions?: ImageResizeOptions,
+): Promise<ProcessImageViewResult> {
+	const normalized = await normalizeImage(bytes, mimeType);
+	if (!normalized) return { ok: false, message: "Image could not be converted to a supported inline image format." };
+	const rendered = await renderImageView(normalized.bytes, normalized.mimeType, view, resizeOptions);
+	if (!rendered.ok) return rendered;
+	const convertedHint = conversionHint(normalized.convertedFrom, rendered.images[0].mimeType);
+	return { ...rendered, hints: convertedHint ? [convertedHint] : [] };
 }
 
 export async function processImage(

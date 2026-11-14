@@ -6,13 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/utils/image-resize.js", () => ({
 	resizeImage: vi.fn(),
+	renderImageView: vi.fn(),
 	formatDimensionNote: vi.fn(() => undefined),
 }));
 
 import { processFileArguments } from "../src/cli/file-processor.ts";
 import type { ExtensionToolContext } from "../src/core/extensions/types.ts";
 import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.ts";
-import { resizeImage } from "../src/utils/image-resize.ts";
+import { renderImageView, resizeImage } from "../src/utils/image-resize.ts";
 
 const TINY_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
@@ -25,6 +26,8 @@ describe("image resize callers", () => {
 		mkdirSync(testDir, { recursive: true });
 		vi.mocked(resizeImage).mockReset();
 		vi.mocked(resizeImage).mockResolvedValue(null);
+		vi.mocked(renderImageView).mockReset();
+		vi.mocked(renderImageView).mockResolvedValue({ ok: false, message: "could not be resized" });
 	});
 
 	afterEach(() => {
@@ -80,7 +83,7 @@ describe("image resize callers", () => {
 			ctx,
 		);
 
-		expect(resizeImage).toHaveBeenCalledWith(expect.any(Uint8Array), "image/png", resize);
+		expect(renderImageView).toHaveBeenCalledWith(expect.any(Uint8Array), "image/png", { kind: "whole" }, resize);
 	});
 
 	it("can defer resizing file attachments until prompt dispatch", async () => {

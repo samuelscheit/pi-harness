@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- `read` takes `tiles: true` to send an image at native resolution as a grid of overlapping tiles (at most the model's image size each, 16 per read, each labeled with its pixel box) and `region: {x, y, width, height}` to send one box of an image; a capped grid names the regions left to read
+
 ### Fixed
 
+- Fixed `read` downscaling large images with only a trailing note to the model: the result now starts with an `[Image downscaled ...]` line giving the factor, both sizes and how to read at native resolution, and the collapsed tool row shows the same line to the user
 - Fixed MCP tools loaded by `tool_search` being dropped on resume and `/reload` when an extension deactivates only its own tool at `session_start`, as pi-web-access and pi-subagents do in `toolActivation: "auto"` mode ([#11996](https://github.com/earendil-works/pi/issues/11996))
 - Fixed the standalone binary failing to resolve extension npm dependencies whose entry point is declared in `package.json` `main` or `exports` (for example `shiki`, `yaml`, `graceful-fs`), including imports made from inside other dependencies ([#12012](https://github.com/earendil-works/pi/issues/12012))
 - Fixed the find tool returning no results for patterns starting with `./`, such as `./src/*.ts` ([#12020](https://github.com/earendil-works/pi/issues/12020))

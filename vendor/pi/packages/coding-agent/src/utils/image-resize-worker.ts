@@ -3,19 +3,26 @@ import {
 	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
 	type ImageResizeOptions,
 	type ResizeImageWorkerResponse,
-	resizeImageInProcess,
+	renderImageViewInProcess,
 } from "./image-resize-core.ts";
+import type { ImageView } from "./image-view.ts";
 
 interface ResizeImageWorkerRequest {
 	inputBytes: Uint8Array;
 	mimeType: string;
+	view: ImageView;
 	options?: ImageResizeOptions;
 }
 
 function isResizeImageWorkerRequest(value: unknown): value is ResizeImageWorkerRequest {
 	if (!value || typeof value !== "object") return false;
 	const record = value as Record<string, unknown>;
-	return record.inputBytes instanceof Uint8Array && typeof record.mimeType === "string";
+	return (
+		record.inputBytes instanceof Uint8Array &&
+		typeof record.mimeType === "string" &&
+		typeof record.view === "object" &&
+		record.view !== null
+	);
 }
 
 const port = parentPort;
@@ -29,7 +36,12 @@ port.once("message", (message: unknown) => {
 			if (!isResizeImageWorkerRequest(message)) {
 				throw new Error("Invalid image resize worker request");
 			}
-			const result = await resizeImageInProcess(message.inputBytes, message.mimeType, message.options);
+			const result = await renderImageViewInProcess(
+				message.inputBytes,
+				message.mimeType,
+				message.view,
+				message.options,
+			);
 			const response: ResizeImageWorkerResponse = { type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE, result };
 			port.postMessage(response);
 		} catch (error) {

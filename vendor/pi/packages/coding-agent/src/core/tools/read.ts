@@ -1,12 +1,12 @@
-import type { Api, ImageContent, Model, ModelImageResizeOptions, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, ModelImageResizeOptions, TextContent } from "@earendil-works/pi-ai";
 import { constants } from "fs";
 import { access as fsAccess, open as fsOpen, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { TextDecoder } from "util";
-import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
+import { MAX_TILES_PER_READ, readImageContent } from "./read-image.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
@@ -15,6 +15,23 @@ const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	tiles: Type.Optional(
+		Type.Boolean({
+			description:
+				"Images only: send the image (or the region) at native resolution as a grid of overlapping tiles, each labeled with its pixel box",
+		}),
+	),
+	region: Type.Optional(
+		Type.Object(
+			{
+				x: Type.Integer({ minimum: 0 }),
+				y: Type.Integer({ minimum: 0 }),
+				width: Type.Integer({ minimum: 1 }),
+				height: Type.Integer({ minimum: 1 }),
+			},
+			{ description: "Images only: the box to send, in original image pixels; clamped to the image bounds" },
+		),
+	),
 });
 
 export const readToolSystemPromptContribution = {
@@ -30,15 +47,20 @@ export type ReadToolInput = Static<typeof readSchema>;
  * such as resize hints. Property descriptions are left out so the type stays on one line in tool
  * descriptions.
  */
-const readOutputSchema = Type.Union([
-	Type.String(),
-	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String(), note: Type.String() }),
-]);
+const readImageOutputSchema = Type.Object({
+	type: Type.Literal("image"),
+	data: Type.String(),
+	mimeType: Type.String(),
+	note: Type.String(),
+});
+const readOutputSchema = Type.Union([Type.String(), readImageOutputSchema, Type.Array(readImageOutputSchema)]);
 
 export type ReadToolOutput = Static<typeof readOutputSchema>;
 
 export interface ReadToolDetails {
 	truncation?: TruncationResult;
+	/** Loss of resolution or omitted area of an image read, shown to the user as well as the model. */
+	imageNotice?: string;
 }
 
 /**
@@ -95,18 +117,23 @@ export interface ReadToolOptions {
 	operations?: ReadOperations;
 }
 
-/** The image block and its note, or the text for text files and images that could not be processed. */
+/**
+ * The image block with its note (the text before it), a list of them for tiles, or the text for
+ * text files and images that could not be processed.
+ */
 function toReadOutput(content: (TextContent | ImageContent)[]): ReadToolOutput {
-	const text = content.find((block) => block.type === "text")?.text ?? "";
-	const image = content.find((block) => block.type === "image");
-	return image ? { type: "image", data: image.data, mimeType: image.mimeType, note: text } : text;
-}
-
-function getNonVisionImageNote(model: Model<Api> | undefined): string | undefined {
-	if (!model || model.input.includes("image")) {
-		return undefined;
+	const images: Static<typeof readImageOutputSchema>[] = [];
+	const notes: string[] = [];
+	for (const block of content) {
+		if (block.type === "text") {
+			notes.push(block.text);
+			continue;
+		}
+		images.push({ type: "image", data: block.data, mimeType: block.mimeType, note: notes.join("\n") });
+		notes.length = 0;
 	}
-	return "[Current model does not support images. The image will be omitted from this request.]";
+	if (images.length === 0) return notes.join("\n");
+	return images.length === 1 ? images[0] : images;
 }
 
 /** The lines a read shows, with the file's line count; line counts follow `text.split("\n")`. */
@@ -238,7 +265,7 @@ export function createReadToolDefinition(
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete. Images larger than the model's image size limit are downscaled, and the result then starts with an "[Image downscaled ...]" line; small text may be unreadable at that size. For native resolution use tiles: true (the image as a grid of overlapping tiles, at most ${MAX_TILES_PER_READ} per read, each labeled with its pixel box) and/or region: {x, y, width, height} in original image pixels.`,
 		promptSnippet: readToolSystemPromptContribution.snippet,
 		promptGuidelines: [...readToolSystemPromptContribution.guidelines],
 		parameters: readSchema,
@@ -246,7 +273,7 @@ export function createReadToolDefinition(
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
 			_toolCallId,
-			{ path, offset, limit }: { path: string; offset?: number; limit?: number },
+			{ path, offset, limit, tiles, region }: ReadToolInput,
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?: ExtensionContext,
@@ -274,28 +301,23 @@ export function createReadToolDefinition(
 							const mimeType = ops.detectImageMimeType ? await ops.detectImageMimeType(absolutePath) : undefined;
 							let content: (TextContent | ImageContent)[];
 							let details: ReadToolDetails | undefined;
-							const nonVisionImageNote = getNonVisionImageNote(ctx?.model);
 							if (mimeType) {
-								// Read image as binary.
-								const buffer = await ops.readFile(absolutePath);
-								const processed = await processImage(buffer, mimeType, {
-									autoResizeImages,
-									resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
-								});
-								if (!processed.ok) {
-									let textNote = `Read image file [${mimeType}]\n${processed.message}`;
-									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
-									content = [{ type: "text", text: textNote }];
-								} else {
-									let textNote = `Read image file [${processed.mimeType}]`;
-									if (processed.hints.length > 0) textNote += `\n${processed.hints.join("\n")}`;
-									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
-									content = [
-										{ type: "text", text: textNote },
-										{ type: "image", data: processed.data, mimeType: processed.mimeType },
-									];
-								}
+								const image = await readImageContent(
+									await ops.readFile(absolutePath),
+									mimeType,
+									{ tiles, region },
+									{
+										autoResizeImages,
+										resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
+										model: ctx?.model,
+									},
+								);
+								content = image.content;
+								if (image.notice) details = { imageNotice: image.notice };
 							} else {
+								if (tiles || region) {
+									throw new Error("tiles and region apply only to image files.");
+								}
 								// Read text content. Convert offset from 1-indexed input to 0-indexed line access.
 								const startLine = offset ? Math.max(0, offset - 1) : 0;
 								const startLineDisplay = startLine + 1;

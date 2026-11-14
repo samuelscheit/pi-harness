@@ -2,12 +2,14 @@ import { Worker } from "node:worker_threads";
 import {
 	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
 	type ImageResizeOptions,
+	type ImageViewResult,
 	type ResizedImage,
 	type ResizeImageWorkerResponse,
-	resizeImageInProcess,
+	renderImageViewInProcess,
 } from "./image-resize-core.ts";
+import type { ImageView } from "./image-view.ts";
 
-export type { ImageResizeOptions, ResizedImage } from "./image-resize-core.ts";
+export type { ImageResizeOptions, ImageViewResult, ResizedImage } from "./image-resize-core.ts";
 
 function toTransferableBytes(input: Uint8Array): Uint8Array<ArrayBuffer> {
 	// Transfer detaches the buffer, so transfer a worker-owned copy and leave the
@@ -25,18 +27,19 @@ function createResizeWorker(workerSpecifier: string | URL): Worker {
 	return new Worker(workerSpecifier);
 }
 
-async function resizeImageInWorker(
+async function renderImageViewInWorker(
 	workerSpecifier: string | URL,
 	inputBytes: Uint8Array,
 	mimeType: string,
+	view: ImageView,
 	options?: ImageResizeOptions,
-): Promise<ResizedImage | null> {
+): Promise<ImageViewResult> {
 	const worker = createResizeWorker(workerSpecifier);
 	try {
 		const inputBytesForWorker = toTransferableBytes(inputBytes);
-		return await new Promise<ResizedImage | null>((resolve, reject) => {
+		return await new Promise<ImageViewResult>((resolve, reject) => {
 			let settled = false;
-			const settle = (result: ResizedImage | null): void => {
+			const settle = (result: ImageViewResult): void => {
 				if (settled) return;
 				settled = true;
 				resolve(result);
@@ -64,6 +67,7 @@ async function resizeImageInWorker(
 				{
 					inputBytes: inputBytesForWorker,
 					mimeType,
+					view,
 					options,
 				},
 				[inputBytesForWorker.buffer],
@@ -78,16 +82,30 @@ async function resizeImageInWorker(
 
 /**
  * Resize an image to fit within the specified max dimensions and encoded file size.
- * Runs Photon in a worker thread so WASM decoding, resizing, and encoding do not
- * block the TUI event loop. If the worker cannot be loaded (for example in some
- * Bun compiled executable layouts), fall back to in-process resizing so image
- * reads still work.
+ * Returns null if it cannot be decoded or resized below maxBytes.
  */
 export async function resizeImage(
 	inputBytes: Uint8Array,
 	mimeType: string,
 	options?: ImageResizeOptions,
 ): Promise<ResizedImage | null> {
+	const result = await renderImageView(inputBytes, mimeType, { kind: "whole" }, options);
+	return result.ok ? result.images[0] : null;
+}
+
+/**
+ * Render a view of an image (whole, region, or tiles) within the max dimensions and encoded size.
+ * Runs Photon in a worker thread so WASM decoding, resizing, and encoding do not
+ * block the TUI event loop. If the worker cannot be loaded (for example in some
+ * Bun compiled executable layouts), fall back to in-process rendering so image
+ * reads still work.
+ */
+export async function renderImageView(
+	inputBytes: Uint8Array,
+	mimeType: string,
+	view: ImageView,
+	options?: ImageResizeOptions,
+): Promise<ImageViewResult> {
 	const isTypeScriptRuntime = import.meta.url.endsWith(".ts");
 	const workerUrl = new URL(
 		isTypeScriptRuntime ? "./image-resize-worker.ts" : "./image-resize-worker.js",
@@ -99,14 +117,20 @@ export async function resizeImage(
 	// release binary uses the embedded worker instead of falling back in-process.
 	if (typeof process.versions.bun === "string") {
 		try {
-			return await resizeImageInWorker("./src/utils/image-resize-worker.ts", inputBytes, mimeType, options);
+			return await renderImageViewInWorker(
+				"./src/utils/image-resize-worker.ts",
+				inputBytes,
+				mimeType,
+				view,
+				options,
+			);
 		} catch {}
 	}
 
 	try {
-		return await resizeImageInWorker(workerUrl, inputBytes, mimeType, options);
+		return await renderImageViewInWorker(workerUrl, inputBytes, mimeType, view, options);
 	} catch {
-		return resizeImageInProcess(inputBytes, mimeType, options);
+		return renderImageViewInProcess(inputBytes, mimeType, view, options);
 	}
 }
 

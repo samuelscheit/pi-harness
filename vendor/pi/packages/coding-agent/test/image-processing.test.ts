@@ -229,6 +229,7 @@ describe("formatDimensionNote", () => {
 			width: 100,
 			height: 100,
 			wasResized: false,
+			box: { x: 0, y: 0, width: 100, height: 100 },
 		});
 		expect(note).toBeUndefined();
 	});
@@ -242,6 +243,7 @@ describe("formatDimensionNote", () => {
 			width: 1000,
 			height: 500,
 			wasResized: true,
+			box: { x: 0, y: 0, width: 2000, height: 1000 },
 		});
 		expect(note).toContain("original 2000x1000");
 		expect(note).toContain("displayed at 1000x500");
