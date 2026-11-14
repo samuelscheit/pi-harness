@@ -22,7 +22,9 @@
  *    leaves as `outOfEditScope`, still observed, so a blocker recorded while
  *    its line was edited stays pending until a run no longer observes it.
  *    This comes first, so the cross-tool class merge (#5416) cannot raise a
- *    demoted copy back. A whole-file write marks every line as changed.
+ *    demoted copy back. A write of an existing file marks the lines it
+ *    changed against the bytes before it (`write-line-baseline.ts`); a
+ *    created file, or one without that baseline, marks every line.
  * 2. On an edited line, a parse error always blocks: the file does not load.
  * 3. Without a project config for a style linter
  *    ({@link STYLE_LINTER_CONFIG}), the findings come from the tool's or

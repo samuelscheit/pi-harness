@@ -1631,7 +1631,7 @@
 		"tests/scripts/install-smoke-handshake-steps.test.ts": 0.03,
 		"tests/scripts/knip-command.test.ts": 0.01,
 		"tests/scripts/knip-runner.test.ts": 0.02,
-		"tests/scripts/knip-sibling-purge.test.ts": 0.11,
+		"tests/scripts/knip-snapshot.test.ts": 0.11,
 		"tests/scripts/label-triage-fetch.test.ts": 0.01,
 		"tests/scripts/label-triage.test.ts": 0.02,
 		"tests/scripts/lane-check-lock.test.ts": 15.47,

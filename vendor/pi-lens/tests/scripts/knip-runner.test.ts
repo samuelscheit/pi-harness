@@ -5,49 +5,63 @@ function fakeSpawn(status: number | null, error?: Error) {
 	return vi.fn().mockReturnValue({ status, error });
 }
 
-describe("runKnip (#2698 review rounds 2-3)", () => {
-	it("purges, then spawns the resolved command, and propagates knip's exit code", () => {
-		const purge = vi.fn().mockReturnValue(["clients/a.js"]);
-		const resolveCommand = vi
-			.fn()
-			.mockReturnValue({ command: "node", args: ["bin/knip.js", "--x"] });
+const command = () =>
+	vi.fn().mockReturnValue({ command: "node", args: ["bin/knip.js"] });
+
+describe("runKnip", () => {
+	it("runs knip in a copy of the tree, removes the copy, and propagates knip's exit code", () => {
+		const snapshot = vi.fn().mockReturnValue({ dir: "/tmp/copy", files: 3 });
+		const removeSnapshot = vi.fn();
 		const spawn = fakeSpawn(3);
-		const log = vi.fn();
 
 		const code = runKnip(["--x"], "/repo", {
-			purge,
-			resolveCommand,
+			snapshot,
+			removeSnapshot,
+			resolveCommand: vi
+				.fn()
+				.mockReturnValue({ command: "node", args: ["bin/knip.js", "--x"] }),
 			spawn,
-			log,
+			log: vi.fn(),
 			logError: vi.fn(),
 		});
 
-		expect(purge).toHaveBeenCalledWith("/repo");
+		expect(snapshot).toHaveBeenCalledWith("/repo");
 		expect(spawn).toHaveBeenCalledWith(
 			"node",
 			["bin/knip.js", "--x"],
-			expect.objectContaining({ cwd: "/repo" }),
+			expect.objectContaining({ cwd: "/tmp/copy" }),
 		);
+		expect(removeSnapshot).toHaveBeenCalledWith("/tmp/copy");
 		expect(code).toBe(3);
 	});
 
-	// #2698 review F3: the pre-fix caller caught ANY purge failure (including
-	// a real ENOBUFS from an unbounded git buffer), warned, and fell through
-	// to spawning knip anyway — regenerating the false "unused files" report
-	// this wrapper exists to prevent. This is the red-first proof that the
-	// caller now honors scripts/lib/knip-sibling-purge.test.ts's "propagates
-	// a git failure" contract instead of swallowing it.
-	it("F3: aborts with a non-zero exit and never spawns knip when the purge throws", () => {
-		const purge = vi.fn().mockImplementation(() => {
-			throw new Error("git ls-files ENOBUFS");
-		});
-		const resolveCommand = vi.fn();
+	it("removes the copy when knip throws", () => {
+		const removeSnapshot = vi.fn();
+		expect(() =>
+			runKnip([], "/repo", {
+				snapshot: vi.fn().mockReturnValue({ dir: "/tmp/copy", files: 1 }),
+				removeSnapshot,
+				resolveCommand: command(),
+				spawn: vi.fn().mockImplementation(() => {
+					throw new Error("spawn blew up");
+				}),
+				log: vi.fn(),
+				logError: vi.fn(),
+			}),
+		).toThrow("spawn blew up");
+		expect(removeSnapshot).toHaveBeenCalledWith("/tmp/copy");
+	});
+
+	it("aborts with a non-zero exit, and never runs knip in the checkout, when the copy fails", () => {
 		const spawn = vi.fn();
 		const logError = vi.fn();
 
 		const code = runKnip(["--reporter", "json"], "/repo", {
-			purge,
-			resolveCommand,
+			snapshot: vi.fn().mockImplementation(() => {
+				throw new Error("git ls-files ENOBUFS");
+			}),
+			removeSnapshot: vi.fn(),
+			resolveCommand: command(),
 			spawn,
 			log: vi.fn(),
 			logError,
@@ -56,111 +70,73 @@ describe("runKnip (#2698 review rounds 2-3)", () => {
 
 		expect(code).toBe(1);
 		expect(spawn).not.toHaveBeenCalled();
-		expect(resolveCommand).not.toHaveBeenCalled();
 		expect(logError).toHaveBeenCalledWith(
 			expect.stringContaining("git ls-files ENOBUFS"),
 		);
+		expect(logError).not.toHaveBeenCalledWith(
+			expect.stringMatching(/^::error::/),
+		);
 	});
 
-	it("F3: prints an ::error:: line under CI on a purge failure", () => {
-		const purge = vi.fn().mockImplementation(() => {
-			throw new Error("boom");
-		});
+	it("prints an ::error:: line under CI when the copy fails", () => {
 		const logError = vi.fn();
-
 		runKnip([], "/repo", {
-			purge,
-			resolveCommand: vi.fn(),
+			snapshot: vi.fn().mockImplementation(() => {
+				throw new Error("boom");
+			}),
+			resolveCommand: command(),
 			spawn: vi.fn(),
 			log: vi.fn(),
 			logError,
 			isCI: true,
 		});
-
 		expect(logError).toHaveBeenCalledWith(expect.stringMatching(/^::error::/));
 	});
 
-	// #2698 review round 3, R2-F1, red-first over the whole per-argv skip
-	// table: round 2 listed `-v` (lowercase) as knip's short version flag,
-	// but knip's real short flag is `-V` (capital) — `-v` is "Unknown
-	// option" to knip itself (verified against the installed 6.34.0 binary).
-	// `npm run knip -- -V` still purged under round 2's code. This table
-	// covers every skip arg AND proves `-v` is no longer treated as one.
+	// knip's short version flag is `-V`; `-v` is "Unknown option" to knip and
+	// so is analysed like any other run (#2698 review round 3, R2-F1).
 	it.each([
-		["--help", 0],
-		["-h", 0],
-		["--version", 0],
-		["-V", 0],
-		// Not a recognized knip flag (knip itself rejects it) — must NOT be
-		// treated as a version request, so the purge still runs.
-		["-v", 1],
-	])("F5/R2-F1: purge call count for %s is %i", (arg, purgeCallCount) => {
-		const purge = vi.fn().mockReturnValue([]);
-		const resolveCommand = vi
-			.fn()
-			.mockReturnValue({ command: "node", args: ["bin/knip.js", arg] });
+		["--help", 0, "/repo"],
+		["-h", 0, "/repo"],
+		["--version", 0, "/repo"],
+		["-V", 0, "/repo"],
+		["-v", 1, "/tmp/copy"],
+	])("%s makes %i copies and runs in %s", (arg, copies, cwd) => {
+		const snapshot = vi.fn().mockReturnValue({ dir: "/tmp/copy", files: 1 });
 		const spawn = fakeSpawn(0);
 
 		const code = runKnip([arg], "/repo", {
-			purge,
-			resolveCommand,
+			snapshot,
+			removeSnapshot: vi.fn(),
+			resolveCommand: command(),
 			spawn,
 			log: vi.fn(),
 			logError: vi.fn(),
 		});
 
-		expect(purge).toHaveBeenCalledTimes(purgeCallCount);
-		expect(spawn).toHaveBeenCalled();
+		expect(snapshot).toHaveBeenCalledTimes(copies);
+		expect(spawn).toHaveBeenCalledWith(
+			"node",
+			["bin/knip.js"],
+			expect.objectContaining({ cwd }),
+		);
 		expect(code).toBe(0);
 	});
 
-	it("F5: prints the rebuild reminder only when files were actually purged", () => {
-		const log = vi.fn();
-		runKnip([], "/repo", {
-			purge: vi.fn().mockReturnValue(["clients/a.js"]),
-			resolveCommand: vi.fn().mockReturnValue({ command: "node", args: [] }),
-			spawn: fakeSpawn(0),
-			log,
-			logError: vi.fn(),
-		});
-		expect(log).toHaveBeenCalledWith(
-			expect.stringContaining('needs "npm run build"'),
-		);
-	});
-
-	it("F5: does not print the rebuild reminder when nothing was purged", () => {
-		const log = vi.fn();
-		runKnip([], "/repo", {
-			purge: vi.fn().mockReturnValue([]),
-			resolveCommand: vi.fn().mockReturnValue({ command: "node", args: [] }),
-			spawn: fakeSpawn(0),
-			log,
-			logError: vi.fn(),
-		});
-		expect(log).not.toHaveBeenCalledWith(
-			expect.stringContaining('needs "npm run build"'),
-		);
-	});
-
-	it("reports a failure to even start knip", () => {
+	it.each([
+		["a failure to start knip", fakeSpawn(null, new Error("ENOENT"))],
+		["a signal-killed knip (no numeric status)", fakeSpawn(null)],
+	])("treats %s as a failure and still removes the copy", (_, spawn) => {
+		const removeSnapshot = vi.fn();
 		const code = runKnip([], "/repo", {
-			purge: vi.fn().mockReturnValue([]),
-			resolveCommand: vi.fn().mockReturnValue({ command: "node", args: [] }),
-			spawn: fakeSpawn(null, new Error("ENOENT")),
+			snapshot: vi.fn().mockReturnValue({ dir: "/tmp/copy", files: 1 }),
+			removeSnapshot,
+			resolveCommand: command(),
+			spawn,
 			log: vi.fn(),
 			logError: vi.fn(),
 		});
 		expect(code).toBe(1);
-	});
-
-	it("treats a signal-killed spawn (no numeric status) as a failure", () => {
-		const code = runKnip([], "/repo", {
-			purge: vi.fn().mockReturnValue([]),
-			resolveCommand: vi.fn().mockReturnValue({ command: "node", args: [] }),
-			spawn: fakeSpawn(null),
-			log: vi.fn(),
-			logError: vi.fn(),
-		});
-		expect(code).toBe(1);
+		expect(removeSnapshot).toHaveBeenCalledWith("/tmp/copy");
 	});
 });

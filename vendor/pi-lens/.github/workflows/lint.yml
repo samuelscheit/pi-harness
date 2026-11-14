@@ -183,11 +183,9 @@ jobs:
           version=$(node -p "require('./package.json').devDependencies.knip")
           npm install --no-save --no-audit --no-fund --ignore-scripts "knip@${version}"
 
-      # scripts/run-knip.mjs purges gitignored compiled clients/*.js siblings
-      # before invoking knip (see its header comment and knip.jsonc's) —
-      # this checkout never ran `npm run build`, so there is nothing to
-      # purge here, but the same script runs identically for a contributor
-      # who has built locally.
+      # scripts/run-knip.mjs runs knip in a temporary copy of the working
+      # tree without gitignored build output (scripts/lib/knip-snapshot.mjs),
+      # so a local built checkout analyses the same as this unbuilt one.
       - name: Run knip
         run: node scripts/run-knip.mjs
 

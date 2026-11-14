@@ -4,7 +4,11 @@
 import type { SpawnSyncReturns } from "node:child_process";
 
 export interface RunKnipDeps {
-	purge?: (repoRoot: string, deps?: unknown) => string[];
+	snapshot?: (
+		repoRoot: string,
+		deps?: unknown,
+	) => { dir: string; files: number };
+	removeSnapshot?: (dir: string) => void;
 	resolveCommand?: (
 		extraArgs: string[],
 		deps?: unknown,

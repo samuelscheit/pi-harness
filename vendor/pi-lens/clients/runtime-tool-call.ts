@@ -52,6 +52,7 @@ import {
 import { isProvisionalLearnedAttribution } from "./mutation-attribution.js";
 import { armObservedMutation } from "./observed-mutation.js";
 import { extractWrittenPathsFromCommand } from "./bash-file-access.js";
+import { recordPreWriteLines } from "./write-line-baseline.js";
 import { getLSPService } from "./lsp/capabilities.js";
 import {
 	findDocumentSymbolAtLine,
@@ -670,23 +671,27 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// the capture is stat-only and budgeted, so awaiting it is bounded work on
 	// an already-second-scale bash path.
 	const commandInput = (event as { input?: { command?: unknown } }).input;
-	if (toolName === "bash") {
+	const callId = resolveToolCallCorrelationId(event);
+	if (toolName === "bash" && typeof commandInput?.command === "string") {
+		const targets = extractWrittenPathsFromCommand(
+			commandInput.command,
+			runtime.projectRoot || process.cwd(),
+		);
+		// Each recognized write is replayed as a `write`; its edit scope is the
+		// lines it changed against these bytes (write-line-baseline.ts).
+		recordPreWriteLines(callId, targets);
 		// #4131: a recognized bash write credits authorship without the bytes
 		// it wrote, so it may only advance an authorship whose bytes still
 		// hold. One another writer broke ends here, before the command rewrites
 		// around the other writer's bytes (the tool_result path's root).
-		if (typeof commandInput?.command === "string" && !getFlag("no-read-guard"))
-			for (const target of extractWrittenPathsFromCommand(
-				commandInput.command,
-				runtime.projectRoot || process.cwd(),
-			))
+		if (!getFlag("no-read-guard"))
+			for (const target of targets)
 				runtime.readGuardFor(deps.sessionId).retireChangedAuthorship?.(target);
 	}
 	// #4504: the record and the take resolve their root through one owner, so a
 	// session whose cwd is not the coordinator's project root (a concurrent
 	// secondary, #473) cannot key the two lookups apart.
 	const scanRoot = opaquePrescanRoot(ctx.cwd, runtime.projectRoot);
-	const callId = resolveToolCallCorrelationId(event);
 	// #4732: the command text the prescan reads its roots from. bash: its
 	// non-empty command, as before. Any other tool the gate does not know to be
 	// read-only or structured, and whose event the structured classifier does
@@ -911,6 +916,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		`tool_call fired for: ${filePath} (exists: ${nodeFs.existsSync(filePath)})`,
 	);
 	const toolCallId = resolveToolCallCorrelationId(event);
+	// The write's edit scope is the lines it changes against these bytes.
+	if (mutation?.kind === "write") recordPreWriteLines(toolCallId, [filePath]);
 	// #4138: a read is attributed too, so its tool_result resolves a relative
 	// path against the cwd this call ran under instead of failing closed at
 	// `path_attribution_missing` and never writing the delivered record.

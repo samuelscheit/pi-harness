@@ -2349,6 +2349,12 @@ export type DegradationKind =
 	 * `WidgetDiagnostic.suppressedRetained` in `clients/widget-state.ts`.
 	 */
 	| "widget-suppressed-retention-capped"
+	/**
+	 * `write-line-baseline-unreadable`: The bytes before a write could not be
+	 * read at tool_call (`clients/write-line-baseline.ts`), so the write keeps
+	 * the whole file in edit scope. Subject is the file.
+	 */
+	| "write-line-baseline-unreadable"
 	/** `word-index-arena-recompact`: Incremental word-index churn required an arena re-compaction. */
 	| "word-index-arena-recompact"
 	/**

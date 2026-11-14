@@ -970,7 +970,10 @@ describe("#4484 witness, round 2: only evidence retires a recorded blocker", () 
 	}, 120_000);
 
 	// Recurrence: a run with no verdict read as an empty, clean observation
-	// (TLC MutFailClear).
+	// (TLC MutFailClear). And (2026-11-12): the carried copy adopted the hash
+	// of bytes no check saw, so the turn end re-served it as authoritative
+	// every turn. It is pending and gates the commit, but turn end names it
+	// as unconfirmed ("re-run to confirm"), not as a fresh verdict.
 	it("keeps an LSP error pending when the server does not answer the next write (row 10)", async () => {
 		boundary.lsp.enabled = true;
 		const s = await openSession("xt", "src/carry-timeout.ts", V_FIXED);
@@ -992,10 +995,45 @@ describe("#4484 witness, round 2: only evidence retires a recorded blocker", () 
 		expect(await s.commitBlocked()).toBe(true);
 		const turnEnd = await s.endTurn();
 		expect(turnEnd).toContain(
-			"Unresolved from this turn — src/carry-timeout.ts:",
+			"[stale — re-run to confirm] src/carry-timeout.ts:",
 		);
+		expect(turnEnd).not.toContain("Unresolved from this turn");
 		expect(turnEnd).not.toContain("Resolved this turn");
+		expect(await s.commitBlocked()).toBe(true);
 		boundary.lsp.mode = "answer";
+		await fixAndDrain(s);
+	}, 120_000);
+
+	// Recurrence (2026-11-12, define-tool/index.ts): the agent's fix rewrote the
+	// TS2322 line while the typescript server gave no verdict; the old error
+	// was carried as "Still unfixed … could not be re-placed" and re-served
+	// every turn though tsc was green. A write that rewrote or deleted the
+	// blocker's own line drops it; the next conclusive check reports it again
+	// if it persists.
+	it("drops an LSP error whose own line the write rewrote while the server does not answer", async () => {
+		boundary.lsp.enabled = true;
+		const s = await openSession("rw", "src/carry-rewritten.ts", V_FIXED);
+		expect(await s.write(V1)).toContain("🔴 STOP");
+		boundary.lsp.mode = "inconclusive";
+		const w2 = await s.edit(V1_LINE_REWRITTEN, [2]);
+		expect(w2).not.toMatch(/Still unfixed/);
+		expect(w2).not.toContain("🔴 STOP");
+		expect(await s.commitBlocked()).toBe(false);
+		const turnEnd = await s.endTurn();
+		expect(turnEnd).not.toContain("src/carry-rewritten.ts:");
+		// Deleting the line drops it the same way.
+		boundary.lsp.mode = "answer";
+		expect(await s.write(V1)).toContain("🔴 STOP");
+		boundary.lsp.mode = "inconclusive";
+		const w3 = await s.write(V_FIXED_OTHER);
+		expect(w3).not.toMatch(/Still unfixed/);
+		// (The commit gate is not read here: the first turn end's cascade note
+		// about another cell's file holds it, which is not this record.)
+		expect(await s.endTurn()).not.toContain("src/carry-rewritten.ts:");
+		// The server answers again: a rewritten line that still errs is new.
+		boundary.lsp.mode = "answer";
+		expect(await s.write(V1_LINE_REWRITTEN_OTHER_LINE)).toContain("🔴 STOP");
+		expect(await s.commitBlocked()).toBe(true);
 		await fixAndDrain(s);
 	}, 120_000);
 
@@ -1015,21 +1053,32 @@ describe("#4484 witness, round 2: only evidence retires a recorded blocker", () 
 				String(row.subject ?? "").includes("unalign.ts"),
 			);
 		expect(await s.write(V1)).toContain("🔴 STOP");
-		// The server stops answering, and the blocker's own line is rewritten:
-		// the alignment cannot place it, so this write marks the record stale
-		// instead of counting it as unplaced yet.
+		// The server stops answering, and an insert above makes the alignment
+		// place the blocker on its moved line: placed, not counted.
 		boundary.lsp.mode = "inconclusive";
-		expect(await s.edit(V1_LINE_REWRITTEN, [2])).toContain(
-			"Still unfixed: 1 blocker reported earlier",
+		expect(await s.edit(V2_INSERT_ABOVE, [1])).toContain(
+			"Still unfixed: 1 blocker reported earlier (L3",
 		);
 		expect(await unalignedRows("blocker-position-unaligned")).toEqual([]);
-		// The next write has nothing to place that stale record against.
-		expect(await s.write(V1_LINE_REWRITTEN_OTHER_LINE)).toContain(
-			"Still unfixed: 1 blocker reported earlier",
-		);
+		// A rewrite past the alignment's edit cap leaves it no place; its line
+		// text is still there, so it stays, counted as unplaced.
+		const pad = Array.from({ length: 1100 }, (_, i) => `// pad ${i}`);
+		expect(
+			await s.write(`${pad.join("\n")}\n${V2_INSERT_ABOVE}const tail = 1;\n`),
+		).toContain("Still unfixed: 1 blocker reported earlier");
 		expect(await unalignedRows("blocker-position-unaligned")).toContainEqual(
 			expect.objectContaining({ count: 1 }),
 		);
+		// Unplaced from now on, it is judged by its text: a write that keeps
+		// the line keeps it, one that rewrites the line drops it.
+		expect(
+			await s.write(`${pad.join("\n")}\n${V2_INSERT_ABOVE}const tail = 2;\n`),
+		).toContain("Still unfixed: 1 blocker reported earlier");
+		expect(
+			await s.write(
+				`${pad.join("\n")}\n${V2_INSERT_ABOVE.replace("BAD_CALL()", "BAD_CALL(1)")}const tail = 2;\n`,
+			),
+		).not.toMatch(/Still unfixed/);
 		boundary.lsp.mode = "answer";
 		await fixAndDrain(s);
 	}, 120_000);
@@ -2169,8 +2218,9 @@ describe("#4509 witness: a recorded blocker is judged by a run of its own runner
 		const turnEnd = await s.endTurn();
 		expect(turnEnd).not.toContain("line no longer exists");
 		expect(turnEnd).not.toContain("Retired after this delivery");
+		// No check saw these bytes, so it is named unconfirmed, still gating.
 		expect(turnEnd).toMatch(
-			/STOP[^]*no-unknown-returns|STOP[^]*Function returns 'unknown'/,
+			/\[stale — re-run to confirm\] src\/stale-eof\.ts:[^]*Function returns 'unknown'/,
 		);
 		expect(await s.commitBlocked()).toBe(true);
 		expect(
@@ -2498,17 +2548,14 @@ describe("#5008 witness: a partial run answers for the servers that answered", (
 		expect(await s.edit(`${twoErrors}const c = 3;\n`, [5])).toMatch(
 			/Still unfixed: 2 blockers reported earlier \(L2 ts:2304, L3 ts:2304\)\./,
 		);
-		// One blocker's own line is rewritten, so its line number is from older
-		// bytes: it stays counted, and the line says its line moved (review r3
-		// F6: this is not the "no line in this file" cause).
+		// One blocker's own line is rewritten while the server is silent: that
+		// one is dropped (its text is gone), the other stays listed.
 		expect(
 			await s.edit(
 				"const a = 1;\nBAD_CALL(1);\nBAD_CALL();\nconst b = 2;\n",
 				[2],
 			),
-		).toMatch(
-			/Still unfixed: 2 blockers reported earlier \(L3 ts:2304\); 1 whose line could not be re-placed in these bytes\./,
-		);
+		).toMatch(/Still unfixed: 1 blocker reported earlier \(L3 ts:2304\)\./);
 		boundary.lsp.mode = "answer";
 		await fixAndDrain(s);
 	}, 120_000);

@@ -24,9 +24,9 @@
 	// referenced against tracked `.ts` siblings, then re-run with those
 	// siblings removed: unused files fell to 31, dependencies false-positives
 	// vanished). No knip config option overrides `extensionAlias`'s order, so
-	// `npm run knip` (scripts/run-knip.mjs) removes exactly those gitignored
-	// compiled `.js` siblings before invoking knip — never a bare
-	// `git clean`, so it can't touch grammars/ or other gitignored state.
+	// `npm run knip` (scripts/run-knip.mjs) runs knip in a temporary copy of
+	// the tracked and untracked, non-ignored files (scripts/lib/
+	// knip-snapshot.mjs): no build output, and the checkout is never written.
 	"entry": [
 		"index.ts",
 		// MCP server/CLI entry points (package.json#bin targets, built

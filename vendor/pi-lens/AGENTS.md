@@ -532,6 +532,13 @@ node scripts/guard-bash-probe.mjs <matrix.jsonl> [--head <ref|file>] [--base <re
                                         prints only the rows that changed head vs base
 ```
 
+`npm run knip` analyses a temporary copy of the working tree (tracked plus
+untracked, non-ignored files; `node_modules` linked) and removes it after,
+so it never deletes the compiled `.js` twins other agents' test runs need in
+a shared checkout, and a new untracked source is analysed without its twin
+(`scripts/lib/knip-snapshot.mjs`). Never run knip on the checkout directly:
+a compiled twin makes knip report its `.ts` source unused.
+
 CI jobs, required contexts, the Windows leg, caches, smoke paths, shard weights
 and the pre-push base-range logic are in [docs/ci.md](docs/ci.md). Two rules
 bind an agent who edits a workflow or a hook:

@@ -110,5 +110,16 @@
 - Deferred work has a bounded queue, wall budget, abort path, carry-forward
   identity, and honest partial/deferred delivery. It never publishes a false
   clean result after cutting work.
+- A write's edit scope is the lines it changed: `tool_call` records each
+  target's line hashes (host `write`, recognized bash writes) and
+  `tool_result` aligns them (`clients/write-line-baseline.ts`); only a create
+  or a write without that baseline scopes the whole file.
+- A recorded blocker whose source reached no verdict is carried
+  (`carryRecordedBlockers`), except when the write rewrote or deleted its own
+  line and no collect-later run will judge it: then it is dropped. A record
+  of carried blockers only keeps the baseline of the bytes they were last
+  observed in (`InlineBlockerRecord.observedHash`), so the turn-end freshness
+  sweep names it "re-run to confirm" instead of re-serving it as a fresh
+  verdict; it still gates the commit.
 
 </important>

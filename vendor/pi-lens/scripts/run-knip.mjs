@@ -2,31 +2,22 @@
 /**
  * scripts/run-knip.mjs (#2698, refs #2697 item 6).
  *
- * Wraps the `knip` binary with one mutation: delete gitignored compiled
- * `.js` files that sit beside a tracked `.ts` file of the same name, before
- * knip runs (scripts/lib/knip-sibling-purge.mjs), then spawns knip's real
- * bin entry directly (scripts/lib/knip-command.mjs). Orchestration
- * (including the fail-loud-on-purge-failure and skip-purge-on---help/
- * --version behavior) lives in scripts/lib/knip-runner.mjs, which is
- * unit-tested; this file is a 3-line invocation of it.
+ * Runs knip in a temporary copy of the working tree that holds no gitignored
+ * build output (scripts/lib/knip-snapshot.mjs), then removes the copy. The
+ * checkout itself is never written: agents sharing it keep their compiled
+ * `.js` twins and their running test suites.
  *
- * Why the purge is required, not cosmetic: `npm run build` (tsc, no
- * `outDir`) writes `clients/x.js` beside every `clients/x.ts` — gitignored,
- * but present on disk after any build. Every source file imports its
- * siblings with an explicit `.js` specifier (nodenext `moduleResolution`).
- * knip's own resolver (packages/knip/src/util/resolve.ts's
- * `extensionAlias`, at the pinned 6.34.0 tag) tries the literal `.js`
- * candidate BEFORE the `.ts` source for a `.js` specifier, and its graph
- * walker does not gitignore-filter a resolved import target — so whenever a
- * build artifact sits on disk, knip's reachability graph walks into the
- * compiled `.js` copy and never returns to the `.ts` source. Measured on
- * this repo: 491 files reported "unused" with the siblings present, 0 with
- * them removed (see knip.jsonc's header comment and the PR body for the
- * full before/after). No knip config option overrides `extensionAlias`'s
- * resolution order, so the fix has to happen before knip's process starts.
+ * Why the copy is required: `npm run build` (tsc, no `outDir`) writes
+ * `clients/x.js` beside every `clients/x.ts`, and every source imports its
+ * siblings with an explicit `.js` specifier (nodenext). knip's resolver
+ * (`extensionAlias`, packages/knip/src/util/resolve.ts) tries the literal
+ * `.js` candidate before the `.ts` source and does not gitignore-filter a
+ * resolved target, so on a built tree its graph walks into the compiled
+ * copies: 491 files reported "unused" with them present, 0 without (see
+ * knip.jsonc's header). No knip option changes that order.
  *
- * This script never rebuilds what it deletes — every deleted file is a
- * `tsc` build artifact `npm run build` recreates on the next build.
+ * Orchestration (fail loud when the copy fails, no copy for --help/
+ * --version) lives in scripts/lib/knip-runner.mjs, which is unit-tested.
  */
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";

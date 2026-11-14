@@ -1505,10 +1505,10 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the pipefail pipe into tee and the failing-row report are shell text from the workflow; only a real bash running the extracted run: shows that a red handshake exits non-zero and that a crash with no rows is not reported as clean",
 	},
-	// #2698: gitignore/tracked-vs-untracked resolution (git init/add/commit/
-	// ls-files against a throwaway fixture repo) is the exact mechanism
-	// scripts/lib/knip-sibling-purge.mjs depends on and this file tests.
-	"real-process-spawn:scripts/knip-sibling-purge.test.ts": {
+	// #2698: which files git lists as tracked, untracked or ignored (git
+	// init/add/commit/ls-files against a throwaway fixture repo) is the exact
+	// mechanism scripts/lib/knip-snapshot.mjs depends on and this file tests.
+	"real-process-spawn:scripts/knip-snapshot.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"gitignore/tracked-vs-untracked resolution is the mechanism under test; no mock reproduces git's own resolution faithfully",

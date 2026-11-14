@@ -1,38 +1,26 @@
 // scripts/lib/knip-runner.mjs (#2698).
 //
-// Orchestrates one `npm run knip` invocation: purge the gitignored compiled
-// `.js` siblings (scripts/lib/knip-sibling-purge.mjs), then spawn knip's
-// real bin entry (scripts/lib/knip-command.mjs). Split out from
-// scripts/run-knip.mjs so the control flow -- especially "a purge failure
-// must abort loudly, never fall through to spawning knip" -- is unit-
-// testable without a real git repo or a real knip install.
+// Orchestrates one `npm run knip` invocation: copy the working tree without
+// its gitignored build output (scripts/lib/knip-snapshot.mjs), spawn knip's
+// real bin entry (scripts/lib/knip-command.mjs) in the copy, remove the copy.
+// The checkout itself is never written, so agents sharing it keep their
+// compiled `.js` twins (the 2026-11-14 purge broke their vitest runs).
 //
-// #2698 review round 2:
-// - F3: a purge failure (buffer overflow, git timeout, anything) now ABORTS
-//   with a non-zero exit and a printed message -- an `::error::` line too
-//   under CI -- instead of warning and running knip against a tree that is
-//   still fully built. Silently degrading here regenerates exactly the
-//   false "unused files" report this wrapper exists to prevent.
-// - F5: the purge is skipped for `--help`/`--version` (a read-only,
-//   informational invocation has no business mutating the tree), and a
-//   successful purge that actually removed files prints a reminder that the
-//   tree now needs `npm run build` before `npm test` (the CLAUDE.md
-//   non-negotiable, but easy to forget immediately after this script just
-//   deleted the build's own output).
-//
-// #2698 review round 3, R2-F1: knip's actual short version flag is `-V`
-// (capital) -- `-v` is "Unknown option" to knip itself (verified:
-// `node_modules/.bin/knip -v` errors, `-V`/`--version` both print the
-// version). Round 2 listed `-v`, so `npm run knip -- -V` still purged.
+// A snapshot failure aborts loudly (an `::error::` line under CI too) rather
+// than running knip in the built checkout, which would report every source
+// behind a compiled twin as unused (#2698 review round 2, F3). `--help` and
+// `--version` (`-h`, `-V`) analyse nothing, so they run in the checkout
+// without a copy (#2698 review rounds 2-3).
 import { spawnSync } from "node:child_process";
-import { purgeCompiledSiblings } from "./knip-sibling-purge.mjs";
 import { resolveKnipCommand } from "./knip-command.mjs";
+import { createKnipSnapshot, removeKnipSnapshot } from "./knip-snapshot.mjs";
 
-const SKIP_PURGE_ARGS = new Set(["--help", "-h", "--version", "-V"]);
+const INFORMATIONAL_ARGS = new Set(["--help", "-h", "--version", "-V"]);
 
 /**
  * @typedef {{
- *   purge?: typeof purgeCompiledSiblings,
+ *   snapshot?: typeof createKnipSnapshot,
+ *   removeSnapshot?: typeof removeKnipSnapshot,
  *   resolveCommand?: typeof resolveKnipCommand,
  *   spawn?: typeof spawnSync,
  *   log?: (message: string) => void,
@@ -48,44 +36,45 @@ const SKIP_PURGE_ARGS = new Set(["--help", "-h", "--version", "-V"]);
  * @returns {number} the process exit code to use.
  */
 export function runKnip(argv, repoRoot, deps = {}) {
-	const purge = deps.purge ?? purgeCompiledSiblings;
+	const snapshot = deps.snapshot ?? createKnipSnapshot;
+	const removeSnapshot = deps.removeSnapshot ?? removeKnipSnapshot;
 	const resolveCommand = deps.resolveCommand ?? resolveKnipCommand;
 	const spawn = deps.spawn ?? spawnSync;
 	const log = deps.log ?? ((message) => console.log(message));
 	const logError = deps.logError ?? ((message) => console.error(message));
 	const isCI = deps.isCI ?? Boolean(process.env.CI);
 
-	if (!argv.some((arg) => SKIP_PURGE_ARGS.has(arg))) {
-		let purged;
-		try {
-			purged = purge(repoRoot);
-		} catch (err) {
-			const message =
-				`compiled-sibling purge failed (${err.message}); refusing to run ` +
-				`knip against a possibly still-built tree -- that would silently ` +
-				`regenerate the false "unused files" report this wrapper exists ` +
-				`to prevent.`;
-			logError(`[run-knip] ${message}`);
-			if (isCI) logError(`::error::${message}`);
+	const { command, args } = resolveCommand(argv);
+	const run = (cwd) => {
+		const result = spawn(command, args, { cwd, stdio: "inherit" });
+		if (result.error) {
+			logError(`[run-knip] failed to start knip: ${result.error.message}`);
 			return 1;
 		}
-		log(
-			`[run-knip] purged ${purged.length} compiled .js sibling(s) before analysis.`,
-		);
-		if (purged.length > 0) {
-			log(`[run-knip] this tree needs "npm run build" before "npm test" now.`);
-		}
-	}
+		// Killed by a signal (e.g. SIGTERM from a CI timeout): non-zero.
+		return typeof result.status === "number" ? result.status : 1;
+	};
 
-	const { command, args } = resolveCommand(argv);
-	const result = spawn(command, args, { cwd: repoRoot, stdio: "inherit" });
+	if (argv.some((arg) => INFORMATIONAL_ARGS.has(arg))) return run(repoRoot);
 
-	if (result.error) {
-		logError(`[run-knip] failed to start knip: ${result.error.message}`);
+	let copy;
+	try {
+		copy = snapshot(repoRoot);
+	} catch (err) {
+		const message =
+			`could not copy the working tree for analysis (${err.message}); ` +
+			`refusing to run knip in the built checkout, where compiled .js ` +
+			`twins make it report their sources as unused.`;
+		logError(`[run-knip] ${message}`);
+		if (isCI) logError(`::error::${message}`);
 		return 1;
 	}
-	if (typeof result.status === "number") return result.status;
-	// Killed by a signal (e.g. SIGTERM from a CI timeout) — mirror the
-	// non-zero-but-not-a-status-code shape other wrappers in this repo use.
-	return 1;
+	log(
+		`[run-knip] analysing a copy of ${copy.files} file(s) without build output: ${copy.dir}`,
+	);
+	try {
+		return run(copy.dir);
+	} finally {
+		removeSnapshot(copy.dir);
+	}
 }

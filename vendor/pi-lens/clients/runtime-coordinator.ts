@@ -356,6 +356,17 @@ export interface InlineBlockerRecord {
 	 */
 	recordedHash?: string;
 	/**
+	 * The baseline of the bytes the record's blockers were last observed in,
+	 * set only while no check observed them in the bytes `recordedHash` names:
+	 * every blocker was carried unobserved (`recordInlineBlockers`'
+	 * `unconfirmed`). The freshness sweep's self axis compares against these,
+	 * so a carried snapshot shows as drifted ("re-run to confirm") instead of
+	 * being re-served as authoritative every turn. `recordedHash` stays the
+	 * analysed bytes, which a collect-later settle must match to retire.
+	 */
+	observedSize?: number;
+	observedHash?: string;
+	/**
 	 * #1641: the 1-based cited lines of the diagnostics behind `summary`,
 	 * captured at write time (`dispatchResult.blockers[].line` in
 	 * `pipeline.ts`) rather than re-parsed from the rendered text — see
@@ -1925,7 +1936,10 @@ export class RuntimeCoordinator {
 	 * Record a file's blocking verdict. Returns its freshness baseline, or
 	 * undefined when a newer dispatch of the same file already recorded or
 	 * cleared it (#3507). `recordedAtMs` is the pipeline's analysis read time
-	 * (#3503); a caller without one stamps now.
+	 * (#3503); a caller without one stamps now. `unconfirmed`: no blocker of
+	 * the verdict was observed in the analysed bytes (all carried copies,
+	 * `PipelineResult.inlineBlockersUnconfirmed`), so the record keeps the
+	 * baseline of the bytes they were last observed in (`observedHash`).
 	 */
 	recordInlineBlockers(
 		filePath: string,
@@ -1939,6 +1953,7 @@ export class RuntimeCoordinator {
 		recordedAtMs = Date.now(),
 		/** #4921: the turn session of the write (`ToolResultDeps.sessionId`). */
 		sessionId?: string,
+		unconfirmed = false,
 	): number | undefined {
 		const writeOrder = writeOrderToken(orderTurn, writeIndex);
 		if (
@@ -1952,7 +1967,14 @@ export class RuntimeCoordinator {
 		// retirement of the same file — the agent is blocked on it again, so a
 		// carried "Resolved" entry would be a false claim.
 		this._resolvedBlockerFilesThisTurn.delete(filePath);
+		const prior = unconfirmed
+			? this._pendingInlineBlockers.get(filePath)
+			: undefined;
+		const observedSize = prior?.observedSize ?? prior?.recordedSize;
+		const observedHash = prior?.observedHash ?? prior?.recordedHash;
 		this._pendingInlineBlockers.set(filePath, {
+			...(observedSize !== undefined &&
+				observedHash !== undefined && { observedSize, observedHash }),
 			filePath,
 			summary,
 			writeIndex,

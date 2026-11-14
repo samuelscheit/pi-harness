@@ -73,6 +73,7 @@ import {
 	PYTHON_SQLALCHEMY_RECEIVER_NAMES,
 	PYTHON_SQLALCHEMY_STATEMENT_BUILDERS,
 } from "./python-provenance.js";
+import { sqlTemplateInterpolatesOnlyFixedValues } from "./sql-fixed-identifiers.js";
 import {
 	type TreeSitterQuery,
 	TreeSitterQueryLoader,
@@ -4805,6 +4806,19 @@ export class TreeSitterClient {
 					/^(exec|execSync)$/.test(captures.FN?.text ?? "")
 				);
 			case "ts_sql_injection_sink": {
+				// A table or column name cannot be a bound parameter; one the file
+				// itself fixes is not injection (sql-fixed-identifiers.ts).
+				if (
+					captures.TEMPLATE &&
+					sqlTemplateInterpolatesOnlyFixedValues(captures.TEMPLATE, (id) =>
+						// The check hands back the nodes of the tree it was given.
+						!rootNode ||
+						this.isShadowedByEnclosingParam(id as TreeSitterNode, id.text)
+							? null
+							: this.resolveFileConstValueNode(id.text, rootNode),
+					)
+				)
+					return false;
 				const template = captures.TEMPLATE?.text ?? "";
 				// Inspect only the template's raw prefix. Leading SQL comments are
 				// ignored; comments and unrelated strings elsewhere cannot satisfy it.

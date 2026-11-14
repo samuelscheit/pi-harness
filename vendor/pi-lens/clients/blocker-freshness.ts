@@ -1204,6 +1204,8 @@ export async function sweepInlineBlockerFreshness(
 		staleReason?: "dependency-drift" | "past-eof" | "self-drift";
 		recordedSize?: number;
 		recordedHash?: string;
+		observedSize?: number;
+		observedHash?: string;
 	}>;
 	try {
 		inlineEntries = runtime.getInlineBlockersSnapshot({
@@ -1219,8 +1221,11 @@ export async function sweepInlineBlockerFreshness(
 		recordedAtMs: entry.recordedAtMs,
 		sources: entry.sources,
 		staleReason: entry.staleReason,
-		recordedSize: entry.recordedSize,
-		recordedHash: entry.recordedHash,
+		// A record of carried blockers is judged against the bytes they were
+		// last observed in, not the bytes the carrying run read
+		// (`InlineBlockerRecord.observedHash`).
+		recordedSize: entry.observedSize ?? entry.recordedSize,
+		recordedHash: entry.observedHash ?? entry.recordedHash,
 		demote: () =>
 			runtime.markInlineBlockerStale(entry.filePath, "dependency-drift"),
 		setSelfDrift: (isSelfDrift: boolean) =>

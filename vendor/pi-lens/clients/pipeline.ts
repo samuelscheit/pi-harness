@@ -470,6 +470,16 @@ export interface PipelineResult {
 	 */
 	inlineBlockerFileContent?: { size: number; sha256: string };
 	/**
+	 * Every blocker of the record is a carried copy no check of these bytes
+	 * observed (its source reached no verdict). The record then keeps the
+	 * baseline of the bytes its blockers were last observed in, never
+	 * `inlineBlockerFileContent`: the freshness sweep sees the file drifted
+	 * from them and demotes the record to "re-run to confirm"
+	 * (`blocker-freshness.ts`) instead of re-serving a snapshot no checker
+	 * confirmed as authoritative.
+	 */
+	inlineBlockersUnconfirmed?: true;
+	/**
 	 * #4484: how many blockers this run's observation still holds after the
 	 * deleted-path gate, new or held back by the delta, whether or not the run
 	 * may deliver them. `clearInlineBlockers` refuses a clear while it is
@@ -1995,6 +2005,17 @@ function buildEnrichedBlockerOutput(
  * `editRanges`. One outside, or unplaced, stays as for no verdict.
  * #4509 (N3): a kept recorded blocker this write could not place is marked
  * `positionStale`.
+ *
+ * A recorded blocker whose own line this write edited or deleted is never
+ * kept unobserved: the write rewrote the text the finding was about, so a
+ * copy carried without any check of these bytes would claim "still unfixed"
+ * for a line that is gone, and be re-served every turn (2026-11-12: a fixed
+ * TS2322 the typescript server had not re-checked). Its line is gone when the
+ * alignment maps it nowhere, or, unplaced, when no line of these bytes holds
+ * its text (`lineTextHeld`). The next conclusive check reports it again if it
+ * persists. A blocker whose runner still runs collect-later is exempt: that
+ * run answers for these bytes when it settles. `unobserved` holds the carried
+ * recorded copies no finding of this run matched and no such run will judge.
  */
 function carryRecordedBlockers(
 	prior: readonly Diagnostic[],
@@ -2007,16 +2028,37 @@ function carryRecordedBlockers(
 	positionOf: (d: Diagnostic) => number | undefined | typeof ANY_POSITION,
 	matchesAnywhere: (prior: Diagnostic, observed: Diagnostic) => boolean,
 	editRanges: readonly { start: number; end: number }[] | undefined,
-): { carried: Diagnostic[]; matched: ReadonlySet<Diagnostic> } {
-	if (prior.length === 0) return { carried: [], matched: new Set() };
+	lineTextHeld: (lineHash: number) => boolean,
+): {
+	carried: Diagnostic[];
+	matched: ReadonlySet<Diagnostic>;
+	unobserved: ReadonlySet<Diagnostic>;
+} {
+	if (prior.length === 0)
+		return { carried: [], matched: new Set(), unobserved: new Set() };
 	const runnerIds = new Set(dispatchResult.inconclusiveSources?.runnerIds);
 	const serverIds = new Set(dispatchResult.inconclusiveSources?.serverIds);
 	const editScoped = new Set(dispatchResult.editScopedRunnerIds);
+	const collectLater = new Set(
+		dispatchResult.inconclusiveSources?.collectLaterRunnerIds,
+	);
+	const judgedLater = (d: Diagnostic) =>
+		d.runnerId !== undefined && collectLater.has(d.runnerId);
 	const insideEdit = (d: Diagnostic) => {
 		const at = d.line === undefined ? ANY_POSITION : positionOf(d);
 		return (
 			at === undefined ||
 			(typeof at === "number" && spanOverlapsModifiedRanges(at, at, editRanges))
+		);
+	};
+	const ownLineGone = (d: Diagnostic) => {
+		if (d.line === undefined || judgedLater(d)) return false;
+		const at = positionOf(d);
+		return (
+			at === undefined ||
+			(at === ANY_POSITION &&
+				d.lineHash !== undefined &&
+				!lineTextHeld(d.lineHash))
 		);
 	};
 	const observedNow = new Set(observed);
@@ -2028,14 +2070,16 @@ function carryRecordedBlockers(
 			positionOf,
 			matchesAnywhere,
 			keepUnobserved: (d) =>
-				(d.runnerId !== undefined && runnerIds.has(d.runnerId)) ||
-				(d.serverId !== undefined && serverIds.has(d.serverId)) ||
-				(d.runnerId !== undefined &&
-					editScoped.has(d.runnerId) &&
-					!insideEdit(d)),
+				!ownLineGone(d) &&
+				((d.runnerId !== undefined && runnerIds.has(d.runnerId)) ||
+					(d.serverId !== undefined && serverIds.has(d.serverId)) ||
+					(d.runnerId !== undefined &&
+						editScoped.has(d.runnerId) &&
+						!insideEdit(d))),
 		},
 	);
 	const matched = new Set(kept.flatMap((d) => (observedNow.has(d) ? [d] : [])));
+	const unobserved = new Set<Diagnostic>();
 	const carried = kept.flatMap((d) => {
 		if (observedNow.has(d)) return [];
 		if (!recorded.has(d)) return [d];
@@ -2043,9 +2087,16 @@ function carryRecordedBlockers(
 		// #4509 (N3): kept without a place in these bytes, its line number is
 		// from older bytes; say so instead of leaving a later write to infer it
 		// from one line's hash.
-		if (typeof at !== "number")
-			return [d.positionStale ? d : { ...d, positionStale: true as const }];
-		return [at === d.line ? d : { ...d, line: at }];
+		const copy =
+			typeof at !== "number"
+				? d.positionStale
+					? d
+					: { ...d, positionStale: true as const }
+				: at === d.line
+					? d
+					: { ...d, line: at };
+		if (!judgedLater(d)) unobserved.add(copy);
+		return [copy];
 	});
 	if (carried.some((d) => !dispatchResult.stillObserved?.includes(d))) {
 		incrementDegradationCount({
@@ -2055,7 +2106,7 @@ function carryRecordedBlockers(
 				"a recorded blocker's source reached no verdict on this write, so the blocker stays pending (#4484)",
 		});
 	}
-	return { carried, matched };
+	return { carried, matched, unobserved };
 }
 
 /**
@@ -2148,6 +2199,15 @@ function anchorToPriorAnalysis(
 		const text = hashAt(observed.line);
 		return text === undefined || text === prior.lineHash;
 	};
+	// Whether some line of these bytes holds a line's text (true: unread).
+	let heldHashes: ReadonlySet<number> | undefined;
+	const lineTextHeld = (lineHash: number) => {
+		if (fileContent === undefined) return true;
+		heldHashes ??= new Set(
+			currentHashes() ?? fileContent.split(/\r?\n/).map(lineHashOf),
+		);
+		return heldHashes.has(lineHash);
+	};
 	const owed = new Map<string, { start: number; end: number }[]>();
 	const owe = (runnerId: string, ranges: { start: number; end: number }[]) => {
 		if (ranges.length > 0) owed.set(runnerId, ranges);
@@ -2185,6 +2245,7 @@ function anchorToPriorAnalysis(
 	return {
 		positionOf,
 		matchesAnywhere,
+		lineTextHeld,
 		owed,
 		next(
 			sources: InconclusiveSources | undefined,
@@ -2567,24 +2628,28 @@ async function analysePipeline(
 	// #4484 round 3: a recorded blocker is matched only at its own position.
 	const heldBackBlockers = dispatchResult.heldBackBlockers ?? [];
 	const ownFile = normalizeEphemeralMapKey(filePath);
-	const { carried: carriedBlockers, matched: matchedBlockers } =
-		carryRecordedBlockers(
-			ctx.priorInlineBlockers?.() ?? [],
-			[...dispatchResult.blockers, ...heldBackBlockers],
-			dispatchResult,
-			filePath,
-			(d) =>
-				d.line === undefined ||
-				(d.filePath && normalizeEphemeralMapKey(d.filePath) !== ownFile)
-					? d.line
-					: anchoring.positionOf({
-							line: d.line,
-							lineHash: d.lineHash,
-							positionStale: d.positionStale,
-						}),
-			anchoring.matchesAnywhere,
-			ctx.modifiedRanges,
-		);
+	const {
+		carried: carriedBlockers,
+		matched: matchedBlockers,
+		unobserved: unobservedBlockers,
+	} = carryRecordedBlockers(
+		ctx.priorInlineBlockers?.() ?? [],
+		[...dispatchResult.blockers, ...heldBackBlockers],
+		dispatchResult,
+		filePath,
+		(d) =>
+			d.line === undefined ||
+			(d.filePath && normalizeEphemeralMapKey(d.filePath) !== ownFile)
+				? d.line
+				: anchoring.positionOf({
+						line: d.line,
+						lineHash: d.lineHash,
+						positionStale: d.positionStale,
+					}),
+		anchoring.matchesAnywhere,
+		ctx.modifiedRanges,
+		anchoring.lineTextHeld,
+	);
 	// #4484 round 3 (F4): a held-back blocker no recorded blocker matched was
 	// never delivered (a new error that took a fixed one's line-bound id), so
 	// it renders in the STOP block, not as still unfixed.
@@ -2983,6 +3048,10 @@ async function analysePipeline(
 					}
 				: undefined,
 		inlineBlockerFileContent,
+		...(recordBlockers.length > 0 &&
+			recordBlockers.every((b) => unobservedBlockers.has(b)) && {
+				inlineBlockersUnconfirmed: true as const,
+			}),
 		analysisAnchor: anchoring.next(
 			dispatchResult.inconclusiveSources,
 			ctx.modifiedRanges,

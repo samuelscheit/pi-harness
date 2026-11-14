@@ -347,6 +347,72 @@ describe("tree-sitter security gap rules", () => {
 			);
 			expect(matches).toHaveLength(0);
 		});
+
+		describe("identifiers the file itself fixes", () => {
+			const linesOf = async (source: string[]) => {
+				const client = getSharedTreeSitterClient()!;
+				const query = await getQuery("sql-injection");
+				const matches = await client.runQueryOnFile(
+					query,
+					writeTempFile("ts", source.join("\n")),
+					"typescript",
+				);
+				// One match per substitution: a line is reported once.
+				return [...new Set(matches.map((m) => m.line))];
+			};
+
+			it("stays quiet on the 2026-11-12 metrics store (sqlite_master rebuild, fixed table list)", async () => {
+				expect(
+					await linesOf([
+						'import { DatabaseSync } from "node:sqlite";',
+						'const SESSION_TABLES = ["requests", "tool_calls", "sessions"] as const;',
+						"export function rebuild(db: DatabaseSync): void {",
+						`\tconst tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];`,
+						'\tfor (const { name } of tables) db.exec(`DROP TABLE IF EXISTS "${name}"`);',
+						"}",
+						"export function deleteSession(db: DatabaseSync, sessionId: string): void {",
+						"\tfor (const table of SESSION_TABLES) {",
+						'\t\tdb.prepare(`DELETE FROM ${table} WHERE ${table === "sessions" ? "id" : "session_id"} = ?`).run(sessionId);',
+						"\t}",
+						"}",
+					]),
+				).toEqual([]);
+			});
+
+			it("accepts an inline literal array, a satisfies-wrapped const, renamed schema columns and a row member", async () => {
+				expect(
+					await linesOf([
+						'const KINDS = ["a", "b"] satisfies string[];',
+						'for (const t of ["x", "y"]) run(`DELETE FROM ${t}`);',
+						"for (const t of KINDS) run(`DROP TABLE ${t}`);",
+						'for (const { tbl_name: table } of db.prepare("SELECT tbl_name FROM main.sqlite_schema").iterate()) run(`DROP TABLE "${table}"`);',
+						'for (const row of db.prepare("select name from sqlite_master").all()) run(`DROP INDEX "${row.name}"`);',
+					]),
+				).toEqual([]);
+			});
+
+			it("keeps every substitution it cannot prove fixed", async () => {
+				expect(
+					await linesOf([
+						/* 1 */ 'const MIXED = ["a", userTable];',
+						/* 2 */ "for (const t of MIXED) run(`DELETE FROM ${t}`);",
+						/* 3 */ 'let LOOSE = ["a"];',
+						/* 4 */ "for (const t of LOOSE) run(`DELETE FROM ${t}`);",
+						/* 5 */ 'for (let t of ["a"]) run(`DELETE FROM ${t}`);',
+						/* 6 */ 'for (const t of ["a"]) [t].map((t) => run(`DELETE FROM ${t}`));',
+						/* 7 */ 'for (const t of ["a"]) run(`DELETE FROM ${t} WHERE id = ${id}`);',
+						/* 8 */ 'const rows = db.prepare("SELECT name FROM sqlite_master").all();',
+						/* 9 */ "for (const { name } of rows) run(`DROP TABLE ${name}`);",
+						/* 10 */ 'for (const { name } of db.prepare("SELECT name FROM users").all()) run(`DROP TABLE "${name}"`);',
+						/* 11 */ 'for (const { sql } of rows) run(`DROP VIEW "${sql}"`);',
+						/* 12 */ 'for (const row of rows) run(`DROP TABLE "${row.sql}"`);',
+						/* 13 */ "function drop(T: string[]) { for (const t of T) run(`DROP TABLE ${t}`); }",
+						/* 14 */ 'const ALL = ["a"]; function f(ALL: string[]) { for (const t of ALL) run(`DROP TABLE ${t}`); }',
+						/* 15 */ "for (const t of input) run(`DROP TABLE ${t}`);",
+					]),
+				).toEqual([2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]);
+			});
+		});
 	});
 
 	it("does not match SQLAlchemy session.execute(stmt)", async () => {

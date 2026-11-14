@@ -1858,6 +1858,141 @@ describe("bash grep searchReads registration", () => {
 		}
 	});
 
+	describe("a whole-file write's edit scope is the lines it changed", () => {
+		const pipelineRangesFor = (filePath: string) =>
+			vi
+				.mocked(runPipeline)
+				.mock.calls.filter(
+					([ctx]) =>
+						normalizeMapKey(ctx.filePath) === normalizeMapKey(filePath),
+				)
+				.map(([ctx]) => ctx.modifiedRanges);
+		const callTool = async (
+			runtime: RuntimeCoordinator,
+			cwd: string,
+			event: Record<string, unknown>,
+		) =>
+			runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					event,
+					ctx: { cwd },
+					lensEnabled: true,
+					getFlag: () => false,
+					dbg: () => {},
+					runtime,
+					cacheManager: new CacheManager(false),
+					ensureLSPConfigInitialized: async () => {},
+					updateLspStatus: () => {},
+					resetLSPService: () => {},
+				} as any),
+			);
+		const resultOf = (
+			runtime: RuntimeCoordinator,
+			event: Record<string, unknown>,
+		) =>
+			handleToolResult({
+				event,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				resetLSPService: () => {},
+				readGuard: runtime.readGuard,
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+		const original = Array.from(
+			{ length: 30 },
+			(_, i) => `export const v${i + 1} = ${i + 1};`,
+		);
+
+		beforeEach(() => {
+			vi.mocked(runPipeline).mockClear();
+			vi.mocked(runPipeline).mockResolvedValue({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+				checkedClean: false,
+			});
+		});
+
+		it("a bash rewrite of one line (2026-11-12 sed on store.ts) is scoped to that line", async () => {
+			const env = setupTestEnvironment("pi-lens-write-scope-bash-");
+			try {
+				const filePath = path.join(env.tmpDir, "store.ts");
+				fs.writeFileSync(filePath, `${original.join("\n")}\n`, "utf8");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const rewritten = [...original];
+				rewritten[14] = "const v15 = 15;";
+				const command = `cat > ${toPosix(filePath)} <<'EOF'\n${rewritten.join("\n")}\nEOF`;
+				const toolCallId = "write-scope-bash";
+				await callTool(runtime, env.tmpDir, {
+					toolName: "bash",
+					toolCallId,
+					input: { command },
+				});
+				const result = await createBashToolDefinition(env.tmpDir, {
+					exposeSessionEnvironment: false,
+				}).execute(toolCallId, { command }, undefined, undefined, {
+					cwd: env.tmpDir,
+				} as never);
+				await resultOf(runtime, {
+					toolName: "bash",
+					toolCallId,
+					input: { command },
+					content: result.content,
+					details: result.details,
+				});
+				expect(pipelineRangesFor(filePath)).toEqual([[{ start: 15, end: 15 }]]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("a host write of an existing file is scoped to its inserted lines; a created file keeps every line", async () => {
+			const env = setupTestEnvironment("pi-lens-write-scope-host-");
+			try {
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const existing = path.join(env.tmpDir, "existing.ts");
+				const created = path.join(env.tmpDir, "created.ts");
+				fs.writeFileSync(existing, `${original.join("\n")}\n`, "utf8");
+				const inserted = [
+					...original.slice(0, 5),
+					"export const a = 1;",
+					"export const b = 2;",
+					...original.slice(5),
+				];
+				for (const [toolCallId, filePath, content] of [
+					["write-scope-existing", existing, `${inserted.join("\n")}\n`],
+					[
+						"write-scope-created",
+						created,
+						"export const c = 3;\nexport const d = 4;",
+					],
+				] as const) {
+					const event = {
+						toolName: "write",
+						toolCallId,
+						input: { path: filePath, content },
+					};
+					await callTool(runtime, env.tmpDir, event);
+					fs.writeFileSync(filePath, content, "utf8");
+					await resultOf(runtime, {
+						...event,
+						content: [{ type: "text", text: "ok" }],
+					});
+				}
+				expect(pipelineRangesFor(existing)).toEqual([[{ start: 6, end: 7 }]]);
+				expect(pipelineRangesFor(created)).toEqual([[{ start: 1, end: 2 }]]);
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
 	it("does not mark a content-identical opaque rewrite as authored", async () => {
 		const env = setupTestEnvironment("pi-lens-2802-opaque-noop-");
 		try {

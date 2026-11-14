@@ -209,6 +209,44 @@ function backtrack(
 	}
 }
 
+/**
+ * The lines of `after` a change from `before` wrote, as ranges: every line no
+ * line of `before` aligns to, and for each run of deleted lines the line that
+ * now stands where the run was (a deletion changes what that line follows).
+ * Empty when the hashes are equal; undefined when the change exceeds
+ * `maxEdits` (no alignment, so no line can be called unchanged).
+ */
+export function changedLineRanges(
+	before: Uint32Array,
+	after: Uint32Array,
+	maxEdits: number = MAX_ALIGNMENT_EDITS,
+): { start: number; end: number }[] | undefined {
+	const map = alignLines(before, after, maxEdits);
+	if (map === undefined) return undefined;
+	const kept = new Uint8Array(after.length);
+	const junctions: number[] = [];
+	let lastTarget = 0;
+	let deleting = false;
+	for (let line = 1; line <= before.length; line += 1) {
+		const at = map(line);
+		if (at === undefined) {
+			deleting = true;
+			continue;
+		}
+		if (deleting) junctions.push(lastTarget + 1);
+		deleting = false;
+		kept[at - 1] = 1;
+		lastTarget = at;
+	}
+	if (deleting && after.length > 0)
+		junctions.push(Math.min(lastTarget + 1, after.length));
+	const lines = junctions;
+	kept.forEach((isKept, index) => {
+		if (isKept === 0) lines.push(index + 1);
+	});
+	return rangesOfLines(lines);
+}
+
 /** Every line `ranges` cover (1-based, inclusive ends). */
 export function linesOfRanges(
 	ranges: ReadonlyArray<{ readonly start: number; readonly end: number }>,

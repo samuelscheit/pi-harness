@@ -955,14 +955,14 @@ export const wallClockBudgetInclude = [
 	// a real bash running the extracted `run:` shows pipefail and the crash line.
 	"tests/scripts/install-smoke-handshake-steps.test.ts",
 	// #2698: real `git init`/`add`/`commit`/`ls-files` calls against a
-	// throwaway fixture repo — gitignore/tracked-vs-untracked resolution is
-	// the exact mechanism under test, which no mock reproduces faithfully.
+	// throwaway fixture repo — which files git lists as tracked, untracked or
+	// ignored is the mechanism under test, which no mock reproduces faithfully.
 	// No wall-clock budget assertion (a handful of `git` calls on a
-	// two-file fixture has none worth pinning); membership here is solely
+	// small fixture has none worth pinning); membership here is solely
 	// to satisfy flake-shape-ratchet.test.ts's real-process-spawn admission
 	// gate, which requires it for any newly admitted real spawn regardless
 	// of this list's own "carries a budget assertion" charter above.
-	"tests/scripts/knip-sibling-purge.test.ts",
+	"tests/scripts/knip-snapshot.test.ts",
 	// #4047: `npm run lane:check` against real Git fixtures, the real pre-push
 	// selector, red-on-base and vitest (real child processes, flake-shape
 	// admission).

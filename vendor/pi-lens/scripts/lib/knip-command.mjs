@@ -6,11 +6,7 @@
 //
 // Node >=20.12 rejects spawning a `.cmd` file with `shell` unset or false
 // (the CVE-2024-27980 EINVAL fix), so `node_modules/.bin/knip.cmd` on
-// Windows failed to start at all -- and by the time that spawn failed,
-// scripts/lib/knip-sibling-purge.mjs had ALREADY deleted the compiled `.js`
-// siblings, so the failure mode was not "no output": it silently left the
-// tree half-purged with no rebuild prompted. AGENTS.md: this repo develops
-// on Windows.
+// Windows failed to start at all. AGENTS.md: this repo develops on Windows.
 //
 // Spawning knip's real `bin/knip.js` file (resolved via its own
 // package.json#bin, same as `node_modules/.bin/knip`'s own shim does

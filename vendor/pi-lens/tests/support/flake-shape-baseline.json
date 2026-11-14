@@ -153,7 +153,7 @@
 		"scripts/guard-bash-hook.test.ts": 19,
 		"scripts/guard-bash-probe.test.ts": 4,
 		"scripts/install-smoke-handshake-steps.test.ts": 2,
-		"scripts/knip-sibling-purge.test.ts": 1,
+		"scripts/knip-snapshot.test.ts": 1,
 		"scripts/lane-check-lock.test.ts": 13,
 		"scripts/lane-check-secondary.test.ts": 19,
 		"scripts/lane-check.test.ts": 22,

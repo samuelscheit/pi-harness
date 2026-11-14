@@ -40,10 +40,10 @@ const NOT_A_FIXTURE = [
 	// repo through gitFixtureEnv.
 	"scripts/lib/test-history-selection.mjs",
 	"scripts/prune-agent-worktrees.mjs",
-	// #2698: reads THIS checkout's own `git ls-files` state (untracked+
-	// ignored .js siblings, tracked .ts sources) before `knip` runs — same
-	// "drives the real repo" shape as the two scripts above, not a fixture.
-	"scripts/lib/knip-sibling-purge.mjs",
+	// #2698: lists THIS checkout's tracked and untracked files (`git
+	// ls-files`) to copy them for `knip` — same "drives the real repo" shape
+	// as the two scripts above, not a fixture.
+	"scripts/lib/knip-snapshot.mjs",
 	// #2758: runs `git diff` on the real CI checkout to find changed files
 	// for Stryker mutation testing — drives the real checkout, not a fixture.
 	"scripts/stryker-diff.mjs",

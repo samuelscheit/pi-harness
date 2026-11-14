@@ -140,6 +140,7 @@ import type {
 import { EXPANSION_LIMIT_LINES } from "./read-expansion.js";
 import { resyncGitGuardAfterRetire, syncGitGuardRecord } from "./git-guard.js";
 import { isCrossFileBlocker } from "./inline-blocker-fields.js";
+import { takeWriteChangedRanges } from "./write-line-baseline.js";
 import { writeOrderToken } from "./write-ordering-guard.js";
 import { hashFileBytes } from "./content-stamp.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
@@ -1479,6 +1480,7 @@ function publishInlineVerdict(args: {
 					// #3503: the freshness baseline is the analysis read.
 					result.analysisReadAtMs,
 					sessionId,
+					result.inlineBlockersUnconfirmed === true,
 				),
 			) !== undefined;
 	} else {
@@ -4515,11 +4517,17 @@ export async function handleToolResult(
 			modifiedRanges = [{ start: 1, end: lineCount }];
 			addTurnRange({ start: 1, end: lineCount }, importsChanged);
 		} else if (mutation.kind === "write" && nodeFs.existsSync(filePath)) {
+			// A write replaced the file: its scope is the lines it changed against
+			// the bytes `tool_call` saw, else the whole file (a create, or no
+			// baseline). write-line-baseline.ts.
 			const content = nodeFs.readFileSync(filePath, "utf-8");
-			const lineCount = content.split("\n").length;
 			const hasImports = /^import\s/m.test(content);
-			modifiedRanges = [{ start: 1, end: lineCount }];
-			addTurnRange({ start: 1, end: lineCount }, hasImports);
+			modifiedRanges = takeWriteChangedRanges(
+				toolCallId,
+				filePath,
+				content,
+			) ?? [{ start: 1, end: content.split("\n").length }];
+			for (const range of modifiedRanges) addTurnRange(range, hasImports);
 		}
 	} catch (err) {
 		dbg(`turn state tracking error: ${err}`);
