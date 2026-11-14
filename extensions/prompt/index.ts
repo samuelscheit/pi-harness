@@ -10,6 +10,9 @@
 // it, no tool's guidance reached the model (found 2026-11-13: the bash `tool` command went unused).
 // Pi still appends context files (AGENTS.md of the project and its parents), the skills list and
 // the working directory as their own sections.
+// Sections other extensions set before this handler (the goal, extensions/goal) are moved after
+// the harness's own: they change during a session, and a change at the end leaves the prompt before
+// it, and its cache, intact also for models that get no mid-conversation prompt updates.
 // Everything is read on every run, so an edit (by the user or the improvement loop), a forced arm
 // or a stopped experiment reaches running sessions as a section and tool update.
 
@@ -49,6 +52,7 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 	let reported = "";
 	pi.on("before_agent_start", (event, ctx) => {
 		const options = event.systemPromptOptions;
+		const foreign = Object.entries(options.sections);
 		options.customPrompt = readFileSync(BASE_PROMPT, "utf8").trim();
 		options.contextFiles = [
 			{ path: GLOBAL_RULES_SHOWN, content: readFileSync(GLOBAL_RULES, "utf8").trim() },
@@ -77,5 +81,9 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		const guidelines = toolGuidelinesSection(options);
 		if (guidelines) options.sections[TOOL_GUIDELINES_SECTION] = guidelines;
 		else delete options.sections[TOOL_GUIDELINES_SECTION];
+		for (const [name, content] of foreign) {
+			delete options.sections[name];
+			options.sections[name] = content;
+		}
 	});
 }

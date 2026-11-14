@@ -29,6 +29,7 @@ The design is grounded in a literature and source-code survey of how other harne
 | Dashboard | Local web UI for the metrics: overview, cost drivers, context and tools, sessions, waste, subagents, harness versions | [metrics.md](docs/metrics.md#dashboard) |
 | Self-improvement | `note_improvement` friction capture, nightly dreaming that turns corrections into rules, changelog | [self-improvement.md](docs/self-improvement.md) |
 | Bash | Long commands move to the background after 2 minutes and wake the agent when they finish; a guard against orphaned background processes; `tool <name>` calls any agent tool from a shell script | [tools.md](docs/tools.md#bash) |
+| Goal | `/goal <objective>` (or the agent's `goal` tool) keeps a session working until the objective is achieved, its check passes, it is blocked, or its budget is spent; with background jobs running, the agent does the independent steps instead of waiting | [goal.md](docs/goal.md) |
 | Workflows | The agent writes TypeScript scripts that do a procedure in code and call a model only for judgments (`llm()`, `agent()`); saved workflows become tools; `fix_loop` hands a failing check to a cheaper child agent | [tools.md](docs/tools.md#workflow-and-fix_loop) |
 | Other tools | Asynchronous `ask_user`, `web_search` / `web_fetch` through Anthropic server tools, layered [pi-lens](https://github.com/apmantza/pi-lens) configuration (LSP, linters, structural search) | [tools.md](docs/tools.md) |
 
@@ -101,6 +102,7 @@ npm run metrics -- --since 2026-11-01   # the stats report from a shell
 - [Prompt, rules and experiments](docs/prompt.md)
 - [Releases and hot reload](docs/releases.md)
 - [Tools](docs/tools.md): bash, workflows, `ask_user`, web, pi-lens
+- [Goal](docs/goal.md): `/goal` and the end-of-turn check
 - [Metrics and dashboard](docs/metrics.md)
 - [Self-improvement](docs/self-improvement.md): notes, dreaming, changelog
 - [Roadmap and open questions](docs/roadmap.md)

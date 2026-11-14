@@ -11,6 +11,7 @@
 | Rules | [`prompt/rules/<name>.md`](../prompt/rules) | One section per promoted rule, named after the file. |
 | Experiments | `prompt/experiments/<name>.md` | The variant's text, only for sessions in arm B. |
 | Tool guidelines | the active tools' `promptGuidelines` | Rendered as the section `tool-guidelines`. Pi only puts them into its default prompt, which the base replaces. |
+| Other extensions' sections | e.g. [`goal`](goal.md) while a goal is active | Moved after the harness's own sections: they change during a session, so a change leaves the prompt before them intact. |
 | Project context, skills, working directory | Pi | Pi appends the project's AGENTS.md files, the skills list and `cwd` as their own sections. |
 
 The base prompt started from Codex CLI's instructions and was cut down to what the evidence supports. It grows only when a gap shows up in sessions.
