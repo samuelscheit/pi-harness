@@ -19,6 +19,7 @@
 - Fixed `/export` HTML showing raw terminal hyperlink escape codes around links in custom tool output; links are now clickable ([#12003](https://github.com/earendil-works/pi/issues/12003))
 - Fixed the bash tool returning no output, with a footer like `[Showing lines 3-2 of 2]`, when the output ends in one line longer than about 100KB, such as a `grep` match in a minified file; it now shows the end of that line ([#12062](https://github.com/earendil-works/pi/issues/12062))
 - Fixed provider errors reading "Connection closed." not triggering automatic retries ([#12064](https://github.com/earendil-works/pi/issues/12064))
+- Fixed a provider or network outage of a minute failing the run: connections now get 30 seconds to open instead of undici's 10, and after the fast retries, network and server errors are retried with waits of 30 s, 1 min, 2 min, 5 min and 5 min, reported through `auto_retry_start` with `tier` and the transport `errorClass` (e.g. `UND_ERR_CONNECT_TIMEOUT`)
 
 ## [1.5.2] - 2026-11-10
 

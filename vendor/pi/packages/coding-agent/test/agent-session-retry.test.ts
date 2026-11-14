@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Agent, type AgentEvent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -47,6 +47,7 @@ describe("AgentSession retry", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
 		if (session) {
 			session.dispose();
 		}
@@ -60,8 +61,10 @@ describe("AgentSession retry", () => {
 		maxRetries?: number;
 		maxAgentDelayMs?: number;
 		delayAssistantMessageEndMs?: number;
+		errorMessage?: string;
 	}) {
 		const failCount = options?.failCount ?? 1;
+		const errorMessage = options?.errorMessage ?? "overloaded_error";
 		const maxRetries = options?.maxRetries ?? 3;
 		const maxAgentDelayMs = options?.maxAgentDelayMs ?? 60000;
 		const delayAssistantMessageEndMs = options?.delayAssistantMessageEndMs ?? 0;
@@ -76,10 +79,7 @@ describe("AgentSession retry", () => {
 				const stream = createAssistantMessageEventStream();
 				queueMicrotask(() => {
 					if (callCount <= failCount) {
-						const msg = createAssistantMessage("", {
-							stopReason: "error",
-							errorMessage: "overloaded_error",
-						});
+						const msg = createAssistantMessage("", { stopReason: "error", errorMessage });
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "error", reason: "error", error: msg });
 					} else {
@@ -137,8 +137,8 @@ describe("AgentSession retry", () => {
 		expect(created.session.isRetrying).toBe(false);
 	});
 
-	it("exhausts max retries and emits failure", async () => {
-		const created = await createSession({ failCount: 99, maxRetries: 2 });
+	it("exhausts max retries of a rate limit and emits failure", async () => {
+		const created = await createSession({ failCount: 99, maxRetries: 2, errorMessage: "429 Too Many Requests" });
 		const events: string[] = [];
 		created.session.subscribe((event) => {
 			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
@@ -152,6 +152,112 @@ describe("AgentSession retry", () => {
 		expect(events).toContain("start:2");
 		expect(events).toContain("end:success=false");
 		expect(created.session.isRetrying).toBe(false);
+	});
+
+	function recordRetryEvents(target: AgentSession): string[] {
+		const events: string[] = [];
+		target.subscribe((event) => {
+			if (event.type === "auto_retry_start") {
+				events.push(
+					`start:${event.attempt}/${event.maxAttempts}:${event.tier}:${event.delayMs}:${event.errorClass}`,
+				);
+			}
+			if (event.type === "auto_retry_end") events.push(`end:${event.success}:${event.attempt}:${event.finalError}`);
+		});
+		return events;
+	}
+
+	// The session reads files between attempts; that I/O needs real event-loop turns, which
+	// setImmediate (not faked) gives, while the retry waits run on the fake clock.
+	async function untilEvents(events: string[], count: number): Promise<void> {
+		for (let turn = 0; events.length < count; turn++) {
+			if (turn > 10_000) throw new Error(`Expected ${count} retry events, got ${JSON.stringify(events)}`);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	}
+
+	async function waitRetry(events: string[], count: number, delayMs: number): Promise<void> {
+		await untilEvents(events, count);
+		await vi.advanceTimersByTimeAsync(delayMs);
+	}
+
+	it("continues with the slow tier after the fast retries and succeeds", async () => {
+		const created = await createSession({
+			failCount: 4,
+			maxRetries: 2,
+			errorMessage: "Connection error.: Connect Timeout Error (UND_ERR_CONNECT_TIMEOUT)",
+		});
+		const events = recordRetryEvents(created.session);
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+		const prompt = created.session.prompt("Test");
+		await waitRetry(events, 1, 1);
+		await waitRetry(events, 2, 2);
+		await waitRetry(events, 3, 29_999);
+		expect(created.getCallCount()).toBe(3);
+		expect(created.session.isRetrying).toBe(true);
+		await vi.advanceTimersByTimeAsync(1);
+		await waitRetry(events, 4, 60_000);
+		await prompt;
+
+		expect(created.getCallCount()).toBe(5);
+		expect(events).toEqual([
+			"start:1/7:fast:1:UND_ERR_CONNECT_TIMEOUT",
+			"start:2/7:fast:2:UND_ERR_CONNECT_TIMEOUT",
+			"start:3/7:slow:30000:UND_ERR_CONNECT_TIMEOUT",
+			"start:4/7:slow:60000:UND_ERR_CONNECT_TIMEOUT",
+			"end:true:4:undefined",
+		]);
+		expect(created.session.isRetrying).toBe(false);
+	});
+
+	it("fails after the slow tier is used up", async () => {
+		const created = await createSession({ failCount: 99, maxRetries: 1, errorMessage: "529 overloaded" });
+		const events = recordRetryEvents(created.session);
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+		const prompt = created.session.prompt("Test");
+		await waitRetry(events, 1, 1);
+		for (const [index, delayMs] of [30_000, 60_000, 120_000, 300_000, 300_000].entries()) {
+			await waitRetry(events, index + 2, delayMs);
+		}
+		await prompt;
+
+		expect(created.getCallCount()).toBe(7); // 1 initial + 1 fast + 5 slow
+		expect(events.at(-2)).toBe("start:6/6:slow:300000:undefined");
+		expect(events.at(-1)).toBe("end:false:6:529 overloaded");
+	});
+
+	it("aborts a slow-tier wait", async () => {
+		const created = await createSession({ failCount: 99, maxRetries: 1, errorMessage: "read ECONNRESET" });
+		const events = recordRetryEvents(created.session);
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+		const prompt = created.session.prompt("Test");
+		await waitRetry(events, 1, 1);
+		await waitRetry(events, 2, 10_000);
+		expect(events.at(-1)).toBe("start:2/6:slow:30000:ECONNRESET");
+		expect(created.getCallCount()).toBe(2);
+		created.session.abortRetry();
+		await prompt;
+
+		expect(created.getCallCount()).toBe(2);
+		expect(events.at(-1)).toBe("end:false:2:Retry cancelled");
+		expect(created.session.isRetrying).toBe(false);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("does not retry a client error", async () => {
+		const created = await createSession({
+			failCount: 99,
+			errorMessage: '400 {"type":"invalid_request_error","message":"connection timeout must be positive"}',
+		});
+		const events = recordRetryEvents(created.session);
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(1);
+		expect(events).toEqual([]);
 	});
 
 	it("caps agent retry delay", async () => {

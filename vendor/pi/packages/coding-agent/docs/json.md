@@ -165,16 +165,19 @@ See [Compaction and Branch Summaries](compaction.md) for result semantics.
 Assistant-turn retry emits:
 
 ```json
-{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"529 overloaded"}
-{"type":"auto_retry_end","success":true,"attempt":2}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":8,"delayMs":2000,"tier":"fast","errorMessage":"529 overloaded"}
+{"type":"auto_retry_start","attempt":4,"maxAttempts":8,"delayMs":30000,"tier":"slow","errorMessage":"Connection error.: Connect Timeout Error (UND_ERR_CONNECT_TIMEOUT)","errorClass":"UND_ERR_CONNECT_TIMEOUT"}
+{"type":"auto_retry_end","success":true,"attempt":4}
 ```
 
 On final failure, `auto_retry_end` has `success: false` and a `finalError` string.
 
+`tier` is `"fast"` for the `retry.maxRetries` exponential-backoff retries. Network errors and server errors (5xx, overloaded) then get the `"slow"` tier: waits of 30 s, 1 min, 2 min, 5 min and 5 min. Rate limits get the fast tier only, and client errors other than 408 and 429 are never retried. `maxAttempts` counts both tiers for the error at hand. `errorClass` names the transport error code in the message (`UND_ERR_CONNECT_TIMEOUT`, `ECONNRESET`, `ENOTFOUND`, ...) when there is one.
+
 Compaction and branch-summary retry emit:
 
 ```json
-{"type":"summarization_retry_scheduled","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"terminated"}
+{"type":"summarization_retry_scheduled","attempt":1,"maxAttempts":8,"delayMs":2000,"tier":"fast","errorMessage":"terminated"}
 {"type":"summarization_retry_attempt_start","source":"compaction","reason":"threshold"}
 {"type":"summarization_retry_finished"}
 ```

@@ -108,10 +108,11 @@ describe("AgentSession retry and event characterization", () => {
 			if (event.type === "auto_retry_end") retryEvents.push(`end:${event.success}`);
 		});
 
+		// A rate limit gets no slow tier, so the run ends after the fast retries.
 		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests" }),
 		]);
 
 		await harness.session.prompt("test");

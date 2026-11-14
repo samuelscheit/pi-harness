@@ -10,6 +10,7 @@
 
 - Fixed tools with `strict: "prefer"` constrained sampling being sent in strict mode when their schema contains a node without a `type` (such as `items: {}`, `Type.Unknown()`, or a bare `const`), which OpenAI rejects with a 400 error; these tools now fall back to non-strict mode, and `strict: "require"` fails locally. Nodes with only an `enum` stay strict ([#12049](https://github.com/earendil-works/pi/issues/12049))
 - Fixed provider errors reading "Connection closed." not being retried ([#12064](https://github.com/earendil-works/pi/issues/12064))
+- Fixed `retryAssistantCall` giving up on network and server errors after the fast retries: `scheduleRetry` adds a slow tier (30 s, 1 min, 2 min, 5 min, 5 min) for them, `onRetryScheduled` now receives a `ScheduledRetry` with `tier` and the transport `errorClass`, client errors other than 408 and 429 are never retried (also not by `retryProviderRequest`, which retried 409 and `x-should-retry: true`), and messages naming a transport error code such as `ECONNRESET` are retryable
 
 ## [1.5.2] - 2026-11-10
 

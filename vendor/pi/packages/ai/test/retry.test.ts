@@ -1,6 +1,22 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
-import { isRetryableAssistantError, type RetryPolicy, retryAssistantCall, retryDelayMs } from "../src/utils/retry.ts";
+import {
+	isRetryableAssistantError,
+	type RetryPolicy,
+	retryAssistantCall,
+	retryDelayMs,
+	type ScheduledRetry,
+	SLOW_RETRY_DELAYS_MS,
+	scheduleRetry,
+	transportErrorClass,
+} from "../src/utils/retry.ts";
+
+const connectTimeoutMessage =
+	"Connection error.: Connect Timeout Error (attempted address: api.anthropic.com:443, timeout: 30000ms) (UND_ERR_CONNECT_TIMEOUT)";
+
+function errorMessage(text: string) {
+	return fauxAssistantMessage("", { stopReason: "error", errorMessage: text });
+}
 
 const openAIExplicitRetryMessage =
 	"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID req_******** in your message.";
@@ -176,6 +192,134 @@ describe("provider retry classification", () => {
 	])("does not match status codes inside ids or longer numbers: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
 	});
+
+	it.each([
+		"400 upstream request timed out while validating the image",
+		'401 {"error":{"message":"network error while verifying key"}}',
+		"404 model overloaded_model not found",
+		"409 conflict: connection reset by peer",
+		"413 request too large, fetch failed",
+		"OpenAI API error (403): server error forwarding credentials",
+	])("never retries a client error other than 408 and 429: %s", (text) => {
+		expect(isRetryableAssistantError(errorMessage(text))).toBe(false);
+	});
+
+	it.each(["408 Request Timeout", "429 Too Many Requests", "OpenAI API error (429): rate limit reached"])(
+		"retries 408 and 429: %s",
+		(text) => {
+			expect(isRetryableAssistantError(errorMessage(text))).toBe(true);
+		},
+	);
+
+	it("does not mistake a 4xx number inside the text for a status", () => {
+		expect(isRetryableAssistantError(errorMessage("503 service unavailable, retry 404 times"))).toBe(true);
+		expect(isRetryableAssistantError(errorMessage("overloaded (request 4001)"))).toBe(true);
+	});
+});
+
+describe("transportErrorClass", () => {
+	it.each([
+		[connectTimeoutMessage, "UND_ERR_CONNECT_TIMEOUT"],
+		["Connection error.: other side closed (UND_ERR_SOCKET)", "UND_ERR_SOCKET"],
+		["read ECONNRESET", "ECONNRESET"],
+		["request to https://x/token failed, reason: connect ECONNREFUSED 127.0.0.1:9", "ECONNREFUSED"],
+		["getaddrinfo ENOTFOUND api.example.com", "ENOTFOUND"],
+		["getaddrinfo EAI_AGAIN api.example.com", "EAI_AGAIN"],
+		["connect ETIMEDOUT 1.2.3.4:443", "ETIMEDOUT"],
+		["The pending stream has been canceled (ERR_HTTP2_STREAM_CANCEL)", "ERR_HTTP2_STREAM_CANCEL"],
+	])("names the transport error in %s", (text, errorClass) => {
+		expect(transportErrorClass(text)).toBe(errorClass);
+	});
+
+	it.each(["529 overloaded", "terminated", "XECONNRESETX", "UND_ERR"])("names none in %s", (text) => {
+		expect(transportErrorClass(text)).toBeUndefined();
+	});
+
+	it.each(["read ECONNRESET", "connect EHOSTUNREACH 10.0.0.1:443", "UND_ERR_SOCKET", "write EPIPE"])(
+		"makes a bare transport error retryable: %s",
+		(text) => {
+			expect(isRetryableAssistantError(errorMessage(text))).toBe(true);
+		},
+	);
+});
+
+describe("scheduleRetry", () => {
+	const policy: RetryPolicy = { enabled: true, maxRetries: 3, baseDelayMs: 2000 };
+
+	function tiers(text: string): Array<Pick<ScheduledRetry, "attempt" | "tier" | "delayMs" | "maxAttempts">> {
+		const retries: Array<Pick<ScheduledRetry, "attempt" | "tier" | "delayMs" | "maxAttempts">> = [];
+		for (let attempt = 1; ; attempt++) {
+			const retry = scheduleRetry(policy, attempt, errorMessage(text));
+			if (!retry) return retries;
+			retries.push({
+				attempt: retry.attempt,
+				tier: retry.tier,
+				delayMs: retry.delayMs,
+				maxAttempts: retry.maxAttempts,
+			});
+		}
+	}
+
+	it("follows the fast retries with the slow tier for network and server errors", () => {
+		const expected = [
+			{ attempt: 1, tier: "fast", delayMs: 2000, maxAttempts: 8 },
+			{ attempt: 2, tier: "fast", delayMs: 4000, maxAttempts: 8 },
+			{ attempt: 3, tier: "fast", delayMs: 8000, maxAttempts: 8 },
+			{ attempt: 4, tier: "slow", delayMs: 30_000, maxAttempts: 8 },
+			{ attempt: 5, tier: "slow", delayMs: 60_000, maxAttempts: 8 },
+			{ attempt: 6, tier: "slow", delayMs: 120_000, maxAttempts: 8 },
+			{ attempt: 7, tier: "slow", delayMs: 300_000, maxAttempts: 8 },
+			{ attempt: 8, tier: "slow", delayMs: 300_000, maxAttempts: 8 },
+		];
+		for (const text of [connectTimeoutMessage, "529 overloaded", "503 Service Unavailable", "terminated"]) {
+			expect(tiers(text)).toEqual(expected);
+		}
+		// About 15 minutes in total, counting the failed attempts.
+		expect(SLOW_RETRY_DELAYS_MS.reduce((sum, delay) => sum + delay, 0)).toBe(810_000);
+	});
+
+	it("gives rate limits the fast retries only", () => {
+		for (const text of [
+			"429 Too Many Requests",
+			"rate_limit_error",
+			"ResourceExhausted: limit",
+			"Server requested 120s retry delay (max: 60s)",
+		]) {
+			expect(tiers(text).map((retry) => retry.tier)).toEqual(["fast", "fast", "fast"]);
+			expect(tiers(text)[0]?.maxAttempts).toBe(3);
+		}
+	});
+
+	it("schedules nothing for non-retryable errors, a disabled policy or zero retries", () => {
+		expect(scheduleRetry(policy, 1, errorMessage("400 invalid request: timeout must be positive"))).toBeUndefined();
+		expect(scheduleRetry(policy, 1, errorMessage("insufficient_quota"))).toBeUndefined();
+		expect(scheduleRetry(policy, 1, fauxAssistantMessage("ok"))).toBeUndefined();
+		expect(scheduleRetry(policy, 1, fauxAssistantMessage("", { stopReason: "aborted" }))).toBeUndefined();
+		expect(scheduleRetry({ ...policy, enabled: false }, 1, errorMessage("terminated"))).toBeUndefined();
+		expect(scheduleRetry({ ...policy, maxRetries: 0 }, 1, errorMessage("terminated"))).toBeUndefined();
+	});
+
+	it("starts the slow tier right after a single fast retry", () => {
+		const single: RetryPolicy = { ...policy, maxRetries: 1 };
+		expect(scheduleRetry(single, 2, errorMessage("terminated"))).toMatchObject({
+			tier: "slow",
+			delayMs: 30_000,
+			maxAttempts: 6,
+		});
+		expect(scheduleRetry(single, 7, errorMessage("terminated"))).toBeUndefined();
+	});
+
+	it("reports the error message and its transport error class", () => {
+		expect(scheduleRetry(policy, 4, errorMessage(connectTimeoutMessage))).toEqual({
+			attempt: 4,
+			maxAttempts: 8,
+			delayMs: 30_000,
+			tier: "slow",
+			errorMessage: connectTimeoutMessage,
+			errorClass: "UND_ERR_CONNECT_TIMEOUT",
+		});
+		expect(scheduleRetry(policy, 1, errorMessage("529 overloaded"))?.errorClass).toBeUndefined();
+	});
 });
 
 describe("retryDelayMs", () => {
@@ -190,6 +334,12 @@ describe("retryDelayMs", () => {
 describe("retryAssistantCall", () => {
 	const disabled: RetryPolicy = { enabled: false, maxRetries: 3, baseDelayMs: 0 };
 	const enabled: RetryPolicy = { enabled: true, maxRetries: 3, baseDelayMs: 0 };
+	// Fast tier waits 1s, 2s, 4s: 7s before the first slow wait.
+	const timed: RetryPolicy = { enabled: true, maxRetries: 3, baseDelayMs: 1000 };
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
 
 	it("returns a successful response immediately without retrying", async () => {
 		const produce = vi.fn(async () => fauxAssistantMessage("ok"));
@@ -220,15 +370,103 @@ describe("retryAssistantCall", () => {
 		expect(onRetryFinished).not.toHaveBeenCalled();
 	});
 
-	it("retries a transient error up to maxRetries then returns the final error", async () => {
-		const produce = vi.fn(async () => fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }));
+	it("retries a rate limit up to maxRetries then returns the final error", async () => {
+		const produce = vi.fn(async () => errorMessage("429 Too Many Requests"));
 		const onRetryScheduled = vi.fn();
 		const onRetryFinished = vi.fn();
 		const res = await retryAssistantCall(produce, enabled, undefined, { onRetryScheduled, onRetryFinished });
 		expect(res.stopReason).toBe("error");
 		expect(produce).toHaveBeenCalledTimes(4); // 1 initial + 3 retries
 		expect(onRetryScheduled).toHaveBeenCalledTimes(3);
-		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "terminated");
+		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "429 Too Many Requests");
+	});
+
+	it("waits out a network outage through the slow tier, reporting every wait", async () => {
+		vi.useFakeTimers();
+		const produce = vi.fn(async () => errorMessage(connectTimeoutMessage));
+		const scheduled: ScheduledRetry[] = [];
+		const onRetryFinished = vi.fn();
+		const result = retryAssistantCall(produce, timed, undefined, {
+			onRetryScheduled: (retry) => {
+				scheduled.push(retry);
+			},
+			onRetryFinished,
+		});
+
+		await vi.advanceTimersByTimeAsync(7_000);
+		expect(produce).toHaveBeenCalledTimes(4);
+		await vi.advanceTimersByTimeAsync(29_999);
+		expect(produce).toHaveBeenCalledTimes(4);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(produce).toHaveBeenCalledTimes(5);
+		await vi.advanceTimersByTimeAsync(780_000);
+
+		const res = await result;
+		expect(res.stopReason).toBe("error");
+		expect(produce).toHaveBeenCalledTimes(9); // 1 initial + 3 fast + 5 slow
+		expect(scheduled.map((retry) => [retry.attempt, retry.tier, retry.delayMs])).toEqual([
+			[1, "fast", 1000],
+			[2, "fast", 2000],
+			[3, "fast", 4000],
+			[4, "slow", 30_000],
+			[5, "slow", 60_000],
+			[6, "slow", 120_000],
+			[7, "slow", 300_000],
+			[8, "slow", 300_000],
+		]);
+		expect(
+			scheduled.every((retry) => retry.maxAttempts === 8 && retry.errorClass === "UND_ERR_CONNECT_TIMEOUT"),
+		).toBe(true);
+		expect(onRetryFinished).toHaveBeenCalledOnce();
+		expect(onRetryFinished).toHaveBeenCalledWith(false, 8, connectTimeoutMessage);
+	});
+
+	it("succeeds after a slow retry", async () => {
+		vi.useFakeTimers();
+		let n = 0;
+		const produce = vi.fn(async () =>
+			++n <= 5 ? errorMessage("529 overloaded") : fauxAssistantMessage("recovered"),
+		);
+		const onRetryFinished = vi.fn();
+		const result = retryAssistantCall(produce, timed, undefined, { onRetryFinished });
+
+		await vi.advanceTimersByTimeAsync(7_000 + 30_000 + 59_999);
+		expect(produce).toHaveBeenCalledTimes(5);
+		await vi.advanceTimersByTimeAsync(1);
+
+		const res = await result;
+		expect(res.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(produce).toHaveBeenCalledTimes(6);
+		expect(onRetryFinished).toHaveBeenCalledWith(true, 5);
+	});
+
+	it("aborts a slow-tier wait", async () => {
+		vi.useFakeTimers();
+		const controller = new AbortController();
+		const produce = vi.fn(async () => errorMessage("ECONNRESET"));
+		const onRetryFinished = vi.fn();
+		const result = retryAssistantCall(produce, timed, controller.signal, { onRetryFinished });
+
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(produce).toHaveBeenCalledTimes(4);
+		expect(vi.getTimerCount()).toBe(1);
+		controller.abort();
+
+		const res = await result;
+		expect(res.stopReason).toBe("aborted");
+		expect(res.errorMessage).toBeUndefined();
+		expect(vi.getTimerCount()).toBe(0);
+		expect(produce).toHaveBeenCalledTimes(4);
+		expect(onRetryFinished).toHaveBeenCalledWith(false, 4, "ECONNRESET");
+	});
+
+	it("does not retry a client error", async () => {
+		const produce = vi.fn(async () => errorMessage("400 invalid_request_error: connection field is invalid"));
+		const onRetryScheduled = vi.fn();
+		const res = await retryAssistantCall(produce, enabled, undefined, { onRetryScheduled });
+		expect(res.stopReason).toBe("error");
+		expect(produce).toHaveBeenCalledTimes(1);
+		expect(onRetryScheduled).not.toHaveBeenCalled();
 	});
 
 	it("reports capped retry delays", async () => {
@@ -245,7 +483,7 @@ describe("retryAssistantCall", () => {
 
 		await retryAssistantCall(produce, policy, undefined, { onRetryScheduled });
 
-		expect(onRetryScheduled.mock.calls.map((call) => call[2])).toEqual([10, 15, 15, 15]);
+		expect(onRetryScheduled.mock.calls.map(([retry]) => retry.delayMs)).toEqual([10, 15, 15, 15]);
 	});
 
 	it("stops retrying once a call succeeds", async () => {
@@ -299,8 +537,8 @@ describe("retryAssistantCall", () => {
 				? fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" })
 				: fauxAssistantMessage("recovered");
 		});
-		const onRetryScheduled = vi.fn((attempt: number) => {
-			events.push(`retry:${attempt}`);
+		const onRetryScheduled = vi.fn((retry: ScheduledRetry) => {
+			events.push(`retry:${retry.attempt}`);
 		});
 		const onRetryAttemptStart = vi.fn(() => {
 			events.push("attempt-start");

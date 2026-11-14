@@ -37,6 +37,27 @@ describe("provider request retries", () => {
 		expect(request).toHaveBeenCalledTimes(1);
 	});
 
+	it.each([400, 401, 403, 404, 409, 413, 422])(
+		"never retries client error %i, even when marked retryable",
+		async (status) => {
+			const error = providerError(status, { "x-should-retry": "true", "retry-after-ms": "0" });
+			const request = vi.fn<() => Promise<string>>().mockRejectedValue(error);
+
+			await expect(retryProviderRequest(request, { maxRetries: 3 })).rejects.toBe(error);
+			expect(request).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it.each([408, 429, 500, 503, 529, undefined])("retries status %s", async (status) => {
+		const request = vi
+			.fn<() => Promise<string>>()
+			.mockRejectedValueOnce(providerError(status, { "retry-after-ms": "0" }))
+			.mockResolvedValue("ok");
+
+		await expect(retryProviderRequest(request, { maxRetries: 1 })).resolves.toBe("ok");
+		expect(request).toHaveBeenCalledTimes(2);
+	});
+
 	it("does not retry statuses listed in noRetryStatuses", async () => {
 		const error = providerError(504, { "retry-after-ms": "0" });
 		const request = vi.fn<() => Promise<string>>().mockRejectedValue(error);

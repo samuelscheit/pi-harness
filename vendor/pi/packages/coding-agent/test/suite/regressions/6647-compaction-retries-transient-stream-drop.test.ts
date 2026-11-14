@@ -104,8 +104,9 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		const ends = harness.eventsOfType("summarization_retry_finished");
 		expect(starts).toHaveLength(2);
 		expect(ends).toHaveLength(1);
-		expect(starts[0]).toMatchObject({ attempt: 1, maxAttempts: 3, errorMessage: "terminated" });
-		expect(starts[1]).toMatchObject({ attempt: 2, maxAttempts: 3 });
+		// 3 fast retries plus the slow tier's 5 for a dropped stream.
+		expect(starts[0]).toMatchObject({ attempt: 1, maxAttempts: 8, tier: "fast", errorMessage: "terminated" });
+		expect(starts[1]).toMatchObject({ attempt: 2, maxAttempts: 8, tier: "fast" });
 		expect(ends[0]).toMatchObject({ type: "summarization_retry_finished" });
 		// model.* referenced to keep imports honest
 		expect(model.id).toBeTruthy();
@@ -151,13 +152,14 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		seedCompactableSession(harness);
 		harness.settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 2, baseDelayMs: 0 } });
 
+		// A rate limit gets the fast retries only; the slow tier is covered in agent-session-retry.test.ts.
 		const error: AssistantMessage = {
-			...fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+			...fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests" }),
 			usage: createUsage(10),
 		};
 		const getCallCount = useScriptedStreamFn(harness, [error, error, error]);
 
-		await expect(harness.session.compact()).rejects.toThrow("terminated");
+		await expect(harness.session.compact()).rejects.toThrow("429 Too Many Requests");
 		expect(getCallCount()).toBe(3); // 1 initial + 2 retries
 		const starts = harness.eventsOfType("summarization_retry_scheduled");
 		const ends = harness.eventsOfType("summarization_retry_finished");

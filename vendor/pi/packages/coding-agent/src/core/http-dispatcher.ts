@@ -2,6 +2,9 @@ import { EventEmitter } from "node:events";
 import * as undici from "undici";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
+// Undici's 10s default fails TCP+TLS setup on slow or lossy routes, and every failed attempt
+// spends a retry; three of them used up the fast tier in 45s on 2026-11-12.
+export const HTTP_CONNECT_TIMEOUT_MS = 30_000;
 // Node's 250ms default can terminate valid connection attempts on high-latency routes.
 const DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS = 2_000;
 
@@ -90,6 +93,7 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 			proxyTunnel: true,
 			bodyTimeout: normalizedTimeoutMs,
 			connect: {
+				timeout: HTTP_CONNECT_TIMEOUT_MS,
 				autoSelectFamilyAttemptTimeout: DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,
 			},
 			headersTimeout: normalizedTimeoutMs,

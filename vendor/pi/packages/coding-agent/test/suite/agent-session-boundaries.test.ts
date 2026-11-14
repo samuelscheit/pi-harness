@@ -1023,9 +1023,10 @@ describe("durable length recovery", () => {
 			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
+		// A rate limit gets no slow tier, so the run ends after the one fast retry.
 		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests" }),
 		]);
 
 		await harness.session.prompt("start");

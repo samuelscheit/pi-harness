@@ -1,9 +1,24 @@
 import http from "node:http";
+import { createRequire } from "node:module";
 import net from "node:net";
+import { dirname, join } from "node:path";
 import tls from "node:tls";
+import { withCauseDetail } from "@earendil-works/pi-ai/utils/error-body";
+import { transportErrorClass } from "@earendil-works/pi-ai/utils/retry";
 import * as undici from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyHttpProxySettings, configureHttpDispatcher } from "../src/core/http-dispatcher.ts";
+import {
+	applyHttpProxySettings,
+	configureHttpDispatcher,
+	HTTP_CONNECT_TIMEOUT_MS,
+} from "../src/core/http-dispatcher.ts";
+
+// Undici's connect timeout runs on its own timer module; the dispatcher's undici shares this
+// CommonJS instance, so a spy on it sees the timeout the connector arms.
+const require = createRequire(import.meta.url);
+const undiciTimers = require(join(dirname(require.resolve("undici")), "lib/util/timers.js")) as {
+	setFastTimeout: (callback: () => void, delay: number) => unknown;
+};
 
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
 const DISPATCHER_PROXY_ENV_KEYS = [...PROXY_ENV_KEYS, "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"] as const;
@@ -167,5 +182,40 @@ describe("http dispatcher", () => {
 		);
 		expect(connectSpy.mock.calls[0]?.[0]).not.toHaveProperty("autoSelectFamily");
 		expect(net.getDefaultAutoSelectFamilyAttemptTimeout()).toBe(originalAttemptTimeoutMs);
+	});
+
+	it("gives connections 30 seconds to open and reports a timeout as UND_ERR_CONNECT_TIMEOUT", async () => {
+		globalThis.fetch = async () => {
+			throw new Error("Unexpected global fetch");
+		};
+		const timers = vi.spyOn(undiciTimers, "setFastTimeout");
+		// A socket that never connects, as on the route that timed out on 2026-11-12.
+		const socket = new net.Socket();
+		vi.spyOn(tls, "connect").mockReturnValue(socket as tls.TLSSocket);
+
+		configureHttpDispatcher();
+		const response = undici.fetch("https://api.example.test/v1/messages");
+		const rejection = response.catch((error: unknown) => error);
+
+		await vi.waitFor(() => expect(tls.connect).toHaveBeenCalled());
+		expect(HTTP_CONNECT_TIMEOUT_MS).toBe(30_000);
+		const connectTimeouts = timers.mock.calls.filter(([, delay]) => delay === HTTP_CONNECT_TIMEOUT_MS);
+		expect(connectTimeouts).toHaveLength(1);
+		// No timer of undici's 10s default connect timeout is armed.
+		expect(timers.mock.calls.some(([, delay]) => delay === 10_000)).toBe(false);
+
+		// Fire the connect timeout instead of waiting 30 seconds.
+		connectTimeouts[0]![0]();
+		const error = await rejection;
+
+		expect(error).toBeInstanceOf(TypeError);
+		const cause = (error as TypeError).cause as Error & { code?: string };
+		expect(cause.code).toBe("UND_ERR_CONNECT_TIMEOUT");
+		expect(cause.message).toContain("timeout: 30000ms");
+		expect(socket.destroyed).toBe(true);
+		// Provider errors carry the class through withCauseDetail; the retry policy reads it back.
+		const message = withCauseDetail(new Error("Connection error.", { cause: error }));
+		expect(message).toContain("(UND_ERR_CONNECT_TIMEOUT)");
+		expect(transportErrorClass(message)).toBe("UND_ERR_CONNECT_TIMEOUT");
 	});
 });

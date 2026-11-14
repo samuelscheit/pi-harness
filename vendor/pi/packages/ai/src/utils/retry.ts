@@ -130,9 +130,31 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"subscription_sharing_user_unavailable",
 ]);
 
+// Errors whose cause is the provider's request budget. They get the fast retries only:
+// waiting out a slow tier would hide a limit the caller should see.
+const RATE_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+	"rate.?limit",
+	"too many requests",
+	"(?<![a-z0-9])429(?![a-z0-9])",
+	"ResourceExhausted",
+	"retry delay",
+]);
+
+// A client error (4xx) other than 408 Request Timeout and 429 Too Many Requests means the
+// request itself is wrong; repeating it cannot help, whatever the rest of the text says.
+// SDK errors start with the status ("400 {...}"); `formatProviderError` writes "Prefix (400): ...".
+const NON_RETRYABLE_CLIENT_STATUS_PATTERN = /^4(?!08|29)\d\d(?![0-9])|\(4(?!08|29)\d\d\):/;
+
+// Transport error codes Node and undici attach to a failed connection; `withCauseDetail`
+// appends them to provider error messages, e.g. "Connection error.: ... (UND_ERR_CONNECT_TIMEOUT)".
+const TRANSPORT_ERROR_CLASS_PATTERN =
+	/\b(UND_ERR_[A-Z_]+|ERR_HTTP2_[A-Z_]+|E(?:CONNRESET|CONNREFUSED|CONNABORTED|NOTFOUND|AI_AGAIN|TIMEDOUT|PIPE|NETUNREACH|NETDOWN|HOSTUNREACH|PROTO))\b/;
+
 /**
  * Retry policy: bounded attempts with exponential backoff (`baseDelayMs * 2^(attempt-1)`).
  * `maxAgentDelayMs` caps each computed delay and defaults to 60 seconds.
+ * After these fast retries, transient network and server errors get the slow tier
+ * ({@link SLOW_RETRY_DELAYS_MS}); see {@link scheduleRetry}.
  * Matches `settings.retry` (`enabled`, `maxRetries`, `baseDelayMs`, `maxAgentDelayMs`) in coding-agent; kept
  * here so the classifier and the policy-driven retry loop live together and stay reusable
  * by the SDK and other callers.
@@ -155,15 +177,64 @@ export function retryDelayMs(policy: Pick<RetryPolicy, "baseDelayMs" | "maxAgent
 	return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
 }
 
+/**
+ * Waits of the slow tier, which follows the fast retries for transient network and server
+ * errors (not rate limits). Outages of a provider or a network path often last minutes, longer
+ * than the fast tier's seconds; these waits add up to 13.5 minutes, about 15 with the fast tier
+ * and the failed attempts, before the caller sees the error.
+ */
+export const SLOW_RETRY_DELAYS_MS: readonly number[] = [30_000, 60_000, 120_000, 300_000, 300_000];
+
+/** A retry decided by {@link scheduleRetry}: which attempt, how long to wait first, and why. */
+export interface ScheduledRetry {
+	/** 1-indexed retry number; the initial call is not a retry. */
+	attempt: number;
+	/** Retries this error can get in total, fast and slow tier together. */
+	maxAttempts: number;
+	delayMs: number;
+	/** `fast`: exponential backoff under the policy. `slow`: the waits of {@link SLOW_RETRY_DELAYS_MS}. */
+	tier: "fast" | "slow";
+	errorMessage: string;
+	/** Transport error code the message names, e.g. `UND_ERR_CONNECT_TIMEOUT` or `ECONNRESET`. */
+	errorClass?: string;
+}
+
+/**
+ * Decide whether a failed assistant call gets retry number `attempt` (1-indexed) and how long to
+ * wait first. Undefined when the message is not a retryable error, the policy is disabled or
+ * allows no retries, or the tiers are used up. Context overflow is the caller's to exclude.
+ */
+export function scheduleRetry(
+	policy: RetryPolicy,
+	attempt: number,
+	message: AssistantMessage,
+): ScheduledRetry | undefined {
+	if (!policy.enabled || policy.maxRetries <= 0 || !isRetryableAssistantError(message)) return undefined;
+	// isRetryableAssistantError guarantees a non-empty message.
+	const errorMessage = message.errorMessage!;
+	const slowAttempts = RATE_LIMIT_ERROR_PATTERN.test(errorMessage) ? 0 : SLOW_RETRY_DELAYS_MS.length;
+	const maxAttempts = policy.maxRetries + slowAttempts;
+	if (attempt > maxAttempts) return undefined;
+	const fast = attempt <= policy.maxRetries;
+	return {
+		attempt,
+		maxAttempts,
+		delayMs: fast ? retryDelayMs(policy, attempt) : SLOW_RETRY_DELAYS_MS[attempt - policy.maxRetries - 1]!,
+		tier: fast ? "fast" : "slow",
+		errorMessage,
+		errorClass: transportErrorClass(errorMessage),
+	};
+}
+
+/** The transport error code (`UND_ERR_*`, `ECONNRESET`, `ENOTFOUND`, ...) an error message names, if any. */
+export function transportErrorClass(errorMessage: string): string | undefined {
+	return TRANSPORT_ERROR_CLASS_PATTERN.exec(errorMessage)?.[1];
+}
+
 /** Optional callbacks emitted by {@link retryAssistantCall} around each retry. */
 export interface RetryCallbacks {
-	/** Emitted before the backoff sleep of each retry attempt (1-indexed). */
-	onRetryScheduled?: (
-		attempt: number,
-		maxAttempts: number,
-		delayMs: number,
-		errorMessage: string,
-	) => void | Promise<void>;
+	/** Emitted before the backoff sleep of each retry. */
+	onRetryScheduled?: (retry: ScheduledRetry) => void | Promise<void>;
 	/** Emitted after the backoff sleep, immediately before the retried call starts. */
 	onRetryAttemptStart?: () => void | Promise<void>;
 	/** Emitted once when the loop ends: success if a later call completed normally. */
@@ -204,7 +275,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  *   too, so callers do not need to care when cancellation happened.
  * - A non-retryable error (per {@link isRetryableAssistantError}, including quota/
  *   billing exhaustion) is returned immediately so deterministic errors fail fast.
- * - Otherwise retries up to `maxRetries` times with exponential backoff, emitting
+ * - Otherwise retries as {@link scheduleRetry} decides (fast tier, then slow tier), emitting
  *   `onRetryScheduled` before each sleep, `onRetryAttemptStart` after each sleep before
  *   the retried call starts, and `onRetryFinished` once at the end (whether the loop
  *   ends in success, exhausted retries, or an aborted backoff).
@@ -218,10 +289,7 @@ export async function retryAssistantCall(
 	signal: AbortSignal | undefined,
 	callbacks?: RetryCallbacks,
 ): Promise<AssistantMessage> {
-	const maxAttempts = policy?.enabled ? policy.maxRetries : 0;
-
-	let attempt = 0;
-	let lastRetry: { attempt: number; errorMessage: string } | undefined;
+	let lastRetry: ScheduledRetry | undefined;
 	for (;;) {
 		const response = await produce();
 
@@ -237,23 +305,22 @@ export async function retryAssistantCall(
 			return response;
 		}
 
-		// Non-retryable, or budget exhausted: return the final error message.
-		if (attempt >= maxAttempts || !isRetryableAssistantError(response)) {
+		// Non-retryable, or tiers used up: return the final error message.
+		const retry = policy && scheduleRetry(policy, (lastRetry?.attempt ?? 0) + 1, response);
+		if (!retry) {
 			if (lastRetry) await callbacks?.onRetryFinished?.(false, lastRetry.attempt, response.errorMessage);
 			return response;
 		}
 
-		attempt++;
-		lastRetry = { attempt, errorMessage: response.errorMessage || "Unknown error" };
-		const delayMs = retryDelayMs(policy!, attempt);
-		await callbacks?.onRetryScheduled?.(attempt, maxAttempts, delayMs, lastRetry.errorMessage);
+		lastRetry = retry;
+		await callbacks?.onRetryScheduled?.(retry);
 
 		// Normalize aborts during retry backoff to the same AssistantMessage shape as
 		// provider stream aborts, so callers do not need to care when cancellation happened.
 		try {
-			await sleep(delayMs, signal);
+			await sleep(retry.delayMs, signal);
 		} catch (error) {
-			await callbacks?.onRetryFinished?.(false, attempt, lastRetry.errorMessage);
+			await callbacks?.onRetryFinished?.(false, retry.attempt, retry.errorMessage);
 			if (error instanceof RetrySleepAbortError) {
 				const { errorMessage: _errorMessage, ...rest } = response;
 				return { ...rest, stopReason: "aborted" };
@@ -276,6 +343,7 @@ export async function retryAssistantCall(
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	const errorMessage = message.errorMessage;
+	if (NON_RETRYABLE_CLIENT_STATUS_PATTERN.test(errorMessage)) return false;
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
-	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage) || transportErrorClass(errorMessage) !== undefined;
 }
