@@ -6,12 +6,17 @@
 // The workflow runs the check itself before the first and after every round, so "green" is the
 // check's exit code, never the child's claim. A round is one message to the child (it may run the
 // check itself in between). The `fix-loop` rule (prompt/rules/fix-loop.md) activates it.
+//
+// agent() does not enforce `files` (its children run in parallel in one working tree, as t3 tasks),
+// so this workflow holds its own contract: a round counts as green only when the check passes and
+// nothing outside `files` changed since the workflow started. Changes outside are not undone for the
+// child; it is told to undo them, and they are returned as `outside` while they remain.
 
 export const meta: WorkflowMeta = {
 	description: [
 		"Make a failing check pass with a cheaper model in a fresh child agent that sees only the goal, the files, the check and its failure, not this conversation.",
-		"The tool runs `check` itself before the first and after every round: green means exit code 0. Between checks the child reads, edits and runs commands; it may change only `files` (others are refused or reverted).",
-		"Returns whether the check passed, the rounds, the diff of the changed files, the last failure output when not green, and the child's summary.",
+		"The tool runs `check` itself before the first and after every round: green means exit code 0 and no file outside `files` changed. Between checks the child reads, edits and runs commands; changes outside `files` are sent back to it to undo.",
+		"Returns whether it is green, the rounds, the diff of the changed files, files changed outside `files`, the last failure output when the check fails, and the child's summary.",
 	].join(" "),
 	guidelines: [
 		"Use fix_loop when a test, type check, lint or build fails with a clear error and the fix is confined to files you can name: give it the check command, those files and a one-line goal, then review the returned diff instead of rereading the files.",
@@ -52,11 +57,20 @@ const tail = (output: string, lines: number) => {
 
 const exitText = (result: { exitCode: number | null; timedOut: boolean }) => (result.timedOut ? "timed out" : `exit ${result.exitCode}`);
 
+/** A path as changes() reports it: relative to cwd, without `./` or a trailing slash. */
+const relativePath = (path: string) => {
+	const trimmed = path.trim();
+	const relative = trimmed.startsWith(`${cwd}/`) ? trimmed.slice(cwd.length + 1) : trimmed;
+	return relative.replace(/^(\.\/)+/, "").replace(/\/+$/, "") || ".";
+};
+
 export default async function ({ goal, files, check, context, maxRounds = 6, model = "anthropic/claude-sonnet-5-5", checkTimeoutSeconds = 600 }: Input) {
 	const runCheck = () => shell(check, { timeoutSeconds: checkTimeoutSeconds });
 	let result = await runCheck();
 	if (result.exitCode === 0) return { ok: true, rounds: 0, summary: "The check already passes; nothing to fix." };
 
+	const allowed = files.map(relativePath);
+	const isAllowed = (path: string) => allowed.some((entry) => entry === "." || path === entry || path.startsWith(`${entry}/`));
 	const child = agent({
 		model,
 		files,
@@ -67,34 +81,37 @@ export default async function ({ goal, files, check, context, maxRounds = 6, mod
 			`Check: \`${check}\` (run it with bash; exit code 0 means it passes)`,
 			...(context?.trim() ? ["", `Context from the caller:\n${context.trim()}`] : []),
 			"",
-			"Read the failure, find its cause, change the allowed files, run the check, repeat until it passes. Fix the cause: do not weaken, skip or delete tests or the check, and do not commit.",
+			`Read the failure, find its cause, change only ${files.join(", ")}, run the check, repeat until it passes. Fix the cause: do not weaken, skip or delete tests or the check, and do not commit. Changes to other files make the result fail until they are undone.`,
 			"When the check passes, or you cannot make progress, stop and answer in one or two sentences: what you changed and why.",
 		].join("\n"),
 	});
 	let message = `The check fails (${exitText(result)}):\n${tail(result.output, 200)}`;
 	let rounds = 0;
 	let summary = "";
-	const reverted = new Set<string>();
+	let outside: string[] = [];
 	while (rounds < maxRounds) {
 		rounds++;
 		log(`round ${rounds}/${maxRounds}`);
 		const reply = await child.run(message);
 		summary = reply.text;
-		for (const path of reply.reverted) reverted.add(path);
 		result = await runCheck();
-		if (result.exitCode === 0) break;
-		const note = reply.reverted.length ? `\nYour changes to ${reply.reverted.join(", ")} were reverted: change only ${files.join(", ")}.` : "";
-		message = `The check still fails (${exitText(result)}, round ${rounds} of ${maxRounds}):\n${tail(result.output, 200)}${note}`;
+		outside = (await changes()).files.filter((path) => !isAllowed(path));
+		if (result.exitCode === 0 && !outside.length) break;
+		const note = outside.length ? `\nYou changed files outside ${files.join(", ")}: ${outside.join(", ")}. Undo those changes (put them back as they were); change only ${files.join(", ")}.` : "";
+		message =
+			result.exitCode === 0
+				? `The check passes (round ${rounds} of ${maxRounds}), but not with only the allowed files changed.${note}`
+				: `The check still fails (${exitText(result)}, round ${rounds} of ${maxRounds}):\n${tail(result.output, 200)}${note}`;
 	}
 
-	const ok = result.exitCode === 0;
+	const ok = result.exitCode === 0 && !outside.length;
 	const { diff } = await changes();
 	return {
 		ok,
 		rounds,
-		...(reverted.size ? { reverted: [...reverted] } : {}),
+		...(outside.length ? { outside } : {}),
 		diff: diff || "No files changed.",
-		...(ok ? {} : { lastCheckOutput: tail(result.output, 40) }),
+		...(result.exitCode === 0 ? {} : { lastCheckOutput: tail(result.output, 40) }),
 		summary,
 	};
 }

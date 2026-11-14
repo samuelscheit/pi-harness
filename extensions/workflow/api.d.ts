@@ -29,15 +29,18 @@ declare function sh(strings: TemplateStringsArray, ...values: unknown[]): string
 declare function llm(prompt: string, options?: { model?: string; system?: string; schema?: object; thinking?: Thinking; cache?: boolean }): Promise<any>;
 
 /**
- * A child agent: a fresh session with tools that sees only what you send it, not this conversation.
- * Created on its first run(); each run() sends one message and resolves with the agent's final text
- * once it stops. Default model anthropic/claude-sonnet-5-5, tools read, bash, edit, write.
- * `files`: the only files or directories it may change. Edits elsewhere are refused, other changes
- * are reverted after each run and listed in `reverted` (needs a git repository). Agents that may
- * write without `files` run one at a time; agents with `files` run in parallel.
+ * A child agent that sees only what you send it, not this conversation. In T3 Code it is a delegated
+ * task with a thread under this one, which the user can watch, steer and stop; elsewhere an
+ * in-process session. Started on its first run(); each run() sends one message (later ones resume
+ * the same conversation) and resolves once the agent stops: `text` its final message, `changed` the
+ * files the working tree changed meanwhile (other agents' too), `cost` the run's USD.
+ * Default model anthropic/claude-sonnet-5-5, tools read, bash, edit, write (names only); `system`
+ * replaces its default role prompt. `schema` (JSON Schema of an object): the agent must submit an
+ * object matching it, returned as `result`, or the run fails. `files`: told to the agent as the
+ * files to change, not enforced. Agents run in parallel in the same working tree.
  */
-declare function agent(options?: { model?: string; system?: string; tools?: string[]; files?: string[]; thinking?: Thinking }): {
-	run(message: string): Promise<{ text: string; reverted: string[] }>;
+declare function agent(options?: { model?: string; system?: string; tools?: string[]; files?: string[]; schema?: object; thinking?: Thinking }): {
+	run(message: string): Promise<{ text: string; result?: any; changed: string[]; cost: number; sessionId?: string; threadId?: string }>;
 	/** Cost in USD so far. */
 	readonly cost: number;
 };

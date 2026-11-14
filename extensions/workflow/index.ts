@@ -2,6 +2,8 @@
 // calls a model only where a judgment is needed (llm() for one request, agent() for a child agent
 // with tools), instead of doing every step itself turn by turn. The script runs in-process (see
 // compile.ts and run.ts; the API is api.d.ts) and only what it returns reaches the conversation.
+// agent() children run as t3 delegated tasks in t3, in-process elsewhere (agent.ts); every session
+// also runs the child side (child.ts), which applies a delegated child's spec.
 //
 // Saved workflows (library.ts) become tools of their own: `<harness>/workflows/*.ts` and
 // `<repository>/.pi/workflows/*.ts`. They are read on every run, so a workflow the agent saves is
@@ -18,6 +20,8 @@ import { type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, ge
 import { type TSchema, Type } from "typebox";
 import { applyToolSwitches, EXPERIMENTS_DIR, listExperiments, recordedArms, toolSwitches } from "../lib/experiments.ts";
 import { HARNESS_ROOT } from "../lib/repository.ts";
+import { delegatedChild } from "./child.ts";
+import { delegationsDir, sweepDelegations } from "./delegation.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
 import { INLINE_FILE, type RunEnv, runWorkflow, type ToolOutcome, type WorkflowDetails } from "./run.ts";
 
@@ -32,6 +36,8 @@ export interface WorkflowExtensionOptions {
 	workflowDirs?: (cwd: string) => string[];
 	/** Default: the agent dir's models and credentials, loaded once per process. */
 	modelRuntime?: () => Promise<ModelRuntime>;
+	/** Where agent() specs and child states live; default `<agentDir>/delegations`. */
+	agentDir?: string;
 }
 
 let sharedRuntime: Promise<ModelRuntime> | undefined;
@@ -47,6 +53,9 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	const experimentsDir = options.experimentsDir ?? EXPERIMENTS_DIR;
 	const workflowDirs = options.workflowDirs ?? ((cwd: string) => [HARNESS_WORKFLOWS, projectWorkflowsDir(cwd)]);
 	const runtime = options.modelRuntime ?? (() => (sharedRuntime ??= ModelRuntime.create()));
+	const agentDir = options.agentDir ?? getAgentDir();
+	// Delegations of parents that never cleaned up (a crash): at most a day old.
+	sweepDelegations(delegationsDir(agentDir));
 	/** llm() results per session. */
 	const caches = new Map<string, Map<string, unknown>>();
 	/** The saved workflows registered now, and every name this extension registered in this process. */
@@ -62,12 +71,14 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		const env: RunEnv = {
 			cwd: ctx.cwd,
 			runtime: await runtime(),
-			agentDir: getAgentDir(),
+			agentDir,
 			llmCache,
 			executeTool: async (name, args, callSignal) => {
 				const result = await ctx.executeTool(name, args, { signal: callSignal });
 				return outcome(ctx.tools.find((t) => t.name === name), result.result as never, result.isError);
 			},
+			toolNames: ctx.tools.map((t) => t.name),
+			sessionId,
 			library: () => library,
 			sessionDir: parentSessionFile ? session.getSessionDir() : undefined,
 			parentSessionFile,
@@ -156,8 +167,11 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	pi.on("before_agent_start", (event, ctx) => {
 		event.systemPromptOptions.selectedTools = switched(ctx, event.systemPromptOptions.selectedTools);
 	});
-	// A workflow saved during a turn is callable from the next turn.
+	// Registered after the switches above: a delegated child's tools replace them.
+	const child = delegatedChild(pi, delegationsDir(agentDir));
+	// A workflow saved during a turn is callable from the next turn (not in a delegated child, whose tools are fixed).
 	pi.on("turn_end", (_event, ctx) => {
+		if (child.active(ctx)) return;
 		const active = pi.getActiveTools();
 		const next = switched(ctx, active);
 		if (next.length !== active.length || next.some((name, i) => name !== active[i])) pi.setActiveTools(next);

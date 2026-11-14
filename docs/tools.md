@@ -71,14 +71,24 @@ Why: agents edited files with inline Python scripts almost twice as often as wit
 | `tools.<name>(args)` | call any session tool |
 | `shell(cmd)`, `` sh`…` `` | run shell commands, with values quoted safely |
 | `llm(prompt, { schema })` | one model request; JSON answers validated against a schema; cached per session |
-| `agent({ files }).run(msg)` | a child agent with tools; `files` limits what it may change, and other changes are reverted |
+| `agent({ system, tools, schema }).run(msg)` | a child agent with tools; in T3 Code a delegated task with its own thread; with `schema` it returns a validated `result` |
 | `map(items, fn)` | bounded concurrency |
 | `changes()` | the files and diff changed during the run |
 | `budget` | the run's USD limit and what it has spent |
 
+### Child agents
+
+`agent()` children ([`agent.ts`](../extensions/workflow/agent.ts)) run as T3 Code delegated tasks when the session has T3's tools ([`t3.ts`](../extensions/workflow/t3.ts)): each child is a thread under the calling one, which the user can watch, steer and stop. The first run is `delegate_task` in wait mode, later runs resume the same thread with `t3_thread_send` (warm context and cache), and a wait that times out continues in code with `t3_thread_wait`. Parallel agents are parallel tasks. Outside T3 (terminal, tests) each child is an in-process Pi session.
+
+Both paths share one protocol ([`delegation.ts`](../extensions/workflow/delegation.ts)). `agent()` writes a spec to `~/.pi/agent/delegations/<id>.json` (system prompt, tool names, result schema, files, caller session), and the child's first message starts with `harness-delegation: <id>` and a readable summary. In the child, the workflow extension ([`child.ts`](../extensions/workflow/child.ts)) reads the marker from the session's first user message, so the spec survives a resume and a restart of the child's Pi. It replaces the base prompt with the spec's system prompt and makes the listed tools the active set; an unknown tool name fails the run before any request.
+
+With a `schema`, the child gets a `submit_result` tool whose parameters are the schema, so Pi validates the result and a wrong shape goes back to the child as an error. A run cannot end without a result: `agent_before_settle` reminds the child, at most twice, then the run fails. The child writes its state (session, cost after every response, each run's text, result or error) to `<id>.result.json`. The parent counts the cost against the workflow's budget while the child runs, cancels the T3 task when the run is aborted or over budget, and returns the run's text, result, cost, thread and the files the working tree changed meanwhile. Spec and state are deleted when the workflow ends; files older than a day are swept at startup.
+
+`files` is only told to the child ("Change only these files"), not enforced: children run in parallel in one working tree, as T3 tasks do. Why: on 2026-11-14 a workflow with six in-process children ran 233 minutes for $107, and the user could not see, steer or stop any of them.
+
 Saved workflows become tools of their own: `<repo>/.pi/workflows/<name>.ts` for a project, [`workflows/`](../workflows) for every session. They are read on every run, so a workflow the agent saves can be called from its next turn.
 
-[`fix_loop`](../workflows/fix_loop.ts) is the shipped workflow. It hands a failing check with a clear error and a known set of files to a cheaper child agent (Sonnet) with a short context. The workflow runs the check itself before the first round and after every round, so "green" means the check's exit code, not the child's claim. Changes outside `files` are refused or reverted.
+[`fix_loop`](../workflows/fix_loop.ts) is the shipped workflow. It hands a failing check with a clear error and a known set of files to a cheaper child agent (Sonnet) with a short context. The workflow runs the check itself before the first round and after every round, so "green" means the check's exit code, not the child's claim, and no change outside `files`. A change outside them is sent back to the child to undo and reported as `outside` while it remains.
 
 Why: in one large project, repair chains (failed check → … → green) cost 17% of all spend, 59% of it cache reads of a median 379k-token context per turn.
 

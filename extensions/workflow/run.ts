@@ -16,6 +16,7 @@ import { stringify } from "yaml";
 import { runShell } from "../lib/process.ts";
 import { canonical, changedPaths, diffSince, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { createAgent } from "./agent.ts";
+import { T3, T3_DELEGATE, T3_PREFIX, t3Data } from "./t3.ts";
 import { compile, evaluate, inlineModule, scriptStack } from "./compile.ts";
 import type { SavedWorkflow } from "./library.ts";
 import { llm } from "./llm.ts";
@@ -46,6 +47,10 @@ export interface RunEnv {
 	llmCache: Map<string, unknown>;
 	/** Run a session tool (ctx.executeTool); undefined outside a session. */
 	executeTool?: (name: string, args: unknown, signal: AbortSignal) => Promise<ToolOutcome>;
+	/** The tools executeTool can call; with t3's, agent() children become t3 tasks. */
+	toolNames?: readonly string[];
+	/** The calling session's id. */
+	sessionId?: string;
 	/** The saved workflows, for workflows.*. */
 	library: () => ReadonlyMap<string, SavedWorkflow>;
 	sessionDir?: string;
@@ -69,6 +74,8 @@ export interface WorkflowDetails {
 	agentRuns: number;
 	/** Child agent sessions (details.childSessions for the metrics index). */
 	childSessions: string[];
+	/** The t3 threads of child agents (links). */
+	childThreads: string[];
 	/** Files changed during the run (absolute; details.changedFiles for the metrics index). */
 	changedFiles: string[];
 	warnings: string[];
@@ -184,6 +191,7 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 		cachedCalls: 0,
 		agentRuns: 0,
 		childSessions: [],
+		childThreads: [],
 		changedFiles: [],
 		warnings: [],
 		log: [],
@@ -209,6 +217,15 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 	const root = await gitRoot(env.cwd);
 	const start: Snapshot | undefined = root ? await snapshot(root) : undefined;
 	const llmSlot = limiter(MAX_LLM_IN_FLIGHT);
+	const executeTool = env.executeTool;
+	const t3 =
+		executeTool && env.toolNames?.includes(T3_DELEGATE)
+			? new T3(async (name, args, callSignal) => {
+					const outcome = await executeTool(`${T3_PREFIX}${name}`, args, callSignal);
+					if (outcome.isError) throw new Error(`t3 ${name}: ${outcome.text || "failed"}`);
+					return t3Data(name, outcome.value, outcome.text);
+				})
+			: undefined;
 	const live = () => {
 		if (signal.aborted) throw signal.reason;
 	};
@@ -268,9 +285,12 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 				agentDir: env.agentDir,
 				sessionDir: env.sessionDir,
 				parentSessionFile: env.parentSessionFile,
+				callerSessionId: env.sessionId,
+				t3,
 				signal,
 				spend,
 				started: (id) => details.childSessions.push(id),
+				thread: (link) => details.childThreads.push(link),
 				ran: () => details.agentRuns++,
 				progress,
 				warn: (line) => details.warnings.push(line),
@@ -345,6 +365,7 @@ function report(details: WorkflowDetails, value: unknown, failed: boolean, lines
 	const out = [`Workflow ${details.workflow ? `${details.workflow} ` : ""}${details.status} · ${stats.join(" · ")}`];
 	if (details.changedFiles.length) out.push(`Changed files: ${details.changedFiles.map((f) => relative(canonical(cwd), f)).join(", ")}`);
 	for (const warning of details.warnings) out.push(`Warning: ${warning}`);
+	if (details.childThreads.length) out.push(`Child threads: ${details.childThreads.join(", ")}`);
 	if (details.childSessions.length) out.push(`Child sessions: ${details.childSessions.join(", ")}`);
 	const shown = show(value);
 	if (shown) out.push("", shown);

@@ -1,6 +1,7 @@
 // The workflow runtime against real git repositories, real child sessions and a faux model: the
 // script API (api.d.ts), its errors, llm() with schemas, retries and the cache, budgets, abort,
-// agents with and without `files` (also in parallel), saved workflows and the fix_loop workflow.
+// in-process agents (also in parallel), saved workflows and the fix_loop workflow. agent() through
+// t3 and the child side of the delegation protocol: test/delegation.test.ts.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -13,8 +14,9 @@ import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFaux
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { compile, evaluate, inlineModule, scriptStack } from "../extensions/workflow/compile.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, metaProblem, type SavedWorkflow } from "../extensions/workflow/library.ts";
-import { WorkspaceLock } from "../extensions/workflow/lock.ts";
+
 import { INLINE_FILE, type RunEnv, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
+import { priced } from "./priced.ts";
 
 let faux: ReturnType<typeof registerFauxProvider>;
 let runtime: ModelRuntime;
@@ -54,22 +56,6 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const BROKEN = "export const add = (a, b) => a - b;\n";
 const FIXED = "export const add = (a, b) => a + b;\n";
-
-/** A runtime whose llm() requests cost `usd` each (the faux provider reports no cost). */
-function priced(usd: number): ModelRuntime {
-	return new Proxy(runtime, {
-		get(target, key) {
-			if (key !== "completeSimple") {
-				const value = Reflect.get(target, key, target);
-				return typeof value === "function" ? value.bind(target) : value;
-			}
-			return async (...args: Parameters<ModelRuntime["completeSimple"]>) => {
-				const message = await target.completeSimple(...args);
-				return { ...message, usage: { ...message.usage, cost: { ...message.usage.cost, total: usd } } };
-			};
-		},
-	});
-}
 
 const env = (extra: Partial<RunEnv> = {}): RunEnv => ({
 	cwd: repo,
@@ -270,7 +256,7 @@ describe("llm()", () => {
 		const { text, details } = await run(
 			"const out = await map(Array.from({ length: 20 }, (_, i) => i), (i) => llm(`item ${i}`, { model: 'faux/faux-1' }), { concurrency: 2 });\nreturn out.length;",
 			0.25,
-			{ runtime: priced(0.1), onUpdate: (d) => updates.push(d) },
+			{ runtime: priced(runtime, 0.1), onUpdate: (d) => updates.push(d) },
 		);
 		assert.equal(details.status, "over budget");
 		assert.equal(details.ok, false);
@@ -311,31 +297,41 @@ describe("agent()", () => {
 		assert.equal(header.parentSession, env().parentSessionFile);
 	});
 
-	test("files: edit and write elsewhere are refused, other changes reverted and returned; the user's edits survive", async () => {
+	test("files are told to the agent, not enforced; each run returns the files changed meanwhile and its cost", async () => {
 		writeFileSync(join(repo, "README.md"), "user's uncommitted edit\n");
-		let refusal = "";
+		let first = "";
 		respond(
-			tool("write", { path: "check.mjs", content: "process.exit(0)\n" }),
 			(context) => {
-				refusal = seen(context);
-				return tool("bash", { command: "echo cheat > check.mjs && echo junk > new.txt && echo clobbered > README.md" });
+				first = seen(context);
+				return tool("bash", { command: "echo junk > new.txt" });
 			},
 			tool("write", { path: "src/calc.mjs", content: FIXED }),
 			say("done"),
+			say("nothing to do"),
 		);
-		const { text, details } = await run("const a = agent({ model: 'faux/faux-1', files: ['src'] });\nconst r = await a.run('fix it');\nreturn JSON.stringify(r);");
+		const { text, details } = await run(
+			"const a = agent({ model: 'faux/faux-1', files: ['src'] });\nconst r = await a.run('fix it');\nconst again = await a.run('anything else?');\nreturn JSON.stringify({ r, again, total: a.cost });",
+			1,
+			{ runtime: priced(runtime, 0.01) },
+		);
 		assert.equal(details.status, "completed", details.error);
-		const result = JSON.parse(text.split("\n\n").at(-1)!);
-		assert.deepEqual(result.reverted.sort(), ["README.md", "check.mjs", "new.txt"]);
-		assert.match(refusal, /check\.mjs is not one of the files you may change: src/);
+		const { r, again, total } = JSON.parse(text.split("\n\n").at(-1)!);
+		assert.match(first, /Change only these files: src\./);
+		assert.equal(r.text, "done");
+		assert.deepEqual(r.changed, ["new.txt", "src/calc.mjs"]);
+		assert.deepEqual(again.changed, [], "the second run changed nothing");
+		assert.equal(r.result, undefined, "no schema, no result");
+		assert.ok(Math.abs(r.cost - 0.03) < 1e-9, `three responses: ${r.cost}`);
+		assert.ok(Math.abs(again.cost - 0.01) < 1e-9, `one response: ${again.cost}`);
+		assert.ok(Math.abs(total - 0.04) < 1e-9, "agent().cost sums the runs");
+		assert.ok(Math.abs(details.cost - 0.04) < 1e-9, "the runs' cost counts against the budget");
+		assert.equal(r.sessionId, details.childSessions[0]);
+		assert.equal(r.threadId, undefined, "no t3 thread in-process");
 		assert.equal(readFileSync(join(repo, "README.md"), "utf8"), "user's uncommitted edit\n");
-		assert.match(readFileSync(join(repo, "check.mjs"), "utf8"), /expected 5/);
-		assert.equal(existsSync(join(repo, "new.txt")), false);
-		assert.equal(readFileSync(join(repo, "src", "calc.mjs"), "utf8"), FIXED);
-		assert.deepEqual(details.changedFiles, [join(real(), "src", "calc.mjs")]);
+		assert.deepEqual(details.changedFiles, [join(real(), "new.txt"), join(real(), "src", "calc.mjs")]);
 	});
 
-	test("guarded agents run in parallel without reverting each other's files", async () => {
+	test("agents run in parallel in the same working tree", async () => {
 		writeFileSync(join(repo, "a.txt"), "a\n");
 		writeFileSync(join(repo, "b.txt"), "b\n");
 		git("-c", "user.email=t@t", "-c", "user.name=t", "add", ".");
@@ -345,7 +341,7 @@ describe("agent()", () => {
 		// Each agent writes its own file with bash (not refused, only checked afterwards), slowly.
 		const step = async (context: unknown) => {
 			const text = seen(context);
-			const own = /Files you may change: (\w)\.txt/.exec(text)![1]!;
+			const own = /Change only these files: (\w)\.txt/.exec(text)![1]!;
 			if (text.includes('"role":"toolResult"')) return say(`${own} done`);
 			active++;
 			peak = Math.max(peak, active);
@@ -358,27 +354,34 @@ describe("agent()", () => {
 			"const out = await map(['a', 'b'], async (f) => (await agent({ model: 'faux/faux-1', files: [`${f}.txt`] }).run('change your file')), { concurrency: 2 });\nreturn JSON.stringify(out);",
 		);
 		assert.equal(details.status, "completed", details.error);
-		assert.deepEqual(JSON.parse(text.split("\n\n").at(-1)!), [{ text: "a done", reverted: [] }, { text: "b done", reverted: [] }]);
+		const out = JSON.parse(text.split("\n\n").at(-1)!) as { text: string; changed: string[] }[];
+		assert.deepEqual(out.map((r) => r.text), ["a done", "b done"]);
+		for (const r of out) assert.ok(r.changed.includes(`${r.text[0]}.txt`), "its own change is among the run's changes");
 		assert.equal(peak, 2, "both ran at once");
 		assert.equal(readFileSync(join(repo, "a.txt"), "utf8"), "changed\n");
 		assert.equal(readFileSync(join(repo, "b.txt"), "utf8"), "changed\n");
 		assert.equal(details.childSessions.length, 2);
 	});
 
-	test("invalid options fail at agent(); files need a git repository; abort stops a running agent", async () => {
+	test("invalid options fail at agent(); outside a repository nothing is reported as changed; abort stops a running agent", async () => {
 		for (const [code, error] of [
 			["agent({ files: [] })", /files must be a non-empty array/],
 			["agent({ tools: 'read' })", /tools must be a non-empty array/],
 			["agent({ model: 'faux/none' })", /unknown model faux\/none/],
 			["agent({ colour: 1 })", /unknown option colour/],
+			["agent({ system: ' ' })", /system must be a non-empty string/],
+			["agent({ schema: { type: 'array' } })", /schema must be a JSON Schema of an object/],
+			["agent(5)", /options must be an object/],
 			["await agent({ model: 'faux/faux-1' }).run('')", /message must be a non-empty string/],
 		] as const) {
 			const { details } = await run(code);
 			assert.match(details.error!, error, code);
 		}
 		const outside = mkdtempSync(join(tmpdir(), "no-git-"));
-		const noGit = await run("agent({ model: 'faux/faux-1', files: ['x'] });", 1, { cwd: outside });
-		assert.match(noGit.details.error!, /files needs a git repository/);
+		respond(tool("bash", { command: "echo x > made.txt" }), say("made"));
+		const noGit = await run("return JSON.stringify(await agent({ model: 'faux/faux-1', files: ['x'] }).run('make it'));", 1, { cwd: outside, sessionDir: undefined });
+		assert.equal(noGit.details.status, "completed", noGit.details.error);
+		assert.deepEqual(JSON.parse(noGit.text.split("\n\n").at(-1)!).changed, []);
 		rmSync(outside, { recursive: true, force: true });
 
 		const controller = new AbortController();
@@ -416,46 +419,6 @@ describe("prompt cache retention", () => {
 	});
 });
 
-describe("workspace lock", () => {
-	test("shared leases overlap and see each other's files; exclusive waits for all and blocks later shared ones", async () => {
-		const lock = new WorkspaceLock();
-		const a = await lock.acquire("shared", ["/r/a"]);
-		const b = await lock.acquire("shared", ["/r/b"]);
-		assert.deepEqual(a.allowed().sort(), ["/r/a", "/r/b"]);
-		assert.deepEqual(b.allowed().sort(), ["/r/a", "/r/b"]);
-		const order: string[] = [];
-		const exclusive = lock.acquire("exclusive", []).then((lease) => {
-			order.push("exclusive");
-			return lease;
-		});
-		const later = lock.acquire("shared", ["/r/c"]).then((lease) => {
-			order.push("later shared");
-			return lease;
-		});
-		await new Promise((r) => setTimeout(r, 10));
-		assert.deepEqual(order, [], "the exclusive lease waits for both, the later shared one waits behind it");
-		a.release();
-		b.release();
-		b.release();
-		const e = await exclusive;
-		assert.deepEqual(order, ["exclusive"]);
-		e.release();
-		const c = await later;
-		assert.deepEqual(c.allowed(), ["/r/c"], "a finished lease does not widen a later one");
-		c.release();
-	});
-
-	test("a waiter that is aborted leaves the queue", async () => {
-		const lock = new WorkspaceLock();
-		const held = await lock.acquire("exclusive", []);
-		const controller = new AbortController();
-		const waiting = lock.acquire("shared", ["/x"], controller.signal);
-		controller.abort(new Error("stop"));
-		await assert.rejects(waiting, /stop/);
-		held.release();
-		(await lock.acquire("exclusive", [])).release();
-	});
-});
 
 describe("saved workflows", () => {
 	const save = (folder: string, name: string, source: string) => {
@@ -584,7 +547,7 @@ describe("fix_loop workflow", () => {
 		assert.match(seenSecond[0]!, /still fails \(exit 1, round 1 of 2\)/);
 	});
 
-	test("cheating outside the files is reverted and told to the child", async () => {
+	test("cheating outside the files is not green: the child is told to undo it, and it is reported while it remains", async () => {
 		const later: string[] = [];
 		respond(
 			tool("bash", { command: "echo 'process.exit(0)' > check.mjs" }),
@@ -595,9 +558,23 @@ describe("fix_loop workflow", () => {
 			},
 		);
 		const { text, details } = await runFixLoop({ maxRounds: 2 });
-		assert.equal(details.ok, false, "the cheat was reverted before the check");
-		assert.match(text, /reverted:\n\s+- check\.mjs/);
-		assert.match(later[0]!, /Your changes to check\.mjs were reverted: change only src\/calc\.mjs/);
-		assert.match(readFileSync(join(repo, "check.mjs"), "utf8"), /expected 5/);
+		assert.equal(details.ok, false, "a passing check with a change outside the files is not green");
+		assert.match(text, /\nok: false\nrounds: 2\noutside:\n\s+- check\.mjs/);
+		assert.doesNotMatch(text, /lastCheckOutput/, "the check itself passed");
+		assert.match(later[0]!, /The check passes \(round 1 of 2\), but not with only the allowed files changed\.\\nYou changed files outside src\/calc\.mjs: check\.mjs\. Undo those changes/);
+	});
+
+	test("a change outside the files that the child undoes leaves the round green", async () => {
+		respond(
+			tool("bash", { command: "echo 'process.exit(0)' > check.mjs" }),
+			say("Cheated."),
+			tool("bash", { command: "git checkout check.mjs" }),
+			tool("write", { path: "src/calc.mjs", content: FIXED }),
+			say("Undone and fixed."),
+		);
+		const { text, details } = await runFixLoop({ maxRounds: 3 });
+		assert.equal(details.ok, true, details.error);
+		assert.match(text, /\nok: true\nrounds: 2\n/);
+		assert.doesNotMatch(text, /outside:/);
 	});
 });

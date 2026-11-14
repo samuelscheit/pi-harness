@@ -1,8 +1,8 @@
-// The working tree of a git repository before and after an agent worked in it: which files it
-// changed, putting back the ones it was not allowed to change, and the diff of the others.
+// The working tree of a git repository before and after a workflow or an agent worked in it: which
+// files changed, and their diff.
 //
 // A snapshot holds every path `git status` lists (modified, deleted, untracked; ignored files are
-// not tracked) with a hash of its content and the content itself for restoring. A path not in a
+// not tracked) with a hash of its content and the content itself for the diff. A path not in a
 // snapshot has its HEAD content (or does not exist when HEAD lacks it). Comparing two snapshots
 // therefore finds every change to a tracked or untracked file, also one that undid an earlier
 // uncommitted change. Only working-tree content counts: what is staged is left as it is.
@@ -10,15 +10,15 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { createTwoFilesPatch } from "diff";
 
 const exec = promisify(execFile);
 const git = async (root: string, args: string[]) => (await exec("git", args, { cwd: root, maxBuffer: 256 * 1024 * 1024, encoding: "buffer" })).stdout;
 
-/** Larger uncommitted files are hashed but not kept, so a change to one can be found but not undone. */
+/** Larger uncommitted files are hashed but not kept, so a change to one can be found but not diffed. */
 const MAX_KEPT_BYTES = 16 * 1024 * 1024;
 
 /** A file's state: absent, or present with a content hash (and the content, when small enough to keep). */
@@ -108,8 +108,6 @@ export async function changedPaths(before: Snapshot, after: Snapshot): Promise<s
 	return changed.sort();
 }
 
-/** Whether `path` (absolute) is one of `allowed` (absolute files or directories) or inside one of them. */
-export const isAllowed = (path: string, allowed: readonly string[]) => allowed.some((entry) => path === entry || path.startsWith(entry.endsWith(sep) ? entry : entry + sep));
 
 /** A path with symlinks resolved in its longest existing part, so it compares with git's paths. */
 export function canonical(path: string): string {
@@ -122,32 +120,6 @@ export function canonical(path: string): string {
 	}
 }
 
-/** Paths as given to a tool (relative to `cwd` or absolute), made absolute and canonical. */
-export const absolutePaths = (paths: readonly string[], cwd: string) => paths.map((p) => canonical(isAbsolute(p) ? p : resolve(cwd, p)));
-
-/**
- * Put `paths` back to their state in `before`: kept content is written back, files absent then are
- * removed, files with their HEAD content then get it again. Returns the paths it could not restore
- * (uncommitted content too large to keep).
- */
-export async function restore(before: Snapshot, paths: readonly string[]): Promise<string[]> {
-	const failed: string[] = [];
-	for (const path of paths) {
-		const state = before.files.get(path);
-		const content = state === undefined ? await headContent(before, path) : state.exists ? state.content : undefined;
-		if (state?.exists && content === undefined) {
-			failed.push(path);
-			continue;
-		}
-		if (content === undefined) {
-			rmSync(path, { force: true, recursive: true });
-		} else {
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(path, content);
-		}
-	}
-	return failed;
-}
 
 /** A unified diff of `paths` from their state in `before` to the working tree now. */
 export async function diffSince(before: Snapshot, paths: readonly string[]): Promise<string> {
