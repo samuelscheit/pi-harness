@@ -131,6 +131,22 @@ export interface AfterToolCallContext {
 	context: AgentContext;
 }
 
+/** Context passed to `executeToolCall`. */
+export interface ExecuteToolCallContext {
+	/** The assistant message that requested the tool call. */
+	assistantMessage: AssistantMessage;
+	/** The raw tool call block from `assistantMessage.content`, with the arguments as the model wrote them. */
+	toolCall: AgentToolCall;
+	/** Validated tool arguments, after `beforeToolCall`: what the tool receives. */
+	args: unknown;
+	/** The agent abort signal. */
+	signal: AbortSignal | undefined;
+	/** Reports a partial result while the call is the tool call the loop waits for. */
+	onUpdate: AgentToolUpdateCallback;
+	/** Run the tool with `signal` and `onUpdate`, which may differ from the loop's. */
+	execute(signal: AbortSignal | undefined, onUpdate: AgentToolUpdateCallback): Promise<AgentToolResult<any>>;
+}
+
 /** Context passed to completed-turn callbacks. */
 export interface AgentTurnContext {
 	/** The assistant message that completed the turn. */
@@ -339,6 +355,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+
+	/**
+	 * Runs the execution of a tool call the model made, between `beforeToolCall` and `afterToolCall`.
+	 * Without it, the loop calls `context.execute(context.signal, context.onUpdate)`. The hook may run
+	 * the tool with another signal or update callback, and may return a result before the tool ends
+	 * (the loop then goes on with that result). Calls run through {@link runToolCall}, such as calls
+	 * one tool makes on another, do not pass through it.
+	 */
+	executeToolCall?: (context: ExecuteToolCallContext) => Promise<AgentToolResult<any>>;
 }
 
 /**

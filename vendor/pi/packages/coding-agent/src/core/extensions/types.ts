@@ -719,6 +719,34 @@ export type ToolRendererResolver = (
 	next: () => ToolRenderers | undefined,
 ) => ToolRenderers | undefined;
 
+/** One execution of a tool call the model made, as a {@link ToolExecutionWrapper} sees it. */
+export interface ToolExecution {
+	toolName: string;
+	toolCallId: string;
+	/** The arguments as the model wrote them (`tool_call` handlers changed a copy). */
+	input: Record<string, unknown>;
+	/** The agent abort signal of the turn. */
+	signal: AbortSignal | undefined;
+	/** Shows a partial result while the turn waits for this call. */
+	onUpdate: AgentToolUpdateCallback;
+	/**
+	 * Run the call (through the wrappers registered after this one) with `signal` and `onUpdate`.
+	 * The tool's context gets `signal`, so it is also the default signal of its `ctx.executeTool()` calls.
+	 */
+	execute(signal: AbortSignal | undefined, onUpdate: AgentToolUpdateCallback): Promise<AgentToolResult<unknown>>;
+}
+
+/**
+ * Wraps the execution of every tool call the model makes, of any tool: built-in, extension or MCP.
+ * Calls a tool makes through `ctx.executeTool()` do not pass through it. It runs after `tool_call`
+ * handlers and before `tool_result` handlers, and may return a result before the call ends: the
+ * turn then goes on with that result while the call keeps running.
+ */
+export type ToolExecutionWrapper = (
+	execution: ToolExecution,
+	ctx: ExtensionContext,
+) => Promise<AgentToolResult<unknown>>;
+
 /**
  * Preserve parameter inference for standalone tool definitions.
  *
@@ -1798,6 +1826,9 @@ export interface ExtensionAPI {
 	/** Choose how tool calls are drawn. Resolvers run in extension load order. */
 	registerToolRenderer(resolver: ToolRendererResolver): void;
 
+	/** Wrap the execution of the tool calls the model makes. Wrappers nest in extension load order (the first outermost). */
+	wrapToolExecution(wrapper: ToolExecutionWrapper): void;
+
 	// =========================================================================
 	// Actions
 	// =========================================================================
@@ -2376,6 +2407,7 @@ export interface Extension {
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	toolRenderers?: ToolRendererResolver[];
+	toolExecutionWrappers?: ToolExecutionWrapper[];
 	markdownTransformer?: MarkdownTransformerRegistration;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;

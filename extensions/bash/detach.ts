@@ -11,6 +11,7 @@
 // inside a literal `bash -c '…'` script does.
 
 import { type Command, forEachChild, parse, type SyntaxNode } from "../../vendor/pi-lens/node_modules/unbash/dist/parser.js";
+import { clip } from "../background/jobs.ts";
 
 /** Commands that run their arguments as a command. */
 const WRAPPERS = new Set(["builtin", "caffeinate", "command", "env", "exec", "gtimeout", "nice", "nohup", "stdbuf", "sudo", "time", "timeout"]);
@@ -57,10 +58,6 @@ export function setsidCommands(source: string): string[] {
 	return found;
 }
 
-const clip = (text: string, max: number) => {
-	const line = text.replace(/\s+/g, " ").trim();
-	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
-};
 
 /** The tool result of a refused command: why, and how to start the job instead. */
 export function refusal(commands: readonly string[], platform: NodeJS.Platform = process.platform): string {

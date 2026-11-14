@@ -2,17 +2,22 @@
 
 The harness adds or replaces these tools on top of Pi's built-ins (`read`, `edit`, `write`, `grep`, `find`, `ls`). Optional tools are registered inactive and switched on by a [rule or an experiment](prompt.md).
 
+## No tool call blocks for more than two minutes
+
+[`extensions/background`](../extensions/background/index.ts) wraps the execution of every tool call the model makes, whatever the tool: built-in, harness (`bash`, `workflow`, `fix_loop`) or MCP (`mcp__t3-code__delegate_task`, `t3_thread_wait`). A call moves to the background, without being stopped, after two minutes, or as soon as a user message arrives while it runs. The tool returns at once with the output so far and the path of a log of the latest output. When the call ends, its normal result (images included) arrives as a message that names the tool and its arguments and wakes the session, even after the turn has ended. So waiting loops (`until grep …; do sleep 5; done`) are never needed: the tool guideline says so.
+
+- Calls a tool makes itself (`ctx.executeTool` in a workflow script, `tool` inside bash) stay in the foreground of their caller, which needs the result. Only the model's call moves.
+- The turn's abort stops a call in the foreground, not one in the background. A background call stops when the session ends (through its AbortSignal; bash's then kills its process group), not on a harness reload.
+- While calls run in the background, the session reports background work (`pi.setBackgroundWork`), so T3 keeps it loaded and keeps a delegated child's run open. The jobs live in process state (`sessionJobs(sessionId).jobs`), so a reload mid-call still delivers the result.
+- Calls that end within the limit are untouched.
+
+The seam is Pi's `pi.wrapToolExecution` (added in `vendor/pi`): a wrapper around the execution of model-issued calls only, which may run the tool with its own signal and return before it ends.
+
+Why: agents sat 37 and 40 minutes in a single build command; on one day child agents sat in `workflow` calls of 233, 76 and 62 minutes, a 19-minute `fix_loop` and several 5-minute `delegate_task` waits, about 7 hours in which they could do nothing else and the user's messages could not reach them.
+
 ## bash
 
-[`extensions/bash`](../extensions/bash) owns the `bash` tool. Each feature was added after a measured failure in real sessions.
-
-### Long commands move to the background
-
-[`jobs.ts`](../extensions/bash/jobs.ts) wraps Pi's bash. A command the model runs moves to the background, without being stopped, after two minutes, or as soon as a user message arrives while it runs. The tool returns at once with the output so far, the process group (`kill -- -<pgid>`) and the path of a log of the latest output. When the command ends, its normal result arrives as a message that wakes the session, even after the turn has ended.
-
-While jobs run, the session reports background work (`pi.setBackgroundWork`), so T3 keeps it loaded and keeps a delegated child's run open. Jobs live in process state, so a harness reload mid-job still delivers the result.
-
-Why: agents sat 37 and 40 minutes in a single build command, and the user's messages could not reach them.
+[`extensions/bash`](../extensions/bash) owns the `bash` tool. Each feature was added after a measured failure in real sessions. A long command moves to the background as every tool call does (above); its message adds the command's process group (`kill -- -<pgid>`).
 
 ### Processes a command leaves running are tracked
 

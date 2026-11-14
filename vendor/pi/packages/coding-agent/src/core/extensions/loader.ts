@@ -36,6 +36,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
+	ToolExecutionWrapper,
 	ToolRendererResolver,
 } from "./types.ts";
 
@@ -382,6 +383,12 @@ function createExtensionAPI(
 			assertActive();
 			extension.toolRenderers ??= [];
 			extension.toolRenderers.push(resolver);
+		},
+
+		wrapToolExecution(wrapper: ToolExecutionWrapper): void {
+			assertActive();
+			extension.toolExecutionWrappers ??= [];
+			extension.toolExecutionWrappers.push(wrapper);
 		},
 
 		// Flag access - checks extension registered it, reads from runtime

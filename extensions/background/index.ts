@@ -1,0 +1,158 @@
+// Background calls: no tool call the model makes blocks the agent for long.
+//
+// Bash commands that ran 37 and 40 minutes (12.11.2026) moved to the background first. Other tools
+// blocked without limit: on one day, child agents sat in `workflow` calls of 233, 76 and 62 minutes,
+// a 19-minute `fix_loop` and several 5-minute `delegate_task` waits (about 7 hours), and the user's
+// messages could not reach them.
+//
+// Every tool call the model makes (Pi's `pi.wrapToolExecution`: built-in, extension and MCP tools;
+// not calls a tool makes through `ctx.executeTool`, whose caller needs the result) moves to the
+// background, without being stopped, once it runs `DETACH_AFTER_MS` or as soon as a user message
+// arrives while it runs. The tool returns at once with the output so far and a log of the latest
+// output. The call keeps running and, when it ends, its normal result (images included) reaches the
+// session as a message that starts a run if the session is idle. While jobs run, the session
+// reports background work (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated
+// child's run open.
+//
+// The turn's abort stops a call in the foreground, not one in the background. A background call
+// stops at the session's end (its AbortSignal), not on a harness reload: its end reaches the
+// reloaded extension (jobs.ts keeps the state in process state).
+
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	type DetachReason,
+	detachedText,
+	dropSession,
+	finishedContent,
+	finishedText,
+	type Job,
+	type Outcome,
+	OutputLog,
+	reportWork,
+	sessionJobs,
+	stopHintOf,
+	textOf,
+	wake,
+} from "./jobs.ts";
+
+/** How long a call runs in the foreground before it moves to the background. */
+export const DETACH_AFTER_MS = 2 * 60_000;
+
+export const BACKGROUND_GUIDELINE = (detachAfterMs: number) =>
+	`No tool call blocks you for more than ${detachAfterMs / 60_000} minutes: a call still running then, or when the user sends a message, moves to the background and keeps running, and its result reaches you as a new message when it ends, also after your turn. So run long builds, tests, workflows and waits in the foreground, with no sleep or poll loops (\`until grep …; do sleep …; done\`) waiting for them.`;
+
+export interface BackgroundOptions {
+	/** Foreground time before a call moves to the background. */
+	detachAfterMs?: number;
+	/** Directory for job logs; default a per-process directory in the system temp dir. */
+	logRoot?: string;
+}
+
+const killProcess = (pid: number) => {
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch {
+		// Already gone.
+	}
+};
+
+export default function background(pi: ExtensionAPI, options: BackgroundOptions = {}) {
+	const detachAfterMs = options.detachAfterMs ?? DETACH_AFTER_MS;
+	const logRoot = options.logRoot ?? join(tmpdir(), "pi-harness-jobs", String(process.pid));
+	const logDir = (sessionId: string) => {
+		const dir = join(logRoot, encodeURIComponent(sessionId));
+		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+		return dir;
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		const jobs = sessionJobs(ctx.sessionManager.getSessionId());
+		jobs.api = pi;
+		reportWork(jobs);
+	});
+
+	// A reload: this instance goes stale, so jobs report through the reloaded one (its
+	// session_start). Any other end of the session: nothing is left to report to, so its background
+	// calls and the processes bash calls left stop.
+	pi.on("session_shutdown", (event, ctx) => {
+		const id = ctx.sessionManager.getSessionId();
+		const jobs = sessionJobs(id);
+		jobs.api = undefined;
+		if (event.reason === "reload") return;
+		for (const job of jobs.jobs.values()) job.controller.abort(new Error("the session ended"));
+		for (const pid of jobs.leftovers.keys()) killProcess(pid);
+		clearInterval(jobs.poll);
+		dropSession(id);
+		rmSync(join(logRoot, encodeURIComponent(id)), { recursive: true, force: true });
+	});
+
+	// A message arriving during a run: every foreground call moves to the background, so the agent
+	// reads the message after this tool call instead of after the call.
+	pi.on("input", (event, ctx) => {
+		if (event.streamingBehavior === undefined || event.source === "extension") return;
+		for (const detach of sessionJobs(ctx.sessionManager.getSessionId()).foreground.values()) detach("message");
+	});
+
+	pi.wrapToolExecution(async (execution, ctx) => {
+		const { toolCallId: callId, toolName, input, signal } = execution;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const jobs = sessionJobs(sessionId);
+
+		// The call gets its own signal: the turn's abort reaches it only while it is in the foreground.
+		const controller = new AbortController();
+		const forward = () => controller.abort(signal?.reason);
+		if (signal?.aborted) controller.abort(signal.reason);
+		else signal?.addEventListener("abort", forward, { once: true });
+
+		const startedAt = Date.now();
+		const output = new OutputLog();
+		// In the foreground, updates reach the tool's display; in the background, the log.
+		const update: AgentToolUpdateCallback = (partial) => {
+			if (!output.update(partial)) execution.onUpdate(partial);
+		};
+
+		let detach!: (reason: DetachReason) => void;
+		const detached = new Promise<DetachReason>((resolve) => (detach = resolve));
+		jobs.foreground.set(callId, detach);
+		const timer = setTimeout(() => detach("time"), detachAfterMs);
+		const run: Promise<Outcome> = execution.execute(controller.signal, update).then(
+			(result) => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		const first = await Promise.race([run, detached]);
+		clearTimeout(timer);
+		jobs.foreground.delete(callId);
+		signal?.removeEventListener("abort", forward);
+		if (typeof first === "object") {
+			if ("error" in first) throw first.error;
+			return first.result;
+		}
+
+		// In the background from here: the turn's abort no longer stops it.
+		const job: Job = {
+			callId,
+			toolName,
+			input,
+			startedAt,
+			stop: stopHintOf(toolName)?.(sessionId, callId),
+			log: join(logDir(sessionId), `${encodeURIComponent(callId)}.log`),
+			controller,
+		};
+		output.open(job.log);
+		jobs.jobs.set(callId, job);
+		reportWork(jobs);
+		void run.then((outcome) => {
+			// The log ends with the final output, also when a throttled write is still pending.
+			if ("result" in outcome) output.update(outcome.result);
+			output.write();
+			if (!jobs.jobs.delete(callId)) return;
+			reportWork(jobs);
+			wake(jobs, finishedContent(finishedText(job, outcome, Date.now()), outcome), `the end of ${callId}`);
+		});
+		return { content: [{ type: "text", text: detachedText(job, first, textOf(output.latest), Date.now()) }], details: output.latest?.details } satisfies AgentToolResult<unknown>;
+	});
+}

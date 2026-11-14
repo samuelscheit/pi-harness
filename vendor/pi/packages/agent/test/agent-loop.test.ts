@@ -453,6 +453,78 @@ describe("agentLoop with AgentMessage", () => {
 		expect(blocked).not.toHaveProperty("durationMs");
 	});
 
+	it("executeToolCall runs model-issued calls: it can swap the signal and updates and return before the tool ends", async () => {
+		const toolSchema = obj({ value: str() });
+		const { promise: released, resolve: release } = Promise.withResolvers<void>();
+		const seen: { signal: AbortSignal | undefined; updates: string[] } = { signal: undefined, updates: [] };
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "slow",
+			label: "Slow",
+			description: "Slow tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params, signal, onUpdate) {
+				seen.signal = signal;
+				onUpdate?.({ content: [{ type: "text", text: "early" }], details: {} });
+				await released;
+				onUpdate?.({ content: [{ type: "text", text: "late" }], details: {} });
+				return { content: [{ type: "text", text: `done ${params.value}` }], details: {} };
+			},
+		};
+		const own = new AbortController();
+		const hookCalls: unknown[] = [];
+		let finished: Promise<unknown> | undefined;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			beforeToolCall: async ({ args }) => {
+				(args as { value: string }).value = "changed";
+				return undefined;
+			},
+			executeToolCall: async ({ assistantMessage, toolCall, args, onUpdate, execute }) => {
+				hookCalls.push({ stopReason: assistantMessage.stopReason, arguments: toolCall.arguments, args });
+				const updated = Promise.withResolvers<void>();
+				finished = execute(own.signal, (partial) => {
+					seen.updates.push((partial.content[0] as { text: string }).text);
+					onUpdate(partial);
+					updated.resolve();
+				});
+				await updated.promise;
+				return { content: [{ type: "text", text: "moved on" }], details: {} };
+			},
+		};
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "s", name: "slow", arguments: { value: "a" } }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: callIndex === 0 ? "toolUse" : "stop", message });
+				callIndex++;
+			});
+			return stream;
+		};
+		const stream = agentLoop([createUserMessage("go")], { messages: [], tools: [tool] }, config, undefined, streamFn);
+		const updates: string[] = [];
+		for await (const event of stream) {
+			if (event.type === "tool_execution_update")
+				updates.push((event.partialResult.content[0] as { text: string }).text);
+		}
+		const [result] = (await stream.result()).filter((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(result?.content).toEqual([{ type: "text", text: "moved on" }]);
+		expect(hookCalls).toEqual([{ stopReason: "toolUse", arguments: { value: "a" }, args: { value: "changed" } }]);
+		expect(seen.signal).toBe(own.signal);
+		release();
+		expect(await finished).toMatchObject({ content: [{ type: "text", text: "done changed" }] });
+		expect(seen.updates).toEqual(["early", "late"]);
+		// Updates after the result reach the hook's callback, not the loop.
+		expect(updates).toEqual(["early"]);
+	});
+
 	it("should not execute tool calls from a length-truncated assistant message", async () => {
 		const toolSchema = obj({ value: str() });
 		const executed: string[] = [];

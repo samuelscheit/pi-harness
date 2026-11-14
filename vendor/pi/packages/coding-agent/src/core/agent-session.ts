@@ -744,6 +744,7 @@ export class AgentSession {
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
 		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.executeToolCall = (context) => this._extensionRunner.executeToolCall(context);
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */

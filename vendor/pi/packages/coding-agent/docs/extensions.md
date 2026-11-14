@@ -1964,6 +1964,27 @@ Report how much work your extension keeps running for the session outside any ag
 pi.setBackgroundWork("my-jobs", jobs.size);
 ```
 
+### pi.wrapToolExecution(wrapper)
+
+Wrap the execution of every tool call the model makes, of any tool (built-in, extension or MCP). The wrapper runs after `tool_call` handlers and before `tool_result` handlers. `execution.execute(signal, onUpdate)` runs the call (through wrappers registered later); the tool's context gets that signal, so it is also the default signal of the tool's `ctx.executeTool()` calls. Calls a tool makes through `ctx.executeTool()` do not pass through wrappers. Wrappers nest in extension load order, the first outermost.
+
+A wrapper may return a result before the call ends: the turn goes on with it while the call keeps running. This is how a harness moves long calls to the background:
+
+```typescript
+pi.wrapToolExecution(async (execution, ctx) => {
+  const own = new AbortController();
+  const running = execution.execute(own.signal, () => {});
+  const first = await Promise.race([running, sleep(120_000).then(() => undefined)]);
+  if (first) return first;
+  void running.then((result) =>
+    pi.sendMessage({ customType: "job", content: result.content, display: true }, { triggerTurn: true, deliverAs: "steer" }),
+  );
+  return { content: [{ type: "text", text: `${execution.toolName} moved to the background` }], details: undefined };
+});
+```
+
+`execution.input` holds the arguments as the model wrote them; `tool_call` handlers changed a copy, which is what the tool receives.
+
 ### pi.events
 
 Shared event bus for communication between extensions:

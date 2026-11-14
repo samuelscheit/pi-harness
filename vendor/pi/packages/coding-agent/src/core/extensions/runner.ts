@@ -2,7 +2,13 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type {
+	AgentMessage,
+	AgentTool,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ExecuteToolCallContext,
+} from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
@@ -812,6 +818,31 @@ export class ExtensionRunner {
 		const resolve = (index: number): ToolRenderers | undefined =>
 			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
 		return resolve(0);
+	}
+
+	/** Run a model-issued tool call through the extensions' execution wrappers, in load order. */
+	executeToolCall(context: ExecuteToolCallContext): Promise<AgentToolResult<unknown>> {
+		const wrappers = this.extensions.flatMap((ext) => ext.toolExecutionWrappers ?? []);
+		const { toolCall } = context;
+		const run = (
+			index: number,
+			signal: AbortSignal | undefined,
+			onUpdate: AgentToolUpdateCallback,
+		): Promise<AgentToolResult<unknown>> =>
+			index < wrappers.length
+				? wrappers[index](
+						{
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							input: toolCall.arguments,
+							signal,
+							onUpdate,
+							execute: (nextSignal, nextUpdate) => run(index + 1, nextSignal, nextUpdate),
+						},
+						this.createContext(),
+					)
+				: context.execute(signal, onUpdate);
+		return run(0, context.signal, context.onUpdate);
 	}
 
 	getEntryRenderer(customType: string): EntryRenderer | undefined {

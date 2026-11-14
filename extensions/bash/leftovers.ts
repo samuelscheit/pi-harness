@@ -11,12 +11,17 @@
 // parent is no longer in the group: the jobs the command's shell started and left (their own
 // children are part of them). Each is adopted with the command that started it and listed in the
 // call's result. A poll per session checks them each second; when one has ended, a message names
-// it and wakes the session (as a background command's end does, jobs.ts). Children it left in turn
+// it and wakes the session (as a background call's end does, ../background). Children it left in turn
 // are adopted then. A process outside the group (`setsid`, a daemon that forks into its own
 // session) is not seen: `setsid` is refused (detach.ts).
 //
 // A non-child's exit code is unknown: the message says when it ended, and its output is wherever
-// the command redirected it. Leftovers stop with the session (not on a harness reload).
+// the command redirected it. Leftovers stop with the session (not on a harness reload;
+// ../background/index.ts).
+
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { clip, minutes, reportWork, type SessionJobs, wake } from "../background/jobs.ts";
 
 /** One live process of `ps -A -o pid=,ppid=,pgid=,stat=,etime=,command=`. */
 export interface PsRow {
@@ -57,15 +62,6 @@ export interface Leftover {
 	adoptedAt: number;
 }
 
-const clip = (text: string, max: number) => {
-	const line = text.replace(/\s+/g, " ").trim();
-	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
-};
-
-const minutes = (ms: number) => {
-	const s = Math.round(ms / 1000);
-	return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
-};
 
 const list = (processes: readonly Pick<Leftover, "pid" | "command">[]) => processes.map((p) => `- pid ${p.pid}: \`${clip(p.command, 160)}\``);
 
@@ -110,4 +106,38 @@ export function sweep(leftovers: Leftovers, rows: readonly PsRow[], now: number)
 	const ended = [...leftovers.values()].filter((l) => !live.has(`${l.pid}:${l.pgid}`));
 	for (const l of ended) leftovers.delete(l.pid);
 	return ended.map((l) => ({ ended: l, orphans: adopt(leftovers, rows, l.pgid, l.startedBy, now) }));
+}
+
+const execFileAsync = promisify(execFile);
+export const defaultPs = async () => (await execFileAsync("ps", PS_ARGS, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).stdout;
+
+/** One check of the session's leftovers: each one that ended wakes the session with its own message. */
+async function checkLeftovers(jobs: SessionJobs, ps: () => Promise<string>): Promise<void> {
+	const ended = sweep(jobs.leftovers, parsePs(await ps()), Date.now());
+	if (ended.length === 0) return;
+	if (jobs.leftovers.size === 0) {
+		clearInterval(jobs.poll);
+		jobs.poll = undefined;
+	}
+	reportWork(jobs);
+	for (const { ended: leftover, orphans } of ended) wake(jobs, endedText(leftover, orphans, Date.now()), `the end of pid ${leftover.pid}`);
+}
+
+/** Adopt what a call left running in group `pgid`, and check the session's leftovers while there are any. */
+export async function adoptLeftovers(jobs: SessionJobs, pgid: number, command: string, ps: () => Promise<string>, pollMs: number): Promise<Leftover[]> {
+	const adopted = adopt(jobs.leftovers, parsePs(await ps()), pgid, command, Date.now());
+	if (adopted.length === 0) return adopted;
+	if (jobs.poll === undefined) {
+		let busy = false;
+		jobs.poll = setInterval(() => {
+			if (busy) return;
+			busy = true;
+			checkLeftovers(jobs, ps)
+				.catch((error: unknown) => console.error("[background] cannot check leftover processes:", error))
+				.finally(() => (busy = false));
+		}, pollMs);
+		jobs.poll.unref?.();
+	}
+	reportWork(jobs);
+	return adopted;
 }

@@ -28,6 +28,8 @@ import type {
 	AgentToolCall,
 	AgentToolCallOutcome,
 	AgentToolResult,
+	AgentToolUpdateCallback,
+	ExecuteToolCallContext,
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
@@ -565,7 +567,12 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				preparation,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+				hookOf(config, assistantMessage),
+			);
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -636,7 +643,12 @@ async function executeToolCallsParallel(
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				preparation,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+				hookOf(config, assistantMessage),
+			);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -828,26 +840,35 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 	return finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
 }
 
+/** The loop's `executeToolCall` hook for calls of `assistantMessage`. */
+type ExecutionHook = (context: Omit<ExecuteToolCallContext, "assistantMessage">) => Promise<AgentToolResult<any>>;
+
+function hookOf(config: AgentLoopConfig, assistantMessage: AssistantMessage): ExecutionHook | undefined {
+	const hook = config.executeToolCall;
+	return hook && ((context) => hook({ ...context, assistantMessage }));
+}
+
 async function executePreparedToolCall(
 	prepared: PreparedToolCall,
 	signal: AbortSignal | undefined,
 	onUpdate: ToolUpdateSink,
+	hook?: ExecutionHook,
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
 	const startedAt = performance.now();
 	const elapsed = () => Math.round(performance.now() - startedAt);
+	const update = (partialResult: AgentToolResult<any>) => {
+		if (!acceptingUpdates) return;
+		updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+	};
+	const execute = (callSignal: AbortSignal | undefined, onCallUpdate: AgentToolUpdateCallback) =>
+		prepared.tool.execute(prepared.toolCall.id, prepared.args as never, callSignal, onCallUpdate);
 
 	try {
-		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
-			prepared.args as never,
-			signal,
-			(partialResult) => {
-				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
-			},
-		);
+		const result = await (hook
+			? hook({ toolCall: prepared.toolCall, args: prepared.args, signal, onUpdate: update, execute })
+			: execute(signal, update));
 		const durationMs = elapsed();
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
