@@ -182,26 +182,17 @@ interface Thread {
 	session: AgentSession;
 	runs: Map<string, Promise<void>>;
 	pending: Map<string, { questions: ExtensionUIQuestion[]; answer: (values: (string | undefined)[] | undefined) => void }>;
-	/** Resolves when the next question is asked. */
-	asked: Promise<void>;
-	signalAsked: () => void;
 }
 
 /** A thread record whose UI turns ask_user's questions into pending requests, as t3's Pi adapter does. */
 function newThread(): { thread: Omit<Thread, "session">; ui: ExtensionUIContext } {
 	let requests = 0;
-	const thread: Omit<Thread, "session"> = { runs: new Map(), pending: new Map(), asked: Promise.resolve(), signalAsked: () => undefined };
-	const arm = () => {
-		thread.asked = new Promise((r) => (thread.signalAsked = r));
-	};
-	arm();
+	const thread: Omit<Thread, "session"> = { runs: new Map(), pending: new Map() };
 	const questions = (asked: { title: string; options?: string[] }[]) =>
 		new Promise<(string | undefined)[] | undefined>((resolve) => {
 			const id = `request-${++requests}`;
 			// Answered by respond or by the user on the card: no longer pending.
 			thread.pending.set(id, { questions: asked, answer: (values) => (thread.pending.delete(id), resolve(values)) });
-			thread.signalAsked();
-			arm();
 		});
 	return { thread, ui: questionsUi((asked) => questions(asked)) };
 }
@@ -260,7 +251,8 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 		const runId = `run-${++ids}`;
 		// As t3 does: a `/compact` message is Pi's compaction, not a prompt.
 		const compact = parseCompact(message);
-		thread.runs.set(runId, compact ? thread.session.compact(compact.instructions).then(() => undefined) : thread.session.prompt(message));
+		// A compaction Pi refuses still ends the run, as in t3.
+		thread.runs.set(runId, compact ? thread.session.compact(compact.instructions).then(() => undefined, () => undefined) : thread.session.prompt(message));
 		return runId;
 	};
 	const threadOf = (taskId: unknown) => /^task-(thread-\d+)/.exec(String(taskId))?.[1];
@@ -304,7 +296,6 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 				}
 				const { thread, ui } = newThread();
 				const session = await newSession([workflowExtension(childRuntime), askUser, warm], manager, childRuntime, ui);
-				// The same object: its question promise is replaced on every question.
 				fx.threads.set(threadId, Object.assign(thread, { session }));
 				// t3 sends a one-line role preamble, a blank line, then the task.
 				known = { threadId, runId: start(threadId, `You are a delegated ${String(args.role)} child.\n\n${String(args.task)}`) };
@@ -327,11 +318,9 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 		});
 		tool("t3_thread_wait", async (args) => {
 			const thread = fx.threads.get(String(args.threadId))!;
-			// A pending question ends a wait, as in t3.
-			const run = thread.runs.get(String(args.runId))!;
-			const ended = thread.pending.size ? "asked" : await Promise.race([finishedWithin(run, waitMs), thread.asked.then(() => "asked" as const)]);
-			const done = ended === true;
-			return { threadId: args.threadId, runId: args.runId, status: done ? "completed" : "running", timedOut: ended === false };
+			// As in t3: only the run's end or the timeout ends a wait, not a pending question.
+			const done = await finishedWithin(thread.runs.get(String(args.runId))!, Math.min(waitMs, Number(args.timeoutMs ?? waitMs)));
+			return { threadId: args.threadId, runId: args.runId, status: done ? "completed" : "running", timedOut: !done };
 		});
 		tool("t3_pending_request", async (args) => {
 			const thread = fx.threads.get(String(args.threadId))!;
@@ -685,6 +674,16 @@ describe("the handle", () => {
 		const journal = readJournal(details.journal);
 		assert.ok(source.sessionManager.getEntries().some((e) => e.type === "custom" && e.customType === "harness-warm"), "the child holds its cache warm");
 		assert.deepEqual(journal.flatMap((e) => (e.t === "start" ? [e.label] : [])), ["#1: first", "#1 compact: keep the verdict", "#1 warm: 2h", "#1 run 2: slow", "#1 steer: also check the tests", "#1 run 3: wait forever", "#1 stop", "#2: forked"]);
+	});
+
+	test("a compaction that does not happen fails compact(), in t3 and in-process", async () => {
+		const code = "const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });\nawait a.run('short');\nreturn await a.compact().then(() => 'compacted', (e) => e.message);";
+		const inT3 = await runInT3(code, say("short answer"));
+		assert.equal(inT3.details.status, "completed", inT3.details.error);
+		assert.match(inT3.text.split("\n\n").at(-1)!, /^delegate 1: the compaction failed: Compaction failed: Nothing to compact \(session too small\)$/);
+		faux.setResponses([say("short answer")]);
+		const inProcess = await runWorkflow({ source: code, filename: INLINE_FILE, inline: true }, 1, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
+		assert.match(inProcess.text.split("\n\n").at(-1)!, /Nothing to compact \(session too small\)/);
 	});
 
 	test("in-process: compact is Pi's compaction, steer and stop reach the session, fork is Pi's session fork", async () => {

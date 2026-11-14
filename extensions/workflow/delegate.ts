@@ -599,7 +599,21 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		},
 		compact: (instructions?: unknown) => {
 			if (instructions !== undefined && typeof instructions !== "string") return Promise.reject(new TypeError("delegate().compact(instructions?): instructions must be a string"));
-			return queued(() => operate("compact", instructions as string | undefined, (requestId, signal) => transport.command(compactCommand(instructions as string | undefined), requestId, signal)));
+			return queued(() =>
+				operate("compact", instructions as string | undefined, async (requestId, signal) => {
+					// The child reports every compaction: a /compact that did not happen (Pi refused it, t3 ignored it) is an error.
+					const before = (spec && readState(dir, spec.id)?.compactions) ?? 0;
+					await transport.command(compactCommand(instructions as string | undefined), requestId, signal);
+					const deadline = Date.now() + STATE_WAIT_MS;
+					let state = spec && readState(dir, spec.id);
+					while ((state?.compactions ?? 0) <= before && Date.now() < deadline && !signal.aborted) {
+						await new Promise((r) => setTimeout(r, 100));
+						state = spec && readState(dir, spec.id);
+					}
+					if ((state?.compactions ?? 0) <= before) throw new Error(`${label}: the child did not compact; ${transport.describe()}`);
+					if (state?.compactionError) throw new Error(`${label}: the compaction failed: ${state.compactionError}`);
+				}),
+			);
 		},
 		warm: (duration: unknown) => {
 			try {

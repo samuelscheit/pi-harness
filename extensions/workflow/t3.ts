@@ -9,8 +9,9 @@
 // prompt cache are warm). Both carry a `clientRequestId` per run, which t3 dedupes within one MCP
 // session (one Pi process; a new process gets a new task for the same id, seen 2026-11-14). A wait
 // that times out does not end the run: it continues with `t3_thread_wait` until the run is over. A
-// question or an approval the child waits for also ends a wait: the child's `waiting` hook (the
-// workflow's onAsk) may answer it, else the code keeps waiting for whoever answers.
+// question the child waits for does not end a thread wait (t3 reports it to the calling thread), so
+// with a `waiting` hook (the workflow's onAsk) the code waits in short slices and the hook looks
+// for pending questions in between (verified in a real run on 2026-11-14).
 // Afterwards `task_status` reads the task, which marks its result delivered, so t3 does not wake
 // the calling thread for a result the script already has.
 
@@ -20,8 +21,13 @@ export const T3_DELEGATE = `${T3_PREFIX}delegate_task`;
 export const WAIT_MS = 10 * 60_000;
 /** How long the starting delegate_task waits: short, so the ids are known (and journaled) early. */
 export const START_WAIT_MS = 5_000;
-/** A wait that returns sooner without the run being over (a pending question) is repeated after this. */
+/** A wait that returns sooner without the run being over is repeated after this. */
 const RETRY_MS = 5_000;
+/**
+ * With a `waiting` hook (onAsk), how long one wait slice blocks before pending questions are looked
+ * at: t3's thread wait does not end on a question (only on the run's end), so the code looks itself.
+ */
+export const ASK_POLL_MS = 2_000;
 /** Thread statuses after which the run is over. */
 const OVER = new Set(["idle", "completed", "interrupted", "failed", "cancelled", "rolled_back"]);
 
@@ -173,11 +179,11 @@ export class T3Child {
 	private async wait(runId: string | undefined, signal: AbortSignal): Promise<void> {
 		for (;;) {
 			const started = Date.now();
-			const waited = await this.t3.call("t3_thread_wait", { threadId: this.threadId, ...(runId ? { runId } : {}), timeoutMs: WAIT_MS, untilDelegatedWorkSettled: true }, signal);
+			const waited = await this.t3.call("t3_thread_wait", { threadId: this.threadId, ...(runId ? { runId } : {}), timeoutMs: this.waiting ? ASK_POLL_MS : WAIT_MS, untilDelegatedWorkSettled: true }, signal);
 			this.status = String(waited.status);
 			if (OVER.has(this.status)) return;
-			if (waited.timedOut === true) continue;
 			const answered = (await this.waiting?.(this, signal)) ?? false;
+			if (waited.timedOut === true) continue;
 			if (!answered && Date.now() - started < RETRY_MS) await sleep(RETRY_MS, signal);
 		}
 	}

@@ -4,10 +4,10 @@
 // returns undefined passes the question up unchanged: whoever runs the workflow (the orchestrator,
 // at top level the user) answers it, as without a handler.
 //
-// - In t3 the child's question is a pending request in its thread. A wait for the child's run ends
-//   early while it is pending (t3.ts); the workflow then reads it (`t3_pending_request` read) and
-//   responds with the handler's answers, which the child's blocking `ask_user` returns as its tool
-//   result. A question passed up stays pending; t3 reports it to the parent thread as before.
+// - In t3 the child's question is a pending request in its thread. t3's thread wait does not end on
+//   it, so with a handler the wait goes in short slices (t3.ts), and in between the workflow reads
+//   pending requests (`t3_pending_request` list, read) and responds with the handler's answers,
+//   which the child's blocking `ask_user` returns as its tool result. A question passed up stays pending; t3 reports it to the parent thread as before.
 // - In-process the child's `ask_user` shows its questions on a UI the workflow gives the child
 //   session: the handler answers, and a question passed up goes to the workflow session's own
 //   `ask_user`.

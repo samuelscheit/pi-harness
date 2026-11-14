@@ -110,7 +110,7 @@ With a `schema`, the child gets a `submit_result` tool whose parameters are the 
 | | |
 | --- | --- |
 | `h.run(message)` | the first run delegates (`delegate_task`), later runs resume the same thread (`t3_thread_send`) |
-| `h.compact(instructions?)` | sends `/compact <instructions>`, Pi's own command (t3 maps it to Pi's compaction) |
+| `h.compact(instructions?)` | sends `/compact <instructions>`, Pi's own command (t3 maps it to Pi's compaction); the child reports every compaction in its state, so one that did not happen or failed ("Nothing to compact") throws |
 | `h.warm(duration)` | sends `/warm <duration>` (`2h`, `until 18:00`, `off`), the harness's [`/warm`](#warm-and-keep_warm): holds the child's prompt cache warm, e.g. while the workflow does other work before its next run |
 | `h.steer(text)` | steers the running turn (`t3_thread_send` in steer mode) |
 | `h.stop()` | stops the child's work (`task_cancel`); its running `run` fails |
@@ -126,7 +126,7 @@ Outside T3 (terminal, tests) each child is an in-process Pi session with the sam
 A delegated child that does not know how to go on asks with `ask_user` (blocking; its brief says to ask with options rather than guess). The question goes up the chain, as in a condition system, not as an exception ([`ask.ts`](../extensions/workflow/ask.ts)):
 
 - `delegate({ …, onAsk: async (questions) => answers | undefined })`. The handler gets `[{ id, title, options? }]` and may answer from data, with `llm()`, by asking its own parent (`await tools.ask_user(...)`), or throw to stop the run (the child is cancelled).
-- In t3 the child's question is a pending request in its thread, and a `t3_thread_wait` ends early while it is pending. With a handler, the workflow reads it (`t3_pending_request` list and read), calls the handler and responds with its answers. The child's blocking `ask_user` returns them as its tool result, and the child continues in the same turn. Each request is handled once.
+- In t3 the child's question is a pending request in its thread. A `t3_thread_wait` does not end on it (only on the run's end; t3 reports the question to the calling thread), so with a handler the workflow waits in 2-second slices and looks for pending requests in between (`t3_pending_request` list and read), calls the handler and responds with its answers. t3 still notifies the session running the workflow of the question; by the time it reads it, the question is usually answered. The child's blocking `ask_user` returns them as its tool result, and the child continues in the same turn. Each request is handled once.
 - Returning `undefined` passes the question up unchanged: in t3 it stays pending and t3 reports it to the parent thread, so the session running the workflow (the orchestrator, or at top level the user) answers it as before. In-process it goes to that session's own `ask_user`.
 - In-process children load `ask_user` with a headless UI whose questions dialog is the same handler.
 - Every question and its answer (or that it passed up) is a journaled call (kind `ask`), so a resume replays the answer instead of calling the handler again.

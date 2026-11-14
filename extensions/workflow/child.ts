@@ -10,7 +10,7 @@
 //   MAX_REMINDERS times, then the run fails. Each run needs its own result. The run's final message
 //   ends with the result as JSON (RESULT_HEADING), so it reaches whoever reads the task's result
 //   (t3's summary, the parent's wake message);
-// - reports its state (session, cost, the run's text, result or error) to the parent.
+// - reports its state (session, cost, the run's text, result or error, compactions) to the parent.
 //
 // The workflow extension wires this into every harness session (a t3 delegated child is one), and
 // delegate() into its in-process children. Everything is derived from the session and the state
@@ -140,7 +140,8 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			// A new run: by the parent (its marker numbers the run) or by the user in the child's thread.
 			const marker = parseMarker(prompt);
 			const run = marker?.id === child.spec.id ? marker.run : child.state.run;
-			child.state = { sessionId: child.state.sessionId, cost: child.state.cost, run, done: false };
+			const { sessionId, cost, compactions, compactionError } = child.state;
+			child.state = { sessionId, cost, run, done: false, ...(compactions ? { compactions } : {}), ...(compactionError ? { compactionError } : {}) };
 		} else if (!event.reloaded) {
 			// The session continues on its own (a background job ended): the run is not done yet.
 			child.state = { ...child.state, done: false };
@@ -183,6 +184,17 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 		const text = `${RESULT_HEADING}${JSON.stringify(child.state.result, null, 2)}\n\`\`\``;
 		return { message: { ...message, content: [...message.content, { type: "text", text }] } };
 	});
+
+	// Compactions, for a parent's /compact (delegate's compact() checks that one happened).
+	const compacted = (ctx: ExtensionContext, error?: string) => {
+		const child = resolve(ctx);
+		if (!child) return;
+		const { compactionError: _previous, ...rest } = child.state;
+		child.state = { ...rest, compactions: (child.state.compactions ?? 0) + 1, ...(error ? { compactionError: error } : {}) };
+		save(child);
+	};
+	pi.on("session_compact", (_event, ctx) => compacted(ctx));
+	pi.on("session_compact_failed", (event, ctx) => compacted(ctx, event.aborted ? "the compaction was aborted" : (event.errorMessage ?? "the compaction failed")));
 
 	pi.on("agent_before_settle", (event, ctx) => {
 		const child = resolve(ctx);

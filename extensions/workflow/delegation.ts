@@ -118,6 +118,9 @@ export interface DelegationState {
 	result?: unknown;
 	/** Why the run failed. */
 	error?: string;
+	/** Compactions the session went through (succeeded or failed), and why the latest failed. */
+	compactions?: number;
+	compactionError?: string;
 }
 
 export const specPath = (dir: string, id: string) => join(dir, `${id}.json`);
