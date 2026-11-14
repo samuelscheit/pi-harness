@@ -70,7 +70,7 @@ WHERE s.source = 'pi' AND r.cache_event IS NOT NULL GROUP BY 1 ORDER BY 4 DESC;
 
 ### How the metrics size thinking
 
-`extensions/metrics/blocks.ts` sizes a block as `thinking.length / 4 + signature.length × 0.75 / 4`, i.e. summary characters plus decoded signature bytes, each at 4 per token. `attribution.ts` then scales every block to the real prompt size. HANDOFF already flags this as an estimate.
+`extensions/metrics/blocks.ts` sizes a block as `thinking.length / 4 + signature.length × 0.75 / 4`, i.e. summary characters plus decoded signature bytes, each at 4 per token. `attribution.ts` then scales every block to the real prompt size. The harness docs already flagged this as an estimate.
 
 ### Measured: what a replayed block is billed at
 
@@ -162,7 +162,7 @@ These two fallback labels are guesses. All the classifier knows is that the sess
 
 The only part of the request that changes without being persisted is **pi-lens's context injection** (`vendor/pi-lens/index.ts` `injectIntoRequest`, `context_with_system` hook):
 
-- **What `retain` does:** with `contextInjection.retain: true` (our global default since 16:04 UTC, `config/pi-lens.json`, see HANDOFF), pi-lens re-sends earlier injections byte for byte where they sat. It does so from an in-memory ledger (`clients/context-injection-ledger.ts`, a `BoundedLruCache`).
+- **What `retain` does:** with `contextInjection.retain: true` (our global default since 16:04 UTC, `config/pi-lens.json`, see [tools](../../tools.md#pi-lens)), pi-lens re-sends earlier injections byte for byte where they sat. It does so from an in-memory ledger (`clients/context-injection-ledger.ts`, a `BoundedLruCache`).
 - **When the ledger is lost:**
   - **Pi restart:** t3 resumes a session in a new process. This shows as `model_change` + `session_info` entries between two requests.
   - **Extension reload:** the harness hot-reloads every session on every commit (`pi.requestReload()`). Pi loads extensions with `jiti` and `moduleCache: false` (`core/extensions/loader.ts`), so the ledger module is new and empty.
@@ -235,7 +235,7 @@ The same prefix change breaks thinking blocks too. Each block generated after a 
 2. **Size thinking at its billed size in the metrics.**
    - In `extensions/metrics/blocks.ts` (`blocksOf`, assistant case), use the message's `usage.reasoning`, split across its thinking blocks. Fall back to the current estimate only when it is missing (19 blocks today).
    - Effect: the dashboard's "thinking" falls from 21.6% to ~11%. Tool results and the other categories get the ~$42 the estimate took from them.
-   - Also have the indexer read `anthropic_input_transformations` and price the dropped blocks at 0. That gives the 8.2% lower bound. Update HANDOFF's "Metrics open points".
+   - Also have the indexer read `anthropic_input_transformations` and price the dropped blocks at 0. That gives the 8.2% lower bound. Update the metrics open points ([roadmap](../../roadmap.md#metrics)).
 3. **Do not build "drop thinking at cache loss" now.**
    - Its realistic saving is 0.4% of spend (idle expiry and compaction only), and it costs reasoning.
    - If idle expiries grow, add it where Pi already knows the cache is cold: the `compaction.coldCache` path / cache-warming decision in `agent-session.ts`, at a user-turn start only.

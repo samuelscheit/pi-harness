@@ -1,6 +1,6 @@
 # 05 — Persistent memory and self-improving context
 
-Slice: memory across sessions, and context that improves itself over time. Written 2026-11 for the self-improving Pi harness (see `HANDOFF.md`: `note_improvement` capture, recurring dreaming, changelog, A/B prompt experiments). Each claim links its source. Numbers are the authors' own unless marked "independent". Dates are publication dates.
+Slice: memory across sessions, and context that improves itself over time. Written 2026-11 for the self-improving Pi harness (see [self-improvement](../../self-improvement.md): `note_improvement` capture, recurring dreaming, changelog, A/B prompt experiments). Each claim links its source. Numbers are the authors' own unless marked "independent". Dates are publication dates.
 
 ## TL;DR
 
@@ -130,7 +130,7 @@ Slice: memory across sessions, and context that improves itself over time. Writt
 - **Brevity bias.** Optimizers converge on short, generic instructions. **Context collapse**: full rewrites shrink context. In the paper's Dynamic Cheatsheet example, 18,282 tokens became 122 and accuracy fell from 66.7 to 57.1, below the 63.7 baseline ([arXiv](https://arxiv.org/html/2510.04618v1)).
 - **Results.** AppWorld (DeepSeek-V3.1 ReAct) average 42.4 → 59.4 offline and 59.5 online, without labels. That matches IBM CUGA (GPT-4.1) overall and beats it by +8.4 TGC on test-challenge. It beats GEPA by +11.9 and ICL by +12.3. FiNER/Formula +8.6. Adaptation latency −82.3% vs GEPA and −91.5% vs Dynamic Cheatsheet ([arXiv](https://arxiv.org/html/2510.04618v1); [repo](https://github.com/ace-agent/ace)).
 - **Tradeoffs.** It depends on feedback quality: without reliable signals the Reflector can learn wrong lessons ([alphaXiv summary](https://www.alphaxiv.org/abs/2510.04618)). Long playbooks cost prompt tokens, which prompt caching mitigates. Counter bookkeeping requires the generator to cite bullet ids.
-- **Fit.** Very high. This is the dreaming design already sketched in HANDOFF. Adopt the bullet ids, counters, deterministic merge, dedup and token budget.
+- **Fit.** Very high. This is the dreaming design already sketched for the harness (now built, see [self-improvement](../../self-improvement.md)). Adopt the bullet ids, counters, deterministic merge, dedup and token budget.
 
 ### 4.2 Dynamic Cheatsheet (Apr 2025; EACL 2026)
 
@@ -179,7 +179,7 @@ Slice: memory across sessions, and context that improves itself over time. Writt
 
 - **SICA (Apr 2025).** The agent edits its own code base. Each iteration benchmarks archived versions and the best becomes the meta-agent. SWE-bench Verified (50-task subset) went from 17% to 53%, and file editing from 82% to 94%, over 15 iterations. Most early gains were tools (faster editing, AST navigation) and cost reductions ([arXiv 2504.15228](https://arxiv.org/pdf/2504.15228); [code](https://github.com/MaximeRobeyns/self_improving_coding_agent)).
 - **DGM (Sakana/UBC, May 2025).** An archive-based open-ended evolution of agent code with empirical validation instead of proofs. SWE-bench 20 → 50 and Polyglot 14.2 → 30.7 over 80 iterations, with Claude 3.5 Sonnet as the self-modifier. Without open-ended exploration it reached 23.0. **Objective hacking:** in some runs it removed the hallucination-detection markers and reported false success ([Sakana](https://sakana.ai/dgm/); [arXiv 2505.22954](https://arxiv.org/html/2505.22954v1)).
-- **Fit.** Our A/B arms are a lightweight DGM: keep the archive (git history), keep losing variants revivable, and **never let the improver edit the metrics code or the evaluation thresholds**. Gains concentrate in tooling, which matches HANDOFF's focus on tools.
+- **Fit.** Our A/B arms are a lightweight DGM: keep the archive (git history), keep losing variants revivable, and **never let the improver edit the metrics code or the evaluation thresholds**. Gains concentrate in tooling, which matches the harness's focus on tools.
 
 ### 4.10 Prompt optimizers
 
@@ -260,7 +260,7 @@ Slice: memory across sessions, and context that improves itself over time. Writt
 
 ### Where
 
-- **Files in git, as source of truth.** These are auditable, diffable and revertible; HANDOFF's "visible and revertible" requirement and Letta MemFS take the same approach. No vector DB: every coding tool reviewed uses files plus grep or progressive disclosure, and generic retrieval memories failed on coding (VibeMemBench).
+- **Files in git, as source of truth.** These are auditable, diffable and revertible; the harness's "visible and revertible" requirement ([architecture](../../architecture.md#goals)) and Letta MemFS take the same approach. No vector DB: every coding tool reviewed uses files plus grep or progressive disclosure, and generic retrieval memories failed on coding (VibeMemBench).
 - **`metrics.db` as an index,** not as memory. Bullet counters can live in the playbook file, as ACE does, or be derived in the DB from session citations and written back during dreaming.
 
 ### How to keep it auditable and revertible
@@ -277,7 +277,7 @@ Slice: memory across sessions, and context that improves itself over time. Writt
 - **Budget the always-loaded memory.** Claude Code uses 200 lines/25KB for `MEMORY.md` and under 200 lines per CLAUDE.md; Windsurf allows 6k/12k chars; Codex AGENTS.md has a 32 KiB cap. Track playbook tokens per request in metrics.
 - **Progressive disclosure.** Rules go in the prompt; procedures go in skills, which load on description match; path-specific content goes in path-scoped rules, if Pi gains an equivalent of `.claude/rules` `paths:`.
 - **Lazy refinement.** Dedup and prune only when over budget (ACE lazy mode). Prune by evidence (harmful > helpful, never cited in N sessions), not by age alone.
-- **Cache friendliness.** Playbook edits change a prompt section. Pi sends changed sections as appended system messages, so the cached prefix survives (HANDOFF). Batch dreaming edits so they don't change every session.
+- **Cache friendliness.** Playbook edits change a prompt section. Pi sends changed sections as appended system messages, so the cached prefix survives ([prompt updates and the cache](../../prompt.md#prompt-updates-and-the-cache)). Batch dreaming edits so they don't change every session.
 
 ### Proposed dreaming loop (combines the sources)
 

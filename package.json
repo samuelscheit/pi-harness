@@ -2,7 +2,17 @@
   "name": "pi-harness",
   "private": true,
   "type": "module",
-  "description": "Self-improving Pi harness: own base prompt, gateway models, in-harness metrics.",
+  "description": "Self-improving coding-agent harness on Pi: minimal prompt, randomized A/B experiments on real sessions, in-harness metrics and dashboard, nightly learning from corrections, hot-reloaded releases.",
+  "license": "MIT",
+  "author": "Samuel Scheit",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samuelscheit/pi-harness.git"
+  },
+  "homepage": "https://github.com/samuelscheit/pi-harness#readme",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "install-harness": "node scripts/install.mjs",
     "patch-t3": "node scripts/patch-t3.ts",
