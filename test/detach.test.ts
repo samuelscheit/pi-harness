@@ -18,6 +18,8 @@ describe("commands that use setsid", () => {
 		["start() { setsid server; }; start", ["setsid server"]],
 		["x=$(setsid job)", ["setsid job"]],
 		["if true; then setsid a; fi; setsid b", ["setsid a", "setsid b"]],
+		["eval 'setsid job &'", ["setsid job"]],
+		["cd x && env -i nohup setsid job &", ["env -i nohup setsid job"]],
 	] as const) {
 		test(`uses setsid: ${JSON.stringify(command)}`, () => assert.deepEqual(setsidCommands(command), expected));
 	}

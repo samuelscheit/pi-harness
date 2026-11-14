@@ -5,70 +5,24 @@
 // into a new session and process group, out of that tracking; on macOS it does not even exist, so
 // the job never starts (2026-11-13: `setsid nohup bash -c '… embed …' > embed.log &` → "setsid:
 // command not found", noticed three minutes later).
-//
-// The command is parsed with unbash (a Bash 5.3 parser; pi-lens installs it), so `setsid` in quoted
-// text or a heredoc body does not count, while `setsid` behind wrappers (`nohup`, `env`, `sudo`) and
-// inside a literal `bash -c '…'` script does.
 
-import { type Command, forEachChild, parse, type SyntaxNode } from "../../vendor/pi-lens/node_modules/unbash/dist/parser.js";
-import { clip } from "../background/jobs.ts";
-
-/** Commands that run their arguments as a command. */
-const WRAPPERS = new Set(["builtin", "caffeinate", "command", "env", "exec", "gtimeout", "nice", "nohup", "stdbuf", "sudo", "time", "timeout"]);
-/** Words a wrapper takes before the command: options, `env` assignments and durations or priorities. */
-const WRAPPER_ARGUMENT = /^(?:-.*|[A-Za-z_][A-Za-z0-9_]*=.*|\d+(?:\.\d+)?[smhd]?)$/;
-const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
-
-/** The commands a simple command runs: its name, then the command each wrapper runs, with their arguments. */
-function commandsOf(command: Command): { name: string; args: string[] }[] {
-	const words = [command.name, ...command.args].flatMap((word) => (word?.type === "Word" ? [word.value] : []));
-	const found: { name: string; args: string[] }[] = [];
-	let i = 0;
-	while (i < words.length) {
-		const name = words[i]!.replace(/^.*\//, "");
-		found.push({ name, args: words.slice(i + 1) });
-		if (!WRAPPERS.has(name)) break;
-		i += 1;
-		while (i < words.length && WRAPPER_ARGUMENT.test(words[i]!)) i += 1;
-	}
-	return found;
-}
-
-/** The script a shell runs with `-c` (also `-lc`, `-ec`), when it is literal text. */
-function shellScript(name: string, args: readonly string[]): string | undefined {
-	if (!SHELLS.has(name)) return undefined;
-	const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg));
-	return flag < 0 ? undefined : args[flag + 1];
-}
+import { commandsIn, refusalText } from "./commands.ts";
 
 /** The commands in `source` that run `setsid`, as written, in source order. */
 export function setsidCommands(source: string): string[] {
-	const found: string[] = [];
-	const visit = (node: SyntaxNode) => {
-		if (node.type === "Command") {
-			for (const { name, args } of commandsOf(node)) {
-				if (name === "setsid") found.push(source.slice(node.pos, node.end));
-				const script = shellScript(name, args);
-				if (script !== undefined) found.push(...setsidCommands(script));
-			}
-		}
-		forEachChild(node, visit);
-	};
-	visit(parse(source));
-	return found;
+	return commandsIn(source).flatMap((command) => (command.name === "setsid" ? [command.text] : []));
 }
-
 
 /** The tool result of a refused command: why, and how to start the job instead. */
 export function refusal(commands: readonly string[], platform: NodeJS.Platform = process.platform): string {
-	return [
-		"Not run: this command uses `setsid`:",
-		...[...new Set(commands)].map((c) => `- \`${clip(c, 120)}\``),
+	return refusalText(
+		"uses `setsid`",
+		commands,
 		platform === "darwin"
 			? "`setsid` does not exist on macOS, so the job would never start."
 			: "`setsid` moves the job out of the command's process group, where the bash tool cannot track it.",
 		"Start the job with `&` instead (`nohup` is not needed), its output redirected to a file, e.g. `./job > job.log 2>&1 &`. The bash tool tracks every process a command leaves running and wakes you with a message when each one ends, also after your turn.",
-	].join("\n");
+	);
 }
 
 /** The system the commands run on, for the bash tool's guidelines. */

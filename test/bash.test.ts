@@ -1,11 +1,11 @@
 // The harness's bash (extensions/bash): the record line and messages, then real Pi sessions (faux
 // model, real bash) where commands leave processes running and each one's end wakes the session,
-// where `setsid` is refused, and where a long command moves to the background and its end wakes
-// the session.
+// where `setsid` and git commands that discard or take other agents' work are refused, and where a
+// long command moves to the background and its end wakes the session.
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
@@ -227,12 +227,14 @@ describe("processes a command leaves running", () => {
 
 	test("one entry per job: a subshell and its children are one process; a failing command names its leftovers too", async () => {
 		const s = await newSession();
-		const done = marker();
-		respond(bash(`(sleep 0.2; touch '${done}') > /dev/null 2>&1 &\nexit 3`), fauxAssistantMessage("Noted."), fauxAssistantMessage("Ended."));
+		const [release, done] = [marker(), marker()];
+		// The job runs until the test releases it, so it is still there when the call ends, however slow the machine.
+		respond(bash(`(until [ -e '${release}' ]; do sleep 0.05; done; touch '${done}') > /dev/null 2>&1 &\nexit 3`), fauxAssistantMessage("Noted."), fauxAssistantMessage("Ended."));
 		await s.prompt("go");
 		const [result] = s.messages.filter((m) => m.role === "toolResult");
 		assert.equal(result!.isError, true);
 		assert.match(textOf(result!.content), /exited with code 3[\s\S]*\(1 process\):\n- pid \d+: /);
+		writeFileSync(release, "");
 		await until("the end message", () => jobMessages(s).length === 1 && settled(s, "Ended.")());
 		assert.ok(existsSync(done));
 	});
@@ -373,6 +375,69 @@ describe("setsid", () => {
 	});
 });
 
+describe("shared checkouts", () => {
+	const repoGit = (...args: string[]) =>
+		execFileSync("git", ["-C", join(dir, "repo"), ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+	const initRepo = () => {
+		repoGit("init", "-q");
+		writeFileSync(repoFile("a.ts"), "a\n");
+		writeFileSync(repoFile("b.ts"), "b\n");
+		repoGit("add", "-A");
+		repoGit("commit", "-qm", "init");
+	};
+	const write = (path: string, content: string) => fauxAssistantMessage([fauxToolCall("write", { path, content })], { stopReason: "toolUse" });
+	const commitEnv = "GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t";
+
+	test("git stash, reset --hard, clean -f and whole-tree discards are refused before they run; other agents' work stays", async () => {
+		initRepo();
+		writeFileSync(repoFile("a.ts"), "another agent's work\n");
+		writeFileSync(repoFile("new.ts"), "another agent's new file\n");
+		const s = await newSession();
+		respond(
+			bash("git stash; echo measured; git stash pop"),
+			bash(`git -C '${join(dir, "repo")}' reset --hard`),
+			bash("cd . && nohup git clean -fd"),
+			bash("git checkout -- ."),
+			bash("git stash list && echo listed"),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("measure on a clean tree");
+		const texts = toolTexts(s);
+		assert.match(texts[0]!, /^Not run: this command runs `git stash`:\n- `git stash`\n- `git stash pop`\n/);
+		assert.doesNotMatch(texts[0]!, /measured/, "nothing of the command ran");
+		assert.match(texts[1]!, /^Not run: this command runs `git reset --hard`/);
+		assert.match(texts[2]!, /^Not run: this command runs `git clean` with `-f`:\n- `nohup git clean -fd`/);
+		assert.match(texts[3]!, /^Not run: this command discards the changes of the whole tree/);
+		assert.equal(texts[4], "listed\n");
+		assert.equal(readFileSync(repoFile("a.ts"), "utf8"), "another agent's work\n");
+		assert.ok(existsSync(repoFile("new.ts")));
+		assert.equal(repoGit("stash", "list"), "");
+	});
+
+	test("a commit of the session's own writes and `tool edit`s runs; one that takes another agent's later change is refused until checked", async () => {
+		initRepo();
+		const s = await newSession(FOREGROUND_MS);
+		respond(
+			write("a.ts", "mine\n"),
+			bash("tool edit - <<'EOF'\nb.ts\n<<<<<<< SEARCH\nb\n=======\nb mine\n>>>>>>> REPLACE\nEOF"),
+			bash(`${commitEnv} git commit -qm mine a.ts b.ts && git log --oneline | wc -l`),
+			write("a.ts", "mine again\n"),
+			() => {
+				appendFileSync(repoFile("a.ts"), "another agent's line\n");
+				return bash(`git add a.ts && ${commitEnv} git commit -qm again`);
+			},
+			bash(`PI_COMMIT_CHECKED=1 ${commitEnv} git commit -qam checked && git log --oneline | wc -l`),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("commit");
+		const texts = toolTexts(s);
+		assert.match(texts[2]!, /^\s*2\n$/, `the own commit ran: ${texts[2]}`);
+		assert.match(texts[4]!, /^Not run: this command commits changes your edit and write tools did not make:\n- `GIT_AUTHOR_NAME=t [^`]* git commit -qm again`\nPaths:\n- `a\.ts`: changed since your last edit/);
+		assert.equal(repoGit("diff", "--cached", "--name-only"), "", "the refused command's git add did not run");
+		assert.match(texts[5]!, /^\s*3\n$/, `the checked commit ran: ${texts[5]}`);
+	});
+});
+
 const textOf = (content: string | readonly { type: string; text?: string }[]) => (typeof content === "string" ? content : content.map((c) => c.text ?? "").join(""));
 const jobMessages = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "custom" && m.customType === JOB_MESSAGE_TYPE ? [textOf(m.content)] : []));
 const toolTexts = (s: AgentSession) => s.messages.flatMap((m) => (m.role === "toolResult" ? [m.content.map((c) => (c.type === "text" ? c.text : "")).join("")] : []));
@@ -388,10 +453,11 @@ const alive = (pgid: number) => {
 		return false;
 	}
 };
-async function until(what: string, check: () => boolean, ms = 10_000): Promise<void> {
+/** Waits until `check` holds; on a timeout fails with `details` (the state to debug it). */
+async function until(what: string, check: () => boolean, ms = 10_000, details?: () => string): Promise<void> {
 	const end = Date.now() + ms;
 	while (!check()) {
-		if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
+		if (Date.now() > end) assert.fail(`timed out after ${ms} ms waiting for ${what}${details ? `; ${details()}` : ""}`);
 		await new Promise((r) => setTimeout(r, 20));
 	}
 }
@@ -469,20 +535,31 @@ describe("long commands move to the background", () => {
 	});
 
 	test("an abort stops a foreground command, but not one already in the background", async () => {
-		const s = await newSession();
-		respond(bash("sleep 30"), bash("sleep 31"), fauxAssistantMessage("unused"));
+		// No command reaches the detach limit, however slow the machine: a message moves the first one
+		// to the background, so the second stays in the foreground until the abort.
+		const s = await newSession(FOREGROUND_MS);
+		// Durations of their own, so no other test run's `sleep` matches.
+		const id = `${process.pid}${Date.now() % 1000}`;
+		const [first, second] = [`sleep 30.${id}`, `sleep 31.${id}`];
+		respond(bash(first), bash(second), fauxAssistantMessage("unused"));
 		const run = s.prompt("go");
-		await until("the first command in the background", () => jobsOf(s).size === 1);
-		const [job] = [...jobsOf(s).values()];
-		await new Promise((r) => setTimeout(r, 200));
 		// pgrep, not every command line from ps: those exceed spawnSync's output limit when many processes run.
-		const sleeping = () => spawnSync("pgrep", ["-x", "-f", "sleep 31"]).status === 0;
-		assert.ok(sleeping(), "the second command runs in the foreground");
+		const running = (command: string) => () => spawnSync("pgrep", ["-x", "-f", command]).status === 0;
+		const sleeping = running(second);
+		const state = () =>
+			`jobs: ${JSON.stringify([...jobsOf(s).values()].map((j) => [j.input, j.pgid]))}, foreground calls: ${sessionJobs(s.sessionManager.getSessionId()).foreground.size}, first running: ${running(first)()}, second running: ${sleeping()}, tool results: ${JSON.stringify(toolTexts(s))}`;
+		// Its process runs, so its shell has recorded the process group the job gets.
+		await until("the first command running", running(first), 30_000, state);
+		await s.steer("go on");
+		await until("the first command in the background", () => jobsOf(s).size === 1, 30_000, state);
+		const [job] = [...jobsOf(s).values()];
+		await until("the second command running", sleeping, 30_000, state);
+		assert.equal(jobsOf(s).size, 1, `the second command runs in the foreground; ${state()}`);
 		await s.abort();
 		await run;
-		await until("the foreground command stopped", () => !sleeping(), 3000);
-		assert.ok(alive(pgidOf(job)), "the background job survives the abort");
-		assert.equal(jobsOf(s).size, 1);
+		await until("the foreground command stopped", () => !sleeping(), 30_000, state);
+		assert.ok(alive(pgidOf(job)), `the background job survives the abort; ${state()}`);
+		assert.equal(jobsOf(s).size, 1, state());
 	});
 
 	test("a command's own timeout still ends it in the background, and the report says so", async () => {

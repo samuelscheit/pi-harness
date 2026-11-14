@@ -12,6 +12,10 @@
 //   keeps its call, and its end brings its exit code and result (bridge.ts);
 // - `setsid`, which would move a job out of reach, is refused (detach.ts).
 //
+// Agents share checkouts, so commands that throw away other agents' uncommitted work are refused
+// too (git.ts: `git stash`, `git reset --hard`, `git clean -f`, whole-tree discards), and so is a
+// commit that takes changes the session's edit and write tools did not make (commit.ts).
+//
 // Both rely on the process group: Pi runs every bash command as the leader of its own group
 // (detached spawn), and what the command starts stays in it. Before each bash call this extension
 // prefixes the command with lines that write the shell's `$$` (its pid, the group id) to a file
@@ -28,7 +32,9 @@ import { BACKGROUND_GUIDELINE, DETACH_AFTER_MS } from "../background/index.ts";
 import { sessionJobs, setProcessGroupOf } from "../background/jobs.ts";
 import { shellQuote as quote } from "../lib/process.ts";
 import { clientCommand, openBridge, TOOL_GUIDELINE, toolBinDir, withImages } from "./bridge.ts";
+import { changeEnds, changeStarts, commitRefusal, dropSessionFiles, sessionFiles, toolPath } from "./commit.ts";
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
+import { gitRefusal } from "./git.ts";
 import { defaultPs, type Ps } from "../lib/ps.ts";
 import { adoptLeftovers, leftText, type Untracked, untrackedText } from "./leftovers.ts";
 
@@ -90,6 +96,12 @@ export function readGroup(file: string): number | undefined {
 /** How often processes calls left running are checked. */
 const POLL_MS = 1000;
 
+/** What the tool refuses to run, for its description. */
+const REFUSED = "Refused before they run: `setsid`, `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), and a `git commit` of changes your edit and write tools did not make.";
+/** How to work beside other agents, for the tool's guidelines. */
+const SHARED_CHECKOUT_GUIDELINE =
+	"Other agents may work in the same checkout or worktrees of the same repository, so `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f` and whole-tree discards (`git checkout -- .`, `git restore .`) are refused: for a clean state use `git worktree add /tmp/<name> HEAD`, and restore or commit only your own paths. A `git commit` that would take changes your edit and write tools did not make is refused with the paths; after `git diff` shows they are yours, run it as `PI_COMMIT_CHECKED=1 git commit …`.";
+
 export interface BashOptions {
 	/** Directory for the group files; default a per-process directory in the system temp dir. */
 	dir?: string;
@@ -113,12 +125,25 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 
 	setProcessGroupOf("bash", (sessionId, callId) => readGroup(groupFile(sessionId, callId)));
 
-	// A command using `setsid` is refused here (detach.ts); Pi then runs no later handler.
+	// The session's edits and writes, for the commit check (commit.ts).
+	const FILE_TOOLS = new Set(["edit", "write"]);
+	pi.on("tool_call", (event, ctx) => {
+		const path = FILE_TOOLS.has(event.toolName) ? (event.input as { path?: unknown }).path : undefined;
+		if (typeof path === "string") changeStarts(sessionFiles(ctx.sessionManager.getSessionId()), event.toolCallId, toolPath(path, ctx.cwd));
+	});
+	pi.on("tool_result", (event, ctx) => {
+		if (FILE_TOOLS.has(event.toolName)) changeEnds(sessionFiles(ctx.sessionManager.getSessionId()), event.toolCallId, event.isError);
+	});
+
+	// A command using `setsid`, discarding uncommitted work (git.ts) or committing changes that are
+	// not the session's (commit.ts) is refused here; Pi then runs no later handler.
 	pi.on("tool_call", (event, ctx) => {
 		if (!isToolCallEventType("bash", event)) return;
-		const setsid = setsidCommands(event.input.command);
-		if (setsid.length > 0) return { block: true, reason: refusal(setsid) };
+		const { command } = event.input;
+		const setsid = setsidCommands(command);
 		const id = ctx.sessionManager.getSessionId();
+		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, gitRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
+		if (reasons.length > 0) return { block: true, reason: reasons.join("\n\n") };
 		mkdirSync(sessionDir(id), { recursive: true });
 		event.input.command = recordLine(groupFile(id, event.toolCallId)) + event.input.command;
 	});
@@ -128,6 +153,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 	pi.on("session_shutdown", (event, ctx) => {
 		if (event.reason === "reload") return;
 		rmSync(sessionDir(ctx.sessionManager.getSessionId()), { recursive: true, force: true });
+		dropSessionFiles(ctx.sessionManager.getSessionId());
 	});
 
 	/**
@@ -148,12 +174,14 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 
 	pi.registerTool({
 		...builtin,
+		description: `${builtin.description} ${REFUSED}`,
 		promptGuidelines: [
 			...(builtin.promptGuidelines ?? []),
 			systemGuideline(),
 			TOOL_GUIDELINE,
 			BACKGROUND_GUIDELINE(options.detachAfterMs ?? DETACH_AFTER_MS),
 			"Jobs a command starts with `&` (a server for a test, parallel jobs) may keep running after it: the tool tracks each one and its end reaches you as a new message. Redirect their output to a file (`./server > server.log 2>&1 &`): output to the tool's pipe is lost once the command returns. Processes that programs start on their own (a daemon such as git's fsmonitor, the `&` jobs of a script or `bash -c`) are named in the result but not tracked: to be told when a script's job ends, run the script itself with `&`. `setsid` is refused.",
+			SHARED_CHECKOUT_GUIDELINE,
 		],
 		// Run the built-in call with `tool` on its PATH and adopt what it left; the result (or error) names the leftovers.
 		async execute(callId, params, signal, onUpdate, ctx) {
