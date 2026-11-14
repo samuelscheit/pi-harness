@@ -1,5 +1,6 @@
 import { type AssistantMessage, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { describeSummaryModel } from "../../src/core/compaction/index.ts";
 import type { CompactionEntry } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -10,8 +11,12 @@ const SUMMARY_COST = { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 };
 // ~40k tokens of context per prompt (4 characters per token).
 const BIG = "word ".repeat(32_000);
 
-/** A session on `main` that compacts with `summary` when that saves at least `minSaving` dollars. */
-async function economicHarness(minSaving: number | undefined, warm = true): Promise<Harness> {
+/** A session on `main` that compacts with `summaryModel` when that saves at least `minSaving` dollars. */
+async function economicHarness(
+	minSaving: number | undefined,
+	warm = true,
+	summaryModel = "faux/summary",
+): Promise<Harness> {
 	const harness = await createHarness({
 		models: [
 			{ id: "main", cost: MAIN_COST },
@@ -22,7 +27,7 @@ async function economicHarness(minSaving: number | undefined, warm = true): Prom
 			cacheRetention: "short",
 			compaction: {
 				keepRecentTokens: 1_000,
-				...(minSaving === undefined ? {} : { economic: { model: "faux/summary", minSaving, warm } }),
+				...(minSaving === undefined ? {} : { economic: { model: summaryModel, minSaving, warm } }),
 			},
 		},
 	});
@@ -131,6 +136,73 @@ describe("economic compaction", () => {
 			vi.restoreAllMocks();
 			expect(compactions(harness)).toHaveLength(0);
 		}
+	});
+
+	describe("manual compaction", () => {
+		/** Two small prompts, then `/compact` after `delay`; returns the models called and the summary request. */
+		async function compactAfter(harness: Harness, delay: number, instructions?: string) {
+			const calls: string[] = [];
+			const requests: string[] = [];
+			const summarize = (context: unknown, _options: unknown, _state: unknown, model: Model<string>) => {
+				calls.push(model.id);
+				requests.push(JSON.stringify(context));
+				return fauxAssistantMessage("## Goal\nsummary") as AssistantMessage;
+			};
+			harness.setResponses([reply("one", calls), reply("two", calls), summarize, summarize]);
+			await harness.session.prompt(`first ${"word ".repeat(2_000)}`);
+			await harness.session.prompt(`second ${"word ".repeat(2_000)}`);
+			const now = Date.now();
+			vi.spyOn(Date, "now").mockReturnValue(now + delay);
+			const result = await harness.session.compact(instructions);
+			return { calls: calls.slice(2), requests, result };
+		}
+
+		it("an expired cache: the economic model writes the summary, whatever minSaving says", async () => {
+			const harness = await economicHarness(1000, false);
+			harnesses.push(harness);
+			const { calls, result } = await compactAfter(harness, FIVE_MINUTES + 1000);
+			expect(calls.length).toBeGreaterThan(0);
+			expect(calls.every((id) => id === "summary")).toBe(true);
+			expect(result.generatedBy).toEqual({ provider: "faux", model: "summary" });
+			expect(result.summaryModelReason).toBe("cache expired");
+			expect(describeSummaryModel(result)).toBe("cache expired: summary by summary");
+			expect(compactions(harness).map((entry) => [entry.reason, entry.model])).toEqual([["manual", "summary"]]);
+			expect(harness.eventsOfType("compaction_end").map((event) => event.result?.summaryModelReason)).toEqual([
+				"cache expired",
+			]);
+			expect(harness.session.model?.id).toBe("main");
+		});
+
+		it("a warm cache: the session model writes the summary", async () => {
+			const harness = await economicHarness(0);
+			harnesses.push(harness);
+			const { calls, result } = await compactAfter(harness, 1000);
+			expect(calls.length).toBeGreaterThan(0);
+			expect(calls.every((id) => id === "main")).toBe(true);
+			expect(result.generatedBy).toEqual({ provider: "faux", model: "main" });
+			expect(result.summaryModelReason).toBeUndefined();
+			expect(describeSummaryModel(result)).toBeUndefined();
+		});
+
+		it("an expired cache without an economic model, or with an unknown one: the session model", async () => {
+			for (const harness of [await economicHarness(undefined), await economicHarness(0, true, "faux/missing")]) {
+				harnesses.push(harness);
+				const { calls, result } = await compactAfter(harness, FIVE_MINUTES + 1000);
+				vi.restoreAllMocks();
+				expect(calls.length).toBeGreaterThan(0);
+				expect(calls.every((id) => id === "main")).toBe(true);
+				expect(result.generatedBy).toEqual({ provider: "faux", model: "main" });
+				expect(result.summaryModelReason).toBeUndefined();
+			}
+		});
+
+		it("passes custom instructions to the economic model", async () => {
+			const harness = await economicHarness(0);
+			harnesses.push(harness);
+			const { calls, requests } = await compactAfter(harness, FIVE_MINUTES + 1000, "keep the zebra decision");
+			expect(calls[0]).toBe("summary");
+			expect(requests[0]).toContain("keep the zebra decision");
+		});
 	});
 
 	it("counts a warm refresh as keeping the cache alive", async () => {

@@ -77,6 +77,7 @@ import {
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
 import { formatCacheWarmingStatus, formatCacheWarmingUsage } from "../../core/cache-warmer.ts";
+import { describeSummaryModel } from "../../core/compaction/index.ts";
 import { findExtensionStackMatches, recordCrash, takeUnnotifiedCrash } from "../../core/crash-log.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
 import type {
@@ -3879,6 +3880,8 @@ export class InteractiveMode {
 							new Date().toISOString(),
 						),
 					);
+					const summaryModelNote = describeSummaryModel(event.result);
+					if (summaryModelNote) this.showStatus(`Compaction: ${summaryModelNote}`);
 					if (event.result.usage) {
 						this.addCompactionCostNotice({
 							type: "compaction_cost",

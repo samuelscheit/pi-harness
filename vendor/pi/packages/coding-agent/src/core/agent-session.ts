@@ -176,6 +176,9 @@ import {
  */
 const runtimeStreamFunctions = new WeakMap<StreamFn, ModelRuntime>();
 
+/** Why `compaction.economic.model` wrote a summary instead of the session model (see `describeSummaryModel`). */
+const SUMMARY_MODEL_REASONS = { cold: "cache expired", economic: "cheaper than carrying the context" } as const;
+
 /** Mark `streamFn` as resolving auth through `modelRuntime` on its own. */
 export function markRuntimeStreamFunction(streamFn: StreamFn, modelRuntime: ModelRuntime): void {
 	runtimeStreamFunctions.set(streamFn, modelRuntime);
@@ -874,6 +877,22 @@ export class AgentSession {
 	}
 
 	/**
+	 * The `compaction.economic` summary model and whether the branch's prompt cache expired for
+	 * `model`; undefined when the setting is unset, its model unknown, or `model` virtual (its cache
+	 * belongs to whatever model a request is routed to).
+	 */
+	private _economicSummary(model: Model<any>) {
+		const economic = this.settingsManager.getEconomicCompaction();
+		if (!economic || isVirtualModel(model)) return undefined;
+		const summaryModel = this._modelRuntime.getModel(economic.model.provider, economic.model.id);
+		if (!summaryModel) return undefined;
+		const branch = this.sessionManager.getBranch();
+		const streamOptions = { cacheRetention: this.settingsManager.getCacheRetention() };
+		const cold = isPromptCacheCold(branch, getPromptCacheTtlMs(model, streamOptions), Date.now());
+		return { economic, summaryModel, cold, branch, streamOptions };
+	}
+
+	/**
 	 * Compact before a run when that is cheaper over the expected rest of the session: always
 	 * considered when the prompt cache expired, with a warm cache only when `compaction.economic.warm`
 	 * is set (what a summary loses is not priced, only the cache cost).
@@ -883,15 +902,10 @@ export class AgentSession {
 	 * summary, then the much smaller kept context is carried instead (see `compactionSaving`).
 	 */
 	private async _compactIfCheaper(): Promise<void> {
-		const economic = this.settingsManager.getEconomicCompaction();
 		const model = this.model;
-		if (!economic || !model || isVirtualModel(model)) return;
-		const summaryModel = this._modelRuntime.getModel(economic.model.provider, economic.model.id);
-		if (!summaryModel) return;
-		const branch = this.sessionManager.getBranch();
-		const streamOptions = { cacheRetention: this.settingsManager.getCacheRetention() };
-		const ttlMs = getPromptCacheTtlMs(model, streamOptions);
-		const cold = isPromptCacheCold(branch, ttlMs, Date.now());
+		const plan = model && this._economicSummary(model);
+		if (!model || !plan) return;
+		const { economic, summaryModel, cold, branch, streamOptions } = plan;
 		if (!cold && !economic.warm) return;
 		// Anthropic bills a one-hour cache write at twice the input price (see calculateCost).
 		const writePerMillion =
@@ -3044,6 +3058,10 @@ export class AgentSession {
 	 * Aborts the current agent operation first. Manual compaction never retries or
 	 * continues the interrupted agent turn.
 	 *
+	 * The session model writes the summary, reading the context from its prompt cache. When that
+	 * cache expired, every model reads the context uncached, so `compaction.economic.model` writes it
+	 * instead (no `minSaving` check: the user asked for the compaction).
+	 *
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
@@ -3072,6 +3090,8 @@ export class AgentSession {
 				throw new Error("Nothing to compact (session too small)");
 			}
 
+			const economic = this._economicSummary(model);
+			const summaryModel = economic?.cold ? economic.summaryModel : model;
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
@@ -3101,11 +3121,12 @@ export class AgentSession {
 				extensionCompaction ??
 				(await this._runDefaultCompaction(
 					preparation,
-					model,
+					summaryModel,
 					customInstructions,
 					this._compactionAbortController.signal,
 					"manual",
 				));
+			const summaryModelReason = !fromExtension && summaryModel !== model ? SUMMARY_MODEL_REASONS.cold : undefined;
 			const { summary, firstKeptEntryId, tokensBefore, usage, details, generatedBy } = compacted;
 
 			if (this._compactionAbortController.signal.aborted) {
@@ -3148,6 +3169,7 @@ export class AgentSession {
 				estimatedTokensAfter,
 				usage,
 				generatedBy,
+				summaryModelReason,
 				details,
 			};
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
@@ -3471,6 +3493,10 @@ export class AgentSession {
 				estimatedTokensAfter,
 				usage,
 				generatedBy,
+				summaryModelReason:
+					summaryModel && !fromExtension && (reason === "cold" || reason === "economic")
+						? SUMMARY_MODEL_REASONS[reason]
+						: undefined,
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });

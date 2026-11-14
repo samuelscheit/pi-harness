@@ -38,7 +38,7 @@ During a multi-turn agent run, Pi checks the canonical projected context after t
 
 A provider context-overflow error or an early final `stopReason: "length"` can select one compact-and-retry recovery attempt. Length responses with tool calls retain their synthetic failed tool results and follow the ordinary tool/queue scheduler rather than forcing the run to end.
 
-You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
+You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary. The session model writes the summary, reading the context from its prompt cache. When that cache expired, every model would read the whole context uncached, so the cheaper [`compaction.economic.model`](settings.md#compaction) writes it instead when set; the result's `summaryModelReason` and the notice say so ("cache expired: summary by claude-haiku-5-5").
 
 ### How It Works
 

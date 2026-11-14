@@ -111,8 +111,18 @@ export interface CompactionResult<T = unknown> {
 	usage?: Usage;
 	/** The model that generated this summary, if known */
 	generatedBy?: CompactionModel;
+	/** Why another model than the session's wrote the summary, e.g. "cache expired" (see `describeSummaryModel`). */
+	summaryModelReason?: string;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+}
+
+/** "cache expired: summary by claude-haiku-5-5" when another model than the session's wrote the summary. */
+export function describeSummaryModel(
+	result: Pick<CompactionResult, "generatedBy" | "summaryModelReason">,
+): string | undefined {
+	if (!result.summaryModelReason || !result.generatedBy) return undefined;
+	return `${result.summaryModelReason}: summary by ${result.generatedBy.model}`;
 }
 
 /** The model a compaction summary was generated with. */
