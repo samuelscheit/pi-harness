@@ -225,3 +225,68 @@ test("the frontend is rebuilt when a build input is newer than the build", () =>
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+describe("workflow runs", () => {
+	const ID = "20261114-120000-abc123";
+	const journal = () => join(dir, "agent", "workflows", ID, "journal.jsonl");
+	const line = (entry: object) => `${JSON.stringify(entry)}\n`;
+	before(() => {
+		mkdirSync(join(dir, "agent", "workflows", ID), { recursive: true });
+		writeFileSync(
+			journal(),
+			line({ t: "run", id: ID, at: T0, entry: { source: "x", filename: "workflow.ts", inline: true, name: "fix_loop" }, budget: 2, cwd: "/repo" }) +
+				line({ t: "attempt", n: 1, at: T0, pid: 1 }) +
+				line({ t: "start", key: "shell:a#1", kind: "shell", label: "npm test", at: T0 + 10 }),
+		);
+	});
+
+	test("/workflows lists recent runs; /workflows/<id> serves the renderer's page with the theme and live updates", async () => {
+		const list = await get("/workflows");
+		assert.equal(list.status, 200);
+		assert.match(list.text, new RegExp(`<a href="/workflows/${ID}">${ID}</a></td><td>fix_loop</td><td>running or interrupted</td>`));
+		const page = await get(`/workflows/${ID}`);
+		assert.equal(page.status, 200);
+		assert.match(page.headers.get("content-type")!, /text\/html/);
+		const { renderWorkflowBody } = await import("../extensions/workflow/render.ts");
+		const { readJournal } = await import("../extensions/workflow/journal.ts");
+		assert.ok(page.text.includes(renderWorkflowBody(readJournal(journal()))), "the same renderer's body");
+		assert.match(page.text, /--success:/, "t3's theme variables are defined");
+		assert.match(page.text, new RegExp(`new EventSource\\("/workflows/${ID}/events"\\)`));
+		assert.equal((await get("/workflows/20261114-120000-ffffff")).status, 404);
+		assert.equal((await get("/workflows/..%2F..%2Fsecret")).status, 404);
+		assert.equal((await get("/workflows/x/y/z")).status, 200, "other paths go to the app");
+	});
+
+	test("/workflows/<id>/events sends the page body at once and again on every journal append", async () => {
+		const controller = new AbortController();
+		const response = await fetch(`${base}/workflows/${ID}/events`, { signal: controller.signal });
+		assert.match(response.headers.get("content-type")!, /text\/event-stream/);
+		const reader = response.body!.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		const next = async (): Promise<string> => {
+			for (;;) {
+				const end = buffer.indexOf("\n\n");
+				if (end >= 0) {
+					const event = buffer.slice(0, end);
+					buffer = buffer.slice(end + 2);
+					if (event.startsWith("data: ")) return (JSON.parse(event.slice(6)) as { body: string }).body;
+					continue;
+				}
+				const { value, done } = await reader.read();
+				if (done) throw new Error("the stream ended");
+				buffer += decoder.decode(value, { stream: true });
+			}
+		};
+		const first = await next();
+		assert.match(first, /npm test/);
+		assert.match(first, /<b>1<\/b> open · <b>0<\/b> done/);
+		writeFileSync(journal(), line({ t: "done", key: "shell:a#1", at: T0 + 2010, value: { exitCode: 0 } }), { flag: "a" });
+		const second = await next();
+		assert.match(second, /<b>0<\/b> open · <b>1<\/b> done/);
+		assert.match(second, /s-done/);
+		writeFileSync(journal(), line({ t: "start", key: "llm:b#1", kind: "llm", label: "Summarize the failures", at: T0 + 2100 }), { flag: "a" });
+		assert.match(await next(), /Summarize the failures/);
+		controller.abort();
+	});
+});

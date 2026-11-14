@@ -1,6 +1,8 @@
 // The usage dashboard's server: node:http on every interface (this machine and its LAN), the JSON
 // API under /api/ and the built frontend (dashboard/dist) for every other path.
 //
+// Workflow runs have pages of their own under /workflows, updated live (workflows.ts).
+//
 // It indexes Pi's sessions on start and on POST /api/refresh, in a worker; Claude Code
 // transcripts are imported only once a refresh asks for a source that includes them. Responses
 // are cached per URL until the next index completes.
@@ -19,6 +21,7 @@ import { CLAUDE_PROJECTS, metricsPath, needsClaude } from "../../extensions/metr
 import { RELEASE } from "../../extensions/lib/repository.ts";
 import { openStore } from "../../extensions/metrics/store.ts";
 import { ApiError, route } from "./api.ts";
+import { handleWorkflows } from "./workflows.ts";
 
 export const APP = "pi-harness-dashboard";
 export const DEFAULT_PORT = 4317;
@@ -182,6 +185,7 @@ export async function startDashboard({ port = DEFAULT_PORT, agentDir = getAgentD
 		const url = new URL(req.url ?? "/", `http://${host}`);
 		if (!url.pathname.startsWith("/api/")) {
 			if (req.method !== "GET" && req.method !== "HEAD") return sendJson(res, 405, { error: "method not allowed" });
+			if (handleWorkflows(req, res, url.pathname, agentDir)) return;
 			return serveStatic(res, dist, url.pathname);
 		}
 		const path = url.pathname.slice("/api/".length);
