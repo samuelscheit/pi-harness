@@ -13,7 +13,7 @@ import { openStore } from "../extensions/metrics/store.ts";
 import { applyDelta, type ApplyContext, withLearnedLine } from "../scripts/dream/apply.ts";
 import { collect, precedingAgentText } from "../scripts/dream/collect.ts";
 import { type Candidate, parseDeltas } from "../scripts/dream/curate.ts";
-import { type LedgerRecord, openNotes, readLedger, readSince, recurrences, report } from "../scripts/dream/ledger.ts";
+import { type LedgerRecord, readLedger, readSince, recurrences, report } from "../scripts/dream/ledger.ts";
 import { globalRules, instructionFile, type KnownRule, projectRules } from "../scripts/dream/rules.ts";
 import { dream } from "../scripts/dream/run.ts";
 import { type Ask, isHuman, labelMessages, parseLabels } from "../scripts/lib/labels.ts";
@@ -302,7 +302,7 @@ describe("ledger and report", () => {
 		]);
 	});
 
-	test("the report lists changes, recurrences, stubborn rules, the rate per run and open notes per backlog", () => {
+	test("the report lists changes, recurrences, stubborn rules, the rate per run and the notes per backlog in full", () => {
 		const records = [
 			record({ op: "add", target: "rules/x", targetText: "Never wait idly.", commit: "abcdef1234567" }),
 			record({ op: "recur", target: "AGENTS.md:3", targetText: "Find the root cause.", session: "s2" }),
@@ -311,9 +311,9 @@ describe("ledger and report", () => {
 		];
 		const earlier = [record({ run: "2026-11-12T03:00:00.000Z", op: "recur", targetText: "Find the root cause.", session: "s0" })];
 		const text = report({ run: new Date("2026-11-13T03:00:00Z"), since: 0, until: 1, messages: 9, labelled: { correction: 3, new_task: 6 }, records, notes: [
-					{ backlog: "/h/.agents/improvements.md", at: "2026-11-11 08:00", observation: "old friction", new: false },
-					{ backlog: "/h/.agents/improvements.md", at: "2026-11-12 21:57", observation: "pi-lens noise", new: true },
-					{ backlog: "/p/.agents/improvements.md", at: "2026-11-12 22:00", observation: "project friction", new: true },
+					{ backlog: "/h/.agents/improvements.md", at: "2026-11-11 08:00", body: "- **Observation:** old friction\n- **Proposal:** fix it" },
+					{ backlog: "/h/.agents/improvements.md", at: "2026-11-12 21:57", body: "- **Observation:** pi-lens noise" },
+					{ backlog: "/p/.agents/improvements.md", at: "2026-11-12 22:00", body: "- **Observation:** project friction" },
 				] }, [...earlier, ...records]);
 		assert.match(text, /^# Dream 2026-11-13/);
 		assert.match(text, /Labels: new_task 6, correction 3\./);
@@ -322,22 +322,14 @@ describe("ledger and report", () => {
 		assert.match(text, /- update \/r:4: Run make check\. — not applied: AGENTS\.md in \/r has uncommitted changes/);
 		assert.match(text, /\| Find the root cause\. \| 2 \| 2 \| 1970-01-01 \| – \|/);
 		assert.match(text, /\| 2026-11-12 03:00 \| 1 \| 100% \|\n\| 2026-11-13 03:00 \| 4 \| 33% \|/);
-		assert.match(text, /### \/h\/\.agents\/improvements\.md \(2 open, 1 new\)\n\n- 2026-11-11 08:00: old friction\n- 2026-11-12 21:57 \(new\): pi-lens noise\n/);
-		assert.match(text, /### \/p\/\.agents\/improvements\.md \(1 open, 1 new\)\n\n- 2026-11-12 22:00 \(new\): project friction/);
+		assert.match(
+			text,
+			/### \/h\/\.agents\/improvements\.md\n\n#### 2026-11-11 08:00 UTC\n\n- \*\*Observation:\*\* old friction\n- \*\*Proposal:\*\* fix it\n\n#### 2026-11-12 21:57 UTC\n\n- \*\*Observation:\*\* pi-lens noise\n\n### \/p\/\.agents\/improvements\.md\n\n#### 2026-11-12 22:00 UTC\n\n- \*\*Observation:\*\* project friction\n/,
+		);
 		assert.doesNotMatch(text, /\n\n\n/);
 	});
 
-	test("openNotes reads every note of every backlog, marking those after the position as new", () => {
-		const file = join(dir, "improvements.md");
-		const other = join(dir, "other.md");
-		writeFileSync(file, "# Improvement backlog\n\n## 2026-11-12 16:47 UTC\n- **Observation:** old one\n\n## 2026-11-12 21:57 UTC\n- **Session:** x\n- **Observation:** new one\n- **Proposal:** p\n");
-		writeFileSync(other, "# Improvement backlog\n\nNoted by agents.\n");
-		assert.deepEqual(openNotes([file, join(dir, "none.md"), other], Date.parse("2026-11-12T20:00:00Z")), [
-			{ backlog: file, at: "2026-11-12 16:47", observation: "old one", new: false },
-			{ backlog: file, at: "2026-11-12 21:57", observation: "new one", new: true },
-		]);
-		assert.deepEqual(openNotes([], 0), []);
-	});
+
 });
 
 describe("a dream run", () => {
@@ -380,8 +372,13 @@ describe("a dream run", () => {
 			],
 		});
 		const now = new Date("2026-11-13T03:00:00Z");
+		const backlog = join(project, ".agents/improvements.md");
+		mkdirSync(join(project, ".agents"));
+		writeFileSync(backlog, "# Improvement backlog\n\nheader\n\n## 2026-11-12 09:00 UTC\n- **Observation:** the build is slow\n- **Proposal:** cache it\n");
 
 		const dry = await dream({ source, db, now, ask, dryRun: true });
+		assert.match(dry.text, /#### 2026-11-12 09:00 UTC\n\n- \*\*Observation:\*\* the build is slow/);
+		assert.match(readFileSync(backlog, "utf8"), /the build is slow/, "a dry run leaves the notes in the backlog");
 		assert.deepEqual(dry.deltas.map((d) => d.op), ["add", "add", "recur"]);
 		assert.equal(dry.reportFile, undefined);
 		assert.equal(existsSync(join(source, ".agents")), false, "a dry run writes nothing");
@@ -402,6 +399,8 @@ describe("a dream run", () => {
 		assert.equal(readSince(source), now.getTime());
 		assert.equal(result.reportFile, join(source, ".agents/dreams/2026-11-13.md"));
 		assert.match(readFileSync(result.reportFile!, "utf8"), /Messages the user typed .*: 4\./);
+		assert.match(readFileSync(result.reportFile!, "utf8"), new RegExp(`### ${project}/\\.agents/improvements\\.md\\n\\n#### 2026-11-12 09:00 UTC\\n\\n- \\*\\*Observation:\\*\\* the build is slow\\n- \\*\\*Proposal:\\*\\* cache it`));
+		assert.doesNotMatch(readFileSync(backlog, "utf8"), /## 2026/, "the notes moved into the report");
 		assert.equal(git(source, "status", "--porcelain"), "", "everything committed");
 
 		// The next run reads only newer messages; a second report the same day gets the time in its name.

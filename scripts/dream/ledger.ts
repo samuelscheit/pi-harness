@@ -13,6 +13,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { BacklogNote } from "../../extensions/improvements/index.ts";
 
 export interface LedgerRecord {
 	/** When the run happened (ISO). */
@@ -101,18 +102,8 @@ export interface RunSummary {
 	messages: number;
 	labelled: Record<string, number>;
 	records: readonly LedgerRecord[];
-	/** Every open improvement note, per backlog. */
-	notes: readonly OpenNote[];
-}
-
-/** A note still in a backlog: fixing it removes it there, so every note listed is open. */
-export interface OpenNote {
-	backlog: string;
-	/** `YYYY-MM-DD HH:MM` (UTC), the note's heading. */
-	at: string;
-	observation: string;
-	/** Written after the run's start position. */
-	new: boolean;
+	/** The improvement notes the run took out of the backlogs. */
+	notes: readonly BacklogNote[];
 }
 
 /** The run's report in Markdown. */
@@ -163,34 +154,15 @@ export function report(summary: RunSummary, ledger: readonly LedgerRecord[]): st
 		"|---|---|---|",
 		...[...runs].map(([run, records]) => `| ${run.slice(0, 16).replace("T", " ")} | ${records.length} | ${rate(records)} |`),
 		"",
-		"## Open improvement notes",
+		"## Improvement notes",
 		"",
-		"Friction agents noted (`note_improvement`). Each one stays here until a fix removes it from its backlog.",
+		"Friction agents noted (`note_improvement`), moved here from their backlogs: fix each, or put it back into its backlog to read it again next run.",
 		"",
-		...(summary.notes.length
-			? [...Map.groupBy(summary.notes, (n) => n.backlog)].flatMap(([backlog, notes]) => [
-					`### ${backlog} (${notes.length} open, ${notes.filter((n) => n.new).length} new)`,
-					"",
-					...notes.map((n) => `- ${n.at}${n.new ? " (new)" : ""}: ${clip(n.observation, 200)}`),
-					"",
-				])
-			: ["None."]),
+		...(summary.notes.length ? [...Map.groupBy(summary.notes, (n) => n.backlog)].flatMap(([backlog, notes]) => [`### ${backlog}`, "", ...notes.flatMap((n) => [`#### ${n.at} UTC`, "", n.body, ""])]) : ["None."]),
 		"",
 	]
 		.filter((line, i, all) => !(line === "" && all[i - 1] === ""))
 		.join("\n");
 }
 
-/** The notes in improvement backlogs (`.agents/improvements.md`), oldest first per backlog; missing files have none. */
-export function openNotes(backlogs: readonly string[], since: number): OpenNote[] {
-	return backlogs.filter((file) => existsSync(file)).flatMap((backlog) =>
-		readFileSync(backlog, "utf8")
-			.split(/\n(?=## \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC)/)
-			.flatMap((block) => {
-				const when = /^## (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) UTC/.exec(block);
-				if (!when) return [];
-				const observation = /\*\*Observation:\*\* (.*)/.exec(block)?.[1] ?? "";
-				return [{ backlog, at: `${when[1]} ${when[2]}`, observation, new: Date.parse(`${when[1]}T${when[2]}:00Z`) > since }];
-			}),
-	);
-}
+

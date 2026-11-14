@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { appendNote, backlogPath, formatNote } from "../extensions/improvements/index.ts";
+import { appendNote, backlogPath, formatNote, readNotes, takeNotes } from "../extensions/improvements/index.ts";
 import { repositoryRoot } from "../extensions/lib/repository.ts";
 
 let dir: string;
@@ -11,6 +11,35 @@ beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "improvements-"));
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+describe("reading and taking notes", () => {
+	const note = (observation: string, at: string) => formatNote({ scope: "project", observation, proposal: "p" }, new Date(at), "s", "/w");
+
+	test("readNotes parses every note of every backlog with its full body; missing and empty backlogs have none", () => {
+		const a = join(dir, "a.md");
+		const b = join(dir, "b.md");
+		appendNote(a, note("one\nsecond line", "2026-11-12T16:47:00Z"));
+		appendNote(a, note("two ## not a heading", "2026-11-12T21:57:00Z"));
+		appendNote(b, note("three", "2026-11-13T01:00:00Z"));
+		writeFileSync(join(dir, "empty.md"), "# Improvement backlog\n");
+		const notes = readNotes([a, join(dir, "missing.md"), join(dir, "empty.md"), b]);
+		assert.deepEqual(notes.map((n) => [n.backlog, n.at]), [[a, "2026-11-12 16:47"], [a, "2026-11-12 21:57"], [b, "2026-11-13 01:00"]]);
+		assert.equal(notes[0]!.body, "- **Session:** s (/w)\n- **Observation:** one\n  second line\n- **Proposal:** p");
+		assert.match(readFileSync(a, "utf8"), /one/, "reading changes nothing");
+	});
+
+	test("takeNotes empties the backlogs to their header; a note appended afterwards is the only one left", () => {
+		const a = join(dir, "a.md");
+		appendNote(a, note("one", "2026-11-12T16:47:00Z"));
+		assert.deepEqual(takeNotes([a, join(dir, "missing.md")]).map((n) => n.at), ["2026-11-12 16:47"]);
+		assert.deepEqual(readNotes([a]), []);
+		assert.match(readFileSync(a, "utf8"), /^# Improvement backlog\n/);
+		appendNote(a, note("later", "2026-11-14T08:00:00Z"));
+		assert.deepEqual(readNotes([a]).map((n) => n.at), ["2026-11-14 08:00"]);
+		assert.deepEqual(takeNotes([a]).map((n) => n.at), ["2026-11-14 08:00"]);
+		assert.deepEqual(takeNotes([a]), [], "nothing left: the file stays as it is");
+	});
+});
 
 describe("backlog location", () => {
 	test("project notes go to the repository root, also from a subdirectory", () => {
