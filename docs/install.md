@@ -47,7 +47,7 @@ T3 has not shipped some adapter fixes the harness depends on. [`scripts/patch-t3
 | Patch | Fixes |
 | --- | --- |
 | `cache-warming` | T3 unloaded idle sessions after 30 minutes before Pi's cache refresh at 54 minutes could run |
-| `dialogs`, `session-questions` | open dialogs were cancelled when a turn ended, so an asynchronous `ask_user` card vanished seconds after it appeared |
+| `dialogs`, `session-questions` | open dialogs were cancelled when a turn ended, so an `ask_user` card left open past its turn vanished seconds after it appeared |
 | `background-work` | sessions with bash jobs in the background were unloaded, and a delegated child reported "done" while its build was still running |
 | `questions` | an `ask_user` call with several questions became several cards; now it is one card, paged |
 

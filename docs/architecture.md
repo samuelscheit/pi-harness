@@ -51,7 +51,7 @@ flowchart TB
 | [`extensions/background`](../extensions/background/index.ts) | Moves every tool call still running after two minutes (or when a user message arrives) to the background; its end wakes the session. |
 | [`extensions/bash`](../extensions/bash/index.ts) | Owns the `bash` tool: tracking of processes a command leaves running, refusal of self-detaching commands, `tool` bridge. |
 | [`extensions/workflow`](../extensions/workflow/index.ts) | The `workflow` tool and saved workflows as tools; durable runs (journal, replay, resume) and their pages. |
-| [`extensions/ask-user`](../extensions/ask-user/index.ts) | Asynchronous `ask_user` on Pi dialogs. |
+| [`extensions/ask-user`](../extensions/ask-user/index.ts) | `ask_user` on Pi dialogs: waits for the answers or a chat reply; unanswered in time, they arrive later as a message. |
 | [`extensions/web`](../extensions/web/index.ts) | `web_search` and `web_fetch` through Anthropic server tools. |
 | [`extensions/improvements`](../extensions/improvements/index.ts) | `note_improvement`, the agent's friction log. |
 | [`extensions/goal`](../extensions/goal/index.ts) | `/goal` and the `goal` tool: a session goal that holds the run at its end until it is achieved, blocked or out of budget ([goal.md](goal.md)). |

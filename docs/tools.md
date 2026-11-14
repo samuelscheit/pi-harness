@@ -2,7 +2,7 @@
 
 The harness adds or replaces these tools on top of Pi's built-ins (`read`, `edit`, `write`, `grep`, `find`, `ls`). Optional tools are registered inactive and switched on by a [rule or an experiment](prompt.md).
 
-## No tool call blocks for more than two minutes
+## No tool call blocks for more than two minutes (except a waiting ask_user)
 
 [`extensions/background`](../extensions/background/index.ts) wraps the execution of every tool call the model makes, whatever the tool: built-in, harness (`bash`, `workflow`, `fix_loop`) or MCP (`mcp__t3-code__delegate_task`, `t3_thread_wait`). A call moves to the background, without being stopped, after two minutes, or as soon as a user message arrives while it runs. The tool returns at once with the output so far and the path of a log of the latest output. When the call ends, its normal result (images included) arrives as a message that names the tool and its arguments and wakes the session, even after the turn has ended. So waiting loops (`until grep …; do sleep 5; done`) are never needed: the tool guideline says so.
 
@@ -11,7 +11,7 @@ The harness adds or replaces these tools on top of Pi's built-ins (`read`, `edit
 - To start anything else in the background at once: `cmd > log 2>&1 &` in bash, `tool <name> … > out 2>&1 &` in bash for any tool (below), or `delegate_task` in async mode. The guideline says so.
 - The turn's abort stops a call in the foreground, not one in the background. A background call stops when the session ends (through its AbortSignal; bash's then kills its process group), not on a harness reload.
 - While calls run in the background, the session reports background work (`pi.setBackgroundWork`), so T3 keeps it loaded and keeps a delegated child's run open. The jobs live in process state (`sessionJobs(sessionId).jobs`), so a reload mid-call still delivers the result.
-- Calls that end within the limit are untouched.
+- Calls that end within the limit are untouched, and so are calls of `ask_user`, which wait for an answer (`WAITING_TOOLS`, see [ask_user](#ask_user)).
 
 The seam is Pi's `pi.wrapToolExecution` (added in `vendor/pi`): a wrapper around the execution of model-issued calls only, which may run the tool with its own signal and return before it ends.
 
@@ -131,9 +131,17 @@ Why: in one large project, repair chains (failed check → … → green) cost 1
 
 ## ask_user
 
-[`extensions/ask-user`](../extensions/ask-user/index.ts) implements Codex's asynchronous `request_user_input` contract on Pi's dialogs. It shows the questions and returns `{"accepted":true}` at once. The answers arrive later as a message that steers the running turn or starts a new one. One call is one dialog: in T3 a single card with every question, each also accepting typed text; in the terminal, one question after another. Calls do not queue behind each other.
+[`extensions/ask-user`](../extensions/ask-user/index.ts) asks whoever directs the agent: at top level the user, as a delegated child its parent (T3 reports a child's card to the parent thread as a pending request). One call is one dialog: in T3 a single card with every question, each also accepting typed text; in the terminal, one question after another.
 
-The tool description is taken from Codex CLI (Apache-2.0, see [NOTICE](../NOTICE)). In T3 it needs the [patches](install.md#t3-code-integration).
+The call blocks until it is answered, up to `wait_minutes` (default 15), and the answers are its result. The wait ends early when:
+
+- the dialog is answered or dismissed;
+- a user message arrives: a reply in the chat instead of on the card. Its text answers every question (the result notes that it was a chat reply), the dialog closes (Pi's `dismiss`, so the T3 card disappears), and the message is consumed, so the conversation does not get it a second time. Any user message during the wait counts: while the agent is blocked on its questions a message is almost always the reply, and an unrelated instruction still reaches the agent in full;
+- the turn is aborted: the dialog closes and the call fails.
+
+When the time runs out, or at once with `wait_minutes: 0`, the call returns that no answer is there yet. The dialog stays open and its answers arrive later as a message that steers the running turn or starts a new one. Calls do not queue behind each other. A waiting `ask_user` is the one tool call that never moves to the background (`WAITING_TOOLS` in [`extensions/background`](../extensions/background/index.ts)): after two minutes it would cut every wait short, and on the user's message it would detach before the message could answer it.
+
+Why it blocks: until 2026-11 it followed Codex's asynchronous `request_user_input` contract and returned `{"accepted":true}` at once. Agents then went on guessing or ended their turn instead of waiting, and a reply typed in the chat left the card open. Parts of the tool description are taken from Codex CLI (Apache-2.0, see [NOTICE](../NOTICE)). In T3 it needs the [patches](install.md#t3-code-integration).
 
 ## web_search and web_fetch
 

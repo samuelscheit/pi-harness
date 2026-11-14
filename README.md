@@ -31,7 +31,7 @@ The design is grounded in a literature and source-code survey of how other harne
 | Bash | Long commands move to the background after 2 minutes and wake the agent when they finish; a guard against orphaned background processes; `tool <name>` calls any agent tool from a shell script | [tools.md](docs/tools.md#bash) |
 | Goal | `/goal <objective>` (or the agent's `goal` tool) keeps a session working until the objective is achieved, its check passes, it is blocked, or its budget is spent; with background jobs running, the agent does the independent steps instead of waiting | [goal.md](docs/goal.md) |
 | Workflows | The agent writes TypeScript scripts that do a procedure in code and call a model only for judgments (`llm()`, `agent()`); saved workflows become tools; `fix_loop` hands a failing check to a cheaper child agent | [tools.md](docs/tools.md#workflow-and-fix_loop) |
-| Other tools | Asynchronous `ask_user`, `web_search` / `web_fetch` through Anthropic server tools, layered [pi-lens](https://github.com/apmantza/pi-lens) configuration (LSP, linters, structural search) | [tools.md](docs/tools.md) |
+| Other tools | `ask_user` that waits for the answer or a chat reply, `web_search` / `web_fetch` through Anthropic server tools, layered [pi-lens](https://github.com/apmantza/pi-lens) configuration (LSP, linters, structural search) | [tools.md](docs/tools.md) |
 
 ## How it fits together
 
@@ -112,7 +112,7 @@ npm run metrics -- --since 2026-11-01   # the stats report from a shell
 
 - [Pi](https://github.com/earendil-works/pi) by Mario Zechner (MIT) is the agent this harness extends. It is bundled in `vendor/pi` with patches described in [docs/install.md](docs/install.md#bundled-pi-and-pi-lens).
 - [pi-lens](https://github.com/apmantza/pi-lens) by Apostolos Mantzaris and contributors (MIT) supplies LSP, linting and structural code tools. It is bundled in `vendor/pi-lens`.
-- The `ask_user` tool description comes from [OpenAI Codex CLI](https://github.com/openai/codex) (Apache-2.0). See [NOTICE](NOTICE).
+- Parts of the `ask_user` tool description are adapted from [OpenAI Codex CLI](https://github.com/openai/codex) (Apache-2.0). See [NOTICE](NOTICE).
 
 ## License
 
