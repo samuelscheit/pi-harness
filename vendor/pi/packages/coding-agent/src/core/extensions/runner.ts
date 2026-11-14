@@ -369,6 +369,20 @@ const noOpUIContext: ExtensionUIContext = {
 	setToolsExpanded: () => {},
 };
 
+const STALE_CTX_MESSAGE =
+	"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload(). Only the ctx of a running tool call survives a reload.";
+
+/**
+ * Whether a runner serves its session. A reload replaces the runner with the reloaded extensions'
+ * runner: `reloading` until that runner exists, then `reloaded` naming it. Session replacement and
+ * dispose make it `stale`.
+ */
+type RunnerLifecycle =
+	| { kind: "active" }
+	| { kind: "reloading" }
+	| { kind: "reloaded"; next: ExtensionRunner }
+	| { kind: "stale"; message: string };
+
 export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
@@ -403,7 +417,7 @@ export class ExtensionRunner {
 	private shutdownHandler: ShutdownHandler = () => {};
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
-	private staleMessage: string | undefined;
+	private lifecycle: RunnerLifecycle = { kind: "active" };
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -740,19 +754,45 @@ export class ExtensionRunner {
 		return this.shortcutDiagnostics;
 	}
 
-	invalidate(
-		message = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
-	): void {
-		if (!this.staleMessage) {
-			this.staleMessage = message;
-			this.runtime.invalidate(message);
-		}
+	/**
+	 * Mark the runner stale after session replacement or dispose: every context it created throws
+	 * from now on, including the contexts of tool calls still running.
+	 */
+	invalidate(message = STALE_CTX_MESSAGE): void {
+		if (this.lifecycle.kind === "stale") return;
+		this.runtime.invalidate(message);
+		this.lifecycle = { kind: "stale", message };
+	}
+
+	/**
+	 * Start a reload. The extension instances and the event handler and command contexts turn stale.
+	 * Tool calls still running keep working: background calls outlive reloads.
+	 */
+	beginReload(): void {
+		this.runtime.invalidate(STALE_CTX_MESSAGE);
+		this.lifecycle = { kind: "reloading" };
+	}
+
+	/** Finish a reload: contexts of running tool calls act through `next`, the reloaded extensions' runner. */
+	completeReload(next: ExtensionRunner): void {
+		this.lifecycle = { kind: "reloaded", next };
 	}
 
 	private assertActive(): void {
-		if (this.staleMessage) {
-			throw new Error(this.staleMessage);
-		}
+		if (this.lifecycle.kind === "stale") throw new Error(this.lifecycle.message);
+		if (this.lifecycle.kind !== "active") throw new Error(STALE_CTX_MESSAGE);
+	}
+
+	/**
+	 * The runner a tool call's context acts through: this one, or after reloads the session's current
+	 * one. While a reload builds the next runner this one still acts, since its bindings call into the
+	 * same session. Throws once the session was replaced or disposed.
+	 */
+	private toolCallRunner(): ExtensionRunner {
+		let runner: ExtensionRunner = this;
+		while (runner.lifecycle.kind === "reloaded") runner = runner.lifecycle.next;
+		if (runner.lifecycle.kind === "stale") throw new Error(runner.lifecycle.message);
+		return runner;
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {
@@ -928,102 +968,72 @@ export class ExtensionRunner {
 	 * Context values are resolved at call time, so changes via bindCore/bindUI are reflected.
 	 */
 	createContext(): ExtensionContext {
-		const runner = this;
-		const getModel = this.getModel;
-		const getScopedModels = this.getScopedModels;
+		return this.createContextResolvingTo(() => {
+			this.assertActive();
+			return this;
+		});
+	}
+
+	/** An extension context whose every member acts through the runner `resolve()` returns at call time. */
+	private createContextResolvingTo(resolve: () => ExtensionRunner): ExtensionContext {
 		return {
 			get ui() {
-				runner.assertActive();
-				return runner.uiContext;
+				return resolve().uiContext;
 			},
 			get mode() {
-				runner.assertActive();
-				return runner.mode;
+				return resolve().mode;
 			},
 			get hasUI() {
-				runner.assertActive();
-				return runner.hasUI();
+				return resolve().hasUI();
 			},
 			get cwd() {
-				runner.assertActive();
-				return runner.cwd;
+				return resolve().cwd;
 			},
 			get sessionManager() {
-				runner.assertActive();
-				return runner.sessionManager;
+				return resolve().sessionManager;
 			},
 			get modelRegistry() {
-				runner.assertActive();
-				return runner.modelRegistry;
+				return resolve().modelRegistry;
 			},
 			get model() {
-				runner.assertActive();
-				return getModel();
+				return resolve().getModel();
 			},
 			get scopedModels() {
-				runner.assertActive();
-				return getScopedModels();
+				return resolve().getScopedModels();
 			},
 			get thinkingLevel() {
-				runner.assertActive();
-				return runner.runtime.getThinkingLevel();
+				return resolve().runtime.getThinkingLevel();
 			},
-			isIdle: () => {
-				runner.assertActive();
-				return runner.isIdleFn();
-			},
-			isProjectTrusted: () => {
-				runner.assertActive();
-				return runner.isProjectTrustedFn();
-			},
+			isIdle: () => resolve().isIdleFn(),
+			isProjectTrusted: () => resolve().isProjectTrustedFn(),
 			get signal() {
-				runner.assertActive();
-				return runner.getSignalFn();
+				return resolve().getSignalFn();
 			},
-			abort: () => {
-				runner.assertActive();
-				runner.abortFn();
-			},
-			hasPendingMessages: () => {
-				runner.assertActive();
-				return runner.hasPendingMessagesFn();
-			},
-			shutdown: () => {
-				runner.assertActive();
-				runner.shutdownHandler();
-			},
-			getContextUsage: () => {
-				runner.assertActive();
-				return runner.getContextUsageFn();
-			},
-			compact: (options) => {
-				runner.assertActive();
-				runner.compactFn(options);
-			},
-			getSystemPrompt: () => {
-				runner.assertActive();
-				return runner.getSystemPromptFn();
-			},
+			abort: () => resolve().abortFn(),
+			hasPendingMessages: () => resolve().hasPendingMessagesFn(),
+			shutdown: () => resolve().shutdownHandler(),
+			getContextUsage: () => resolve().getContextUsageFn(),
+			compact: (options) => resolve().compactFn(options),
+			getSystemPrompt: () => resolve().getSystemPromptFn(),
 		};
 	}
 
 	/**
 	 * Create the context for executing the tool call `toolCallId`: the extension context plus
-	 * `tools` and `executeTool()`. `signal` is the default signal of nested calls.
+	 * `tools` and `executeTool()`. `signal` is the default signal of nested calls. The context
+	 * survives reloads (see toolCallRunner()), so calls running in the background across a reload
+	 * reach the reloaded tools.
 	 */
 	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
-		const runner = this;
-		// createContext() returns a fresh object, so adding properties does not affect other contexts.
-		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
+		const resolve = () => this.toolCallRunner();
+		// The context is a fresh object, so adding properties does not affect other contexts.
+		return Object.defineProperties(this.createContextResolvingTo(resolve) as ExtensionToolContext, {
 			tools: {
-				get() {
-					runner.assertActive();
-					return runner.getCallableToolsFn();
-				},
+				get: () => resolve().getCallableToolsFn(),
 			},
 			executeTool: {
 				value: async (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
-					runner.assertActive();
+					const runner = resolve();
 					if (!runner.executeToolFn) {
 						return {
 							toolCall: { type: "toolCall", id: `${toolCallId}/0`, name, arguments: {} },

@@ -1545,13 +1545,14 @@ Important behavior:
 - Code after `await ctx.reload()` still runs from the pre-reload version
 - Code after `await ctx.reload()` must not assume old in-memory extension state is still valid
 - After the handler returns, future commands/events/tool calls use the new extension version
+- The `ctx` of a tool call still running (for example in the background) keeps working: `ctx.executeTool()`, `ctx.tools`, and the other context members act through the reloaded extensions, so nested calls run the reloaded tool definitions, and a tool the reload removed comes back as `Tool <name> not found`. Session replacement (`newSession`, `fork`, `switchSession`) makes that `ctx` stale like any other
 
 For predictable behavior, treat reload as terminal for that handler (`await ctx.reload(); return;`).
 
 Tools and event handlers run with `ExtensionContext`, not `ExtensionCommandContext`, so they cannot call `ctx.reload()`. They call `pi.requestReload()` instead, which reloads at the next safe point:
 
 - idle: at once;
-- during an agent run: at the next turn boundary, after the turn's tool results and before the next model request. Handlers see `before_agent_start` again with `reloaded: true` and rebuild the run's prompt options and tools; the run's remaining turns use them. A tool call still executing then finishes on the old code;
+- during an agent run: at the next turn boundary, after the turn's tool results and before the next model request. Handlers see `before_agent_start` again with `reloaded: true` and rebuild the run's prompt options and tools; the run's remaining turns use them. A tool call still executing then finishes on the old code, and its `ctx` reaches the reloaded tools;
 - a run without a later turn boundary: once it settles.
 
 Repeated requests before the reload are one. Like after `ctx.reload()`, the requesting extension instance is stale once the reload ran.
