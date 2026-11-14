@@ -6,6 +6,9 @@
 //   /harness experiment <name> stop  mark the experiment stopped and log its result in the changelog
 //   /harness experiment <name> promote  make it a stable rule (lib/rules.ts) for every session and log
 //                                    its result in the changelog
+//
+// The changelog (.agents/changelog.md) is local state like the rest of `.agents/`: git-ignored and
+// never committed. Only the experiment and rule files are committed.
 
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
@@ -191,7 +194,7 @@ export function experimentCommand(args: string[], context: ExperimentContext): {
 		const files = action === "stop" ? [stopExperiment(experiment, at)] : promoteExperiment(experiment, context.rulesDir ?? RULES_DIR, at);
 		const changelog = context.changelog ?? CHANGELOG;
 		appendFileSync(changelog, endEntry(results, name, at, action));
-		const published = context.publish ? `\n${context.publish([...files, changelog], `chore(experiments): ${action} ${name}`)}` : "";
+		const published = context.publish ? `\n${context.publish(files, `chore(experiments): ${action} ${name}`)}` : "";
 		const done = action === "stop" ? `Stopped ${name}` : `Promoted ${name} to a rule for every session`;
 		return { text: `${done}; result logged in the changelog.${published}\n${results.map(renderComparison).join("\n\n")}`.trim(), level: "info" };
 	}

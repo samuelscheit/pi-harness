@@ -1,5 +1,6 @@
-// Dreaming, step 5: what each run decided, kept in the harness repository so it is reviewable and
-// versioned with the rules it changed:
+// Dreaming, step 5: what each run decided, kept next to the harness repository's improvement
+// backlog in `.agents/` (local state: git-ignored, never committed; the rules a run changed are
+// commits of their own, see apply.ts):
 //
 //   .agents/dreams/ledger.jsonl   one record per correction a run considered: its label, the rule
 //                                 derived from it, the delta (recur, add, update, skip), the rule it
@@ -33,8 +34,8 @@ export interface LedgerRecord {
 }
 
 export const dreamsDir = (source: string) => join(source, ".agents", "dreams");
-export const ledgerFile = (source: string) => join(dreamsDir(source), "ledger.jsonl");
-export const stateFile = (source: string) => join(dreamsDir(source), "state.json");
+const ledgerFile = (source: string) => join(dreamsDir(source), "ledger.jsonl");
+const stateFile = (source: string) => join(dreamsDir(source), "state.json");
 
 export function readLedger(source: string): LedgerRecord[] {
 	if (!existsSync(ledgerFile(source))) return [];

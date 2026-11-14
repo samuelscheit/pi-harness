@@ -4,15 +4,15 @@
 //   2. label    each one with a cheap model: kind, the reusable rule it implies, its scope (lib/labels.ts)
 //   3. curate   the corrections with a rule into small deltas against the known rules (curate.ts)
 //   4. apply    each delta as its own commit, live at once (apply.ts)
-//   5. record   the ledger, the read position and the report, committed together (ledger.ts)
+//   5. record   the ledger, the read position and the report in .agents/dreams (ledger.ts); local
+//               state, git-ignored, never committed
 //
 // Runs nightly as a t3 scheduled task. Usage:
 //   node scripts/dream/run.ts [--dry-run] [--since <ISO date>]
 // --dry-run labels and curates but changes and commits nothing, and prints the deltas.
 
-import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 import { BACKLOG, readNotes, takeNotes } from "../../extensions/improvements/index.ts";
@@ -23,7 +23,7 @@ import { type Ask, askJson, isNegative, labelMessages } from "../lib/labels.ts";
 import { type Applied, applyDelta } from "./apply.ts";
 import { collect, repositories } from "./collect.ts";
 import { type Candidate, curate, type Delta } from "./curate.ts";
-import { appendLedger, dreamsDir, type LedgerRecord, ledgerFile, readLedger, readSince, report, stateFile, writeSince } from "./ledger.ts";
+import { appendLedger, dreamsDir, type LedgerRecord, readLedger, readSince, report, writeSince } from "./ledger.ts";
 import { globalRules, type KnownRule, projectRules } from "./rules.ts";
 
 export const LABEL_MODEL = "claude-sonnet-5-5";
@@ -114,9 +114,6 @@ export async function dream({ source, db, now = new Date(), since = readSince(so
 	let reportFile = join(dreamsDir(source), `${run.slice(0, 10)}.md`);
 	if (existsSync(reportFile)) reportFile = join(dreamsDir(source), `${run.slice(0, 16).replace(":", "")}.md`);
 	writeFileSync(reportFile, text);
-	const files = [ledgerFile(source), stateFile(source), reportFile].filter(existsSync).map((f) => relative(source, f));
-	execFileSync("git", ["-C", source, "add", "--", ...files]);
-	execFileSync("git", ["-C", source, "commit", "--only", "-m", `chore(dream): report ${run.slice(0, 10)}`, "--", ...files], { stdio: "pipe" });
 	return { deltas, applied, records, reportFile, text };
 }
 

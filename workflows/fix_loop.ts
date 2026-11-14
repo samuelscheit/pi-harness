@@ -5,7 +5,7 @@
 //
 // The workflow runs the check itself before the first and after every round, so "green" is the
 // check's exit code, never the child's claim. A round is one message to the child (it may run the
-// check itself in between). The `fix-loop` experiment (prompt/experiments/fix-loop.md) activates it.
+// check itself in between). The `fix-loop` rule (prompt/rules/fix-loop.md) activates it.
 
 export const meta: WorkflowMeta = {
 	description: [

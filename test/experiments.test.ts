@@ -665,7 +665,7 @@ describe("/harness experiment", () => {
 		experimentFile("y", "Variant.", at);
 		const published: [string[], string][] = [];
 		const text = experimentCommand(["y", "stop"], { ...ctx, publish: (paths, message) => (published.push([paths, message]), "Committed abc.") }).text;
-		assert.deepEqual(published, [[[join(at, "y.md"), changelog], "chore(experiments): stop y"]]);
+		assert.deepEqual(published, [[[join(at, "y.md")], "chore(experiments): stop y"]], "the changelog is local state, not committed");
 		assert.match(text, /^Stopped y; result logged in the changelog\.\nCommitted abc\./);
 		assert.match(experimentCommand(["x", "on"], ctx).text, /already stopped/);
 	});
@@ -702,7 +702,8 @@ describe("/harness experiment", () => {
 		const published: [string[], string][] = [];
 		const promoted = experimentCommand(["x", "promote"], { ...ctx, rulesDir: rules, publish: (paths, message) => (published.push([paths, message]), "Committed abc.") });
 		assert.match(promoted.text, /^Promoted x to a rule for every session; result logged in the changelog\.\nCommitted abc\./);
-		assert.deepEqual(published, [[[join(rules, "x.md"), join(at, "x.md"), changelog], "chore(experiments): promote x"]]);
+		assert.deepEqual(published, [[[join(rules, "x.md"), join(at, "x.md")], "chore(experiments): promote x"]]);
+		assert.match(readFileSync(changelog, "utf8"), /promote/i, "the result is still logged locally");
 		assert.deepEqual(listExperiments(at).map((e) => e.name), ["y"], "the experiment file is gone");
 		assert.equal(readFileSync(join(rules, "x.md"), "utf8"), "---\ntools:\n  - x_tool\n  - y_tool\npromoted: 2026-11-20\n---\n\nVariant.\n");
 		assert.deepEqual(listRules(rules), [{ name: "x", file: join(rules, "x.md"), body: "Variant.", tools: ["x_tool", "y_tool"] }]);

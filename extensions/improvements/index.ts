@@ -1,6 +1,7 @@
 // note_improvement: the model's cheap capture of something the harness or a project should do
 // better. It only appends to a backlog. Dreaming (a t3 scheduled task) takes the notes out of every
-// backlog into its committed report and fixes them, so a backlog holds only notes nobody read yet.
+// backlog into its report (local, in .agents/dreams) and fixes them, so a backlog holds only notes
+// nobody read yet.
 //
 // Backlogs are plain Markdown in the harness-neutral `.agents/` layout:
 // - project: <repository root>/.agents/improvements.md, for the project's AGENTS.md, skills

@@ -356,8 +356,8 @@ describe("a dream run", () => {
 		});
 	};
 
-	test("commits each new rule, records the ledger, moves the position and commits the report; a dry run changes nothing", async () => {
-		const source = repository("harness", { "prompt/AGENTS.md": "Find the root cause.\n", "prompt/rules/batch.md": "Batch calls.\n" });
+	test("commits each new rule, records the ledger, moves the position and writes the report; a dry run changes nothing", async () => {
+		const source = repository("harness", { ".gitignore": ".agents\n", "prompt/AGENTS.md": "Find the root cause.\n", "prompt/rules/batch.md": "Batch calls.\n" });
 		const project = repository("project");
 		const db = index();
 		const t = Date.parse("2026-11-12T10:00:00Z");
@@ -387,7 +387,7 @@ describe("a dream run", () => {
 		const result = await dream({ source, db, now, ask });
 		assert.equal(readFileSync(join(source, "prompt/rules/no-idle-waits.md"), "utf8"), "---\nsource: dream\nadded: 2026-11-13\n---\n\nNever end a turn waiting on background work.\n");
 		assert.match(readFileSync(join(project, "AGENTS.md"), "utf8"), /## Learned rules\n\n- Run make check before committing\.\n/);
-		assert.deepEqual(git(source, "log", "--format=%s").split("\n"), ["chore(dream): report 2026-11-13", "feat(rules): learned rule no-idle-waits", "init"]);
+		assert.deepEqual(git(source, "log", "--format=%s").split("\n"), ["feat(rules): learned rule no-idle-waits", "init"], "only the rule is committed");
 		assert.equal(git(project, "log", "-1", "--format=%s"), "docs(agents): learned rule");
 		const ledger = readLedger(source);
 		assert.deepEqual(ledger.map((r) => [r.entry, r.op, r.target]), [
@@ -401,7 +401,7 @@ describe("a dream run", () => {
 		assert.match(readFileSync(result.reportFile!, "utf8"), /Messages the user typed .*: 4\./);
 		assert.match(readFileSync(result.reportFile!, "utf8"), new RegExp(`### ${project}/\\.agents/improvements\\.md\\n\\n#### 2026-11-12 09:00 UTC\\n\\n- \\*\\*Observation:\\*\\* the build is slow\\n- \\*\\*Proposal:\\*\\* cache it`));
 		assert.doesNotMatch(readFileSync(backlog, "utf8"), /## 2026/, "the notes moved into the report");
-		assert.equal(git(source, "status", "--porcelain"), "", "everything committed");
+		assert.equal(git(source, "status", "--porcelain"), "", "rules committed; the ledger, position and report stay local");
 
 		// The next run reads only newer messages; a second report the same day gets the time in its name.
 		addSession(db, { id: "s2", cwd: project, messages: [["f1", now.getTime() + 1000, "follow-up", "RECUR: root cause again"]] });
@@ -412,12 +412,15 @@ describe("a dream run", () => {
 		db.close();
 	});
 
-	test("nothing new: no model call, the position still moves and the report is committed", async () => {
-		const source = repository("harness", { "prompt/AGENTS.md": "Rule.\n" });
+	test("nothing new: no model call, no commit, the position still moves and the report is written", async () => {
+		const source = repository("harness", { ".gitignore": ".agents\n", "prompt/AGENTS.md": "Rule.\n" });
 		const db = index();
-		const result = await dream({ source, db, now: new Date("2026-11-13T03:00:00Z"), ask: () => assert.fail("no model call") });
+		const now = new Date("2026-11-13T03:00:00Z");
+		const result = await dream({ source, db, now, ask: () => assert.fail("no model call") });
 		assert.deepEqual(result.records, []);
-		assert.equal(git(source, "log", "-1", "--format=%s"), "chore(dream): report 2026-11-13");
+		assert.equal(git(source, "rev-list", "--count", "HEAD"), "1");
+		assert.equal(readSince(source), now.getTime());
+		assert.ok(existsSync(result.reportFile!));
 		db.close();
 	});
 });
