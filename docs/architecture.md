@@ -48,8 +48,7 @@ flowchart TB
 | [`extensions/lib/release.ts`](../extensions/lib/release.ts), [`extensions/release`](../extensions/release/index.ts) | Turn commits into immutable releases and reload running sessions into them. |
 | [`extensions/metrics`](../extensions/metrics/index.ts) | Index session files into SQLite, run the query layer, the `/harness` command, and keep the dashboard running. |
 | [`extensions/lib/experiments.ts`](../extensions/lib/experiments.ts), [`extensions/lib/rules.ts`](../extensions/lib/rules.ts) | A/B experiment assignment, and promoted rules. |
-| [`extensions/background`](../extensions/background/index.ts) | Moves every tool call still running after two minutes (or when a user message arrives) to the background; its end wakes the session. |
-| [`extensions/bash`](../extensions/bash/index.ts) | Owns the `bash` tool: tracking of processes a command leaves running, refusal of self-detaching commands, `tool` bridge. |
+| [`extensions/bash`](../extensions/bash/index.ts) | Owns the `bash` tool: background jobs, background-process guard, refusal of self-detaching commands, `tool` bridge. |
 | [`extensions/workflow`](../extensions/workflow/index.ts) | The `workflow` tool and saved workflows as tools. |
 | [`extensions/ask-user`](../extensions/ask-user/index.ts) | Asynchronous `ask_user` on Pi dialogs. |
 | [`extensions/web`](../extensions/web/index.ts) | `web_search` and `web_fetch` through Anthropic server tools. |
