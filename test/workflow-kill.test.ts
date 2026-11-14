@@ -96,7 +96,7 @@ describe("a workflow whose process is killed", () => {
 	});
 
 	test("an in-flight in-process agent reattaches to its session file and continues", async () => {
-		const code = "const run = await agent({ model: 'faux/faux-1', tools: ['bash'] }).run('do the slow thing');\nreturn 'agent: ' + run.text;";
+		const code = "const run = await delegate({ target: { model: 'faux/faux-1' }, tools: ['bash'] }).run('do the slow thing');\nreturn 'agent: ' + run.text;";
 		const run = await crashAndResume(code, () => existsSync(join(repo, "agent-ready")));
 		assert.deepEqual(run.said.filter((s) => s.startsWith("all done")), ["all done: agent: agent finished after the restart"]);
 		assert.equal(count("agent-count"), 1, "the agent's command was not repeated");

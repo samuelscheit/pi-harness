@@ -2,7 +2,7 @@
 // entry per line. It makes a run durable (durable.ts replays it after the process died) and is the
 // only input of the run's page (render.ts) and of the dashboard's live view.
 //
-// Every call the script makes to the outside (shell, tools.*, llm, agent().run, workflows.*,
+// Every call the script makes to the outside (shell, tools.*, llm, delegate runs, workflows.*,
 // changes) has a key: its kind, a hash of its arguments and its occurrence among calls with the
 // same kind and hash (`shell:3fa2c9d1e0b4#2`). Not a global sequence: parallel calls (map,
 // Promise.all) finish in varying order, while the nth call with the same arguments is the same
@@ -24,7 +24,7 @@ export const SNAPSHOT_FILE = "snapshot.json";
 export const KEEP_DONE_MS = 24 * 60 * 60_000;
 export const KEEP_INTERRUPTED_MS = 7 * 24 * 60 * 60_000;
 
-export type CallKind = "shell" | "tool" | "llm" | "agent" | "workflow" | "changes";
+export type CallKind = "shell" | "tool" | "llm" | "delegate" | "workflow" | "changes";
 
 export interface SerializedError {
 	name: string;

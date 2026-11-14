@@ -7,8 +7,8 @@
 // check's exit code, never the child's claim. A round is one message to the child (it may run the
 // check itself in between). The `fix-loop` rule (prompt/rules/fix-loop.md) activates it.
 //
-// agent() does not enforce `files` (its children run in parallel in one working tree, as t3 tasks),
-// so this workflow holds its own contract: a round counts as green only when the check passes and
+// The child (delegate()) is only told `files` (children run in parallel in one working tree, as t3
+// tasks), so this workflow holds its own contract: a round counts as green only when the check passes and
 // nothing outside `files` changed since the workflow started. Changes outside are not undone for the
 // child; it is told to undo them, and they are returned as `outside` while they remain.
 
@@ -71,9 +71,11 @@ export default async function ({ goal, files, check, context, maxRounds = 6, mod
 
 	const allowed = files.map(relativePath);
 	const isAllowed = (path: string) => allowed.some((entry) => entry === "." || path === entry || path.startsWith(`${entry}/`));
-	const child = agent({
-		model,
-		files,
+	const child = delegate({
+		target: { model },
+		title: `fix_loop: ${goal.slice(0, 60)}`,
+		role: "implementation",
+		tools: ["read", "bash", "edit", "write"],
 		system: [
 			"You make a failing check pass in a code repository. You start without the conversation that led here; everything you need is below or in the files.",
 			"",

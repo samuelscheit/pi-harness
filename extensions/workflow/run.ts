@@ -27,7 +27,7 @@ import { stringify } from "yaml";
 import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
 import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
-import { createAgent } from "./agent.ts";
+import { createDelegate } from "./delegate.ts";
 import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
 import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, WorkflowStopped } from "./durable.ts";
 import { codeHash, currentSource, Journal, type JournalEntry, journalPath, newRunId, readJournal, RESUMABLE, type RunHeader, runDir, runState, SNAPSHOT_FILE } from "./journal.ts";
@@ -62,8 +62,10 @@ export interface RunEnv {
 	llmCache: Map<string, unknown>;
 	/** Run a session tool (ctx.executeTool); undefined outside a session. */
 	executeTool?: (name: string, args: unknown, signal: AbortSignal) => Promise<ToolOutcome>;
-	/** The tools executeTool can call; with t3's, agent() children become t3 tasks. */
+	/** The tools executeTool can call; with t3's, delegate() children become t3 tasks. */
 	toolNames?: readonly string[];
+	/** The calling session's model ("provider/id"): in-process children's default. */
+	model?: string;
 	/** The calling session's id and file. */
 	sessionId?: string;
 	/** The saved workflows, for workflows.*. */
@@ -94,13 +96,13 @@ export interface WorkflowDetails {
 	cost: number;
 	llmCalls: number;
 	cachedCalls: number;
-	agentRuns: number;
+	delegateRuns: number;
 	/** Calls answered from the journal in this execution. */
 	replayedCalls: number;
 	/** Recorded calls the (edited) script did not use. */
 	unusedCalls: number;
 	/** Agent runs a stop left running; their outcomes are recorded when they end. */
-	lingeringAgents: number;
+	lingeringDelegates: number;
 	/** Child agent sessions (details.childSessions for the metrics index). */
 	childSessions: string[];
 	/** The t3 threads of child agents (links). */
@@ -343,10 +345,10 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		cost: 0,
 		llmCalls: 0,
 		cachedCalls: 0,
-		agentRuns: 0,
+		delegateRuns: 0,
 		replayedCalls: 0,
 		unusedCalls: 0,
-		lingeringAgents: 0,
+		lingeringDelegates: 0,
 		childSessions: [],
 		childThreads: [],
 		changedFiles: [],
@@ -380,17 +382,17 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		inFlight,
 		attempt,
 		signal,
-		signalFor: (kind) => (kind === "agent" ? children.signal : signal),
+		signalFor: (kind) => (kind === "delegate" ? children.signal : signal),
 		...(handed ? { inherited: handed.works } : {}),
 		replayed: (kind, cost) => {
 			if (kind === "llm") details.llmCalls++;
-			if (kind === "agent") details.agentRuns++;
+			if (kind === "delegate") details.delegateRuns++;
 			if (cost > 0) spend(cost);
 		},
 		diverged: (error) => controller.abort(error),
 		// Agent runs the edited code does not use, whose t3 children run on without a process waiting for them.
 		dropped: (calls) => {
-			for (const { meta } of calls) if (t3 && typeof meta.taskId === "string") cancelTask(t3, meta.taskId, "the workflow's edited code does not use this agent run");
+			for (const { meta } of calls) if (t3 && typeof meta.taskId === "string") cancelTask(t3, meta.taskId, "the workflow's edited code does not use this delegate run");
 		},
 	});
 	const stopWatch = watchStop(dir, (request) => {
@@ -433,7 +435,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 					return t3Data(name, outcome.value, outcome.text);
 				})
 			: undefined;
-	let agents = 0;
+	let delegates = 0;
 
 	const globals: Record<string, unknown> = {
 		cwd: env.cwd,
@@ -447,8 +449,8 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 								live();
 								if (!executeTool) throw new Error("tools are only available in a session");
 								const idempotent = idempotentOption(options, `tools.${name}()`);
-								return durable.call({ kind: "tool", args: { name, args }, label: `${name} ${firstLine(JSON.stringify(args) ?? "", 100)}`, idempotent }, async () => {
-									const outcome = await executeTool(name, args, signal);
+								return durable.call({ kind: "tool", args: { name, args }, label: `${name} ${firstLine(JSON.stringify(args) ?? "", 100)}`, idempotent }, async (call) => {
+									const outcome = await executeTool(name, args, call.signal);
 									live();
 									if (outcome.isError && !outcome.structured) throw new Error(outcome.text || `tool ${name} failed`);
 									return { value: outcome.value };
@@ -463,23 +465,23 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 			if (cwd !== undefined && typeof cwd !== "string") throw new TypeError("shell(): cwd must be a string");
 			if (timeoutSeconds !== undefined && (typeof timeoutSeconds !== "number" || !(timeoutSeconds > 0))) throw new TypeError("shell(): timeoutSeconds must be a positive number");
 			const idempotent = idempotentOption(options, "shell()");
-			return durable.call({ kind: "shell", args: { command, cwd: cwd ?? null, timeoutSeconds: timeoutSeconds ?? null }, label: firstLine(command), idempotent }, async () => {
+			return durable.call({ kind: "shell", args: { command, cwd: cwd ?? null, timeoutSeconds: timeoutSeconds ?? null }, label: firstLine(command), idempotent }, async (call) => {
 				progress(`shell ${firstLine(command)}`);
-				const result = await runShell(command, { cwd: resolve(env.cwd, cwd ?? "."), signal, timeoutMs: timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000 });
+				const result = await runShell(command, { cwd: resolve(env.cwd, cwd ?? "."), signal: call.signal, timeoutMs: timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000 });
 				live();
 				return { value: { exitCode: result.exitCode, output: result.output, timedOut: result.timedOut } };
 			});
 		},
 		llm: (prompt: unknown, options: unknown) => {
 			const model = (options as { model?: unknown } | undefined)?.model;
-			return durable.call({ kind: "llm", args: { prompt, options: options ?? null }, label: typeof prompt === "string" ? firstLine(prompt, 100) : "llm()", model: typeof model === "string" ? model : DEFAULT_LLM_MODEL }, () =>
+			return durable.call({ kind: "llm", args: { prompt, options: options ?? null }, label: typeof prompt === "string" ? firstLine(prompt, 100) : "llm()", model: typeof model === "string" ? model : DEFAULT_LLM_MODEL }, (call) =>
 				llmSlot(async () => {
 					live();
 					let cost = 0;
 					const value = await llm(prompt, options, {
 						runtime: env.runtime,
 						cache: env.llmCache,
-						signal,
+						signal: call.signal,
 						spend: (u) => {
 							usage = addUsage(usage, u);
 							cost += u.cost.total;
@@ -495,24 +497,25 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				}),
 			);
 		},
-		agent: (options: unknown) =>
-			createAgent(options, {
+		delegate: (params: unknown) =>
+			createDelegate(params, {
 				cwd: env.cwd,
 				root,
 				runtime: env.runtime,
 				agentDir: env.agentDir,
+				...(env.model ? { model: env.model } : {}),
 				sessionDir: env.sessionDir,
 				parentSessionFile: env.parentSessionFile,
 				callerSessionId: env.sessionId,
 				t3,
 				durable,
-				number: ++agents,
+				next: () => ++delegates,
 				spend,
 				started: (id) => {
 					if (!details.childSessions.includes(id)) details.childSessions.push(id);
 				},
 				thread: (link) => details.childThreads.push(link),
-				ran: () => details.agentRuns++,
+				ran: () => details.delegateRuns++,
 				progress,
 				warn: (line) => details.warnings.push(line),
 				onDispose: (dispose) => disposers.push(dispose),
@@ -578,13 +581,13 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	const unsettled = durable.unsettled();
 	const keep = stopped && !(reason as WorkflowStopped).children;
 	if (!keep) for (const work of unsettled.values()) work.cancel(reason);
-	const lingering = keep ? [...unsettled].filter(([, work]) => work.kind === "agent").map(([key]) => key) : [];
+	const lingering = keep ? [...unsettled].filter(([, work]) => work.kind === "delegate").map(([key]) => key) : [];
 	if (diverged) failure = reason;
 	if (root && start) details.changedFiles = await changedPaths(start, await snapshot(root));
 	details.durationMs = performance.now() - started;
 	details.replayedCalls = durable.replayedCalls;
 	details.unusedCalls = durable.unused.length;
-	details.lingeringAgents = lingering.length;
+	details.lingeringDelegates = lingering.length;
 	details.status = overBudget ? "over budget" : diverged ? "diverged" : stopped ? "stopped" : interrupted ? "interrupted" : env.signal?.aborted ? "aborted" : failure !== undefined ? "failed" : "completed";
 	const declaredOk = value && typeof value === "object" && typeof (value as { ok?: unknown }).ok === "boolean" ? (value as { ok: boolean }).ok : true;
 	details.ok = details.status === "completed" && declaredOk;
@@ -612,14 +615,14 @@ function report(details: WorkflowDetails, value: unknown, failed: boolean, lines
 		`${(details.durationMs / 1000).toFixed(1)} s`,
 		`$${details.cost.toFixed(4)} of $${details.budget.toFixed(2)}`,
 		`${details.llmCalls} llm call${details.llmCalls === 1 ? "" : "s"}${details.cachedCalls ? ` (${details.cachedCalls} cached)` : ""}`,
-		`${details.agentRuns} agent run${details.agentRuns === 1 ? "" : "s"}`,
+		`${details.delegateRuns} delegate run${details.delegateRuns === 1 ? "" : "s"}`,
 		...(details.replayedCalls ? [`${details.replayedCalls} replayed from the journal`] : []),
 		`run ${details.id}`,
 	];
 	const out = [`Workflow ${details.workflow ? `${details.workflow} ` : ""}${details.status} · ${stats.join(" · ")}`];
 	if (details.status === "interrupted") out.push(`It can continue from its journal: call workflow with resume: "${details.id}".`);
 	if (details.status === "stopped") {
-		if (details.lingeringAgents) out.push(`${details.lingeringAgents} agent run${details.lingeringAgents === 1 ? " keeps" : "s keep"} running; results are recorded when they end (workflow { stop: "${details.id}", stopChildren: true } cancels them).`);
+		if (details.lingeringDelegates) out.push(`${details.lingeringDelegates} delegate run${details.lingeringDelegates === 1 ? " keeps" : "s keep"} running; results are recorded when they end (workflow { stop: "${details.id}", stopChildren: true } cancels them).`);
 		if (calls.cutOff.length) out.push(`Cut off by the stop, may have taken effect partly: ${calls.cutOff.join("; ")}. A resume asks whether to run them again (inFlight).`);
 		out.push(
 			`Continue with workflow { resume: "${details.id}" }, or change the script and continue with workflow { resume: "${details.id}", code: "…" }: calls the new code makes as before are answered from the journal; from its first other call it runs live. Effects so far (commits, files) stay.`,

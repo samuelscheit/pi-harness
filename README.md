@@ -30,7 +30,7 @@ The design is grounded in a literature and source-code survey of how other harne
 | Self-improvement | `note_improvement` friction capture, nightly dreaming that turns corrections into rules, changelog | [self-improvement.md](docs/self-improvement.md) |
 | Bash | Long commands move to the background after 2 minutes and wake the agent when they finish; a guard against orphaned background processes; `tool <name>` calls any agent tool from a shell script | [tools.md](docs/tools.md#bash) |
 | Goal | `/goal <objective>` (or the agent's `goal` tool) keeps a session working until the objective is achieved, its check passes, it is blocked, or its budget is spent; with background jobs running, the agent does the independent steps instead of waiting | [goal.md](docs/goal.md) |
-| Workflows | The agent writes TypeScript scripts that do a procedure in code and call a model only for judgments (`llm()`, `agent()`); saved workflows become tools; `fix_loop` hands a failing check to a cheaper child agent | [tools.md](docs/tools.md#workflow-and-fix_loop) |
+| Workflows | The agent writes TypeScript scripts that do a procedure in code and call a model only for judgments (`llm()`, `delegate()`); saved workflows become tools; `fix_loop` hands a failing check to a cheaper child agent | [tools.md](docs/tools.md#workflow-and-fix_loop) |
 | Other tools | `ask_user` that waits for the answer or a chat reply, `web_search` / `web_fetch` through Anthropic server tools, layered [pi-lens](https://github.com/apmantza/pi-lens) configuration (LSP, linters, structural search) | [tools.md](docs/tools.md) |
 
 ## How it fits together

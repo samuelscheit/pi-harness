@@ -4,7 +4,7 @@
 // ---
 
 /*
- * Runs are durable: every call below (tools, shell, llm, agent().run, workflows, changes) is
+ * Runs are durable: every call below (tools, shell, llm, delegates, workflows, changes) is
  * journaled, and a run whose process died is resumed by running the script again, with recorded
  * calls answered from the journal. So keep the script deterministic: act on the outside only
  * through these calls (Date.now(), new Date() and Math.random() are recorded too). A shell or tool
@@ -39,21 +39,46 @@ declare function sh(strings: TemplateStringsArray, ...values: unknown[]): string
 declare function llm(prompt: string, options?: { model?: string; system?: string; schema?: object; thinking?: Thinking; cache?: boolean }): Promise<any>;
 
 /**
- * A child agent that sees only what you send it, not this conversation. In T3 Code it is a delegated
- * task with a thread under this one, which the user can watch, steer and stop; elsewhere an
- * in-process session. Started on its first run(); each run() sends one message (later ones resume
- * the same conversation) and resolves once the agent stops: `text` its final message, `changed` the
- * files the working tree changed meanwhile (other agents' too), `cost` the run's USD.
- * Default model anthropic/claude-sonnet-5-5, tools read, bash, edit, write (names only); `system`
- * replaces its default role prompt. `schema` (JSON Schema of an object): the agent must submit an
- * object matching it, returned as `result`, or the run fails. `files`: told to the agent as the
- * files to change, not enforced. Agents run in parallel in the same working tree.
+ * A child agent that sees only what you send it, not this conversation: t3's delegate_task, awaited
+ * (in T3 Code a task with a thread under this one, which the user can watch, steer and stop;
+ * elsewhere an in-process session). Same parameters, without the task. Without `target`, `system`
+ * or `tools` the child has your model and the default prompt and tools. `schema` (JSON Schema of
+ * an object): the child must submit a matching object, returned as `result`. The child starts on
+ * its first run(); later runs continue its conversation; each resolves once it stops, with `text`
+ * (its final message), `changed` (files the working tree changed meanwhile, other agents' too) and
+ * `cost`. `compact` is Pi's /compact; `fork` starts a new child from this one's conversation.
  */
-declare function agent(options?: { model?: string; system?: string; tools?: string[]; files?: string[]; schema?: object; thinking?: Thinking }): {
-	run(message: string): Promise<{ text: string; result?: any; changed: string[]; cost: number; sessionId?: string; threadId?: string }>;
-	/** Cost in USD so far. */
+declare function delegate(params?: {
+	target?: { model?: string; providerInstanceId?: string; options?: Record<string, unknown> };
+	title?: string;
+	role?: "implementation" | "research" | "review" | "design" | "test" | "general";
+	isolation?: "shared" | "worktree";
+	system?: string;
+	tools?: string[];
+	schema?: object;
+	fork?: boolean;
+	forkThreadId?: string;
+}): Delegate;
+
+interface DelegateRun {
+	text: string;
+	result?: any;
+	changed: string[];
+	cost: number;
+	sessionId?: string;
+	threadId?: string;
+}
+
+interface Delegate {
+	run(message: string): Promise<DelegateRun>;
+	compact(instructions?: string): Promise<void>;
+	steer(text: string): Promise<void>;
+	stop(): Promise<void>;
+	fork(message: string): Promise<DelegateRun & { handle: Delegate }>;
+	/** USD so far. */
 	readonly cost: number;
-};
+	readonly threadId: string | undefined;
+}
 
 type Thinking = "off" | "minimal" | "low" | "medium" | "high";
 
@@ -66,7 +91,7 @@ declare function log(...values: unknown[]): void;
 /** The files changed since this run started, with their unified diff (git repositories only). */
 declare function changes(): Promise<{ files: string[]; diff: string }>;
 
-/** This run's spending limit in USD and what llm() and agent() spent so far. Exceeding it aborts the run. */
+/** This run's spending limit in USD and what llm() and delegates spent so far. Exceeding it aborts the run. */
 declare const budget: { readonly limit: number; readonly spent: number };
 
 /** Saved workflows, called with their input. They share this run's budget. */

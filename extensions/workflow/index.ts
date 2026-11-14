@@ -1,9 +1,10 @@
 // workflow: the agent writes a TypeScript script that does a task's procedure deterministically and
-// calls a model only where a judgment is needed (llm() for one request, agent() for a child agent
+// calls a model only where a judgment is needed (llm() for one request, delegate() for a child agent
 // with tools), instead of doing every step itself turn by turn. The script runs in-process (see
 // compile.ts and run.ts; the API is api.d.ts) and only what it returns reaches the conversation.
-// agent() children run as t3 delegated tasks in t3, in-process elsewhere (agent.ts); every session
-// also runs the child side (child.ts), which applies a delegated child's spec.
+// delegate() is t3's delegate_task as the harness extends it (delegate-tool.ts: schema, system,
+// tools), awaited: t3 delegated tasks in t3, in-process elsewhere (delegate.ts); every session also
+// runs the child side (child.ts), which applies a delegated child's spec.
 //
 // Saved workflows (library.ts) become tools of their own: `<harness>/workflows/*.ts` and
 // `<repository>/.pi/workflows/*.ts`. They are read on every run, so a workflow the agent saves is
@@ -25,6 +26,7 @@ import { type TSchema, Type } from "typebox";
 import { applyToolSwitches, EXPERIMENTS_DIR, listExperiments, recordedArms, toolSwitches } from "../lib/experiments.ts";
 import { HARNESS_ROOT } from "../lib/repository.ts";
 import { delegatedChild } from "./child.ts";
+import { extendDelegateTool } from "./delegate-tool.ts";
 import { delegationsDir, sweepDelegations } from "./delegation.ts";
 import { sweepRuns } from "./journal.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
@@ -43,7 +45,7 @@ export interface WorkflowExtensionOptions {
 	workflowDirs?: (cwd: string) => string[];
 	/** Default: the agent dir's models and credentials, loaded once per process. */
 	modelRuntime?: () => Promise<ModelRuntime>;
-	/** Where agent() specs, child states and run journals live; default Pi's agent dir. */
+	/** Where delegation specs, child states and run journals live; default Pi's agent dir. */
 	agentDir?: string;
 	/** The dashboard's base URL for live views; default http://127.0.0.1:4317. */
 	dashboardUrl?: string;
@@ -102,6 +104,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			llmCache,
 			executeTool: execute,
 			toolNames,
+			...(ctx.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 			sessionId,
 			library: () => library,
 			sessionDir: parentSessionFile ? session.getSessionDir() : undefined,
@@ -139,7 +142,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			"Globals:",
 			API,
 		].join("\n\n"),
-		promptSnippet: "Run a TypeScript workflow script: deterministic code with llm() and agent() calls only where judgment is needed",
+		promptSnippet: "Run a TypeScript workflow script: deterministic code with llm() and delegate() calls only where judgment is needed",
 		promptGuidelines: [
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
@@ -150,7 +153,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		parameters: Type.Object({
 			code: Type.Optional(Type.String({ description: "TypeScript: the body of an async function using the globals above. With budget, or with resume: the run's changed code." })),
 			budget: Type.Optional(
-				Type.Number({ exclusiveMinimum: 0, description: "Spending limit of this run in USD for llm() and agent(); the run stops when it is used up. Small llm() calls cost fractions of a cent, an agent run cents to dollars. With resume: a new limit for the whole run." }),
+				Type.Number({ exclusiveMinimum: 0, description: "Spending limit of this run in USD for llm() and delegate(); the run stops when it is used up. Small llm() calls cost fractions of a cent, a delegate run cents to dollars. With resume: a new limit for the whole run." }),
 			),
 			resume: Type.Optional(Type.String({ description: "The id of a run that was interrupted or stopped: continue it from its journal; calls it recorded are not repeated. With code, any ended run." })),
 			inFlight: Type.Optional(
@@ -237,6 +240,8 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	});
 	// Registered after the switches above: a delegated child's tools replace them.
 	const child = delegatedChild(pi, delegationsDir(agentDir));
+	// t3's delegate_task with the harness's schema, system and tools, for the model as for delegate().
+	extendDelegateTool(pi, delegationsDir(agentDir), (ctx) => child.spec(ctx));
 	// A workflow saved during a turn is callable from the next turn (not in a delegated child, whose tools are fixed).
 	pi.on("turn_end", (_event, ctx) => {
 		if (child.active(ctx)) return;

@@ -1,17 +1,20 @@
-// The child side of agent() (see delegation.ts for the protocol): in a session whose first user
-// message carries a delegation marker whose spec exists, this
+// The child side of a harness delegation (see delegation.ts for the protocol): in a session whose
+// user messages carry a first-run delegation marker whose spec exists (the latest one counts: a
+// forked child carries its source's too), this
 // - replaces the base prompt with the spec's system prompt and makes its tools the active set
-//   (activating inactive ones); a tool name the session does not have fails the run before any
-//   request;
+//   (activating inactive ones), each only when the spec has it; a tool name the session does not
+//   have fails the run before any request;
 // - with a schema, offers `submit_result`, whose parameters are the schema, so Pi validates the
 //   result like any tool call and a wrong shape goes back to the child as an error; a run may not
 //   settle without a submitted result: `agent_before_settle` sends a reminder and continues, at most
-//   MAX_REMINDERS times, then the run fails. Each run needs its own result;
+//   MAX_REMINDERS times, then the run fails. Each run needs its own result. The run's final message
+//   ends with the result as JSON (RESULT_HEADING), so it reaches whoever reads the task's result
+//   (t3's summary, the parent's wake message);
 // - reports its state (session, cost, the run's text, result or error) to the parent.
 //
 // The workflow extension wires this into every harness session (a t3 delegated child is one), and
-// agent() into its in-process children. Everything is derived from the session and the state file,
-// so it survives a harness reload and a restart of the child's Pi.
+// delegate() into its in-process children. Everything is derived from the session and the state
+// file, so it survives a harness reload and a restart of the child's Pi.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
@@ -19,6 +22,8 @@ import { TOOL_GUIDELINES_SECTION, toolGuidelinesSection } from "../prompt/index.
 import { type DelegationSpec, type DelegationState, parseMarker, readSpec, readState, SUBMIT_TOOL, writeState } from "./delegation.ts";
 
 export const REMINDER_TYPE = "delegation-result";
+/** Starts the result a run's final message ends with; the run's text is what comes before it. */
+export const RESULT_HEADING = `\n\nResult (${SUBMIT_TOOL}):\n\`\`\`json\n`;
 /** A run's error when it was stopped (cancelled) before it finished. */
 export const RUN_STOPPED = "the run was stopped";
 /** Reminders to submit the result before a run without one fails. */
@@ -40,8 +45,10 @@ export const reminderText = (attempt: number) =>
 	`This run's result is missing: call ${SUBMIT_TOOL} with an object matching its parameters, then finish with a brief summary. (Reminder ${attempt} of ${MAX_REMINDERS}; without a result the run fails.)`;
 
 export interface DelegatedChild {
-	/** Whether the session is a delegated child: its tools are the spec's, nothing else may switch them. */
+	/** Whether the session is a delegated child with its own tools: nothing else may switch them. */
 	active(ctx: ExtensionContext): boolean;
+	/** The session's delegation spec, if it is a delegated child. */
+	spec(ctx: ExtensionContext): DelegationSpec | undefined;
 }
 
 export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
@@ -51,27 +58,40 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 	const userTexts = (ctx: ExtensionContext) =>
 		ctx.sessionManager.getEntries().flatMap((entry) => (entry.type === "message" && entry.message.role === "user" ? [textOf(entry.message.content)] : []));
 
-	/** The session's child, read from its first user message (or the prompt about to become it). */
+	/** A first-run marker whose spec exists: the start of a delegation. */
+	const delegationStart = (text: string) => {
+		const marker = parseMarker(text);
+		return marker?.run === 1 ? readSpec(dir, marker.id) : undefined;
+	};
+
+	/** The session's child: its latest first-run marker in the user messages (and the prompt about to become one). */
 	const resolve = (ctx: ExtensionContext, prompt?: string): Child | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const known = children.get(sessionId);
-		if (known !== undefined) return known ?? undefined;
-		const texts = userTexts(ctx);
-		const first = texts[0] ?? prompt;
-		if (first === undefined) return undefined;
-		const marker = parseMarker(first);
-		const spec = marker && readSpec(dir, marker.id);
-		if (!spec) {
+		const promptSpec = prompt === undefined ? undefined : delegationStart(prompt);
+		// A new delegation (a fork's first message) replaces the one the session knew.
+		if (known !== undefined && !(promptSpec && promptSpec.id !== known?.spec.id)) return known ?? undefined;
+		const entries = ctx.sessionManager.getEntries();
+		const texts = [...entries.flatMap((entry, at) => (entry.type === "message" && entry.message.role === "user" ? [{ text: textOf(entry.message.content), at }] : [])), ...(prompt === undefined ? [] : [{ text: prompt, at: entries.length }])];
+		if (texts.length === 0) return undefined;
+		let start: { spec: DelegationSpec; at: number } | undefined;
+		for (const { text, at } of texts) {
+			const spec = delegationStart(text);
+			if (spec) start = { spec, at };
+		}
+		if (!start) {
 			children.set(sessionId, null);
 			return undefined;
 		}
+		const { spec } = start;
 		let run = 1;
-		for (const text of texts) {
+		for (const { text, at } of texts) {
 			const m = parseMarker(text);
-			if (m?.id === spec.id) run = m.run;
+			if (at >= start.at && m?.id === spec.id) run = m.run;
 		}
+		// A fork's copied messages are its source's cost.
 		let cost = 0;
-		for (const entry of ctx.sessionManager.getEntries()) {
+		for (const entry of entries.slice(start.at)) {
 			if (entry.type === "message" && entry.message.role === "assistant") cost += entry.message.usage.cost.total;
 		}
 		const saved = readState(dir, spec.id);
@@ -90,7 +110,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			name: SUBMIT_TOOL,
 			label: "Submit result",
 			description: "Submit this run's result: an object matching these parameters. A later call in the same run replaces it. After submitting, finish with a brief summary.",
-			// SAFETY: Pi validates arguments against any JSON Schema (pi-schema); agent() checked it is an object schema.
+			// SAFETY: Pi validates arguments against any JSON Schema (pi-schema); prepareDelegation checked it is an object schema.
 			parameters: child.spec.schema as unknown as TSchema,
 			defaultActive: false,
 			async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -128,7 +148,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 
 		const options = event.systemPromptOptions;
 		const available = new Set(pi.getAllTools().map((tool) => tool.name));
-		const unknown = child.spec.tools.filter((name) => !available.has(name));
+		const unknown = (child.spec.tools ?? []).filter((name) => !available.has(name));
 		if (unknown.length) {
 			child.state = { ...child.state, done: true, error: `unknown tool${unknown.length === 1 ? "" : "s"} ${unknown.join(", ")}; this session has ${[...available].sort().join(", ")}` };
 			save(child);
@@ -136,8 +156,8 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			return;
 		}
 		registerSubmit(child);
-		const tools = [...child.spec.tools, ...(child.spec.schema ? [SUBMIT_TOOL] : [])];
-		options.customPrompt = child.spec.system;
+		const tools = [...(child.spec.tools ?? options.selectedTools.filter((name) => name !== SUBMIT_TOOL)), ...(child.spec.schema ? [SUBMIT_TOOL] : [])];
+		if (child.spec.system !== undefined) options.customPrompt = child.spec.system;
 		options.selectedTools = tools;
 		pi.setActiveTools(tools);
 		// The prompt extension rendered the guidelines of the tools it saw; render them for these.
@@ -157,6 +177,11 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 		// A child resolved just now counted the session's messages already.
 		if (!fresh) child.state = { ...child.state, cost: child.state.cost + event.message.usage.cost.total };
 		save(child);
+		// The run's final message (no tool calls) after a submitted result carries the result.
+		const message = event.message;
+		if (!child.state.submitted || message.stopReason !== "stop" || message.content.some((block) => block.type === "toolCall")) return;
+		const text = `${RESULT_HEADING}${JSON.stringify(child.state.result, null, 2)}\n\`\`\``;
+		return { message: { ...message, content: [...message.content, { type: "text", text }] } };
 	});
 
 	pi.on("agent_before_settle", (event, ctx) => {
@@ -178,10 +203,12 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 		if (!error && event.aborted) error = RUN_STOPPED;
 		else if (!error && message?.stopReason === "error") error = `the request failed: ${message.errorMessage ?? "unknown error"}`;
 		else if (!error && child.spec.schema && !child.state.submitted) error = `it finished without calling ${SUBMIT_TOOL} (reminded ${MAX_REMINDERS} times)`;
-		child.state = { ...child.state, done: true, text: message ? textOf(message.content) : "" };
+		const text = message ? textOf(message.content) : "";
+		const cut = text.indexOf(RESULT_HEADING.trimStart());
+		child.state = { ...child.state, done: true, text: (cut < 0 ? text : text.slice(0, cut)).trimEnd() };
 		if (error) child.state.error = error;
 		save(child);
 	});
 
-	return { active: (ctx) => resolve(ctx) !== undefined };
+	return { active: (ctx) => resolve(ctx)?.spec.tools !== undefined, spec: (ctx) => resolve(ctx)?.spec };
 }

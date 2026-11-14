@@ -1,6 +1,6 @@
 // The workflow runtime against real git repositories, real child sessions and a faux model: the
 // script API (api.d.ts), its errors, llm() with schemas, retries and the cache, budgets, abort,
-// in-process agents (also in parallel), saved workflows and the fix_loop workflow. agent() through
+// in-process delegates (also in parallel), saved workflows and the fix_loop workflow. delegate() through
 // t3 and the child side of the delegation protocol: test/delegation.test.ts.
 
 import assert from "node:assert/strict";
@@ -80,7 +80,7 @@ describe("scripts", () => {
 		const text = await run("const n: number = await Promise.resolve(2);\ninterface X { a: string }\nreturn `n=${n as number}`;");
 		assert.equal(text.details.status, "completed");
 		assert.equal(text.details.ok, true);
-		assert.match(text.text, /^Workflow completed · [\d.]+ s · \$0\.0000 of \$1\.00 · 0 llm calls · 0 agent runs · run \d{8}-\d{6}-[0-9a-f]{6}\n\nn=2$/);
+		assert.match(text.text, /^Workflow completed · [\d.]+ s · \$0\.0000 of \$1\.00 · 0 llm calls · 0 delegate runs · run \d{8}-\d{6}-[0-9a-f]{6}\n\nn=2$/);
 		assert.match(text.details.journal, new RegExp(`/agent/workflows/${text.details.id}/journal\\.jsonl$`));
 		const data = await run('return { ok: false, items: ["a", "b"], diff: "line 1\\nline 2" };');
 		assert.equal(data.details.status, "completed");
@@ -271,7 +271,7 @@ describe("llm()", () => {
 	});
 });
 
-describe("agent()", () => {
+describe("delegate()", () => {
 	test("a child session per agent, linked to the parent; runs continue one conversation; cost and runs counted", async () => {
 		const contexts: string[] = [];
 		respond(
@@ -285,11 +285,11 @@ describe("agent()", () => {
 			},
 		);
 		const { text, details } = await run(
-			"const a = agent({ model: 'faux/faux-1', system: 'You are a careful reviewer.', tools: ['read'] });\nconst one = await a.run('Look at README.md');\nconst two = await a.run('And again');\nreturn [one.text, two.text, typeof a.cost].join(' | ');",
+			"const a = delegate({ target: { model: 'faux/faux-1' }, system: 'You are a careful reviewer.', tools: ['read'] });\nconst one = await a.run('Look at README.md');\nconst two = await a.run('And again');\nreturn [one.text, two.text, typeof a.cost].join(' | ');",
 		);
 		assert.equal(details.status, "completed", details.error);
 		assert.equal(text.split("\n\n").at(-1), "first answer | second answer | number");
-		assert.equal(details.agentRuns, 2);
+		assert.equal(details.delegateRuns, 2);
 		assert.equal(details.childSessions.length, 1);
 		assert.match(contexts[0]!, /You are a careful reviewer\./);
 		assert.match(contexts[1]!, /Look at README\.md.*first answer.*And again/, "the second run continues the conversation");
@@ -298,7 +298,7 @@ describe("agent()", () => {
 		assert.equal(header.parentSession, env().parentSessionFile);
 	});
 
-	test("files are told to the agent, not enforced; each run returns the files changed meanwhile and its cost", async () => {
+	test("each run returns the files changed meanwhile and its cost", async () => {
 		writeFileSync(join(repo, "README.md"), "user's uncommitted edit\n");
 		let first = "";
 		respond(
@@ -311,20 +311,20 @@ describe("agent()", () => {
 			say("nothing to do"),
 		);
 		const { text, details } = await run(
-			"const a = agent({ model: 'faux/faux-1', files: ['src'] });\nconst r = await a.run('fix it');\nconst again = await a.run('anything else?');\nreturn JSON.stringify({ r, again, total: a.cost });",
+			"const a = delegate({ target: { model: 'faux/faux-1' } });\nconst r = await a.run('fix src: change only src');\nconst again = await a.run('anything else?');\nreturn JSON.stringify({ r, again, total: a.cost });",
 			1,
 			{ runtime: priced(runtime, 0.01) },
 		);
 		assert.equal(details.status, "completed", details.error);
 		const { r, again, total } = JSON.parse(text.split("\n\n").at(-1)!);
-		assert.match(first, /Change only these files: src\./);
+		assert.match(first, /fix src: change only src/);
 		assert.equal(r.text, "done");
 		assert.deepEqual(r.changed, ["new.txt", "src/calc.mjs"]);
 		assert.deepEqual(again.changed, [], "the second run changed nothing");
 		assert.equal(r.result, undefined, "no schema, no result");
 		assert.ok(Math.abs(r.cost - 0.03) < 1e-9, `three responses: ${r.cost}`);
 		assert.ok(Math.abs(again.cost - 0.01) < 1e-9, `one response: ${again.cost}`);
-		assert.ok(Math.abs(total - 0.04) < 1e-9, "agent().cost sums the runs");
+		assert.ok(Math.abs(total - 0.04) < 1e-9, "the handle's cost sums the runs");
 		assert.ok(Math.abs(details.cost - 0.04) < 1e-9, "the runs' cost counts against the budget");
 		assert.equal(r.sessionId, details.childSessions[0]);
 		assert.equal(r.threadId, undefined, "no t3 thread in-process");
@@ -342,7 +342,7 @@ describe("agent()", () => {
 		// Each agent writes its own file with bash (not refused, only checked afterwards), slowly.
 		const step = async (context: unknown) => {
 			const text = seen(context);
-			const own = /Change only these files: (\w)\.txt/.exec(text)![1]!;
+			const own = /change only (\w)\.txt/.exec(text)![1]!;
 			if (text.includes('"role":"toolResult"')) return say(`${own} done`);
 			active++;
 			peak = Math.max(peak, active);
@@ -352,7 +352,7 @@ describe("agent()", () => {
 		};
 		respond(step, step, step, step);
 		const { text, details } = await run(
-			"const out = await map(['a', 'b'], async (f) => (await agent({ model: 'faux/faux-1', files: [`${f}.txt`] }).run('change your file')), { concurrency: 2 });\nreturn JSON.stringify(out);",
+			"const out = await map(['a', 'b'], async (f) => (await delegate({ target: { model: 'faux/faux-1' } }).run(`change only ${f}.txt`)), { concurrency: 2 });\nreturn JSON.stringify(out);",
 		);
 		assert.equal(details.status, "completed", details.error);
 		const out = JSON.parse(text.split("\n\n").at(-1)!) as { text: string; changed: string[] }[];
@@ -364,23 +364,25 @@ describe("agent()", () => {
 		assert.equal(details.childSessions.length, 2);
 	});
 
-	test("invalid options fail at agent(); outside a repository nothing is reported as changed; abort stops a running agent", async () => {
+	test("invalid parameters fail at delegate(); outside a repository nothing is reported as changed; abort stops a running agent", async () => {
 		for (const [code, error] of [
-			["agent({ files: [] })", /files must be a non-empty array/],
-			["agent({ tools: 'read' })", /tools must be a non-empty array/],
-			["agent({ model: 'faux/none' })", /unknown model faux\/none/],
-			["agent({ colour: 1 })", /unknown option colour/],
-			["agent({ system: ' ' })", /system must be a non-empty string/],
-			["agent({ schema: { type: 'array' } })", /schema must be a JSON Schema of an object/],
-			["agent(5)", /options must be an object/],
-			["await agent({ model: 'faux/faux-1' }).run('')", /message must be a non-empty string/],
+			["delegate({ files: ['x'] })", /unknown parameter files/],
+			["delegate({ tools: 'read' })", /tools must be a non-empty array/],
+			["delegate({ fork: true, system: 'x' })", /fork takes the source thread's provider, model, options, system prompt and tools: drop system/],
+			["delegate({ forkThreadId: 't' })", /forkThreadId needs fork: true/],
+			["delegate({ target: { model: 'faux/none' } })", /unknown model faux\/none/],
+			["delegate({ colour: 1 })", /unknown parameter colour/],
+			["delegate({ system: ' ' })", /system must be a non-empty string/],
+			["delegate({ schema: { type: 'array' } })", /schema must be a JSON Schema of an object/],
+			["delegate(5)", /params must be an object/],
+			["await delegate({ target: { model: 'faux/faux-1' } }).run('')", /must be a non-empty string/],
 		] as const) {
 			const { details } = await run(code);
 			assert.match(details.error!, error, code);
 		}
 		const outside = mkdtempSync(join(tmpdir(), "no-git-"));
 		respond(tool("bash", { command: "echo x > made.txt" }), say("made"));
-		const noGit = await run("return JSON.stringify(await agent({ model: 'faux/faux-1', files: ['x'] }).run('make it'));", 1, { cwd: outside, sessionDir: undefined });
+		const noGit = await run("return JSON.stringify(await delegate({ target: { model: 'faux/faux-1' } }).run('make it'));", 1, { cwd: outside, sessionDir: undefined });
 		assert.equal(noGit.details.status, "completed", noGit.details.error);
 		assert.deepEqual(JSON.parse(noGit.text.split("\n\n").at(-1)!).changed, []);
 		rmSync(outside, { recursive: true, force: true });
@@ -389,7 +391,7 @@ describe("agent()", () => {
 		respond(tool("bash", { command: "sleep 10" }), say("never"));
 		setTimeout(() => controller.abort(), 300);
 		const started = Date.now();
-		const aborted = await run("await agent({ model: 'faux/faux-1', files: ['src'] }).run('wait');", 1, { signal: controller.signal });
+		const aborted = await run("await delegate({ target: { model: 'faux/faux-1' } }).run('wait');", 1, { signal: controller.signal });
 		assert.ok(Date.now() - started < 8000);
 		assert.equal(aborted.details.status, "aborted");
 	});
@@ -405,7 +407,7 @@ describe("prompt cache retention", () => {
 		else process.env.PI_CACHE_RETENTION = previous;
 	});
 
-	test("llm() and agent() requests use the 5-minute cache even when Pi was started with PI_CACHE_RETENTION=long", async () => {
+	test("llm() and delegate() requests use the 5-minute cache even when Pi was started with PI_CACHE_RETENTION=long", async () => {
 		const retention: unknown[] = [];
 		const record = (text: string): FauxResponseStep => (_context, options) => {
 			retention.push(options?.cacheRetention);
@@ -413,10 +415,10 @@ describe("prompt cache retention", () => {
 		};
 		respond(record("plain"), record("first"), record("second"));
 		const { details } = await run(
-			"await llm('hi', { model: 'faux/faux-1', cache: false });\nconst a = agent({ model: 'faux/faux-1', tools: ['read'] });\nawait a.run('one');\nawait a.run('two');\nreturn 'ok';",
+			"await llm('hi', { model: 'faux/faux-1', cache: false });\nconst a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });\nawait a.run('one');\nawait a.run('two');\nreturn 'ok';",
 		);
 		assert.equal(details.status, "completed", details.error);
-		assert.deepEqual(retention, ["short", "short", "short"], "one llm() request and both agent() runs");
+		assert.deepEqual(retention, ["short", "short", "short"], "one llm() request and both delegate runs");
 	});
 });
 

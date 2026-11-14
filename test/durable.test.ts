@@ -184,20 +184,20 @@ describe("replay", () => {
 		const entries: JournalEntry[] = [
 			start("llm", { p: 1 }),
 			start("changes", {}),
-			start("agent", { message: "m" }),
-			{ t: "meta", key: `agent:${argsHash({ message: "m" })}#1`, at, data: { threadId: "thread-9" } },
+			start("delegate", { message: "m" }),
+			{ t: "meta", key: `delegate:${argsHash({ message: "m" })}#1`, at, data: { threadId: "thread-9" } },
 			start("shell", { command: "deploy" }),
 			start("tool", { name: "write" }),
 			start("shell", { command: "build" }, { idempotent: true }),
 		];
-		assert.deepEqual(inFlightCalls(entries).map((c) => c.kind), ["llm", "changes", "agent", "shell", "tool", "shell"]);
+		assert.deepEqual(inFlightCalls(entries).map((c) => c.kind), ["llm", "changes", "delegate", "shell", "tool", "shell"]);
 		assert.deepEqual(blockingCalls(entries).map((c) => c.label), ["shell call", "tool call"]);
 
 		const stop = durable(entries);
 		assert.equal(await stop.d.call(spec("llm", { p: 1 }), value("again")), "again");
 		assert.deepEqual(await stop.d.call(spec("changes", {}), value({ files: [] })), { files: [] });
 		let reattached: Record<string, unknown> | undefined;
-		assert.equal(await stop.d.call(spec("agent", { message: "m" }), never, async (call) => ((reattached = call.recorded), { value: "reattached" })), "reattached");
+		assert.equal(await stop.d.call(spec("delegate", { message: "m" }), never, async (call) => ((reattached = call.recorded), { value: "reattached" })), "reattached");
 		assert.deepEqual(reattached, { threadId: "thread-9" });
 		await assert.rejects(stop.d.call(spec("shell", { command: "deploy" }), never), /in flight when the run stopped/);
 		await assert.rejects(stop.d.call(spec("tool", { name: "write" }), never), /in flight/);
@@ -331,31 +331,31 @@ describe("edited code", () => {
 		await assert.rejects(strict.d.call(spec("shell", { c: "x" }), never), (error: Error) => error instanceof DivergenceError && /If you changed the script on purpose, resume with code/.test(error.message));
 	});
 
-	test("agent runs in flight: the same call adopts work this process still runs; unused ones are cancelled, or named to cancel elsewhere", async () => {
-		const agentStart = (message: string): JournalEntry => ({ t: "start", key: key("agent", { message }), kind: "agent", label: `agent ${message}`, at: 1 });
+	test("delegate runs in flight: the same call adopts work this process still runs; unused ones are cancelled, or named to cancel elsewhere", async () => {
+		const agentStart = (message: string): JournalEntry => ({ t: "start", key: key("delegate", { message }), kind: "delegate", label: `agent ${message}`, at: 1 });
 		const entries: JournalEntry[] = [
 			agentStart("kept"),
 			agentStart("lingering"),
 			agentStart("elsewhere"),
-			{ t: "meta", key: key("agent", { message: "elsewhere" }), at: 1, data: { taskId: "task-9" } },
+			{ t: "meta", key: key("delegate", { message: "elsewhere" }), at: 1, data: { taskId: "task-9" } },
 		];
 		let finish!: (settled: Settled) => void;
 		const cancelled: unknown[] = [];
-		const work = (settled: Promise<Settled>): Work => ({ kind: "agent", settled, cancel: (reason) => cancelled.push(reason) });
+		const work = (settled: Promise<Settled>): Work => ({ kind: "delegate", settled, cancel: (reason) => cancelled.push(reason) });
 		const inherited = new Map([
-			[key("agent", { message: "kept" }), work(new Promise((r) => (finish = r)))],
-			[key("agent", { message: "lingering" }), work(new Promise(() => undefined))],
+			[key("delegate", { message: "kept" }), work(new Promise((r) => (finish = r)))],
+			[key("delegate", { message: "lingering" }), work(new Promise(() => undefined))],
 		]);
 		const edited = durable(entries, "stop", { edit: true, inherited });
-		const adopted = edited.d.call(spec("agent", { message: "kept" }), never, never);
+		const adopted = edited.d.call(spec("delegate", { message: "kept" }), never, never);
 		await sleep(20);
 		finish({ outcome: "done", value: { text: "kept done" }, cost: 0.5 });
 		assert.deepEqual(await adopted, { text: "kept done" }, "the adopted work's outcome, no reattach");
-		assert.deepEqual(edited.replayed, ["agent"]);
-		assert.equal(await edited.d.call(spec("agent", { message: "changed" }), value("new agent")), "new agent");
+		assert.deepEqual(edited.replayed, ["delegate"]);
+		assert.equal(await edited.d.call(spec("delegate", { message: "changed" }), value("new agent")), "new agent");
 		assert.equal(cancelled.length, 1, "the unused lingering work was cancelled");
 		assert.match(String(cancelled[0]), /edited code does not use this call/);
-		assert.deepEqual(edited.dropped, [{ key: key("agent", { message: "elsewhere" }), meta: { taskId: "task-9" } }], "the one not running here is named with its task");
+		assert.deepEqual(edited.dropped, [{ key: key("delegate", { message: "elsewhere" }), meta: { taskId: "task-9" } }], "the one not running here is named with its task");
 		assert.equal(edited.d.unsettled().size, 0);
 	});
 });
@@ -522,14 +522,14 @@ describe("resume", () => {
 		let childRequests = 0;
 		faux.setResponses(Array.from({ length: 5 }, () => async () => (childRequests++, await gate, fauxAssistantMessage("in-process child done"))));
 		let id = "";
-		const code = "await shell('echo s >> s');\nconst run = await agent({ model: 'faux/faux-1', tools: ['read'] }).run('work');\nreturn 'agent: ' + run.text;";
+		const code = "await shell('echo s >> s');\nconst run = await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('work');\nreturn 'agent: ' + run.text;";
 		const running = runWorkflow({ source: code, filename: INLINE_FILE, inline: true }, 1, env({ onStart: (r) => (id = r.id) }));
 		while (childRequests === 0) await sleep(20);
 		writeFileSync(join(runDir(join(dir, "agent"), id), STOP_FILE), JSON.stringify({ children: false }));
 		const stopped = await running;
 		assert.equal(stopped.details.status, "stopped");
-		assert.equal(stopped.details.lingeringAgents, 1);
-		assert.match(stopped.text, /1 agent run keeps running/);
+		assert.equal(stopped.details.lingeringDelegates, 1);
+		assert.match(stopped.text, /1 delegate run keeps running/);
 		assert.equal(lockHeld(join(dir, "agent"), id), true);
 		const resumed = resumeWorkflow({ id }, env());
 		await sleep(100);
@@ -539,9 +539,9 @@ describe("resume", () => {
 		assert.deepEqual([count("s"), childRequests], [1, 1], "nothing ran twice");
 		assert.equal(lockHeld(join(dir, "agent"), id), false);
 		const journal = readJournal(done.details.journal);
-		const agentDone = journal.findIndex((e) => e.t === "done" && e.key.startsWith("agent:"));
+		const agentDone = journal.findIndex((e) => e.t === "done" && e.key.startsWith("delegate:"));
 		assert.ok(agentDone > journal.findIndex((e) => e.t === "attempt" && e.n === 2), "the lingering work recorded its outcome during the resume");
-		assert.equal(journal.filter((e) => e.t === "start" && e.key.startsWith("agent:")).length, 1, "adopted, not started again");
+		assert.equal(journal.filter((e) => e.t === "start" && e.key.startsWith("delegate:")).length, 1, "adopted, not started again");
 	});
 
 	test("nested workflows: a replayed one makes none of its calls; equal calls outside keep their occurrence", async () => {
@@ -596,8 +596,8 @@ const JOURNAL: JournalEntry[] = [
 	{ t: "done", key: "shell:aaa#1", at: 1_004_100, value: { exitCode: 0 } },
 	{ t: "start", key: "llm:bbb#1", kind: "llm", label: "Classify <a> & \"b\"", model: "anthropic/claude-haiku-5-5", at: 1_004_200 },
 	{ t: "start", key: "llm:ccc#1", kind: "llm", label: "Classify c", model: "anthropic/claude-haiku-5-5", at: 1_004_210 },
-	{ t: "start", key: "agent:ddd#1", kind: "agent", label: "agent 1: Review the diff", model: "anthropic/claude-sonnet-5-5", at: 1_004_300 },
-	{ t: "meta", key: "agent:ddd#1", at: 1_005_000, data: { threadId: "thread-1", link: "[workflow agent 1](t3-thread://v2/env/thread-1)" } },
+	{ t: "start", key: "delegate:ddd#1", kind: "delegate", label: "#1: Review the diff", model: "anthropic/claude-sonnet-5-5", at: 1_004_300 },
+	{ t: "meta", key: "delegate:ddd#1", at: 1_005_000, data: { threadId: "thread-1", link: "[workflow agent 1](t3-thread://v2/env/thread-1)" } },
 	{ t: "done", key: "llm:ccc#1", at: 1_005_210, value: "c", cost: 0.0021 },
 	{ t: "failed", key: "llm:bbb#1", at: 1_006_200, error: { name: "Error", message: "llm(): overloaded" }, cost: 0.001 },
 	{ t: "start", key: "tool:eee#1", kind: "tool", label: "write {\"path\":\"a\"}", at: 1_006_300 },
@@ -610,7 +610,7 @@ describe("the page", () => {
 			["shell", "done", 0],
 			["llm", "failed", 0.001],
 			["llm", "done", 0.0021],
-			["agent", "running", 0],
+			["delegate", "running", 0],
 			["tool", "running", 0],
 		]);
 		assert.equal(view.calls[3]!.link, "t3-thread://v2/env/thread-1");
@@ -622,7 +622,7 @@ describe("the page", () => {
 
 	test("calls overlapping in time are lanes side by side; groups follow each other", () => {
 		const groups = layout(viewOf(JOURNAL).calls);
-		assert.deepEqual(groups.map((lanes) => lanes.map((lane) => lane.map((c) => c.key))), [[["shell:aaa#1"]], [["llm:bbb#1", "tool:eee#1"], ["llm:ccc#1"], ["agent:ddd#1"]]]);
+		assert.deepEqual(groups.map((lanes) => lanes.map((lane) => lane.map((c) => c.key))), [[["shell:aaa#1"]], [["llm:bbb#1", "tool:eee#1"], ["llm:ccc#1"], ["delegate:ddd#1"]]]);
 	});
 
 	test("the same journal gives byte-identical HTML that matches the snapshot; only theme variables, no vh, no page background", () => {

@@ -1,5 +1,5 @@
-// agent() children through t3 and the delegation protocol (extensions/workflow/delegation.ts,
-// child.ts, t3.ts): unit tests of the spec, marker, state and cleanup, then real Pi sessions with a
+// delegate() children and t3's delegate_task as the harness extends it, through the delegation
+// protocol (extensions/workflow/delegation.ts, delegate-tool.ts, child.ts, t3.ts): unit tests of the spec, marker, state and cleanup, then real Pi sessions with a
 // faux model. A parent session runs the workflow extension and a fake t3 tool set whose
 // delegate_task, t3_thread_send and t3_thread_wait run child Pi sessions in-process with the task,
 // so the child side of the workflow extension runs for real, as in a t3 child.
@@ -14,10 +14,13 @@ import type { AssistantMessage, Context, JsonObject } from "@earendil-works/pi-a
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { MAX_REMINDERS, REMINDER_TYPE } from "../extensions/workflow/child.ts";
+import { MAX_REMINDERS, REMINDER_TYPE, RESULT_HEADING } from "../extensions/workflow/child.ts";
 import {
+	BRIEF,
 	type DelegationSpec,
+	delegateProblem,
 	delegationMessage,
+	prepareDelegation,
 	delegationsDir,
 	parseMarker,
 	readSpec,
@@ -36,7 +39,8 @@ import { renderWorkflow, viewOf } from "../extensions/workflow/render.ts";
 import { INLINE_FILE, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
 import { lockHeld } from "../extensions/workflow/stop.ts";
 import { livePage } from "../dashboard/server/workflows.ts";
-import { nearestThinking, T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
+import { T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
+import { parseCompact } from "../extensions/workflow/delegate.ts";
 import { priced } from "./priced.ts";
 
 let dir: string;
@@ -46,16 +50,45 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const sweepRoot = () => mkdtempSync(join(dir, "sweep-"));
-const SPEC: DelegationSpec = { id: "0b1c2d3e-aaaa-4bbb-8ccc-123456789abc", system: "x".repeat(1234), tools: ["read", "bash"], schema: { type: "object" }, files: ["src", "README.md"], callerSessionId: "parent-1" };
+const SPEC: DelegationSpec = { id: "0b1c2d3e-aaaa-4bbb-8ccc-123456789abc", system: "x".repeat(1234), tools: ["read", "bash"], schema: { type: "object" }, callerSessionId: "parent-1" };
 
 describe("spec, marker and state", () => {
-	test("the first message: marker, readable summary, files, then the message; later runs: marker with the run", () => {
+	test("the first message: marker, readable summary, brief, then the message; later runs: marker with the run", () => {
 		assert.equal(
 			delegationMessage(SPEC, 1, "Do it."),
-			`harness-delegation: ${SPEC.id}\nStarted by a workflow script's agent(): system prompt (1.2k chars); tools: read, bash; returns its result with submit_result (a JSON Schema).\nChange only these files: src, README.md.\n\nDo it.`,
+			`harness-delegation: ${SPEC.id}\nDelegated by the harness: system prompt (1.2k chars); tools: read, bash; returns its result with submit_result (a JSON Schema). ${BRIEF}\n\nDo it.`,
 		);
+		assert.match(BRIEF, /ask with ask_user and options \(continue \/ replan \/ stop\) rather than guess/);
 		assert.equal(delegationMessage(SPEC, 3, "Again."), `harness-delegation: ${SPEC.id} run 3\n\nAgain.`);
-		assert.equal(specSummary({ id: "a", system: "short", tools: ["read"] }), "Started by a workflow script's agent(): system prompt (5 chars); tools: read.");
+		assert.equal(specSummary({ id: "a", system: "short", tools: ["read"] }), "Delegated by the harness: system prompt (5 chars); tools: read.");
+		assert.equal(specSummary({ id: "a" }), "Delegated by the harness.");
+	});
+
+	test("delegate_task arguments: the harness's keys become a spec; fork goes with none of target, system and tools", () => {
+		const plain = { task: "t", title: "x" };
+		assert.equal(prepareDelegation(plain, dir).input, plain, "t3's alone: untouched, no spec");
+		const { input, spec } = prepareDelegation({ task: "Judge it", title: "x", schema: { type: "object" }, system: " Be brief. ", tools: ["read"] }, dir, { callerSessionId: "p" });
+		assert.deepEqual(Object.keys(input).sort(), ["task", "title"]);
+		assert.deepEqual(readSpec(dir, spec!.id), { id: spec!.id, system: "Be brief.", tools: ["read"], schema: { type: "object" }, callerSessionId: "p" });
+		assert.equal(input.task, delegationMessage(spec!, 1, "Judge it"));
+		assert.equal(prepareDelegation(input, dir).input, input, "prepared already: untouched");
+		const fork = prepareDelegation({ task: "go", fork: true, forkThreadId: "th-1" }, dir, { inherit: { id: "src", system: "S", tools: ["read"] } });
+		assert.deepEqual({ ...fork.spec, id: "" }, { id: "", system: "S", tools: ["read"] }, "a fork always gets a spec, keeping its source's prompt and tools");
+		assert.deepEqual(fork.input.fork, true);
+		assert.deepEqual(fork.input.forkThreadId, "th-1");
+		for (const [args, problem] of [
+			[{ fork: true, target: { model: "m" } }, /fork takes the source thread's provider, model, options, system prompt and tools: drop target/],
+			[{ fork: true, system: "s", tools: ["read"] }, /drop system, tools/],
+			[{ forkThreadId: "x" }, /forkThreadId needs fork: true/],
+			[{ fork: "yes" }, /fork must be a boolean/],
+			[{ schema: { type: "array" } }, /schema must be a JSON Schema of an object/],
+			[{ tools: [] }, /tools must be a non-empty array/],
+			[{ system: "" }, /system must be a non-empty string/],
+		] as const) {
+			assert.match(delegateProblem(args) ?? "", problem, JSON.stringify(args));
+			assert.throws(() => prepareDelegation({ task: "t", ...args }, dir), problem);
+		}
+		assert.equal(delegateProblem({ fork: true, schema: { type: "object" }, title: "t" }), undefined, "a fork may have a schema");
 	});
 
 	test("the marker is found on any line (t3 puts a preamble first) and only in its exact form", () => {
@@ -99,13 +132,7 @@ describe("spec, marker and state", () => {
 		assert.equal(sweepDelegations(join(dir, "missing")), 0);
 	});
 
-	test("thinking maps to the closest level a t3 model offers; t3 data comes from structuredContent or JSON text", () => {
-		const sonnet = ["low", "medium", "high", "xhigh", "max"];
-		assert.equal(nearestThinking("medium", sonnet), "medium");
-		assert.equal(nearestThinking("off", sonnet), "low");
-		assert.equal(nearestThinking("minimal", sonnet), "low");
-		assert.equal(nearestThinking("minimal", ["off", "low"]), "low", "a tie goes up");
-		assert.equal(nearestThinking("high", ["custom"]), "high", "unknown levels: as asked");
+	test("t3 data comes from structuredContent or JSON text", () => {
 		assert.deepEqual(t3Data("x", { content: [], structuredContent: { a: 1 } }, ""), { a: 1 });
 		assert.deepEqual(t3Data("x", "text", '{"b":2}'), { b: 2 });
 		assert.throws(() => t3Data("delegate_task", "oops", "oops"), /t3 delegate_task returned no data: oops/);
@@ -134,6 +161,8 @@ after(() => faux.unregister());
 const say = (text: string) => fauxAssistantMessage(text);
 const call = (name: string, args: JsonObject) => fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 const textOf = (content: unknown) => (typeof content === "string" ? content : (content as { type: string; text?: string }[]).flatMap((b) => (b.type === "text" ? [b.text ?? ""] : [])).join("\n"));
+/** A child's user messages carry the marker (after a compaction only its later runs do). */
+const isChild = (context: Context) => context.messages.some((m) => m.role === "user" && textOf(m.content).includes("harness-delegation:"));
 const firstUser = (context: Context) => textOf(context.messages.find((m) => m.role === "user")?.content ?? "");
 /** The last message that is not a system message (prompt and tool updates come as system messages). */
 const lastMessage = (context: Context) => context.messages.findLast((m) => m.role !== "system")!;
@@ -196,8 +225,16 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 	const start = (threadId: string, message: string) => {
 		const thread = fx.threads.get(threadId)!;
 		const runId = `run-${++ids}`;
-		thread.runs.set(runId, thread.session.prompt(message));
+		// As t3 does: a `/compact` message is Pi's compaction, not a prompt.
+		const compact = parseCompact(message);
+		thread.runs.set(runId, compact ? thread.session.compact(compact.instructions).then(() => undefined) : thread.session.prompt(message));
 		return runId;
+	};
+	const threadOf = (taskId: unknown) => /^task-(thread-\d+)/.exec(String(taskId))?.[1];
+	/** The child's last assistant text: t3's summary of a run. */
+	const summaryOf = (threadId: string | undefined) => {
+		const last = threadId ? fx.threads.get(threadId)?.session.messages.findLast((m) => m.role === "assistant") : undefined;
+		return last ? textOf(last.content) : null;
 	};
 	return (pi: ExtensionAPI) => {
 		const tool = (name: string, run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>) =>
@@ -220,18 +257,19 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 					return { content, structuredContent: { content, structuredContent: data } as unknown as JsonObject, details: undefined };
 				},
 			});
-		tool("orchestrator_capabilities", async () => ({
-			providers: [
-				{ providerInstanceId: "codex", driverKind: "codex", canRunChildTask: false, models: [] },
-				{ providerInstanceId: "pi", driverKind: "pi", canRunChildTask: true, models: [{ id: MODEL, options: [{ id: "thinking", values: ["low", "medium", "high"] }] }] },
-			],
-		}));
 		tool("delegate_task", async (args) => {
 			const request = String(args.clientRequestId);
 			let known = fx.requests.get(request);
 			if (!known) {
 				const threadId = `thread-${++ids}`;
-				const session = await newSession([workflowExtension(childRuntime)], SessionManager.create(fx.repo, fx.sessionsDir), childRuntime);
+				let manager = SessionManager.create(fx.repo, fx.sessionsDir);
+				if (args.fork === true) {
+					// t3 starts the child as `pi --fork <source session file>`.
+					const source = fx.threads.get(String(args.forkThreadId))?.session.sessionFile;
+					if (!source) throw new Error("fake t3: fork needs the forkThreadId of a known thread");
+					manager = SessionManager.forkFrom(source, fx.repo, fx.sessionsDir);
+				}
+				const session = await newSession([workflowExtension(childRuntime)], manager, childRuntime);
 				fx.threads.set(threadId, { session, runs: new Map() });
 				// t3 sends a one-line role preamble, a blank line, then the task.
 				known = { threadId, runId: start(threadId, `You are a delegated ${String(args.role)} child.\n\n${String(args.task)}`) };
@@ -243,6 +281,11 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 		});
 		tool("t3_thread_send", async (args) => {
 			const request = String(args.clientRequestId);
+			if (args.mode === "steer") {
+				const thread = fx.threads.get(String(args.threadId))!;
+				await thread.session.steer(String(args.message));
+				return { threadId: args.threadId, runId: [...thread.runs.keys()].at(-1), status: "running", delivery: "steered" };
+			}
 			const known = fx.requests.get(request) ?? { threadId: String(args.threadId), runId: start(String(args.threadId), String(args.message)) };
 			fx.requests.set(request, known);
 			return { threadId: known.threadId, runId: known.runId, taskId: `task-${known.threadId}-${ids}`, status: "running", delivery: "started" };
@@ -252,9 +295,9 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 			const done = await finishedWithin(thread.runs.get(String(args.runId))!, waitMs);
 			return { threadId: args.threadId, runId: args.runId, status: done ? "completed" : "running", timedOut: !done };
 		});
-		tool("task_status", async (args) => ({ taskId: args.taskId, status: "completed", summary: "t3 summary" }));
+		tool("task_status", async (args) => ({ taskId: args.taskId, status: "completed", summary: summaryOf(threadOf(args.taskId)) }));
 		tool("task_cancel", async (args) => {
-			for (const thread of fx.threads.values()) await thread.session.abort();
+			await fx.threads.get(threadOf(args.taskId)!)?.session.abort();
 			return { taskId: args.taskId, status: "cancel_requested" };
 		});
 	};
@@ -264,13 +307,14 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
  * Run `code` as a workflow from a parent session in "t3": the parent's model calls the workflow tool
  * once, then answers; children answer with `child(context)`. Returns the tool result's details and text.
  */
-async function runInT3(code: string, child: (context: Context) => AssistantMessage | Promise<AssistantMessage>, opts: { childRuntime?: ModelRuntime; budget?: number; signal?: AbortSignal } = {}) {
+async function runInT3(code: string, child: FauxResponseStep, opts: { childRuntime?: ModelRuntime; budget?: number; signal?: AbortSignal } = {}) {
 	const childRuntime = opts.childRuntime ?? runtime;
 	const parent = await newSession([workflowExtension(runtime), fakeT3(childRuntime)]);
 	parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
-	const dispatch: FauxResponseStep = (context) => {
-		if (!firstUser(context).includes("harness-delegation:")) return lastMessage(context).role === "toolResult" ? say("parent done") : call("workflow", { code, budget: opts.budget ?? 5 });
-		return child(context);
+	const dispatch: FauxResponseStep = (...args) => {
+		const [context] = args;
+		if (!isChild(context)) return lastMessage(context).role === "toolResult" ? say("parent done") : call("workflow", { code, budget: opts.budget ?? 5 });
+		return typeof child === "function" ? child(...args) : child;
 	};
 	faux.setResponses(Array.from({ length: 60 }, () => dispatch));
 	await parent.prompt("go");
@@ -292,11 +336,11 @@ const toolNames = (context: Context) => {
 };
 const callsOf = (name: string) => fx.calls.filter((c) => c.name === name);
 
-describe("agent() in t3", () => {
-	test("one run: the system prompt and tool subset apply in the child; title, role and target reach t3; files are cleaned up", async () => {
+describe("delegate() in t3", () => {
+	test("one run: the system prompt and tool subset apply in the child; title, role and target reach t3 as given; files are cleaned up", async () => {
 		let seen: Context | undefined;
 		const { details, text } = await runInT3(
-			"const a = agent({ model: 'faux/faux-1', system: 'You are the careful reviewer.', tools: ['read', 'grep'], files: ['src'], thinking: 'minimal' });\nreturn JSON.stringify(await a.run('Review README.md\\nin depth'));",
+			"const a = delegate({ target: { model: 'faux/faux-1', options: { thinking: 'low' } }, role: 'review', system: 'You are the careful reviewer.', tools: ['read', 'grep'] });\nreturn JSON.stringify(await a.run('Review README.md\\nin depth'));",
 			(context) => {
 				seen = context;
 				return say("Looks fine.");
@@ -311,12 +355,13 @@ describe("agent() in t3", () => {
 		assert.match(systemOf(seen!), /^You are the careful reviewer\./);
 		assert.doesNotMatch(systemOf(seen!), /started by a workflow script\. You start without/, "the script's system replaces the default role");
 		assert.deepEqual(toolNames(seen!), ["grep", "read"], "exactly the listed tools, grep activated");
-		assert.match(firstUser(seen!), /^You are a delegated research child\.\n\nharness-delegation: [\w-]+\nStarted by a workflow script's agent\(\): system prompt \(29 chars\); tools: read, grep\.\nChange only these files: src\.\n\nReview README\.md\nin depth$/);
+		assert.match(firstUser(seen!), /^You are a delegated review child\.\n\nharness-delegation: [\w-]+\nDelegated by the harness: system prompt \(29 chars\); tools: read, grep\. When the plan no longer fits.*\n\nReview README\.md\nin depth$/);
 		const [delegate] = callsOf("delegate_task");
-		assert.equal(delegate!.args.title, "workflow agent " + /agent (\d+)/.exec(String(delegate!.args.title))![1] + ": Review README.md");
-		assert.equal(delegate!.args.role, "research");
+		assert.equal(delegate!.args.title, "workflow delegate 1: Review README.md");
+		assert.equal(delegate!.args.role, "review");
 		assert.equal(delegate!.args.mode, "wait");
-		assert.deepEqual(delegate!.args.target, { providerInstanceId: "pi", model: MODEL, options: { thinking: "low" } });
+		assert.deepEqual(delegate!.args.target, { model: MODEL, options: { thinking: "low" } }, "as given: t3 resolves it");
+		for (const key of ["schema", "system", "tools"]) assert.equal(key in delegate!.args, false, `${key} stays with the harness`);
 		assert.ok(callsOf("task_status").length >= 1, "the result is marked delivered");
 		const childSession = fx.threads.get("thread-1")!.session;
 		assert.deepEqual(details.childSessions, [childSession.sessionId]);
@@ -327,7 +372,7 @@ describe("agent() in t3", () => {
 	});
 
 	test("a slow child: the wait times out and continues with t3_thread_wait until the run is over", async () => {
-		const { details, text } = await runInT3("return (await agent({ model: 'faux/faux-1', tools: ['read'] }).run('slow')).text;", async () => {
+		const { details, text } = await runInT3("return (await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('slow')).text;", async () => {
 			await new Promise((r) => setTimeout(r, 300));
 			return say("finally");
 		});
@@ -339,19 +384,19 @@ describe("agent() in t3", () => {
 
 	test("an unknown tool fails the run before any request of the child", async () => {
 		let childRequests = 0;
-		const { details } = await runInT3("await agent({ model: 'faux/faux-1', tools: ['read', 'nope', 'zap'] }).run('x');", () => {
+		const { details } = await runInT3("await delegate({ target: { model: 'faux/faux-1' }, tools: ['read', 'nope', 'zap'] }).run('x');", () => {
 			childRequests++;
 			return say("never");
 		});
 		assert.equal(details.status, "failed");
-		assert.match(details.error!, /agent \d+: unknown tools nope, zap; this session has .*\bread\b/);
+		assert.match(details.error!, /delegate \d+: unknown tools nope, zap; this session has .*\bread\b/);
 		assert.equal(childRequests, 0);
 	});
 
 	test("schema: a wrong shape goes back to the child as an error; the fixed result arrives as an object", async () => {
 		const seen: Context[] = [];
 		const { details, text } = await runInT3(
-			"const a = agent({ model: 'faux/faux-1', tools: ['read'], schema: { type: 'object', properties: { verdict: { type: 'string', enum: ['ok', 'bad'] }, score: { type: 'number' } }, required: ['verdict', 'score'], additionalProperties: false } });\nreturn JSON.stringify(await a.run('Judge it'));",
+			"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], schema: { type: 'object', properties: { verdict: { type: 'string', enum: ['ok', 'bad'] }, score: { type: 'number' } }, required: ['verdict', 'score'], additionalProperties: false } });\nreturn JSON.stringify(await a.run('Judge it'));",
 			(context) => {
 				seen.push(context);
 				if (seen.length === 1) return call("submit_result", { verdict: "maybe", score: 1 });
@@ -373,12 +418,12 @@ describe("agent() in t3", () => {
 
 	test("schema: a child that never submits is reminded twice, then the run fails", async () => {
 		const seen: Context[] = [];
-		const { details } = await runInT3("await agent({ model: 'faux/faux-1', tools: ['read'], schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }).run('x');", (context) => {
+		const { details } = await runInT3("await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }).run('x');", (context) => {
 			seen.push(context);
 			return say(`no result ${seen.length}`);
 		});
 		assert.equal(details.status, "failed");
-		assert.match(details.error!, new RegExp(`agent \\d+: it finished without calling submit_result \\(reminded ${MAX_REMINDERS} times\\)`));
+		assert.match(details.error!, new RegExp(`delegate \\d+: it finished without calling submit_result \\(reminded ${MAX_REMINDERS} times\\)`));
 		assert.equal(seen.length, 1 + MAX_REMINDERS);
 		assert.match(JSON.stringify(lastMessage(seen[1]!)), /Reminder 1 of 2/);
 		assert.match(JSON.stringify(lastMessage(seen[2]!)), /Reminder 2 of 2/);
@@ -389,7 +434,7 @@ describe("agent() in t3", () => {
 	test("a resume goes to the same thread with t3_thread_send and needs its own result", async () => {
 		const seen: Context[] = [];
 		const { details, text } = await runInT3(
-			"const a = agent({ model: 'faux/faux-1', tools: ['read'], schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });\nconst one = await a.run('first');\nconst two = await a.run('second');\nreturn JSON.stringify({ one, two });",
+			"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });\nconst one = await a.run('first');\nconst two = await a.run('second');\nreturn JSON.stringify({ one, two });",
 			(context) => {
 				seen.push(context);
 				const last = textOf(lastMessage(context).content);
@@ -408,7 +453,7 @@ describe("agent() in t3", () => {
 		const [send] = callsOf("t3_thread_send");
 		assert.equal(send!.args.threadId, one.threadId);
 		assert.match(String(send!.args.message), /^harness-delegation: [\w-]+ run 2\n\nsecond$/);
-		assert.match(systemOf(seen.at(-1)!), /You are an agent started by a workflow script/, "the spec still applies on the resume");
+		assert.deepEqual(toolNames(seen.at(-1)!), ["read", "submit_result"], "the spec still applies on the resume");
 		assert.match(JSON.stringify(seen.at(-1)!.messages), /first.*second/, "the resume continues the conversation");
 		assert.deepEqual(details.childSessions, [one.sessionId], "one child session");
 	});
@@ -417,7 +462,7 @@ describe("agent() in t3", () => {
 		let active = 0;
 		let peak = 0;
 		const { details, text } = await runInT3(
-			"const out = await map(['a', 'b', 'c'], (n) => agent({ model: 'faux/faux-1', tools: ['read'], system: `You are agent ${n}.` }).run('go'), { concurrency: 3 });\nreturn JSON.stringify(out.map((r) => [r.text, r.threadId]));",
+			"const out = await map(['a', 'b', 'c'], (n) => delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], system: `You are agent ${n}.` }).run('go'), { concurrency: 3 });\nreturn JSON.stringify(out.map((r) => [r.text, r.threadId]));",
 			async (context) => {
 				active++;
 				peak = Math.max(peak, active);
@@ -436,7 +481,7 @@ describe("agent() in t3", () => {
 
 	test("cost: the child sessions' cost per run, in total, and against the budget, which stops a child that overspends", async () => {
 		const { details, text } = await runInT3(
-			"const a = agent({ model: 'faux/faux-1', tools: ['read'] });\nconst one = await a.run('one');\nconst two = await a.run('two');\nreturn JSON.stringify({ one: one.cost, two: two.cost, total: a.cost, spent: budget.spent });",
+			"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });\nconst one = await a.run('one');\nconst two = await a.run('two');\nreturn JSON.stringify({ one: one.cost, two: two.cost, total: a.cost, spent: budget.spent });",
 			(context) => (lastMessage(context).role === "toolResult" ? say("done") : textOf(lastMessage(context).content).includes("one") ? call("read", { path: "README.md" }) : say("done")),
 			{ childRuntime: priced(runtime, 0.25) },
 		);
@@ -445,7 +490,7 @@ describe("agent() in t3", () => {
 		assert.deepEqual(cost, { one: 0.5, two: 0.25, total: 0.75, spent: 0.75 });
 		assert.equal(details.cost, 0.75);
 
-		const over = await runInT3("await agent({ model: 'faux/faux-1', tools: ['bash'] }).run('loop');", async () => {
+		const over = await runInT3("await delegate({ target: { model: 'faux/faux-1' }, tools: ['bash'] }).run('loop');", async () => {
 			await new Promise((r) => setTimeout(r, 200));
 			return call("bash", { command: "true" });
 		}, { childRuntime: priced(runtime, 0.4), budget: 1 });
@@ -455,7 +500,163 @@ describe("agent() in t3", () => {
 	});
 });
 
-describe("agent() without t3", () => {
+describe("t3's delegate_task as the harness extends it", () => {
+	const schema = { type: "object", properties: { verdict: { type: "string", enum: ["ok", "bad"] } }, required: ["verdict"], additionalProperties: false };
+
+	/** A parent in "t3" whose model makes the given calls one after another, then says "parent done"; children answer with `child`. */
+	async function parentCalls(calls: { name: string; args: JsonObject }[], child: (context: Context) => AssistantMessage) {
+		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime, { waitMs: 5000 })]);
+		const seen: Context[] = [];
+		let next = 0;
+		const dispatch: FauxResponseStep = (context) => {
+			if (isChild(context)) return child(context);
+			seen.push(context);
+			const step = calls[next++];
+			return step ? call(step.name, step.args) : say("parent done");
+		};
+		faux.setResponses(Array.from({ length: 30 }, () => dispatch));
+		await parent.prompt("go");
+		const results = parent.messages.flatMap((m) => (m.role === "toolResult" ? [{ name: m.toolName, text: textOf(m.content), isError: m.isError }] : []));
+		return { parent, seen, results };
+	}
+
+	test("the model passes schema, system and tools: the tool declares them, t3 gets the prepared task, the child applies them, and the result comes back in the task's result", async () => {
+		const childSeen: Context[] = [];
+		const { seen, results } = await parentCalls(
+			[
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "Judge README.md", title: "judge", mode: "wait", schema, system: "You judge files.", tools: ["read"] } },
+				{ name: `${T3_PREFIX}task_status`, args: { taskId: "task-thread-1" } },
+			],
+			(context) => {
+				childSeen.push(context);
+				return childSeen.length === 1 ? call("submit_result", { verdict: "ok" }) : say("Judged: fine.");
+			},
+		);
+		const declared = seen[0]!.messages.flatMap((m) => (m.role === "system" ? (m.toolsAdded ?? []) : [])).find((t) => t.name === `${T3_PREFIX}delegate_task`)!;
+		assert.deepEqual(Object.keys((declared.parameters as { properties: object }).properties).sort(), ["schema", "system", "tools"], "the model sees the harness's parameters");
+		const [delegated] = callsOf("delegate_task");
+		assert.deepEqual(Object.keys(delegated!.args).sort(), ["mode", "task", "title"], "t3 gets its own arguments only");
+		assert.match(String(delegated!.args.task), /^harness-delegation: [\w-]+\nDelegated by the harness: system prompt \(16 chars\); tools: read; returns its result with submit_result \(a JSON Schema\)\. When the plan no longer fits.*\n\nJudge README\.md$/);
+		assert.match(systemOf(childSeen[0]!), /^You judge files\./);
+		assert.deepEqual(toolNames(childSeen[0]!), ["read", "submit_result"]);
+		const final = fx.threads.get("thread-1")!.session.messages.findLast((m) => m.role === "assistant")!;
+		assert.equal(textOf(final.content), `Judged: fine.\n${RESULT_HEADING}{\n  "verdict": "ok"\n}\n\`\`\``, "the final message carries the result");
+		const status = results.find((r) => r.name === `${T3_PREFIX}task_status`)!;
+		assert.match(status.text, /Result \(submit_result\):\\n```json\\n\{\\n  \\"verdict\\": \\"ok\\"/, "the task's result has it");
+		const spec = readSpec(delegationsDir(fx.agentDir), parseMarker(String(delegated!.args.task))!.id)!;
+		assert.equal(readState(delegationsDir(fx.agentDir), spec.id)!.text, "Judged: fine.", "the run's own text stays without the result");
+	});
+
+	test("invalid harness arguments and a fork with target, system or tools are refused before t3 is called; plain t3 calls pass untouched", async () => {
+		const { results } = await parentCalls(
+			[
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", fork: true, system: "s" } },
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", fork: true, target: { model: MODEL } } },
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", forkThreadId: "thread-9" } },
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", schema: { type: "string" } } },
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "plain", mode: "wait" } },
+			],
+			() => say("child done"),
+		);
+		const refused = results.filter((r) => r.isError).map((r) => r.text);
+		assert.equal(refused.length, 4);
+		assert.match(refused[0]!, /fork takes the source thread's provider, model, options, system prompt and tools: drop system/);
+		assert.match(refused[1]!, /drop target/);
+		assert.match(refused[2]!, /forkThreadId needs fork: true/);
+		assert.match(refused[3]!, /schema must be a JSON Schema of an object/);
+		assert.deepEqual(callsOf("delegate_task").map((c) => c.args), [{ task: "plain", mode: "wait" }], "only the plain call reached t3, unchanged");
+	});
+});
+
+describe("the handle", () => {
+	const BIG = "x".repeat(100_000);
+	/** A child that answers with a long text (so the session can be compacted), and the compaction's summary. */
+	const childAnswers = (log: string[]): FauxResponseStep => async (context, options) => {
+		const all = JSON.stringify(context.messages);
+		if (all.includes("keep the verdict")) return say("Summary: the verdict was ok.");
+		const last = textOf(lastMessage(context).content);
+		log.push(last.split("\n").at(-1)!);
+		if (last.includes("slow")) {
+			await new Promise((r) => setTimeout(r, 600));
+			return lastMessage(context).role === "toolResult" ? say("slow done") : call("read", { path: "README.md" });
+		}
+		// The steering message comes after the tool result, as a user message.
+		if (last.includes("also check the tests")) return say("steered done");
+		if (lastMessage(context).role === "toolResult") return say("tool done");
+		if (last.includes("wait forever")) {
+			// Until the request is aborted (a stop), at most 5 s.
+			await new Promise((r) => {
+				setTimeout(r, 5000);
+				options?.signal?.addEventListener("abort", r, { once: true });
+			});
+			return say("not stopped");
+		}
+		return say(`${last.split("\n").at(-1)} done ${BIG}`);
+	};
+	const script = [
+		"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
+		"const one = await a.run('first');",
+		"await a.compact('keep the verdict');",
+		"const slow = a.run('slow');",
+		"await new Promise((r) => setTimeout(r, 300));",
+		"await a.steer('also check the tests');",
+		"const two = await slow;",
+		"const stopped = a.run('wait forever');",
+		"await new Promise((r) => setTimeout(r, 300));",
+		"await a.stop();",
+		"const error = await stopped.then(() => 'not stopped', (e) => e.message);",
+		"const fork = await a.fork('forked');",
+		"return JSON.stringify({ one: one.text.slice(0, 10), two: two.text, error, fork: fork.text.slice(0, 11), forkThread: fork.threadId ?? null, sameThread: fork.threadId === a.threadId });",
+	].join("\n");
+	const compacted = (session: AgentSession) => session.sessionManager.getEntries().find((e) => e.type === "compaction") as { summary?: string } | undefined;
+
+	test("in t3: compact sends Pi's /compact, steer reaches the running turn, stop cancels the task, fork forks the child's thread", async () => {
+		const log: string[] = [];
+		const { details, text } = await runInT3(script, childAnswers(log), { budget: 5 });
+		assert.equal(details.status, "completed", details.error);
+		const out = value(text);
+		assert.deepEqual(out, { one: "first done", two: "steered done", error: "delegate 1: the run was stopped", fork: "forked done", forkThread: "thread-6", sameThread: false });
+		const sends = callsOf("t3_thread_send").map((c) => [c.args.message, c.args.mode]);
+		assert.deepEqual(sends[0], ["/compact keep the verdict", "queue"]);
+		assert.deepEqual(sends.find(([, mode]) => mode === "steer"), ["also check the tests", "steer"]);
+		const source = fx.threads.get("thread-1")!.session;
+		assert.match(compacted(source)?.summary ?? "", /Summary: the verdict was ok\./, "the child compacted");
+		assert.ok(callsOf("task_cancel").some((c) => String(c.args.taskId).startsWith("task-thread-1")), "stop cancelled the task");
+		const forkCall = callsOf("delegate_task").at(-1)!;
+		assert.equal(forkCall.args.fork, true);
+		assert.equal(forkCall.args.forkThreadId, "thread-1");
+		assert.equal("target" in forkCall.args, false, "a fork takes its source's target");
+		const forked = fx.threads.get("thread-6")!.session;
+		assert.match(JSON.stringify(forked.messages), /also check the tests/, "the fork has the source's conversation");
+		const journal = readJournal(details.journal);
+		assert.deepEqual(journal.flatMap((e) => (e.t === "start" ? [e.label] : [])), ["#1: first", "#1 compact: keep the verdict", "#1 run 2: slow", "#1 steer: also check the tests", "#1 run 3: wait forever", "#1 stop", "#2: forked"]);
+	});
+
+	test("in-process: compact is Pi's compaction, steer and stop reach the session, fork is Pi's session fork", async () => {
+		const log: string[] = [];
+		faux.setResponses(Array.from({ length: 30 }, () => childAnswers(log)));
+		const { details, text } = await runWorkflow({ source: script, filename: INLINE_FILE, inline: true }, 1, {
+			cwd: fx.repo,
+			runtime,
+			agentDir: fx.agentDir,
+			llmCache: new Map(),
+			library: () => new Map(),
+			sessionDir: fx.sessionsDir,
+			parentSessionFile: join(fx.sessionsDir, "parent.jsonl"),
+		});
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(value(text), { one: "first done", two: "steered done", error: "delegate 1: the run was stopped", fork: "forked done", forkThread: null, sameThread: true });
+		assert.equal(details.childSessions.length, 2);
+		const files = readdirSync(fx.sessionsDir).map((f) => readFileSync(join(fx.sessionsDir, f), "utf8"));
+		const source = files.find((f) => f.includes(details.childSessions[0]!) && f.includes('"type":"compaction"'));
+		assert.ok(source?.includes("Summary: the verdict was ok."), "the child compacted with the instructions");
+		const forked = files.find((f) => f.split("\n")[0]!.includes(details.childSessions[1]!))!;
+		assert.match(forked, /also check the tests/, "the fork has the source's conversation");
+		assert.match(forked, /forked/);
+	});
+});
+
+describe("delegate() without t3", () => {
 	test("in-process: the same spec semantics (system prompt, tools, schema and its reminders, resume)", async () => {
 		const seen: Context[] = [];
 		faux.setResponses(
@@ -470,7 +671,7 @@ describe("agent() without t3", () => {
 		);
 		const { details, text } = await runWorkflow(
 			{
-				source: "const a = agent({ model: 'faux/faux-1', system: 'You count.', tools: ['read', 'ls'], schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });\nconst one = await a.run('first');\nconst two = await a.run('second');\nreturn JSON.stringify({ one, two });",
+				source: "const a = delegate({ target: { model: 'faux/faux-1' }, system: 'You count.', tools: ['read', 'ls'], schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });\nconst one = await a.run('first');\nconst two = await a.run('second');\nreturn JSON.stringify({ one, two });",
 				filename: INLINE_FILE,
 				inline: true,
 			},
@@ -483,7 +684,7 @@ describe("agent() without t3", () => {
 		assert.equal(one.threadId, undefined);
 		assert.match(systemOf(seen[0]!), /^You count\./);
 		assert.deepEqual(toolNames(seen[0]!), ["ls", "read", "submit_result"]);
-		assert.match(firstUser(seen[0]!), /^harness-delegation: [\w-]+\nStarted by a workflow script's agent\(\)/);
+		assert.match(firstUser(seen[0]!), /^harness-delegation: [\w-]+\nDelegated by the harness: system prompt/);
 		assert.deepEqual(
 			seen.map((c) => textOf(lastMessage(c).content).split("\n").at(-1)!.slice(0, 30)),
 			["first", "This run's result is missing: ", "Result recorded. Finish with a", "second", "Result recorded. Finish with a"],
@@ -491,7 +692,7 @@ describe("agent() without t3", () => {
 		);
 		assert.deepEqual(readdirSync(delegationsDir(fx.agentDir)), []);
 
-		const unknown = await runWorkflow({ source: "await agent({ model: 'faux/faux-1', tools: ['nope'] }).run('x');", filename: INLINE_FILE, inline: true }, 1, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
+		const unknown = await runWorkflow({ source: "await delegate({ target: { model: 'faux/faux-1' }, tools: ['nope'] }).run('x');", filename: INLINE_FILE, inline: true }, 1, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
 		assert.match(unknown.details.error!, /unknown tool nope/);
 	});
 });
@@ -528,7 +729,7 @@ describe("the child side", () => {
 		const plain = await newSession([workflowExtension(runtime)]);
 		await plain.prompt("just a task");
 		const orphan = await newSession([workflowExtension(runtime)]);
-		await orphan.prompt("harness-delegation: gone-1\nStarted by a workflow script's agent(): …\n\nx");
+		await orphan.prompt("harness-delegation: gone-1\nDelegated by the harness.\n\nx");
 		for (const context of seen) {
 			assert.doesNotMatch(toolNames(context).join(","), /submit_result/);
 			assert.ok(toolNames(context).includes("bash"), "the default tools");
@@ -546,7 +747,7 @@ describe("durable agents in t3", () => {
 	test(`an agent in flight when the parent's session ended reattaches to the same t3 task when the session starts again; the result arrives once (${variant.name})`, async () => {
 		const background = (await import("../extensions/background/index.ts")).default;
 		const withBackground = (pi: ExtensionAPI) => background(pi, { logRoot: join(dir, "logs") });
-		const code = "const run = await agent({ model: 'faux/faux-1', tools: ['read'] }).run('slow work');\nreturn 'agent said: ' + run.text;";
+		const code = "const run = await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('slow work');\nreturn 'agent said: ' + run.text;";
 		let childRuns = 0;
 		const parentSays: string[] = [];
 		const dispatch: FauxResponseStep = async (context) => {
@@ -679,7 +880,7 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 			[
 				"await shell('echo s >> shell-count');",
 				"await tools.bash({ command: 'echo t >> tool-count' });",
-				"const a = agent({ model: 'faux/faux-1', tools: ['read'] });",
+				"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
 				"const [one] = await Promise.all([a.run('slow work A'), shell('echo x >> cut; if [ ! -f go ]; then sleep 2; echo late >> late; fi')]);",
 				"return 'result: ' + one.text;",
 			].join("\n"),
@@ -688,7 +889,7 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		const stopped = await act({ stop: id });
 		assert.match(stopped, new RegExp(`Stopped workflow run ${id}; its result arrives as a message\\. Continue it with workflow \\{ resume: "${id}" \\}, or with changed code`));
 		const result = await message(/Workflow stopped/);
-		assert.match(result, /1 agent run keeps running; results are recorded when they end/);
+		assert.match(result, /1 delegate run keeps running; results are recorded when they end/);
 		assert.match(result, /Cut off by the stop, may have taken effect partly: shell echo x >> cut;.*A resume asks whether to run them again \(inFlight\)/);
 		assert.match(result, new RegExp(`workflow \\{ resume: "${id}", code: "…" \\}: calls the new code makes as before are answered from the journal.*Effects so far \\(commits, files\\) stay`));
 		await sleep(2500);
@@ -699,7 +900,7 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		assert.equal(end.status, "stopped");
 		assert.equal(end.lingering?.length, 1);
 		const agentKey = end.lingering![0]!;
-		assert.match(agentKey, /^agent:/);
+		assert.match(agentKey, /^delegate:/);
 		assert.equal(lockHeld(fx.agentDir, id), true, "the process waits for its agent");
 		assert.match(await act({ stop: id }), /is stopped already; its agents still run: pass stopChildren: true to cancel them/);
 
@@ -722,12 +923,13 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 	test("stopChildren cancels the agents; a resume asks the stopped child to continue", async () => {
 		const { gate, act, start, message } = await parentInT3();
 		const slow = gate("slow work A");
-		const id = await start("const one = await agent({ model: 'faux/faux-1', tools: ['read'] }).run('slow work A');\nreturn 'result: ' + one.text;");
+		const id = await start("const one = await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('slow work A');\nreturn 'result: ' + one.text;");
 		await until("the agent to run", () => slow.runs === 1);
 		assert.match(await act({ stop: id, stopChildren: true }), new RegExp(`Stopped workflow run ${id} and cancelled its agents`));
 		const result = await message(/Workflow stopped/);
 		assert.doesNotMatch(result, /keeps running/);
-		assert.equal(callsOf("task_cancel").length, 1);
+		// The cancel goes out without waiting for t3.
+		await until("the task cancelled", () => callsOf("task_cancel").length === 1);
 		slow.release();
 		const end = journalOf(id).findLast((e) => e.t === "end");
 		assert.ok(end?.t === "end" && end.status === "stopped" && end.lingering === undefined);
@@ -748,8 +950,8 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 			[
 				"await shell('echo s >> shell-count');",
 				"await tools.bash({ command: 'echo t >> tool-count' });",
-				"const a = agent({ model: 'faux/faux-1', tools: ['read'] });",
-				"const b = agent({ model: 'faux/faux-1', tools: ['read'], system: 'You are B.' });",
+				"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
+				"const b = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], system: 'You are B.' });",
 				`const [one, two] = await Promise.all([a.run('slow work A'), b.run('${taskB}')]);`,
 				`await shell('echo ${marker} >> after');`,
 				"return one.text + ' / ' + two.text;",
@@ -767,7 +969,7 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		const completed = await message(/Workflow completed/);
 		slowB.release();
 		assert.equal(completed.split("\n\n").at(-1), "slow work A done / child done");
-		assert.match(completed, /1 recorded call not used by the new code: agent agent 2: slow work B/);
+		assert.match(completed, /1 recorded call not used by the new code: delegate #2: slow work B/);
 		assert.deepEqual([count("shell-count"), count("tool-count")], [1, 1], "shell and tool calls before the edit were not repeated");
 		assert.equal(readFileSync(join(fx.repo, "after"), "utf8"), "v2\n", "the edited part ran live");
 		assert.equal(slowA.runs, 1, "agent A was adopted, not run again");
@@ -784,9 +986,9 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		assert.deepEqual(view.calls.map((c) => [c.label.slice(0, 30), c.status, c.version]), [
 			["echo s >> shell-count", "replayed", 1],
 			['bash {"command":"echo t >> too', "replayed", 1],
-			["agent 1: slow work A", "done", 1],
-			["agent 2: slow work B", "unused", 1],
-			["agent 2: changed work B", "done", 2],
+			["#1: slow work A", "done", 1],
+			["#2: slow work B", "unused", 1],
+			["#2: changed work B", "done", 2],
 			["echo v2 >> after", "done", 2],
 		]);
 		const marker = /<div class="edit-marker" data-version="2">new code from here · v2 <code>\w{12}<\/code><\/div>/;

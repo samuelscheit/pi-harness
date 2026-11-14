@@ -6,7 +6,7 @@
 // - a call with a recorded outcome (`done`, `failed`) runs nothing and returns or throws it;
 // - a call recorded as started without an outcome was in flight when the run stopped: an agent run
 //   a stop left running in this process is adopted (its outcome is awaited), other agent runs
-//   reattach to their t3 task or child session (agent.ts, through `reattach`); llm(), changes()
+//   reattach to their t3 task or child session (delegate.ts, through `reattach`); llm(), changes()
 //   and workflows.* run again (no side effects of their own; a nested workflow's calls are
 //   journaled one by one); shell and tools.* run again only when made with `{ idempotent: true }`
 //   or when the resume says so (`inFlight: "rerun"`); with `inFlight: "fail"` they throw, and
@@ -343,7 +343,7 @@ export class Durable {
 			this.inherited.delete(key);
 			return this.guard(this.adopt(key, spec, work, reattach ?? live));
 		}
-		if (spec.kind === "agent" && reattach) return this.guard(this.run(key, spec, reattach));
+		if (spec.kind === "delegate" && reattach) return this.guard(this.run(key, spec, reattach));
 		const start = this.folded.starts.get(key);
 		if ((spec.kind === "shell" || spec.kind === "tool") && !start?.idempotent && !spec.idempotent) {
 			if (this.policy === "fail") throw new InterruptedCallError(spec.label);
@@ -447,7 +447,7 @@ export class Durable {
 			if (work) {
 				this.inherited.delete(k);
 				work.cancel(new Error("the edited code does not use this call"));
-			} else if (this.folded.starts.get(k)!.kind === "agent") elsewhere.push({ start: this.folded.starts.get(k)!, meta: { ...this.folded.metas.get(k) } });
+			} else if (this.folded.starts.get(k)!.kind === "delegate") elsewhere.push({ start: this.folded.starts.get(k)!, meta: { ...this.folded.metas.get(k) } });
 		}
 		if (elsewhere.length) this.onDropped?.(elsewhere);
 	}
