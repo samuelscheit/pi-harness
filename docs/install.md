@@ -19,7 +19,7 @@ These are the same two variables Claude Code uses for a gateway. Re-run the inst
 
 ## What it does
 
-1. **Builds and links Pi.** It runs `npm ci` and `npm run build:offline` in `vendor/pi` (offline: the committed model catalog, no downloads), removes an npm-installed `@earendil-works/pi-coding-agent`, and links the bundled one as the global `pi`. The harness's `node_modules` is a symlink to `vendor/pi/node_modules`.
+1. **Installs Pi's dependencies.** It runs `npm ci` in `vendor/pi`, and generates the model data if it is missing. Pi builds link to these dependencies and copy the model data (see [releases.md](releases.md#pi-builds)). The harness's `node_modules` is a symlink to `vendor/pi/node_modules`.
 2. **Keeps T3 Code patched.** It writes and loads the LaunchAgent `com.pi-harness.patch-t3`, which runs [`scripts/patch-t3.ts`](../scripts/patch-t3.ts) at login and whenever `/Applications` changes. See [T3 Code integration](#t3-code-integration).
 3. **Builds pi-lens and the dashboard.** pi-lens is built with `npm ci --ignore-scripts` (its `prepare` script would rewire git hooks), `build:dist` and the core tree-sitter grammars. The dashboard runs `npm ci` and `npm run build`.
 4. **Writes `~/.pi/agent/models.json`.**
@@ -27,7 +27,7 @@ These are the same two variables Claude Code uses for a gateway. Re-run the inst
    - A `gateway` provider (`openai-responses`) carries every non-Claude model from the gateway's `/v1/models`, with their context windows. This is the only reason the installer calls the API.
    - `compat.supportsMidConvoSystemMessages` is set on the gateway, so prompt edits are sent as appended developer messages and keep the prompt cache (see [prompt.md](prompt.md#prompt-updates-and-the-cache)).
 5. **Stores the key.** It saves the token in the Keychain item `pi-harness-gateway` and writes `~/.pi/agent/auth.json` so that both providers read it with `!security find-generic-password …`. T3 starts Pi without shell variables, and the token is never written to a file.
-6. **Deploys the first release.** The current branch's latest commit becomes `~/.pi/agent/harness/current`, after an import check. See [releases.md](releases.md).
+6. **Deploys the first release and links Pi.** The current branch's latest commit becomes `~/.pi/agent/harness/current`, after its `vendor/pi` is built and an import check passes. An npm-installed `@earendil-works/pi-coding-agent` is removed. The global package and `pi` command link to `~/.pi/agent/harness/pi`, the build each deploy switches to. See [releases.md](releases.md).
 7. **Writes `~/.pi/agent/settings.json`.**
 
 | Setting | Value | Why |

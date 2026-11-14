@@ -3,22 +3,23 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { builtPi, commitToSource, currentLink, currentRelease, type DeployResult, deploy, harnessDir, heldReleases, holdRelease, piTree, switchTo } from "../extensions/lib/release.ts";
+import { linkModules, piBuildOf, piBuildsDir, piLink } from "../extensions/lib/pi-build.ts";
+import { builtPi, commitToSource, currentLink, currentRelease, type DeployResult, deploy, harnessDir, holdRelease, holds, piTree, switchTo } from "../extensions/lib/release.ts";
 import { inSource, type ReleaseMarker } from "../extensions/lib/repository.ts";
 import release from "../extensions/release/index.ts";
 
 let dir: string;
 let source: string;
 let agentDir: string;
-/** The working-tree content of vendor/pi/core.txt at each Pi build, in order. */
+/** The content of core.txt each Pi build saw in its build directory, in order. */
 let piBuilds: string[];
 beforeEach(() => {
 	piBuilds = [];
-	dir = mkdtempSync(join(tmpdir(), "release-"));
+	dir = realpathSync(mkdtempSync(join(tmpdir(), "release-")));
 	source = join(dir, "source");
 	agentDir = join(dir, "agent");
 	mkdirSync(join(source, "extensions", "a"), { recursive: true });
@@ -49,10 +50,21 @@ async function until(done: () => boolean, ms = 15_000): Promise<void> {
 		await new Promise((wait) => setTimeout(wait, 25));
 	}
 }
-const buildPi = async (from: string) => {
-	piBuilds.push(readFileSync(join(from, "vendor", "pi", "core.txt"), "utf8"));
+/** A pid no process has: a short-lived child that has exited. */
+const deadPid = () => spawnSync(process.execPath, ["-e", ""]).pid!;
+/** A Pi build that records what it saw in `into` and writes its output next to it. */
+const recordingBuild = (into: string[]) => async (build: string) => {
+	const core = readFileSync(join(build, "core.txt"), "utf8");
+	into.push(core);
+	writeFileSync(join(build, "built.txt"), `built from ${core}`);
 };
+const buildPi = (build: string) => recordingBuild(piBuilds)(build);
 const deployMain = (validate?: (root: string) => Promise<void>, build = buildPi) => deploy({ source, branch: "main", agentDir, buildPi: build, ...(validate ? { validate } : {}) });
+/** deployMain bound to this test's repository, agent dir and builds: a session's poll still running after its test must not deploy into the next test's. */
+const boundDeploy = () => {
+	const at = { source, agentDir, builds: piBuilds };
+	return () => deploy({ source: at.source, branch: "main", agentDir: at.agentDir, buildPi: recordingBuild(at.builds) });
+};
 
 describe("deploy", () => {
 	test("builds a snapshot of the branch's commit; uncommitted edits stay out; shared parts are links", async () => {
@@ -67,6 +79,8 @@ describe("deploy", () => {
 		assert.equal(existsSync(join(root, "untracked.txt")), false);
 		assert.ok(lstatSync(join(root, "vendor")).isSymbolicLink(), "vendor is the source's, not copied");
 		assert.equal(readFileSync(join(root, "vendor", "pi", "core.txt"), "utf8"), "pi 1\n");
+		const tree = await piTree(source, head);
+		assert.equal(readlinkSync(join(root, "node_modules")), join(realpathSync(piBuildsDir(harnessDir(agentDir))), tree!, "node_modules"), "Pi's packages are the commit's Pi build");
 		const marker = currentRelease(agentDir)!;
 		assert.deepEqual({ commit: marker.commit, source: marker.source, branch: marker.branch, subject: marker.subject }, { commit: head, source, branch: "main", subject: "first" });
 		assert.deepEqual(await deployMain(), { status: "current", commit: head });
@@ -110,11 +124,6 @@ describe("deploy", () => {
 		assert.deepEqual(await deployMain(), { status: "current", commit: main });
 	});
 
-	/** A pid no process has: a short-lived child that has exited. */
-	const deadPid = () => {
-		const child = spawnSync(process.execPath, ["-e", ""]);
-		return child.pid!;
-	};
 	const lockDir = () => join(harnessDir(agentDir), ".lock");
 	const holdLock = (pid: number, touchedMsAgo = 0) => {
 		mkdirSync(lockDir(), { recursive: true });
@@ -203,11 +212,11 @@ describe("deploy", () => {
 	test("a release a live process holds is never pruned; holds of exited processes are dropped", async () => {
 		const validate = async () => {};
 		const first = (await deployMain(validate)).commit;
-		holdRelease(agentDir, first, process.ppid);
+		holdRelease(agentDir, first, undefined, process.ppid);
 		writeFileSync(join(source, "lib", "value.ts"), "export const value = 'second';\n");
 		const second = commit("second");
 		await deployMain(validate);
-		holdRelease(agentDir, second, deadPid());
+		holdRelease(agentDir, second, undefined, deadPid());
 		for (let i = 0; i < 7; i++) {
 			writeFileSync(join(source, "lib", "value.ts"), `export const value = ${i};\n`);
 			commit(`c${i}`);
@@ -217,10 +226,10 @@ describe("deploy", () => {
 		assert.ok(kept.includes(first), "held by a live process: kept although older than the five newest");
 		assert.ok(!kept.includes(second), "its holder exited: pruned like any other");
 		assert.equal(kept.length, 7, "current, five newest, and the held one");
-		assert.deepEqual([...heldReleases(agentDir)], [first]);
+		assert.deepEqual([...holds(agentDir).releases], [first]);
 		assert.deepEqual(readdirSync(join(harnessDir(agentDir), "in-use")), [String(process.ppid)], "the dead holder's file is gone");
 		// The holder reloads into the current release: the old one becomes prunable.
-		holdRelease(agentDir, currentRelease(agentDir)!.commit, process.ppid);
+		holdRelease(agentDir, currentRelease(agentDir)!.commit, undefined, process.ppid);
 		writeFileSync(join(source, "lib", "value.ts"), "export const value = 'last';\n");
 		commit("last");
 		await deployMain(validate);
@@ -229,53 +238,62 @@ describe("deploy", () => {
 });
 
 describe("the global Pi build", () => {
-	test("the first deploy builds Pi and records the commit's vendor/pi; commits that keep it build nothing", async () => {
+	const builds = () => join(harnessDir(agentDir), "pi-builds");
+	/** The build directory the global Pi runs. */
+	const globalPi = () => realpathSync(piLink(harnessDir(agentDir)));
+	const newPi = (content: string, message = "new pi") => {
+		writeFileSync(join(source, "vendor", "pi", "core.txt"), content);
+		return commit(message);
+	};
+
+	test("the first deploy builds the commit's vendor/pi and points the global Pi at it; commits that keep it build nothing", async () => {
 		const first = (await deployMain()).commit;
+		const tree = (await piTree(source, first))!;
 		assert.deepEqual(piBuilds, ["pi 1\n"]);
-		assert.equal(builtPi(agentDir), await piTree(source, first));
+		assert.equal(builtPi(agentDir), tree);
+		assert.equal(globalPi(), join(realpathSync(builds()), tree));
+		assert.equal(readFileSync(join(globalPi(), "built.txt"), "utf8"), "built from pi 1\n", "built in place");
+		assert.equal(readFileSync(join(harnessDir(agentDir), "pi-build"), "utf8"), `${tree}\n`, "recorded for releases from before builds");
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
 		commit("harness only");
 		assert.equal((await deployMain()).status, "deployed");
 		assert.deepEqual(piBuilds, ["pi 1\n"], "no rebuild for a harness-only commit");
 	});
 
-	test("a commit that changes vendor/pi rebuilds Pi before the import check runs", async () => {
+	test("a commit deploys although the working tree's vendor/pi differs: the built Pi is the commit's tree", async () => {
 		await deployMain();
-		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 2\n");
-		const second = commit("new pi");
+		const second = newPi("pi 2\n");
+		// Another agent's edits in vendor/pi, uncommitted and untracked.
+		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 3, uncommitted\n");
+		writeFileSync(join(source, "vendor", "pi", "untracked.txt"), "x");
 		const order: string[] = [];
 		const result = await deployMain(
-			async () => {
+			async (root) => {
 				order.push("validate");
+				assert.equal(readFileSync(join(realpathSync(join(root, "node_modules")), "..", "core.txt"), "utf8"), "pi 2\n", "the check resolves Pi's packages from the commit's build");
 			},
-			async (from) => {
+			async (build) => {
 				order.push("build");
-				await buildPi(from);
+				await buildPi(build);
 			},
 		);
-		assert.equal(result.status, "deployed");
+		assert.deepEqual(result, { status: "deployed", commit: second, previous: git("rev-parse", "HEAD~1") });
 		assert.deepEqual(order, ["build", "validate"]);
 		assert.deepEqual(piBuilds, ["pi 1\n", "pi 2\n"]);
-		assert.equal(builtPi(agentDir), await piTree(source, second));
+		const tree = (await piTree(source, second))!;
+		assert.equal(builtPi(agentDir), tree);
+		assert.equal(readFileSync(join(globalPi(), "core.txt"), "utf8"), "pi 2\n");
+		assert.equal(existsSync(join(globalPi(), "untracked.txt")), false);
+		// The build directory holds exactly the commit's tree, plus the build's output and node_modules.
+		const files = execFileSync("git", ["-C", source, "ls-tree", "-r", "--name-only", tree], { encoding: "utf8" }).trim().split("\n");
+		assert.deepEqual(readdirSync(globalPi()).sort(), [...files, "built.txt", "node_modules"].sort());
+		assert.equal(readFileSync(join(source, "vendor", "pi", "core.txt"), "utf8"), "pi 3, uncommitted\n", "the working tree is untouched");
 	});
 
-	test("vendor/pi edits not in the commit refuse the deploy without building; the running release stays", async () => {
-		const good = (await deployMain()).commit;
-		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 2\n");
-		const second = commit("new pi");
-		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 3, uncommitted\n");
-		const result = (await deployMain()) as Extract<DeployResult, { status: "failed" }>;
-		assert.equal(result.status, "failed");
-		assert.match(result.error, new RegExp(`vendor/pi in .* has changes not in ${second.slice(0, 9)}`));
-		assert.deepEqual(piBuilds, ["pi 1\n"]);
-		assert.equal(currentRelease(agentDir)!.commit, good);
-		assert.notEqual(builtPi(agentDir), await piTree(source, second));
-	});
-
-	test("a failing Pi build refuses the deploy and keeps the recorded build", async () => {
+	test("a failed build keeps the old one: global Pi, release, nothing half-built left", async () => {
 		const first = (await deployMain()).commit;
-		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 2\n");
-		commit("new pi");
+		const before = globalPi();
+		newPi("pi 2\n");
 		const result = (await deployMain(undefined, async () => {
 			throw new Error("building Pi (vendor/pi) failed:\ntsc: error");
 		})) as Extract<DeployResult, { status: "failed" }>;
@@ -283,6 +301,106 @@ describe("the global Pi build", () => {
 		assert.match(result.error, /tsc: error/);
 		assert.equal(currentRelease(agentDir)!.commit, first);
 		assert.equal(builtPi(agentDir), await piTree(source, first));
+		assert.equal(globalPi(), before);
+		assert.deepEqual(readdirSync(builds()), [await piTree(source, first)], "no build directory for the failed tree");
+	});
+
+	test("a commit whose import check fails keeps the global Pi; its build stays for the fix", async () => {
+		const first = (await deployMain()).commit;
+		newPi("pi 2\n");
+		writeFileSync(join(source, "lib", "value.ts"), "export const value = ;\n");
+		const broken = commit("broken on new pi");
+		assert.equal((await deployMain()).status, "failed");
+		assert.equal(builtPi(agentDir), await piTree(source, first), "the global Pi stays with the running release");
+		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "fixed";\n');
+		const fixed = commit("fix");
+		assert.equal((await deployMain()).status, "deployed");
+		assert.deepEqual(piBuilds, ["pi 1\n", "pi 2\n"], "the fix reuses the build");
+		assert.equal(builtPi(agentDir), await piTree(source, fixed));
+		assert.equal(await piTree(source, broken), await piTree(source, fixed));
+	});
+
+	test("a deployed release whose Pi is not the global Pi deploys again: the Pi is built and switched", async () => {
+		const first = (await deployMain()).commit;
+		rmSync(piLink(harnessDir(agentDir)));
+		rmSync(builds(), { recursive: true });
+		assert.deepEqual(await deployMain(), { status: "deployed", commit: first, previous: first });
+		assert.equal(builtPi(agentDir), await piTree(source, first));
+		assert.deepEqual(await deployMain(), { status: "current", commit: first });
+	});
+
+	test("pruning keeps the builds kept releases use and those live processes run", async () => {
+		const validate = async () => {};
+		const trees: string[] = [];
+		for (let i = 1; i <= 9; i++) {
+			if (i > 1) newPi(`pi ${i}\n`, `pi ${i}`);
+			const { commit: deployed } = await deployMain(validate);
+			trees.push((await piTree(source, deployed))!);
+			// A process started on pi 1 runs it still; one started on pi 2 exited; one runs pi 3 under a release pruned meanwhile.
+			if (i === 1) holdRelease(agentDir, deployed, trees[0], process.ppid);
+			if (i === 2) holdRelease(agentDir, deployed, trees[1], deadPid());
+			if (i === 3) holdRelease(agentDir, "f".repeat(40), trees[2], process.pid);
+		}
+		const kept = new Set(readdirSync(builds()));
+		// Releases kept: current (9), the five newest others (4-8) and the held one (1).
+		for (const i of [1, 3, 4, 5, 6, 7, 8, 9]) assert.ok(kept.has(trees[i - 1]!), `pi ${i} kept`);
+		assert.ok(!kept.has(trees[1]!), "pi 2: its release was pruned and its process exited");
+		assert.equal(kept.size, 8);
+		assert.equal(builtPi(agentDir), trees[8]);
+	});
+
+	test("a build left by a dead process is removed; a live process's build in progress stays", async () => {
+		mkdirSync(builds(), { recursive: true });
+		const orphan = join(builds(), `.${"a".repeat(40)}.${deadPid()}`);
+		const running = join(builds(), `.${"b".repeat(40)}.${process.ppid}`);
+		mkdirSync(orphan);
+		mkdirSync(running);
+		assert.equal((await deployMain()).status, "deployed");
+		assert.equal(existsSync(orphan), false);
+		assert.equal(existsSync(running), true);
+	});
+
+	test("node_modules: workspace packages link into the build, other dependencies to the source's", async () => {
+		writeFileSync(join(source, ".gitignore"), "node_modules\n");
+		mkdirSync(join(source, "vendor", "pi", "packages", "ws"), { recursive: true });
+		writeFileSync(join(source, "vendor", "pi", "packages", "ws", "package.json"), '{ "name": "@pi/ws" }\n');
+		commit("workspace");
+		const modules = join(source, "vendor", "pi", "node_modules");
+		mkdirSync(join(modules, "@pi"), { recursive: true });
+		mkdirSync(join(modules, "dep"));
+		mkdirSync(join(modules, ".bin"));
+		symlinkSync("../../packages/ws", join(modules, "@pi", "ws"));
+		symlinkSync(join(modules, "dep"), join(modules, "@pi", "linked-dep"));
+		mkdirSync(join(source, "vendor", "pi", "packages", "ws", "node_modules"));
+		const build = join(dir, "build");
+		mkdirSync(join(build, "packages", "ws"), { recursive: true });
+		linkModules(join(source, "vendor", "pi"), build);
+		assert.equal(readlinkSync(join(build, "node_modules", "@pi", "ws")), join("..", "..", "packages", "ws"));
+		assert.equal(realpathSync(join(build, "node_modules", "@pi", "ws")), join(build, "packages", "ws"));
+		assert.equal(readlinkSync(join(build, "node_modules", "dep")), join(modules, "dep"));
+		assert.equal(readlinkSync(join(build, "node_modules", "@pi", "linked-dep")), join(modules, "@pi", "linked-dep"), "a link to another dependency stays the source's");
+		assert.equal(readlinkSync(join(build, "node_modules", ".bin")), join(modules, ".bin"));
+		assert.equal(readlinkSync(join(build, "packages", "ws", "node_modules")), join(source, "vendor", "pi", "packages", "ws", "node_modules"));
+		// The deploy's build gets the same links.
+		await deployMain();
+		assert.equal(realpathSync(join(globalPi(), "node_modules", "@pi", "ws")), join(globalPi(), "packages", "ws"));
+	});
+
+	test("piBuildOf names the build a Pi package was loaded from; a checkout is none", async () => {
+		await deployMain();
+		const tree = builtPi(agentDir)!;
+		mkdirSync(join(globalPi(), "packages", "coding-agent"), { recursive: true });
+		assert.equal(piBuildOf(harnessDir(agentDir), join(piLink(harnessDir(agentDir)), "packages", "coding-agent")), tree);
+		assert.equal(piBuildOf(harnessDir(agentDir), join(source, "vendor", "pi")), undefined);
+		assert.equal(piBuildOf(join(dir, "nowhere"), source), undefined);
+	});
+
+	test("a refusal by a release from before builds left the working tree is tried again", async () => {
+		await deployMain();
+		const second = newPi("pi 2\n");
+		mkdirSync(join(harnessDir(agentDir), "failed"), { recursive: true });
+		writeFileSync(join(harnessDir(agentDir), "failed", `${second}.txt`), `vendor/pi in ${source} has changes not in ${second.slice(0, 9)}; commit them, or run scripts/install.mjs to build Pi from the working tree`);
+		assert.equal((await deployMain()).status, "deployed");
 	});
 
 	test("the vendor/pi id comes from the commit alone, whatever the working tree holds", async () => {
@@ -324,8 +442,8 @@ describe("release extension", () => {
 	type Handler = (event: unknown, ctx: unknown) => unknown;
 	const marker = (commit: string): ReleaseMarker => ({ commit, source, branch: "main", subject: "s", deployedAt: "" });
 
-	/** The extension with a fake Pi that counts reload requests. */
-	function load(loaded: string, options: { deploy?: () => Promise<DeployResult> } = {}) {
+	/** The extension with a fake Pi that counts reload requests; by default the process runs the global Pi's build. */
+	function load(loaded: string, options: { deploy?: () => Promise<DeployResult>; pi?: string } = {}) {
 		const handlers = new Map<string, Handler>();
 		const notes: [string, string][] = [];
 		const restarted: string[] = [];
@@ -339,7 +457,8 @@ describe("release extension", () => {
 			agentDir,
 			pollMs: 20,
 			release: marker(loaded),
-			deploy: options.deploy ?? (() => deployMain()),
+			pi: "pi" in options ? options.pi : builtPi(agentDir),
+			deploy: options.deploy ?? boundDeploy(),
 			ensureDashboard: async () => restarted.push(currentRelease(agentDir)!.commit),
 		});
 		const start = async (reason = "startup") => {
@@ -354,7 +473,7 @@ describe("release extension", () => {
 	test("a session deploys a new commit and requests a reload into it, idle or running; the dashboard follows", async () => {
 		const first = (await deployMain()).commit;
 		const session = load(first);
-		assert.equal(readFileSync(join(harnessDir(agentDir), "in-use", String(process.pid)), "utf8"), first, "loading holds the release");
+		assert.equal(readFileSync(join(harnessDir(agentDir), "in-use", String(process.pid)), "utf8"), `${first}\n${builtPi(agentDir)}\n`, "loading holds the release and its Pi");
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
 		const second = commit("second");
 		await session.start();
@@ -389,7 +508,9 @@ describe("release extension", () => {
 		old.stop();
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
 		const second = commit("harness only");
-		await deployMain();
+		// The old session's last poll may still be deploying it: then this one finds the lock taken.
+		while ((await deployMain()).status === "busy") await new Promise((wait) => setTimeout(wait, 25));
+		assert.equal(currentRelease(agentDir)!.commit, second);
 		const reloaded = load(second, { deploy: async () => ({ status: "current", commit: second }) });
 		await reloaded.start("reload");
 		await until(() => reloaded.notes.length >= 1);
@@ -401,8 +522,7 @@ describe("release extension", () => {
 
 	test("a process whose Pi build is unknown reloads into nothing: it says once that Pi needs a restart", async () => {
 		const first = (await deployMain()).commit;
-		rmSync(join(harnessDir(agentDir), "pi-build"));
-		const session = load(first);
+		const session = load(first, { pi: undefined });
 		await session.start();
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
 		const second = commit("harness only");

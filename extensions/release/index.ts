@@ -7,27 +7,30 @@
 // else at the next turn boundary of its run (the run continues on the new tools and prompt; a tool
 // call running then finishes on the old code), else when the run settles. Pi itself (vendor/pi)
 // cannot be swapped in a running process, and a release's extensions may use Pi APIs newer than the
-// process has: a session reloads only into releases whose vendor/pi is the build the process
-// started with (deploying rebuilds the global Pi for new processes), and says once that a newer
-// release needs a restart.
+// process has: a session reloads only into releases whose vendor/pi is the build the process runs
+// (the Pi build its package was loaded from; deploying switches the global Pi for new processes),
+// and says once that a newer release needs a restart.
 //
 // Running from a repository checkout (tests, development) this extension does nothing.
 
 import { statSync } from "node:fs";
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { ensureDashboard } from "../../dashboard/server/launch.ts";
-import { builtPi, currentRelease, type DeployOptions, type DeployResult, deploy, holdRelease, piTree, refFiles, shortCommit } from "../lib/release.ts";
+import { piBuildOf } from "../lib/pi-build.ts";
+import { currentRelease, type DeployOptions, type DeployResult, deploy, harnessDir, holdRelease, piTree, refFiles, shortCommit } from "../lib/release.ts";
 import { RELEASE, type ReleaseMarker } from "../lib/repository.ts";
 
 const POLL_MS = 3000;
 
-/** Per process, across reloads (module state is new after each): the Pi build it started with (a vendor/pi tree id) and the release it last loaded. */
+/** Per process, across reloads (module state is new after each): the Pi build it runs (a vendor/pi tree id) and the release it last loaded. */
 const processState = globalThis as { __harnessRelease?: { pi: string | undefined; loaded: string; piNoticeShown?: boolean } };
 
 export interface ReleaseOptions {
 	agentDir?: string;
 	pollMs?: number;
 	release?: ReleaseMarker;
+	/** The Pi build this process runs; by default the one its Pi package was loaded from (undefined: no build, e.g. a checkout). */
+	pi?: string;
 	deploy?: (options: DeployOptions) => Promise<DeployResult>;
 	/** Move the dashboard to the deployed release (ensureDashboard). */
 	ensureDashboard?: () => Promise<unknown>;
@@ -39,10 +42,11 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 	const { agentDir = getAgentDir(), pollMs = POLL_MS, deploy: deployRelease = deploy } = options;
 	const dashboard = options.ensureDashboard ?? (() => ensureDashboard({ agentDir }));
 	const previous = processState.__harnessRelease?.loaded;
-	const state = (processState.__harnessRelease ??= { pi: builtPi(agentDir), loaded: loaded.commit });
+	const build = "pi" in options ? options.pi : piBuildOf(harnessDir(agentDir), getPackageDir());
+	const state = (processState.__harnessRelease ??= { pi: build, loaded: loaded.commit });
 	state.loaded = loaded.commit;
-	// This process now runs `loaded`: deploys elsewhere must not prune it until the process reloads or exits.
-	holdRelease(agentDir, loaded.commit);
+	// This process now runs `loaded` on its Pi: deploys elsewhere must not prune them until the process reloads or exits.
+	holdRelease(agentDir, loaded.commit, state.pi);
 
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let busy = false;

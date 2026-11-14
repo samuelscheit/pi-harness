@@ -5,8 +5,11 @@
 // Usage: node scripts/install.mjs   (needs ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN, the
 // same gateway settings Claude Code uses)
 //
-// Pi: vendor/pi (a git subtree of github.com/earendil-works/pi) is built and linked globally,
-// replacing an npm-installed @earendil-works/pi-coding-agent. The harness's node_modules links to
+// Pi: vendor/pi (a git subtree of github.com/earendil-works/pi) gets its dependencies installed in
+// the working tree, and the current branch's vendor/pi is built as a deploy builds it
+// (extensions/lib/pi-build.ts: from the commit, not the working tree). The global
+// @earendil-works/pi-coding-agent (an npm-installed one is replaced) and `pi` link to
+// <agent dir>/harness/pi, the build each deploy switches to. The harness's node_modules links to
 // vendor/pi/node_modules, so its scripts, tests and type checks resolve the vendored packages.
 //
 // Writes into $PI_CODING_AGENT_DIR (default ~/.pi/agent):
@@ -28,11 +31,12 @@
 //                  never written to a file.
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { currentLink, deploy, recordPiBuild } from "../extensions/lib/release.ts";
+import { piLink } from "../extensions/lib/pi-build.ts";
+import { currentLink, deploy, harnessDir } from "../extensions/lib/release.ts";
 import { LAUNCH_AGENT, launchAgent } from "./patch-t3.ts";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
@@ -70,14 +74,9 @@ const gatewayModels = data
 	}));
 
 const npm = (cwd, ...args) => execFileSync("npm", args, { cwd, stdio: "inherit" });
+// The dependencies every Pi build links to (extensions/lib/pi-build.ts), and the model data builds copy.
 npm(vendoredPi, "ci");
-// Offline: the committed model catalog, so installing needs no model-catalog downloads.
-npm(vendoredPi, "run", "build:offline");
-const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-if (existsSync(join(globalRoot, PI_PACKAGE)) && !lstatSync(join(globalRoot, PI_PACKAGE)).isSymbolicLink()) {
-	npm(root, "uninstall", "-g", PI_PACKAGE);
-}
-npm(join(vendoredPi, "packages/coding-agent"), "link");
+if (!existsSync(join(vendoredPi, "packages/ai/src/providers/data"))) npm(vendoredPi, "run", "hydrate:model-data");
 // t3's Pi adapter needs fixes it has not shipped (scripts/patch-t3.ts). Every t3 update drops them, so
 // a LaunchAgent applies them at login and whenever /Applications changes; loading it runs it now.
 const agentPlist = join(homedir(), "Library/LaunchAgents", `${LAUNCH_AGENT}.plist`);
@@ -125,13 +124,26 @@ const keyFromKeychain = { type: "api_key", key: `!security find-generic-password
 writeJson(authFile, { ...readJson(authFile), anthropic: keyFromKeychain, gateway: keyFromKeychain });
 chmodSync(authFile, 0o600);
 
-// The first release: the committed state of the current branch (uncommitted edits are not deployed).
+// The first release and its Pi build: the committed state of the current branch (uncommitted edits are not deployed).
 const branch = execFileSync("git", ["-C", root, "branch", "--show-current"], { encoding: "utf8" }).trim();
 if (!branch) throw new Error(`${root} is not on a branch; check out the branch to deploy`);
-// The Pi built above is the branch's (also with uncommitted vendor/pi edits: installing builds them on purpose).
-await recordPiBuild(agentDir, root, branch);
 const deployed = await deploy({ source: root, branch, agentDir });
 if (deployed.status === "failed") throw new Error(`harness commit ${deployed.commit} does not load:\n${deployed.error}`);
+if (deployed.status === "busy") throw new Error(`another Pi process is deploying ${deployed.commit}; run this again when it is done`);
+
+/** Replace `path` with a link to `target`, atomically. */
+const link = (path, target) => {
+	mkdirSync(dirname(path), { recursive: true });
+	rmSync(`${path}.install`, { force: true });
+	symlinkSync(target, `${path}.install`);
+	renameSync(`${path}.install`, path);
+};
+// The global Pi is whatever build <agent dir>/harness/pi points at; deploys switch that link.
+const globalRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+const globalPackage = join(globalRoot, PI_PACKAGE);
+if (existsSync(globalPackage) && !lstatSync(globalPackage).isSymbolicLink()) npm(root, "uninstall", "-g", PI_PACKAGE);
+link(globalPackage, join(piLink(harnessDir(agentDir)), "packages/coding-agent"));
+link(join(execFileSync("npm", ["prefix", "-g"], { encoding: "utf8" }).trim(), "bin", "pi"), join(globalPackage, "dist/bundle/cli.js"));
 
 const settingsFile = join(agentDir, "settings.json");
 const settings = readJson(settingsFile);
