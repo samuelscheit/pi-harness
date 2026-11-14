@@ -55,6 +55,7 @@ flowchart TB
 | [`extensions/web`](../extensions/web/index.ts) | `web_search` and `web_fetch` through Anthropic server tools. |
 | [`extensions/improvements`](../extensions/improvements/index.ts) | `note_improvement`, the agent's friction log. |
 | [`extensions/goal`](../extensions/goal/index.ts) | `/goal` and the `goal` tool: a session goal that holds the run at its end until it is achieved, blocked or out of budget ([goal.md](goal.md)). |
+| [`extensions/warm`](../extensions/warm/index.ts) | `/warm` and the `keep_warm` tool: hold the prompt cache warm until a time, with a budget ([tools.md](tools.md#warm-and-keep_warm)). |
 | [`extensions/lens`](../extensions/lens/index.ts) | Layered global and per-project configuration for pi-lens. |
 | [`dashboard/`](../dashboard) | `node:http` JSON API over the query layer, plus a React frontend. |
 | [`scripts/dream`](../scripts/dream/run.ts) | Nightly learning from user corrections. |

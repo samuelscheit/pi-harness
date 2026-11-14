@@ -137,6 +137,28 @@ The tool description is taken from Codex CLI (Apache-2.0, see [NOTICE](../NOTICE
 
 [`extensions/goal`](../extensions/goal/index.ts): set, show or finish the session's goal (`set`, `achieved`, `blocked`, `wait`, `show`). While a goal is active, the run cannot end until the goal is achieved (its check must exit 0) or blocked, or until every remaining step depends on a running background job. See [goal.md](goal.md).
 
+## /warm and keep_warm
+
+[`extensions/warm`](../extensions/warm/index.ts) holds the session's prompt cache warm until a time, so the next request reads the cache instead of writing the whole context again.
+
+Pi's warmer stops early on its own: an idle refresh must save at least $0.05 assuming a 15% chance that the user returns, and warming ends 60 minutes after the last request while the agent runs, or after `cacheWarmingIdleMinutes` when idle. When the user says they will be back, or a coordinator waits for its children, those guesses are wrong. A hold (`pi.setCacheWarmingHold`, added in `vendor/pi`) tells Pi that the user returns. Until it ends, every refresh is sent, also past those limits and with the `cacheWarming` setting `"off"`. Pi's own checks stay: a request that cannot be replayed safely, a model without a known cache lifetime, a changed conversation, and a failed refresh end warming.
+
+| Command | |
+| --- | --- |
+| `/warm 3h`, `/warm 90m`, `/warm 2h30m` | hold for that long (at most 24 hours) |
+| `/warm until 18:00` | until a local time, the next day if already past (an ISO date-time works too) |
+| `/warm on` | until the next real request, at most 4 hours |
+| `--max $2` | with any of them: a budget for the refreshes |
+| `/warm off` | end the hold |
+| `/warm` | show the hold, its spend and its estimate |
+
+The agent's `keep_warm` tool takes `{ for?, until?, off?, max_usd? }`. Without `for` or `until`, it holds until the next request. Its guideline: use it when the user says they will be back later, or when results arrive later.
+
+- **Storage:** each change appends a custom entry `harness-warm` holding the whole hold (or `null` with the reason it ended). So it survives reloads and restarts: `session_start` sets a hold that is still in the future again. After a restart Pi no longer has the last request to replay, so warming resumes with the next request.
+- **End:** at its time; with `off`; with the next real request for the default hold (an explicit hold outlives requests); when the next refresh would take the spend over the budget; or with the session. Spend is the cost of the session's `cache_warm` usage entries since the hold started. A refresh is priced at what the last one cost, or at Pi's estimate from the model's prices if that is more.
+- **Cost:** setting a hold reports the price of a refresh (Pi's `warmCost`), the refresh interval (90% of the cache lifetime), and the total until the end. The status line shows the end, the next refresh and the spend.
+- **Five-minute cache:** with it, a long hold refreshes every 4.5 minutes, which adds up to about what the misses would cost. The message then says how to switch to the one-hour cache. Retention comes from the request (none sets it today), else the `cacheRetention` setting (the project's `.pi/settings.json` over `~/.pi/agent/settings.json`, read at start and on `/reload`), else `PI_CACHE_RETENTION=long`, else short. The installer sets `"long"`, so this applies to models with only a five-minute tier, or where a setting chose `"short"`.
+
 ## note_improvement
 
 [`extensions/improvements`](../extensions/improvements/index.ts). The agent records friction (a correction, a missing or wrong instruction, a misleading tool) with an observation and a proposal. It only appends to a backlog, so it costs almost nothing during the task. See [self-improvement.md](self-improvement.md).
