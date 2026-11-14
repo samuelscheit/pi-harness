@@ -50,6 +50,7 @@ T3 has not shipped some adapter fixes the harness depends on. [`scripts/patch-t3
 | `dialogs`, `session-questions` | open dialogs were cancelled when a turn ended, so an `ask_user` card left open past its turn vanished seconds after it appeared |
 | `background-work` | sessions with bash jobs in the background were unloaded, and a delegated child reported "done" while its build was still running |
 | `questions` | an `ask_user` call with several questions became several cards; now it is one card, paged |
+| `delegate-fork-*` | `delegate_task` always started its child empty; `fork: true` (with `forkThreadId`, a thread the caller delegated) starts it from a `pi --fork` copy of that Pi conversation up to now, with the same model, so its first request reads the history from the prompt cache |
 
 Unpatched T3 ignores the `questions` dialog, so `ask_user` shows nothing there. Every T3 update replaces the bundle and drops the patches, so the LaunchAgent re-applies them. It restarts T3 if an update started it less than two minutes ago, and otherwise sends a notification to restart. Log: `~/.pi/agent/logs/patch-t3.log`.
 

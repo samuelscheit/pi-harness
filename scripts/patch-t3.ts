@@ -40,6 +40,18 @@
 //   ended, so its agent() calls (`delegate_task`, `t3_thread_wait`) and its page (`html_render`)
 //   failed with `parent_not_active` (2026-11-14, a real thread). While Pi reports background work,
 //   the thread now lists the pending subagent task `pi-background-work`.
+// - delegate-fork-schema, delegate-fork-tool, delegate-fork-runtime (same branch, "feat(orchestrator):
+//   delegate_task can fork a Pi conversation into its child"): `delegate_task({ fork: true, task })`
+//   starts the child from a copy of the calling Pi thread's conversation so far, and with
+//   `forkThreadId` from a thread the caller delegated (directly or through its tasks; a workflow's
+//   handles fork their own threads), so its first request reads the shared history from the prompt
+//   cache. The child takes the source run's exact model selection; `target`, a worktree, a non-Pi
+//   source or one without a session file are refused. The child's first turn start runs the
+//   adapter's existing native fork (`pi --fork <source session file>` in the child's checkout, no
+//   turn boundary: the whole branch up to now, mid-turn included), and a failed fork fails the run
+//   instead of starting without the history. The task message starts "Forked from <source link>".
+//   The patch spans three chunks of t3's server bundle: the contracts, the MCP service, and the
+//   orchestrator with the Pi adapter.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -59,7 +71,9 @@ import { packedFiles, readFile, readHeader, replaceFiles } from "./lib/asar.ts";
 
 export interface Patch {
 	name: string;
-	/** Present in the bundle once the patch is applied. */
+	/** Text only the bundled server file this patch edits contains (t3 splits its server into chunks); default: the Pi adapter's. */
+	file?: string;
+	/** Present in that file once the patch is applied. */
 	marker: string;
 	/** [anchor, replacement]: each anchor must occur exactly once when the patch is applied. */
 	edits: [anchor: string, replacement: string][];
@@ -197,6 +211,164 @@ export const PATCHES: Patch[] = [
 		],
 	},
 	{
+		name: "delegate-fork-runtime",
+		marker: "forkProjection",
+		edits: [
+			[
+				"cause: `Parent node ${command.parentNodeId} is not part of active run ${parentRun.id}.`\n\t\t});",
+				[
+					"cause: `Parent node ${command.parentNodeId} is not part of active run ${parentRun.id}.`",
+					"\t\t});",
+					"\t\tconst forkSource = command.forkSource;",
+					"\t\tconst forkProjection = forkSource === void 0 || forkSource.threadId === command.parentThreadId ? parentProjection : yield* projectionStore.getThreadRecords(forkSource.threadId, [",
+					'\t\t\t"runs",',
+					'\t\t\t"providerThreads",',
+					'\t\t\t"providerTurns",',
+					'\t\t\t"attempts"',
+					"\t\t]).pipe(mapError((cause) => new OrchestratorProjectionError({",
+					"\t\t\tthreadId: forkSource.threadId,",
+					"\t\t\tcause",
+					"\t\t})));",
+					"\t\tconst forkRun = forkSource === void 0 ? void 0 : forkProjection.runs.find((candidate) => candidate.id === forkSource.runId);",
+					"\t\tif (forkSource !== void 0) {",
+					"\t\t\tconst source = forkRun === void 0 ? void 0 : providerThreadForRun(forkProjection, forkRun);",
+					"\t\t\tconst refusal = command.workspaceStrategy !== void 0 ? \"A forked task works in its parent's checkout.\" : source?.nativeThreadRef == null ? `Run ${forkSource.runId} of thread ${forkSource.threadId} has no native conversation to fork.` : source.providerInstanceId !== command.modelSelection.instanceId ? `A forked task runs on its source's provider ${source.providerInstanceId}.` : void 0;",
+					"\t\t\tif (refusal !== void 0) return yield* new OrchestratorDispatchError({",
+					"\t\t\t\tcommandId: command.commandId,",
+					"\t\t\t\tcommandType: command.type,",
+					"\t\t\t\tcause: refusal",
+					"\t\t\t});",
+					"\t\t}",
+				].join("\n"),
+			],
+			[
+				"\t\t\tsourcePoint: {\n\t\t\t\t...contextSourcePointForRun(parentProjection, parentRun),\n\t\t\t\tturnItemId: taskTurnItemId\n\t\t\t},",
+				"\t\t\tsourcePoint: forkRun !== void 0 && forkProjection !== parentProjection ? contextSourcePointForRun(forkProjection, forkRun) : {\n\t\t\t\t...contextSourcePointForRun(parentProjection, parentRun),\n\t\t\t\tturnItemId: taskTurnItemId\n\t\t\t},",
+			],
+			['\t\t\ttargetRunId: childRun.id,\n\t\t\tstatus: "consumed",', '\t\t\ttargetRunId: childRun.id,\n\t\t\tstatus: forkSource === void 0 ? "consumed" : "pending",'],
+			["\t\t\tconsumedAt: now$56\n\t\t};", "\t\t\tconsumedAt: forkSource === void 0 ? now$56 : null\n\t\t};"],
+			[
+				'const nativeForkTransfer = projection.contextTransfers.find((transfer) => transfer.type === "fork" && transfer.targetThreadId',
+				'const nativeForkTransfer = projection.contextTransfers.find((transfer) => (transfer.type === "fork" || transfer.type === "subagent_spawn") && transfer.targetThreadId',
+			],
+			["projectionStore.getThreadRecords(nativeForkTransfer.sourceThreadId, [", "projectionStore.getThreadRecords(nativeForkTransfer.sourcePoint.threadId, ["],
+			[
+				"if (!sourceProjection.runs.some((candidate) => candidate.ordinal > sourceRun.ordinal && isActiveRun$1(candidate))) {",
+				'if (nativeForkTransfer.type === "subagent_spawn" || !sourceProjection.runs.some((candidate) => candidate.ordinal > sourceRun.ordinal && isActiveRun$1(candidate))) {',
+			],
+			[
+				"...sourceProviderTurn === void 0 ? {} : { providerTurnId: sourceProviderTurn.id }",
+				'...nativeForkTransfer.type === "subagent_spawn" || sourceProviderTurn === void 0 ? {} : { providerTurnId: sourceProviderTurn.id }',
+			],
+		],
+	},
+	{
+		name: "delegate-fork-schema",
+		file: "const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+		marker: "forkThreadId: optional(ThreadId",
+		edits: [
+			[
+				"\tinteractionMode: optional(OrchestratorMcpInteractionMode)\n});\nconst ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+				[
+					"\tinteractionMode: optional(OrchestratorMcpInteractionMode),",
+					"\tfork: optional(Boolean$2.annotate({ description: \"Start the child from a copy of this conversation so far, with this thread's model, options and checkout (Pi only; no `target` or worktree).\" })),",
+					'\tforkThreadId: optional(ThreadId.annotate({ description: "With `fork:true`: fork this thread instead of yours. Only a thread you delegated, directly or through your tasks." }))',
+					"});",
+					"const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+				].join("\n"),
+			],
+			[
+				'\t\tcompletionWake: optional(Literals(["always", "settled_only"])),\n\t\tcreatedAt: optional(DateTimeUtc)\n\t}),\n\tStruct({\n\t\ttype: Literal("delegated_task.wake-policy"),',
+				'\t\tcompletionWake: optional(Literals(["always", "settled_only"])),\n\t\tforkSource: optional(Struct({\n\t\t\tthreadId: ThreadId,\n\t\t\trunId: RunId\n\t\t})),\n\t\tcreatedAt: optional(DateTimeUtc)\n\t}),\n\tStruct({\n\t\ttype: Literal("delegated_task.wake-policy"),',
+			],
+		],
+	},
+	{
+		name: "delegate-fork-tool",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "resolveForkSource",
+		edits: [
+			[
+				'description: "Start one child agent with only `task`. No parent history. Separate checkout',
+				'description: "Start one child agent with only `task`. No parent history, unless `fork:true` starts it from a copy of this conversation (Pi only). Separate checkout',
+			],
+			[
+				'function taskPrompt(input) {\n\treturn input.role === void 0 || input.role === "general" ? input.task : `Act as the ${input.role} sub-agent for this task.\\n\\n${input.task}`;\n}',
+				'function taskPrompt(input, forkedFrom) {\n\tconst task = input.role === void 0 || input.role === "general" ? input.task : `Act as the ${input.role} sub-agent for this task.\\n\\n${input.task}`;\n\treturn forkedFrom === void 0 ? task : `Forked from ${forkedFrom}.\\n\\n${task}`;\n}',
+			],
+			[
+				"\tconst resolveProjectTarget = (parent, projectId) =>",
+				[
+					'\tconst resolveForkSource = fn("OrchestratorMcpService.resolveForkSource")(function* (callerThreadId, callerRun, forkThreadId) {',
+					"\t\tconst sourceThreadId = forkThreadId ?? callerThreadId;",
+					'\t\tconst notOwned = failure$2("invalid_request", `Thread ${sourceThreadId} is not a thread you delegated, directly or through your tasks, so you cannot fork it.`);',
+					"\t\tfor (let threadId = sourceThreadId; threadId !== callerThreadId;) {",
+					"\t\t\tconst shell = yield* threadManagement.getThreadShell(threadId).pipe(mapError(threadManagementFailure));",
+					'\t\t\tif (shell === null || shell.deletedAt !== null || shell.lineage.relationshipToParent !== "subagent" || shell.lineage.parentThreadId === null) return yield* notOwned;',
+					"\t\t\tthreadId = shell.lineage.parentThreadId;",
+					"\t\t}",
+					'\t\tconst source = yield* loadThreadRecords(sourceThreadId, ["runs", "providerThreads"]);',
+					'\t\tconst run = sourceThreadId === callerThreadId ? callerRun : source.runs.filter((candidate) => candidate.providerThreadId !== null && candidate.status !== "queued" && candidate.status !== "preparing").toSorted((left, right) => right.ordinal - left.ordinal)[0];',
+					"\t\tconst providerThread = source.providerThreads.find((candidate) => candidate.id === run?.providerThreadId);",
+					'\t\tconst which = forkThreadId === void 0 ? "This thread" : `Thread ${sourceThreadId}`;',
+					'\t\tif (run === void 0 || providerThread === void 0) return yield* failure$2("invalid_request", `${which} has not started a conversation yet, so there is nothing to fork.`);',
+					'\t\tif (providerThread.driver !== "pi") return yield* failure$2("invalid_request", `Only a Pi thread can be forked into a delegated task; ${which.toLowerCase()} runs on ${providerThread.driver}. Delegate without \\`fork\\` and put the context the child needs into \\`task\\`.`);',
+					'\t\tif (providerThread.nativeThreadRef?.nativeId == null) return yield* failure$2("invalid_request", `${which} has no Pi session file yet, so there is no conversation to fork. Delegate without \\`fork\\`.`);',
+					"\t\treturn {",
+					"\t\t\tthread: source.thread,",
+					"\t\t\trun",
+					"\t\t};",
+					"\t});",
+					"\tconst resolveProjectTarget = (parent, projectId) =>",
+				].join("\n"),
+			],
+			[
+				'delegateTask: fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {\n\t\t\tconst environmentId =',
+				[
+					'delegateTask: fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {',
+					"\t\t\tconst fork = input.fork === true;",
+					'\t\t\tif (!fork && input.forkThreadId !== void 0) return yield* failure$2("invalid_request", "`forkThreadId` names the thread to fork; pass it with `fork:true`.");',
+					"\t\t\tif (fork && input.target !== void 0) return yield* failure$2(\"invalid_request\", \"A fork runs on this thread's provider, model and options, the only way its first request reads this conversation from the prompt cache. Omit `target`.\");",
+					"\t\t\tif (fork && input.isolation === \"worktree\") return yield* failure$2(\"invalid_request\", \"A fork works in this thread's checkout: its history names this checkout's paths, and Pi's system prompt names the working directory, so another checkout misses the prompt cache. Omit `isolation` or use 'shared'.\");",
+					"\t\t\tconst environmentId =",
+				].join("\n"),
+			],
+			[
+				'"Delegated tasks require an active run owned by this MCP provider session.");\n\t\t\tconst providers = yield* loadProviders;',
+				'"Delegated tasks require an active run owned by this MCP provider session.");\n\t\t\tconst forkSource = fork ? yield* resolveForkSource(parent.thread.id, parentRun, input.forkThreadId) : void 0;\n\t\t\tconst providers = yield* loadProviders;',
+			],
+			[
+				"\t\t\tconst target = yield* resolveTargetRechecking({\n\t\t\t\tparent,\n\t\t\t\ttarget: input.target,\n\t\t\t\tproviders,\n\t\t\t\tskipProjectEnablementFilter: isRetryOfAcceptedDelegation\n\t\t\t});",
+				[
+					"\t\t\tconst resolved = yield* resolveTargetRechecking({",
+					"\t\t\t\tparent: forkSource === void 0 ? parent : {",
+					"\t\t\t\t\t...parent,",
+					"\t\t\t\t\tthread: {",
+					"\t\t\t\t\t\t...parent.thread,",
+					"\t\t\t\t\t\tmodelSelection: forkSource.run.modelSelection",
+					"\t\t\t\t\t}",
+					"\t\t\t\t},",
+					"\t\t\t\ttarget: input.target,",
+					"\t\t\t\tproviders,",
+					"\t\t\t\tskipProjectEnablementFilter: isRetryOfAcceptedDelegation",
+					"\t\t\t});",
+					"\t\t\tconst target = forkSource === void 0 ? resolved : {",
+					"\t\t\t\t...resolved,",
+					"\t\t\t\tmodelSelection: forkSource.run.modelSelection",
+					"\t\t\t};",
+				].join("\n"),
+			],
+			[
+				"\t\t\t\ttask: taskPrompt(input),\n",
+				"\t\t\t\ttask: taskPrompt(input, forkSource === void 0 ? void 0 : formatThreadLink({\n\t\t\t\t\tenvironmentId: scope.environmentId,\n\t\t\t\t\tthreadId: forkSource.thread.id\n\t\t\t\t}, forkSource.thread.title)),\n",
+			],
+			[
+				'\t\t\t\t...workspaceStrategy === void 0 ? {} : { workspaceStrategy },\n\t\t\t\tcompletionWake: input.mode === "wait" ? "settled_only" : "always"\n',
+				'\t\t\t\t...workspaceStrategy === void 0 ? {} : { workspaceStrategy },\n\t\t\t\t...forkSource === void 0 ? {} : { forkSource: {\n\t\t\t\t\tthreadId: forkSource.thread.id,\n\t\t\t\t\trunId: forkSource.run.id\n\t\t\t\t} },\n\t\t\t\tcompletionWake: input.mode === "wait" ? "settled_only" : "always"\n',
+			],
+		],
+	},
+	{
 		name: "session-questions",
 		marker: "questionOwnedBySession",
 		edits: [
@@ -210,6 +382,9 @@ export const PATCHES: Patch[] = [
 
 /** Identifies the bundled Pi adapter, patched or not. */
 const ADAPTER = '"PiAdapter.cancelPrompt"';
+
+/** The text that identifies the bundled file a patch edits. */
+export const patchFile = (patch: Patch): string => patch.file ?? ADAPTER;
 
 const count = (text: string, anchor: string): number => text.split(anchor).length - 1;
 
@@ -229,26 +404,47 @@ export function patchBundle(text: string, patches: Patch[] = PATCHES): { text: s
 	return { text, applied };
 }
 
+/** The bundled server files of an archive by path, and the one each patch edits; throws unless exactly one file holds a patch's identifying text. */
+export function serverBundles(archive: string): { texts: Map<string, string>; fileOf: (patch: Patch) => string } {
+	const texts = new Map(
+		packedFiles(readHeader(archive).header)
+			.map((f) => f.path)
+			.filter((path) => path.startsWith("apps/server/dist/") && path.endsWith(".mjs"))
+			.map((path) => [path, readFile(archive, path).toString("utf8")] as const),
+	);
+	const paths = new Map<string, string>();
+	for (const id of new Set(PATCHES.map(patchFile))) {
+		const found = [...texts].filter(([, text]) => text.includes(id)).map(([path]) => path);
+		if (found.length !== 1) throw new Error(`t3 changed: expected one bundled server file containing ${id}, found ${found.length}; nothing patched`);
+		paths.set(id, found[0]!);
+	}
+	return { texts, fileOf: (patch) => paths.get(patchFile(patch))! };
+}
+
 /** Applies the missing patches to the app's archive; `applied` names them (empty when there were none). */
 export function patchApp(app: string): { applied: string[]; message: string } {
 	const archive = join(app, "Contents/Resources/app.asar");
 	if (!existsSync(archive)) throw new Error(`${archive}: not found`);
-	const { header } = readHeader(archive);
-	const bundle = packedFiles(header)
-		.map((f) => f.path)
-		.filter((path) => path.startsWith("apps/server/dist/") && path.endsWith(".mjs"))
-		.find((path) => readFile(archive, path).includes(ADAPTER));
-	if (!bundle) throw new Error("t3 changed: its Pi adapter was not found; nothing patched");
-	const original = readFile(archive, bundle).toString("utf8");
-	const { text, applied } = patchBundle(original);
-	if (applied.length === 0) return { applied, message: "already patched" };
+	const { texts, fileOf } = serverBundles(archive);
+	// Every file is patched before anything is written: a broken anchor leaves the archive as it was.
+	const patched = new Map<string, string>();
+	const applied = new Set<string>();
+	for (const patch of PATCHES) {
+		const path = fileOf(patch);
+		const result = patchBundle(patched.get(path) ?? texts.get(path)!, [patch]);
+		patched.set(path, result.text);
+		for (const name of result.applied) applied.add(name);
+	}
+	if (applied.size === 0) return { applied: [], message: "already patched" };
+	const changed = [...patched].filter(([path, text]) => text !== texts.get(path));
 	const backup = `${archive}.pre-pi-harness`;
 	// The backup is t3's own archive: taken when none of the patches is applied yet (a fresh install
 	// or update), kept when an earlier run already patched this archive.
-	if (PATCHES.every((patch) => !original.includes(patch.marker))) copyFileSync(archive, backup);
+	if (PATCHES.every((patch) => !texts.get(fileOf(patch))!.includes(patch.marker))) copyFileSync(archive, backup);
 	// Written to a new file and renamed over the archive: a running t3 keeps reading the old one.
-	replaceFiles(archive, { [bundle]: Buffer.from(text, "utf8") });
-	return { applied, message: `patched ${bundle} (${applied.join(", ")}; original kept as ${backup})` };
+	replaceFiles(archive, Object.fromEntries(changed.map(([path, text]) => [path, Buffer.from(text, "utf8")])));
+	const names = PATCHES.map((patch) => patch.name).filter((name) => applied.has(name));
+	return { applied: names, message: `patched ${changed.map(([path]) => path).join(", ")} (${names.join(", ")}; original kept as ${backup})` };
 }
 
 /** A t3 launched this recently was started by its updater: restarting it loses no work. */

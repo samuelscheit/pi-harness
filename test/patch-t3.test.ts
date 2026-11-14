@@ -6,16 +6,40 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
-import { afterPatch, elapsedSeconds, keepPatched, LAUNCH_AGENT, launchAgent, PATCHES, patchBundle, RESTART_WINDOW_S, startedAgoS } from "../scripts/patch-t3.ts";
+import {
+	afterPatch,
+	elapsedSeconds,
+	keepPatched,
+	LAUNCH_AGENT,
+	launchAgent,
+	type Patch,
+	PATCHES,
+	patchApp,
+	patchBundle,
+	patchFile,
+	RESTART_WINDOW_S,
+	serverBundles,
+	startedAgoS,
+} from "../scripts/patch-t3.ts";
 
-// An unpatched bundle: every anchor once, except those an earlier patch produces.
-const bundle = PATCHES.flatMap((patch, i) =>
-	patch.edits
-		.map(([anchor]) => anchor)
-		.filter((anchor) => !PATCHES.slice(0, i).some((earlier) => earlier.edits.some(([, replacement]) => replacement.includes(anchor)))),
-)
-	.map((anchor) => `\t\t\t${anchor}\n`)
-	.join("const x = piRecordString;\n");
+/** An unpatched bundle for these patches: every anchor once, except those an earlier patch produces. */
+const unpatched = (patches: Patch[]) =>
+	patches
+		.flatMap((patch, i) =>
+			patch.edits
+				.map(([anchor]) => anchor)
+				.filter((anchor) => !patches.slice(0, i).some((earlier) => earlier.edits.some(([, replacement]) => replacement.includes(anchor)))),
+		)
+		.map((anchor) => `\t\t\t${anchor}\n`)
+		.join("const x = piRecordString;\n");
+const bundle = unpatched(PATCHES);
+/** t3's server bundle split as the real one is: one chunk per file the patches edit, each holding its patches' anchors. */
+const chunkPatches = Object.fromEntries(
+	[...new Set(PATCHES.map(patchFile))].map((id, i) => [`apps/server/dist/chunk${i}.mjs`, PATCHES.filter((patch) => patchFile(patch) === id)]),
+);
+const chunks = Object.fromEntries(Object.entries(chunkPatches).map(([path, patches]) => [path, unpatched(patches)]));
+/** The chunk as patchApp leaves it. */
+const patchedChunk = (path: string) => patchBundle(chunks[path]!, chunkPatches[path]).text;
 
 /** A minimal asar writer (the format Electron reads), independent of the code under test. */
 function writeArchive(path: string, tree: Record<string, string | { unpacked: true }>): void {
@@ -104,7 +128,18 @@ describe("asar rewrite", () => {
 
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
-	const ALL = ["cache-warming", "dialogs", "background-work", "questions", "questions-capability", "background-caller", "session-questions"];
+	const ALL = [
+		"cache-warming",
+		"dialogs",
+		"background-work",
+		"questions",
+		"questions-capability",
+		"background-caller",
+		"delegate-fork-runtime",
+		"delegate-fork-schema",
+		"delegate-fork-tool",
+		"session-questions",
+	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
 		const { text, applied } = patchBundle(bundle);
@@ -124,6 +159,17 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('pending > 0;\n\t\t\t\t\tyield* publishBackgroundWork();\n\t\t\t\t\treturn;'), "background work is published on the thread");
 		assert.ok(text.includes("pendingBackgroundTasks: backgroundWorkPending ? [PI_BACKGROUND_WORK_TASK] : []"), "a thread attached during background work lists it");
 		assert.ok(text.indexOf("const publishBackgroundWork") < text.indexOf("const updateProviderThread"));
+		// delegate_task with fork: the tool, its command, the child's spawn transfer and its turn start.
+		assert.ok(text.includes("forkThreadId: optional(ThreadId.annotate("), "the tool takes forkThreadId");
+		assert.ok(text.includes("fork: optional(Boolean$2.annotate("), "the tool takes fork");
+		assert.ok(text.includes("forkSource: optional(Struct({\n\t\t\tthreadId: ThreadId,\n\t\t\trunId: RunId\n\t\t})),"), "the command carries its source");
+		assert.ok(text.includes("const forkSource = fork ? yield* resolveForkSource(parent.thread.id, parentRun, input.forkThreadId) : void 0;"));
+		assert.ok(text.includes("modelSelection: forkSource.run.modelSelection\n\t\t\t};"), "a fork takes its source run's selection");
+		assert.ok(text.includes('status: forkSource === void 0 ? "consumed" : "pending",'), "a fork's spawn waits for its turn start");
+		assert.ok(text.includes('(transfer.type === "fork" || transfer.type === "subagent_spawn") && transfer.targetThreadId'));
+		assert.ok(text.includes("getThreadRecords(nativeForkTransfer.sourcePoint.threadId, ["), "a fork of a delegated thread reads that thread");
+		assert.ok(text.includes('...nativeForkTransfer.type === "subagent_spawn" || sourceProviderTurn === void 0 ? {} : {'), "a delegated fork copies up to now");
+		assert.ok(text.includes("No parent history, unless `fork:true` starts it from a copy of this conversation (Pi only)."));
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -131,7 +177,7 @@ describe("patchBundle", () => {
 		const once = patchBundle(bundle, [cacheWarming]);
 		assert.deepEqual(once.applied, ["cache-warming"]);
 		const { text, applied } = patchBundle(once.text);
-		assert.deepEqual(applied, ["dialogs", "background-work", "questions", "questions-capability", "background-caller", "session-questions"]);
+		assert.deepEqual(applied, ALL.slice(1));
 		assert.equal(text, patchBundle(bundle).text);
 	});
 
@@ -142,18 +188,25 @@ describe("patchBundle", () => {
 
 	// t3's real bundle (the unpatched original the installer keeps), when this machine has it.
 	const original = "/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar.pre-pi-harness";
-	test("patches t3's installed Pi adapter into valid JavaScript", { skip: !existsSync(original) && "t3 not installed" }, () => {
-		const bundle = packedFiles(readHeader(original).header)
-			.map((f) => f.path)
-			.filter((path) => path.startsWith("apps/server/dist/") && path.endsWith(".mjs"))
-			.map((path) => readFile(original, path).toString("utf8"))
-			.find((text) => text.includes('"PiAdapter.cancelPrompt"'));
-		assert.ok(bundle, "no Pi adapter in t3's archive");
-		const { text, applied } = patchBundle(bundle);
+	test("patches t3's installed server bundle into valid JavaScript", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const { texts, fileOf } = serverBundles(original);
+		const patched = new Map<string, string>();
+		const applied: string[] = [];
+		for (const patch of PATCHES) {
+			const path = fileOf(patch);
+			const result = patchBundle(patched.get(path) ?? texts.get(path)!, [patch]);
+			patched.set(path, result.text);
+			applied.push(...result.applied);
+		}
 		assert.deepEqual(applied, ALL);
+		// The fork spans three chunks: contracts, the MCP service, and the orchestrator with the Pi adapter.
+		assert.equal(patched.size, 3);
+		const text = patched.get(fileOf(PATCHES[0]!))!;
+		const server = patched.get(fileOf(PATCHES.find((patch) => patch.name === "delegate-fork-tool")!))!;
 
 		// The patched questions card and its response, run as bundled (with the bundle's own helpers).
-		const source = (start: string, end: string) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
+		const between = (body: string, start: string, end: string) => body.slice(body.indexOf(start), body.indexOf(end, body.indexOf(start)));
+		const source = (start: string, end: string) => between(text, start, end);
 		const helpers = source("function piRecordField(", "function piRecordNumber(");
 		// The helpers call Effect's predicates under the bundler's (build-specific) names.
 		const isObject = /return ([\w$]+)\(input\)/.exec(helpers)![1]!;
@@ -173,10 +226,52 @@ describe("patchBundle", () => {
 		assert.deepEqual(piUiResponse(pending, undefined, undefined), { cancelled: true });
 		assert.deepEqual(piUiResponse({ method: "select", questionId: "q" }, undefined, { q: "A" }), { value: "A" });
 
+		// The forked task's first message, as the patched MCP service writes it.
+		const taskPrompt = new Function(`${between(server, "function taskPrompt(", "// src/mcp/")}\nreturn taskPrompt;`)();
+		const link = "[Research](t3-thread://v2/env/thread%3Aparent)";
+		assert.equal(taskPrompt({ task: "Spike A" }, link), `Forked from ${link}.\n\nSpike A`);
+		assert.equal(taskPrompt({ task: "Spike A", role: "research" }, link), `Forked from ${link}.\n\nAct as the research sub-agent for this task.\n\nSpike A`);
+		assert.equal(taskPrompt({ task: "Spike A", role: "general" }), "Spike A", "a task without fork is unchanged");
+
+		// The forked child's Pi process, as the patched adapter launches it: its launch-argument code run
+		// as bundled, composed as `PiAdapter.forkThread` composes it.
+		const forkThread = source("forkThread: fn(\"PiAdapter.forkThread\")", "forkScoped);");
+		assert.match(forkThread, /args: \[\n\t+\.\.\.forkLaunch\.args,\n\t+"--fork",\n\t+sourceFile\n\t+\],\n\t+cwd,/, "the fork runs `pi … --fork <source session file>` in the child's checkout");
+		assert.match(forkThread, /const boundary = target === void 0 \? \{ type: "nothing" \}/, "without a turn the whole branch is copied");
+		const launchModule = source("const RESERVED_PI_LAUNCH_ARGUMENTS", "const materializePiT3McpExtension") + source("function buildPiRpcLaunch(", "// ../../packages/provider-pi/src/server/usage.ts");
+		const { resolvePiLaunchArgs, buildPiRpcLaunch } = new Function(
+			"tokenizeCliArgs",
+			"T3_MCP_URL_ENV",
+			"T3_MCP_BEARER_ENV",
+			"T3_PI_RUNTIME_MODE_ENV",
+			"T3_PI_MCP_EXTENSION_PATH_ENV",
+			`${launchModule}\nreturn { resolvePiLaunchArgs, buildPiRpcLaunch };`,
+		)((args: string) => args.split(/\s+/).filter(Boolean), "T3_MCP_URL", "T3_MCP_BEARER_TOKEN", "T3_PI_RUNTIME_MODE", "T3_PI_MCP_EXTENSION_PATH");
+		// `--fork` is t3's own: a user's launch arguments cannot set it.
+		assert.deepEqual(resolvePiLaunchArgs("--fork /tmp/other.jsonl"), { ok: false, message: "Pi launch argument '--fork' is controlled by T3 Code and cannot be overridden." });
+		const launchArgs = resolvePiLaunchArgs("--model anthropic/claude-opus --thinking high --extension /harness/ext.ts --tools read,bash");
+		assert.ok(launchArgs.ok);
+		const forkLaunch = buildPiRpcLaunch({
+			launchArgs: launchArgs.args,
+			environment: { HOME: "/home/u", T3_MCP_URL: "http://stale" },
+			mcpSession: undefined,
+			extensionPath: undefined,
+			shortLived: true,
+			disableExtensions: true,
+			disableTools: true,
+		});
+		const sessionFile = "/home/u/.pi/agent/sessions/--parent--/2026-11-14T10-00-00-000Z_abc.jsonl";
+		const args = [...forkLaunch.args, "--fork", sessionFile];
+		assert.deepEqual(args, ["--mode", "rpc", "--model", "anthropic/claude-opus", "--thinking", "high", "--offline", "--no-extensions", "--no-tools", "--fork", sessionFile]);
+		assert.deepEqual(forkLaunch.env, { HOME: "/home/u", PI_RPC_DIALOGS: "questions" });
+
 		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
 		try {
-			writeFileSync(join(dir, "bundle.mjs"), text);
-			execFileSync(process.execPath, ["--check", join(dir, "bundle.mjs")]);
+			for (const [path, patchedText] of patched) {
+				const file = join(dir, path.replaceAll("/", "_"));
+				writeFileSync(file, patchedText);
+				execFileSync(process.execPath, ["--check", file]);
+			}
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -252,14 +347,54 @@ describe("keeping t3 patched", () => {
 			const app = join(dir, "T3 Test.app");
 			const archive = join(app, "Contents/Resources/app.asar");
 			mkdirSync(dirname(archive), { recursive: true });
-			writeArchive(archive, { "apps/server/dist/runtime.mjs": bundle, "apps/server/dist/other.mjs": "export {};\n" });
+			writeArchive(archive, { ...chunks, "apps/server/dist/other.mjs": "export {};\n" });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /^patched apps\/server\/dist\/runtime\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, session-questions;/);
+			assert.match(
+				await keepPatched(app),
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, session-questions;/,
+			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
-			const patched = readFile(archive, "apps/server/dist/runtime.mjs").toString();
-			assert.equal(patched, patchBundle(bundle).text);
+			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
+			assert.equal(readFile(archive, "apps/server/dist/other.mjs").toString(), "export {};\n");
 			assert.equal(await keepPatched(app), "already patched");
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original, "the backup stays t3's own archive");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("patches an archive whose earlier patches are applied, and changes nothing when one file's anchor broke", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "t3-app-"));
+		try {
+			const app = join(dir, "T3 Test.app");
+			const archive = join(app, "Contents/Resources/app.asar");
+			mkdirSync(dirname(archive), { recursive: true });
+			// An archive patched before the fork patches existed: only the adapter chunk is patched.
+			const fork = (patch: Patch) => patch.name.startsWith("delegate-fork");
+			const adapterChunk = "apps/server/dist/chunk0.mjs";
+			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
+			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
+			const original = readFileSync(archive);
+			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool;/);
+			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
+			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
+
+			// t3 changed the MCP service: no chunk is patched, the adapter's included.
+			const toolChunk = Object.keys(chunks).find((path) => chunks[path]!.includes("resolveTargetRechecking"))!;
+			writeArchive(archive, { ...chunks, [toolChunk]: chunks[toolChunk]!.replace("task: taskPrompt(input),", "task: buildTask(input),") });
+			const broken = readFileSync(archive);
+			// patchApp, not keepPatched: that one also posts the failure as a macOS notification.
+			assert.throws(() => patchApp(app), /delegate-fork-tool patch\): expected the anchor once, found it 0 times/);
+			assert.deepEqual(readFileSync(archive), broken);
+			assert.notDeepEqual(broken, original);
+
+			// A file a patch edits that is found twice (or not at all) is not guessed.
+			writeArchive(archive, { ...chunks, "apps/server/dist/copy.mjs": chunks[toolChunk]! });
+			const ambiguous = readFileSync(archive);
+			assert.throws(() => patchApp(app), /expected one bundled server file containing fn\("OrchestratorMcpService\.delegateTask"\), found 2; nothing patched/);
+			assert.deepEqual(readFileSync(archive), ambiguous);
+			writeArchive(archive, Object.fromEntries(Object.entries(chunks).filter(([path]) => path !== toolChunk)));
+			assert.throws(() => patchApp(app), /found 0; nothing patched/);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
