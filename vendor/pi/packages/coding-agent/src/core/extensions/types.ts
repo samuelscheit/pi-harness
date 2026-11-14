@@ -59,7 +59,11 @@ import type {
 import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
-import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
+import type {
+	CacheWarmingDecisionEvent,
+	CacheWarmingDecisionEventResult,
+	CacheWarmingStatus,
+} from "../cache-warmer.ts";
 import type { CompactionModel, CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
@@ -1485,6 +1489,7 @@ export type ExtensionEvent =
 	| ContextEvent
 	| ContextWithSystemEvent
 	| CacheWarmingDecisionEvent
+	| CacheWarmingEvent
 	| BeforeProviderRequestEvent
 	| BeforeProviderHeadersEvent
 	| AfterProviderResponseEvent
@@ -1525,6 +1530,19 @@ export type AgentBeforeSettleEventResult = BoundaryResult;
 export type BeforeProviderRequestEventResult = unknown;
 
 export type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
+
+/**
+ * Cache warming changed state (the session's `cache_warming` event): a refresh was scheduled, is in
+ * flight, or warming stopped with `reason`. Fired after a refresh's usage entry was appended.
+ */
+export interface CacheWarmingEvent {
+	type: "cache_warming";
+	state: CacheWarmingStatus["state"];
+	nextWarmAt?: number;
+	reason?: string;
+	/** End of the session's hold (`pi.setCacheWarmingHold`) while it runs. */
+	holdUntil?: number;
+}
 
 export interface ToolCallEventResult {
 	/** Block tool execution. To modify arguments, mutate `event.input` in place instead. */
@@ -1728,6 +1746,7 @@ export interface ExtensionAPI {
 		event: "cache_warming_decision",
 		handler: ExtensionHandler<CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult>,
 	): () => void;
+	on(event: "cache_warming", handler: ExtensionHandler<CacheWarmingEvent>): () => void;
 	on(
 		event: "before_provider_request",
 		handler: ExtensionHandler<BeforeProviderRequestEvent, BeforeProviderRequestEventResult>,
@@ -1901,6 +1920,20 @@ export interface ExtensionAPI {
 	 * again.
 	 */
 	setBackgroundWork(key: string, pending: number): void;
+
+	/**
+	 * Hold this session's prompt cache warm until `untilMs` (epoch milliseconds), or end the hold
+	 * with `undefined`. While the hold runs, cache warming continues to at least its end, sends every
+	 * refresh (the user counts as returning), and runs even when the `cacheWarming` setting is "off"
+	 * or "streaming". Setting a hold resumes warming of the last request if it had stopped and its
+	 * cache entry is still alive; otherwise it applies from the next request. Requests the session
+	 * cannot replay safely, models without a known cache lifetime, and a failed refresh still stop
+	 * warming. The hold is session state: it survives reloads, not the process.
+	 */
+	setCacheWarmingHold(untilMs: number | undefined): void;
+
+	/** Current cache warming state: schedule, the pending decision with its costs, the hold, and the cache lifetime. */
+	getCacheWarmingStatus(): CacheWarmingStatus | undefined;
 
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
@@ -2328,6 +2361,8 @@ export interface ExtensionActions {
 	setActiveTools: SetActiveToolsHandler;
 	requestReload: RequestReloadHandler;
 	setBackgroundWork: SetBackgroundWorkHandler;
+	setCacheWarmingHold: (untilMs: number | undefined) => void;
+	getCacheWarmingStatus: () => CacheWarmingStatus | undefined;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;

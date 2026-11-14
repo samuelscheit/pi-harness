@@ -3,6 +3,7 @@ import {
 	CACHE_WARMING_MAX_AGE_MS,
 	CACHE_WARMING_MAX_IDLE_AGE_MS,
 	CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS,
+	type CacheRetention,
 	type CacheWarmingAction,
 	type CacheWarmingDecision,
 	type Context,
@@ -54,7 +55,7 @@ export function isPromptCacheCold(branch: SessionEntry[], ttlMs: number | undefi
  * extension might want (model, idle state, context size) is on the context.
  */
 export interface CacheWarmingDecisionEvent
-	extends Pick<CacheWarmingDecision, "warmCost" | "missCost" | "continuationProbability" | "action"> {
+	extends Pick<CacheWarmingDecision, "warmCost" | "missCost" | "continuationProbability" | "held" | "action"> {
 	type: "cache_warming_decision";
 }
 
@@ -73,6 +74,10 @@ export interface CacheWarmingStatus {
 	decision?: CacheWarmingDecision;
 	/** True when an extension changed `decision.action`. */
 	extensionOverride?: boolean;
+	/** End of the session's hold (see `CacheWarmer.setHold`) while it runs. */
+	holdUntil?: number;
+	/** The cache entry of the last eligible request: its lifetime, the refresh interval and the retention tier. */
+	cache?: { ttlMs: number; delayMs: number; retention: CacheRetention };
 }
 
 /** The request whose prompt cache entry should be kept warm, exactly as it was sent. */
@@ -90,6 +95,8 @@ interface ActiveRun extends CacheWarmRequest {
 	/** Latest safe time to send this refresh, leaving half the original expiry margin. */
 	refreshDeadlineAt: number;
 	startedAt: number;
+	/** When the request or the last refresh touched the cache entry; the next refresh is due `delayMs` later. */
+	touchedAt: number;
 	controller: AbortController;
 	phase: "streaming" | "idle";
 	nextWarmAt: number;
@@ -102,9 +109,17 @@ interface ActiveRun extends CacheWarmRequest {
  * Keeps one prompt cache entry alive by re-sending its request with a
  * one-token output cap before the entry expires. `start` replaces any
  * previous run; warm requests never extend the fixed safety windows.
+ *
+ * A hold (`setHold`) is the session's explicit request to keep its cache warm until a time: until
+ * then the deadline is at least the hold's end, every refresh is sent (the user counts as
+ * returning), and warming runs whatever the `cacheWarming` mode. Replayability, a known cache
+ * lifetime and stopping after a failed refresh still apply.
  */
 export class CacheWarmer {
 	private run?: ActiveRun;
+	/** The last eligible request, kept after warming stops so a hold can resume it while its entry lives. */
+	private last?: ActiveRun;
+	private holdUntil?: number;
 	private inactive: CacheWarmingStatus;
 	private readonly models: Pick<ModelRuntime, "streamSimple">;
 	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">;
@@ -137,31 +152,41 @@ export class CacheWarmer {
 	}
 
 	get status(): CacheWarmingStatus {
-		if (this.getMode() === "off") return { state: "inactive", reason: "cache warming disabled" };
+		const last = this.last;
+		const extras: Pick<CacheWarmingStatus, "holdUntil" | "cache"> = {
+			...(this.held() ? { holdUntil: this.holdUntil } : {}),
+			...(last
+				? {
+						cache: {
+							ttlMs: last.ttlMs,
+							delayMs: last.delayMs,
+							retention: resolvePromptCacheRetention(last.options),
+						},
+					}
+				: {}),
+		};
+		if (this.mode() === "off") return { state: "inactive", reason: "cache warming disabled", ...extras };
 		const run = this.run;
-		if (!run) return this.inactive;
-		if (!run.isCurrent()) return { state: "inactive", reason: "conversation context changed" };
+		if (!run) return { ...this.inactive, ...extras };
+		if (!run.isCurrent()) return { state: "inactive", reason: "conversation context changed", ...extras };
 		const decision = this.evaluate(run);
 		const refreshing = run.timer === undefined;
-		if (!decision.economicsAvailable && !refreshing) {
-			return { state: "inactive", reason: "cache economics unavailable" };
+		if (!decision.economicsAvailable && !decision.held && !refreshing) {
+			return { state: "inactive", reason: "cache economics unavailable", ...extras };
 		}
 		return {
 			state: refreshing ? "refreshing" : "scheduled",
 			nextWarmAt: run.nextWarmAt,
 			decision,
 			extensionOverride: run.extensionOverride,
+			...extras,
 		};
 	}
 
 	/** Keep the prompt cache entry written by `request` warm while `isCurrent` holds. */
 	start(request: CacheWarmRequest, isCurrent: () => boolean): void {
 		this.clearRun();
-		const mode = this.getMode();
-		if (mode === "off") {
-			this.stop("cache warming disabled");
-			return;
-		}
+		this.last = undefined;
 		if (!isCacheWarmingReplayable(request.model, request.options)) {
 			this.stop("request cannot be replayed safely");
 			return;
@@ -180,45 +205,93 @@ export class CacheWarmer {
 			this.stop("cache lifetime unavailable");
 			return;
 		}
-		this.run = {
+		const now = Date.now();
+		const run: ActiveRun = {
 			...request,
 			isCurrent,
 			ttlMs,
 			delayMs,
 			refreshDeadlineAt: 0,
-			startedAt: Date.now(),
+			startedAt: now,
+			touchedAt: now,
 			controller: new AbortController(),
 			phase: "streaming",
 			nextWarmAt: 0,
 			extensionOverride: false,
 		};
-		this.schedule(this.run);
+		// Kept even when warming is off, so a hold set later can still keep this entry warm.
+		this.last = run;
+		if (this.mode() === "off") {
+			this.stop("cache warming disabled");
+			return;
+		}
+		this.run = run;
+		this.schedule(run);
 	}
 
 	onAgentSettled(): void {
+		if (this.last) this.last.phase = "idle";
 		const run = this.run;
 		if (!run) return;
-		if (this.getMode() === "streaming") {
-			this.stop("agent run settled");
-			return;
-		}
 		run.phase = "idle";
-		const deadline = run.startedAt + this.getIdleMaxAgeMs();
-		if (run.nextWarmAt > deadline || Date.now() >= deadline) {
-			this.stop(this.idleLimitReason());
-		}
+		const reason = this.getModeStopReason(run) ?? this.deadlineStopReason(run);
+		if (reason) this.stop(reason);
 	}
 
 	/** Reconcile an active run after the persisted warming mode changes. */
 	onModeChanged(): void {
-		const run = this.run;
-		if (!run) return;
-		const reason = this.getModeStopReason(run);
-		if (reason) this.stop(reason);
+		this.reconcile();
+	}
+
+	/**
+	 * Hold the cache warm until `untilMs` (epoch milliseconds), or end the hold with `undefined`.
+	 * While the hold runs, warming continues to at least its end, every refresh is sent, and the
+	 * `cacheWarming` mode does not stop it. Setting a hold resumes warming of the last request when
+	 * warming had stopped and its cache entry is still alive. Ending it applies the normal rules at once.
+	 */
+	setHold(untilMs: number | undefined): void {
+		if (untilMs !== undefined && !Number.isFinite(untilMs)) throw new Error(`Invalid cache warming hold: ${untilMs}`);
+		this.holdUntil = untilMs;
+		if (this.held()) this.resume();
+		else this.reconcile();
+		this.onStatusChanged?.();
 	}
 
 	cancel(): void {
 		this.stop("inactive");
+	}
+
+	/** Whether a hold covers time `at` (default now). */
+	private held(at = Date.now()): boolean {
+		return this.holdUntil !== undefined && at <= this.holdUntil;
+	}
+
+	/** The warming mode in effect: a hold warms as "idle" whatever the setting. */
+	private mode(): CacheWarmingMode {
+		return this.held() ? "idle" : this.getMode();
+	}
+
+	/** Warm the last request again under a hold, if warming stopped while its cache entry is still alive. */
+	private resume(): void {
+		const last = this.last;
+		if (this.run || !last) return;
+		if (!last.isCurrent()) {
+			this.stop("conversation context changed", undefined, true);
+			return;
+		}
+		const run: ActiveRun = { ...last, controller: new AbortController(), timer: undefined, extensionOverride: false };
+		this.last = run;
+		this.run = run;
+		this.schedule(run);
+	}
+
+	/** Stop an active run that the current mode or deadline no longer allows. */
+	private reconcile(): void {
+		const run = this.run;
+		if (!run) return;
+		// A refresh in flight checks its deadline when it schedules the next one.
+		const reason = this.getModeStopReason(run) ?? (run.timer ? this.deadlineStopReason(run) : undefined);
+		if (reason) this.stop(reason);
 	}
 
 	private clearRun(): void {
@@ -229,27 +302,49 @@ export class CacheWarmer {
 		run.controller.abort();
 	}
 
-	private stop(reason: string, stopped?: Pick<CacheWarmingStatus, "decision" | "extensionOverride">): void {
+	/** `forget`: the last request's entry cannot be warmed any more, so a hold must not resume it. */
+	private stop(
+		reason: string,
+		stopped?: Pick<CacheWarmingStatus, "decision" | "extensionOverride">,
+		forget = false,
+	): void {
 		this.clearRun();
+		if (forget) this.last = undefined;
 		this.inactive = { state: "inactive", reason, ...stopped };
 		this.onStatusChanged?.();
 	}
 
 	private schedule(run: ActiveRun): void {
 		run.extensionOverride = false;
-		run.nextWarmAt = Date.now() + run.delayMs;
+		run.nextWarmAt = run.touchedAt + run.delayMs;
 		// A timer can run late after sleep or event-loop blockage. Keep half of
 		// the planned pre-expiry margin for that delay and request dispatch; a
 		// late refresh is likely a full-price cache write, not a cache warm.
 		run.refreshDeadlineAt = run.nextWarmAt + Math.floor((run.ttlMs - run.delayMs) / 2);
-		const deadline = run.startedAt + (run.phase === "idle" ? this.getIdleMaxAgeMs() : CACHE_WARMING_MAX_AGE_MS);
-		if (run.nextWarmAt > deadline || Date.now() >= deadline) {
-			this.stop(run.phase === "idle" ? this.idleLimitReason() : "one-hour safety limit reached");
+		if (Date.now() > run.refreshDeadlineAt) {
+			this.stop("prompt cache entry expired", undefined, true);
+			return;
+		}
+		const reason = this.deadlineStopReason(run);
+		if (reason) {
+			this.stop(reason);
 			return;
 		}
 		run.timer = setTimeout(() => void this.refresh(run), Math.max(0, run.nextWarmAt - Date.now()));
 		run.timer.unref?.();
 		this.onStatusChanged?.();
+	}
+
+	/**
+	 * Why the run's next refresh may not be sent: it falls after the safety window of its phase
+	 * (one hour while streaming, `getIdleMaxAgeMs` when idle) and after the hold's end.
+	 */
+	private deadlineStopReason(run: ActiveRun): string | undefined {
+		const normal = run.startedAt + (run.phase === "idle" ? this.getIdleMaxAgeMs() : CACHE_WARMING_MAX_AGE_MS);
+		const deadline = Math.max(normal, this.holdUntil ?? 0);
+		if (run.nextWarmAt <= deadline && Date.now() < deadline) return undefined;
+		if (this.holdUntil !== undefined && this.holdUntil > normal) return "cache warming hold ended";
+		return run.phase === "idle" ? this.idleLimitReason() : "one-hour safety limit reached";
 	}
 
 	private async refresh(run: ActiveRun): Promise<void> {
@@ -258,7 +353,7 @@ export class CacheWarmer {
 		if (!this.validateRun(run)) return;
 		if (this.refreshDeadlineMissed(run)) return;
 		const decision = this.evaluate(run);
-		const { warmCost, missCost, continuationProbability } = decision;
+		const { warmCost, missCost, continuationProbability, held } = decision;
 		let action = decision.action;
 		try {
 			action = await this.decide({
@@ -266,6 +361,7 @@ export class CacheWarmer {
 				warmCost,
 				missCost,
 				continuationProbability,
+				held,
 				action,
 			});
 		} catch {
@@ -284,6 +380,7 @@ export class CacheWarmer {
 		}
 
 		run.extensionOverride = extensionOverride;
+		let warmed = false;
 		try {
 			const message = await this.models
 				.streamSimple(run.model, run.context, getCacheWarmingRequestOptions(run.options, run.controller.signal))
@@ -297,12 +394,20 @@ export class CacheWarmer {
 					message.usage,
 					extensionOverride ? "extension override" : undefined,
 				);
+				warmed = true;
 				this.onWarmed?.(entry);
 			}
 		} catch {
 			// Cache warming is best-effort and must not affect the active agent run.
 		}
-		if (this.run === run) this.schedule(run);
+		if (this.run !== run) return;
+		// The next refresh would come after the entry expired and write the whole prompt again.
+		if (!warmed) {
+			this.stop("cache refresh failed", undefined, true);
+			return;
+		}
+		run.touchedAt = Date.now();
+		this.schedule(run);
 	}
 
 	private idleLimitReason(): string {
@@ -311,20 +416,24 @@ export class CacheWarmer {
 
 	private refreshDeadlineMissed(run: ActiveRun): boolean {
 		if (Date.now() <= run.refreshDeadlineAt) return false;
-		this.stop("cache refresh deadline missed");
+		this.stop("cache refresh deadline missed", undefined, true);
 		return true;
 	}
 
 	private validateRun(run: ActiveRun): boolean {
 		if (this.run !== run) return false;
-		const reason = this.getModeStopReason(run) ?? (!run.isCurrent() ? "conversation context changed" : undefined);
+		if (!run.isCurrent()) {
+			this.stop("conversation context changed", undefined, true);
+			return false;
+		}
+		const reason = this.getModeStopReason(run);
 		if (!reason) return true;
 		this.stop(reason);
 		return false;
 	}
 
 	private getModeStopReason(run: ActiveRun): string | undefined {
-		const mode = this.getMode();
+		const mode = this.mode();
 		if (mode === "off") return "cache warming disabled";
 		if (mode === "streaming" && run.phase === "idle") return "agent run settled";
 		return undefined;
@@ -336,6 +445,7 @@ export class CacheWarmer {
 			lastPromptTokens(this.sessionManager.getBranch()),
 			run.phase,
 			resolvePromptCacheRetention(run.options),
+			this.held(run.nextWarmAt),
 		);
 	}
 }
@@ -344,7 +454,15 @@ function formatDollars(value: number): string {
 	return value < 0 ? `-$${Math.abs(value).toFixed(3)}` : `$${value.toFixed(3)}`;
 }
 
-function formatCacheWarmingEconomics(decision: CacheWarmingDecision): string {
+function formatClock(time: number): string {
+	return new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatCacheWarmingEconomics(decision: CacheWarmingDecision, holdUntil: number | undefined): string {
+	if (decision.held) {
+		const until = holdUntil === undefined ? "" : ` until ${formatClock(holdUntil)}`;
+		return `held${until}, every refresh is sent at ${formatDollars(decision.warmCost)}`;
+	}
 	if (!decision.economicsAvailable) return "cache economics unavailable";
 	const probability = Math.round(decision.continuationProbability * 100);
 	const probabilityText =
@@ -375,11 +493,11 @@ export function formatCacheWarmingStatus(status: CacheWarmingStatus, now = Date.
 	// A decision is attached once pi (or an extension) acted on it; "inactive"
 	// without one never got that far.
 	if (!decision || (status.state === "inactive" && !decision.economicsAvailable && !status.extensionOverride)) {
-		return `Inactive (${status.reason ?? "unknown reason"})`;
+		const hold = status.holdUntil === undefined ? "" : `, held until ${formatClock(status.holdUntil)}`;
+		return `Inactive (${status.reason ?? "unknown reason"}${hold})`;
 	}
-	const details = status.extensionOverride
-		? `extension override, ${formatCacheWarmingEconomics(decision)}`
-		: `${formatCacheWarmingEconomics(decision)} -> ${decision.action}`;
+	const economics = formatCacheWarmingEconomics(decision, status.holdUntil);
+	const details = status.extensionOverride ? `extension override, ${economics}` : `${economics} -> ${decision.action}`;
 	if (status.state === "inactive") return `Stopped (${details})`;
 	if (status.state === "refreshing") return `Warming cache (${details})`;
 	return `${formatCacheWarmingDecisionTime(status.nextWarmAt, now)} (${details})`;
@@ -391,3 +509,4 @@ export function formatCacheWarmingUsage(totalCost: number, note?: string): strin
 	const cost = totalCost.toFixed(6).replace(/(\.\d{3}\d*?)0+$/, "$1");
 	return `Cache warmed${noteText}: $${cost}`;
 }
+

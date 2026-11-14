@@ -225,7 +225,14 @@ export type AgentSessionEvent =
 	  }
 	| { type: "agent_settled"; aborted: boolean }
 	/** Cache warming changed state: a host keeping sessions loaded can keep this one while a refresh is pending. */
-	| { type: "cache_warming"; state: CacheWarmingStatus["state"]; nextWarmAt?: number; reason?: string }
+	| {
+			type: "cache_warming";
+			state: CacheWarmingStatus["state"];
+			nextWarmAt?: number;
+			reason?: string;
+			/** End of the session's cache warming hold (`pi.setCacheWarmingHold`) while it runs. */
+			holdUntil?: number;
+	  }
 	/** Work extensions keep running outside any run changed (`pi.setBackgroundWork`): a host keeping sessions loaded keeps this one while `pending > 0`. */
 	| { type: "background_work"; pending: number }
 	| {
@@ -290,7 +297,7 @@ export interface AgentSessionConfig {
 	/** Canonical model/auth runtime used by coding-agent internals. */
 	modelRuntime: ModelRuntime;
 	/** Keeps the prompt cache entry of the last session request warm. */
-	cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
+	cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "setHold">;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
 	/**
@@ -524,7 +531,7 @@ export class AgentSession {
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<
 		CacheWarmer,
-		"cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "onStatusChanged"
+		"cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed" | "onStatusChanged" | "setHold"
 	>;
 	/** The last cache warming state emitted, to emit changes only. */
 	private _cacheWarmingEmitted?: string;
@@ -1594,11 +1601,13 @@ export class AgentSession {
 			state: status.state,
 			...(status.nextWarmAt === undefined ? {} : { nextWarmAt: status.nextWarmAt }),
 			...(status.reason === undefined ? {} : { reason: status.reason }),
+			...(status.holdUntil === undefined ? {} : { holdUntil: status.holdUntil }),
 		};
 		const key = JSON.stringify(event);
 		if (key === this._cacheWarmingEmitted) return;
 		this._cacheWarmingEmitted = key;
 		this._emit(event);
+		void this._extensionRunner.emit(event);
 	}
 
 	get cacheWarmingStatus(): CacheWarmingStatus | undefined {
@@ -1609,6 +1618,12 @@ export class AgentSession {
 	setCacheWarmingMode(mode: CacheWarmingMode): void {
 		this.settingsManager.setCacheWarmingMode(mode);
 		this._cacheWarmer?.onModeChanged();
+	}
+
+	/** Hold this session's prompt cache warm until `untilMs`, or end the hold (see ExtensionAPI.setCacheWarmingHold). */
+	setCacheWarmingHold(untilMs: number | undefined): void {
+		this._cacheWarmer?.setHold(untilMs);
+		this._emitCacheWarmingStatus();
 	}
 
 	/** Current model (may be undefined if not yet selected) */
@@ -3681,6 +3696,8 @@ export class AgentSession {
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				requestReload: () => this.requestReload(),
 				setBackgroundWork: (key, pending) => this.setBackgroundWork(key, pending),
+				setCacheWarmingHold: (untilMs) => this.setCacheWarmingHold(untilMs),
+				getCacheWarmingStatus: () => this.cacheWarmingStatus,
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {

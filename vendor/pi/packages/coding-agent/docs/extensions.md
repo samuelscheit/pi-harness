@@ -403,7 +403,8 @@ Other operations change the current session without replacing the runtime:
 | Thinking-level change (settings, keybinding, `pi.setThinkingLevel()`) | `thinking_level_select` |
 | `!` or `!!` command | `user_bash` (can intercept) |
 | Extension dialog or custom screen waits for the user | `ui_prompt_start`, `ui_prompt_end` |
-| Idle prompt-cache refresh | `cache_warming_decision` |
+| Idle prompt-cache refresh | `cache_warming_decision`, then `cache_warming` |
+| Prompt-cache warming scheduled, refreshing or stopped | `cache_warming` |
 | Extension registers or removes an MCP server after startup | `mcp_servers_change` |
 
 <a id="events-and-concurrency"></a>
@@ -918,6 +919,7 @@ pi.on("cache_warming_decision", (event, ctx) => {
   // event.warmCost: price of this refresh
   // event.missCost: extra price of the next request if the entry is lost
   // event.continuationProbability: pi's estimate that a request arrives in time
+  // event.held: true while pi.setCacheWarmingHold() holds the cache warm (then action is "warm")
   // event.action: "warm" | "stop", pi's decision
 
   if (ctx.model?.provider === "my-provider") {
@@ -927,6 +929,17 @@ pi.on("cache_warming_decision", (event, ctx) => {
 ```
 
 Return `{ action: "warm" }` or `{ action: "stop" }` to override; the last handler that returns an action wins. `"stop"` ends warming until the next real request.
+
+#### cache_warming
+
+Fired when cache warming changes state: a refresh is scheduled (`nextWarmAt`), a refresh is in flight, or warming stopped (`reason`). The usage entry of a refresh is appended before the following `scheduled` event, so spend read from the session in the handler is current. `holdUntil` is set while a hold (`pi.setCacheWarmingHold`) runs. The same event goes to RPC clients.
+
+```typescript
+pi.on("cache_warming", (event, ctx) => {
+  // event.state: "inactive" | "scheduled" | "refreshing"
+  // event.nextWarmAt?, event.reason?, event.holdUntil?
+});
+```
 
 ### Model Events
 
@@ -1962,6 +1975,23 @@ Report how much work your extension keeps running for the session outside any ag
 
 ```typescript
 pi.setBackgroundWork("my-jobs", jobs.size);
+```
+
+### pi.setCacheWarmingHold(untilMs) and pi.getCacheWarmingStatus()
+
+Hold this session's prompt cache warm until `untilMs` (epoch milliseconds), for example when the user says they will be back later. While the hold runs:
+
+- warming continues to at least the hold's end, beyond the one-hour streaming limit and `cacheWarmingIdleMinutes`;
+- every refresh is sent: the user counts as returning (`continuationProbability` 1, `held` in `cache_warming_decision`), whatever the expected saving;
+- warming runs even when the `cacheWarming` setting is `"off"` or `"streaming"`.
+
+Setting a hold after warming stopped resumes it for the last request when that request's cache entry is still alive; otherwise the hold applies from the next request. A new request does not end the hold. Requests that cannot be replayed safely, models without a known cache lifetime, a changed conversation and a failed refresh still stop warming, and a `cache_warming_decision` handler can still stop a refresh. `pi.setCacheWarmingHold(undefined)` ends the hold, and the normal rules apply at once. The hold is session state: it survives reloads, not the process, so an extension that persists it (with `pi.appendEntry`) sets it again in `session_start`.
+
+`pi.getCacheWarmingStatus()` returns the current state: `state`, `nextWarmAt`, `reason`, the pending `decision` (with `warmCost`), `holdUntil`, and `cache` (`ttlMs`, `delayMs` between refreshes, `retention`) once a request is known.
+
+```typescript
+pi.setCacheWarmingHold(Date.now() + 3 * 60 * 60_000);
+const { decision, cache } = pi.getCacheWarmingStatus() ?? {};
 ```
 
 ### pi.wrapToolExecution(wrapper)

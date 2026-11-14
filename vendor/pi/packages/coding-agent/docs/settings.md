@@ -18,7 +18,7 @@ Add `"$schema": "https://pi.dev/schemas/settings.schema.json"` to `settings.json
 | `enabledModels` | `string[]` | All available models | Model patterns used for startup selection and model cycling. Uses the same format as `--models`. |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in the transcript. |
 | `showCacheMissNotices` | boolean | `false` | Show notices for significant cache misses, successful cache warming, compaction usage, and provider recovery. |
-| `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"idle"` | Keep eligible provider prompt caches warm during active runs and, with `"idle"`, for up to `cacheWarmingIdleMinutes` between runs. `"streaming"` warms only during active runs. Global setting only. |
+| `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"idle"` | Keep eligible provider prompt caches warm during active runs and, with `"idle"`, for up to `cacheWarmingIdleMinutes` between runs. `"streaming"` warms only during active runs. A refresh that fails ends warming until the next request. An extension can hold one session's cache warm past these limits and this setting (`pi.setCacheWarmingHold`). Global setting only. |
 | `cacheWarmingIdleMinutes` | number | `30` | How long after a request idle warming may still refresh the cache. With a one-hour cache (`cacheRetention: "long"`), the refresh is due at 54 minutes, so 60 allows one refresh. Global setting only. |
 | `cacheRetention` | `"none" \| "short" \| "long"` | `PI_CACHE_RETENTION`, else `"short"` | Prompt cache retention where the provider supports it. Anthropic: 5 minutes (`"short"`) or 1 hour (`"long"`, cache writes at 2x the input price instead of 1.25x). |
 

@@ -47,6 +47,7 @@ export {
 	type BoundaryState,
 	type BuildSystemPromptOptions,
 	type CacheWarmingDecisionEvent,
+	type CacheWarmingEvent,
 	type CacheWarmingDecisionEventResult,
 	type CompactionEntryDraft,
 	type ContextEditEntryDraft,

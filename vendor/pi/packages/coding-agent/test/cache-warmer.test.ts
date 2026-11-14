@@ -12,7 +12,7 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import {
 	CacheWarmer,
@@ -125,7 +125,12 @@ function request(model: Model<Api> = adaptiveModel, options: ModelsSimpleStreamO
 
 const current = () => true;
 
-afterEach(() => vi.useRealTimers());
+// Retention falls back to PI_CACHE_RETENTION; the defaults below assume it is unset.
+beforeEach(() => vi.stubEnv("PI_CACHE_RETENTION", ""));
+afterEach(() => {
+	vi.useRealTimers();
+	vi.unstubAllEnvs();
+});
 
 describe("cache warming", () => {
 	it("derives eligibility and timing from retention and provider behavior", () => {
@@ -311,11 +316,19 @@ describe("cache warming", () => {
 		await vi.advanceTimersByTimeAsync(600_000);
 		expect(pending.calls).toHaveLength(1);
 
+		// The next refresh would come after the entry expired, so a failed one ends warming.
 		const failed = fakeRuntime({ result: async (model) => response(model, "error") });
 		failed.warmer.start(request(), current);
 		await vi.advanceTimersByTimeAsync(270_000);
 		expect(failed.appendUsage).not.toHaveBeenCalled();
-		failed.warmer.cancel();
+		expect(failed.warmer.status).toMatchObject({ state: "inactive", reason: "cache refresh failed" });
+		await vi.advanceTimersByTimeAsync(600_000);
+		expect(failed.calls).toHaveLength(1);
+
+		const thrown = fakeRuntime({ result: async () => Promise.reject(new Error("network")) });
+		thrown.warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+		expect(thrown.warmer.status).toMatchObject({ state: "inactive", reason: "cache refresh failed" });
 	});
 
 	it("formats status and usage entries", () => {
@@ -326,10 +339,22 @@ describe("cache warming", () => {
 			continuationProbability: 0.6,
 			expectedSavings: 0.36,
 			economicsAvailable: true,
+			held: false,
 			action: "warm",
 		};
 		expect(formatCacheWarmingStatus({ state: "scheduled", nextWarmAt: 222_000, decision }, 0)).toBe(
 			"Decision in 3m 42s (60% continuation probability, expected savings $0.360 >= $0.050 -> warm)",
+		);
+		const holdUntil = new Date(2026, 0, 1, 18, 0).getTime();
+		const clock = new Date(holdUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+		expect(
+			formatCacheWarmingStatus(
+				{ state: "scheduled", nextWarmAt: 60_000, decision: { ...decision, held: true }, holdUntil },
+				0,
+			),
+		).toBe(`Decision in 1m (held until ${clock}, every refresh is sent at $0.013 -> warm)`);
+		expect(formatCacheWarmingStatus({ state: "inactive", reason: "waiting for first request", holdUntil })).toBe(
+			`Inactive (waiting for first request, held until ${clock})`,
 		);
 		const usage = {
 			...warmUsage,
@@ -389,6 +414,188 @@ describe("idle warming limit", () => {
 		expect(states).toEqual(["scheduled", "refreshing", "scheduled", "refreshing", "inactive"]);
 		warmer.cancel();
 		expect(states.at(-1)).toBe("inactive");
+	});
+});
+
+describe("cache warming hold", () => {
+	const minutes = (n: number) => n * 60_000;
+
+	it("extends the deadline to the hold's end, then stops; without a hold the idle limit applies", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const plain = fakeRuntime();
+		plain.warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		plain.warmer.onAgentSettled();
+		expect(plain.warmer.status.reason).toBe("30-minute idle safety limit reached");
+
+		const { warmer, calls } = fakeRuntime();
+		warmer.setHold(minutes(180));
+		warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		warmer.onAgentSettled();
+		expect(warmer.status).toMatchObject({
+			state: "scheduled",
+			nextWarmAt: minutes(54),
+			holdUntil: minutes(180),
+			cache: { ttlMs: minutes(60), delayMs: minutes(54), retention: "long" },
+		});
+		await vi.advanceTimersByTimeAsync(minutes(180));
+		// Refreshes at 54, 108 and 162 minutes; the one at 216 falls after the hold.
+		expect(calls).toHaveLength(3);
+		expect(warmer.status).toMatchObject({ state: "inactive", reason: "cache warming hold ended" });
+		await vi.advanceTimersByTimeAsync(minutes(120));
+		expect(calls).toHaveLength(3);
+		expect(warmer.status.holdUntil).toBeUndefined();
+	});
+
+	it("extends the one-hour streaming limit too", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { warmer, calls } = fakeRuntime();
+		warmer.setHold(minutes(20));
+		warmer.start(request(), current);
+		// Streaming refreshes of a five-minute cache every 4.5 minutes: 4 by 18 minutes.
+		await vi.advanceTimersByTimeAsync(minutes(60));
+		expect(calls.length).toBeGreaterThan(4);
+		warmer.setHold(minutes(200));
+		await vi.advanceTimersByTimeAsync(minutes(120));
+		// Without the hold the streaming run would stop at 60 minutes (13 refreshes).
+		expect(calls.length).toBe(Math.floor(minutes(180) / 270_000));
+		warmer.cancel();
+	});
+
+	it("counts the user as returning and sends every refresh, also without known economics", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const unprofitable = fakeRuntime({ branch: branchWithPrompt(5_000) });
+		unprofitable.warmer.setHold(minutes(10));
+		unprofitable.warmer.start(request(), current);
+		unprofitable.warmer.onAgentSettled();
+		expect(unprofitable.warmer.status).toMatchObject({
+			state: "scheduled",
+			decision: { held: true, continuationProbability: 1, action: "warm" },
+		});
+		await vi.advanceTimersByTimeAsync(270_000);
+		expect(unprofitable.events[0]).toMatchObject({ held: true, continuationProbability: 1, action: "warm" });
+		expect(unprofitable.warmedEntries[0]?.note).toBeUndefined();
+		// 9 minutes is still held; at 13.5 minutes the hold is over and the normal economics stop it.
+		await vi.advanceTimersByTimeAsync(minutes(10));
+		expect(unprofitable.calls).toHaveLength(2);
+		expect(unprofitable.events.map((e) => [e.held, e.action])).toEqual([
+			[true, "warm"],
+			[true, "warm"],
+			[false, "stop"],
+		]);
+		expect(unprofitable.warmer.status).toMatchObject({ state: "inactive", reason: "expected savings below threshold" });
+
+		const unknown = fakeRuntime({ branch: branchWithPrompt(0) });
+		unknown.warmer.setHold(Date.now() + minutes(10));
+		unknown.warmer.start(request(), current);
+		expect(unknown.warmer.status.state).toBe("scheduled");
+		await vi.advanceTimersByTimeAsync(270_000);
+		expect(unknown.calls).toHaveLength(1);
+		unknown.warmer.cancel();
+
+		const vetoed = fakeRuntime({ decide: () => "stop" });
+		vetoed.warmer.setHold(Date.now() + minutes(10));
+		vetoed.warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+		expect(vetoed.calls).toHaveLength(0);
+		expect(vetoed.warmer.status).toMatchObject({ state: "inactive", reason: "stopped by extension" });
+	});
+
+	it("warms with the setting off or streaming-only, and resumes the last request when the hold is set later", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const off = fakeRuntime({ mode: "off" });
+		off.warmer.start(request(), current);
+		expect(off.warmer.status.reason).toBe("cache warming disabled");
+		vi.setSystemTime(60_000);
+		off.warmer.setHold(minutes(10));
+		// Resumed from the request's own time: the entry was written at 0, so the refresh is due at 4.5 minutes.
+		expect(off.warmer.status).toMatchObject({ state: "scheduled", nextWarmAt: 270_000, holdUntil: minutes(10) });
+		await vi.advanceTimersByTimeAsync(minutes(10));
+		expect(off.calls).toHaveLength(2);
+		expect(off.warmer.status).toMatchObject({ state: "inactive", reason: "cache warming disabled" });
+
+		const streaming = fakeRuntime({ mode: "streaming" });
+		streaming.warmer.start(request(), current);
+		streaming.warmer.onAgentSettled();
+		expect(streaming.warmer.status.reason).toBe("agent run settled");
+		streaming.warmer.setHold(Date.now() + minutes(10));
+		expect(streaming.warmer.status.state).toBe("scheduled");
+		await vi.advanceTimersByTimeAsync(270_000);
+		expect(streaming.calls).toHaveLength(1);
+		streaming.warmer.cancel();
+	});
+
+	it("does not resume an expired entry, a changed context, a failed refresh or a non-replayable request", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const expired = fakeRuntime({ mode: "off" });
+		expired.warmer.start(request(), current);
+		vi.setSystemTime(285_001);
+		expired.warmer.setHold(minutes(30));
+		expect(expired.warmer.status).toMatchObject({ state: "inactive", reason: "prompt cache entry expired" });
+		await vi.advanceTimersByTimeAsync(minutes(30));
+		expect(expired.calls).toHaveLength(0);
+
+		vi.setSystemTime(0);
+		let stillCurrent = true;
+		const changed = fakeRuntime({ mode: "off" });
+		changed.warmer.start(request(), () => stillCurrent);
+		stillCurrent = false;
+		changed.warmer.setHold(minutes(30));
+		expect(changed.warmer.status).toMatchObject({ state: "inactive", reason: "conversation context changed" });
+
+		const failed = fakeRuntime({ result: async (model) => response(model, "error") });
+		failed.warmer.start(request(), current);
+		await vi.advanceTimersByTimeAsync(270_000);
+		failed.warmer.setHold(Date.now() + minutes(30));
+		expect(failed.warmer.status).toMatchObject({ state: "inactive", reason: "cache refresh failed" });
+
+		const unsafe = fakeRuntime();
+		unsafe.warmer.setHold(Date.now() + minutes(30));
+		unsafe.warmer.start(request(budgetModel, { reasoning: "high" }), current);
+		expect(unsafe.warmer.status.reason).toBe("request cannot be replayed safely");
+		unsafe.warmer.start(request(unknownModel), current);
+		expect(unsafe.warmer.status.reason).toBe("cache lifetime unavailable");
+	});
+
+	it("clearing the hold applies the normal rules at once; a real request keeps it", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const { warmer, calls } = fakeRuntime();
+		const states: string[] = [];
+		warmer.onStatusChanged = () => states.push(warmer.status.state);
+		warmer.setHold(minutes(180));
+		warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		warmer.onAgentSettled();
+		await vi.advanceTimersByTimeAsync(minutes(60));
+		expect(calls).toHaveLength(1);
+		// A new request replaces the run; the hold stays.
+		warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		warmer.onAgentSettled();
+		expect(warmer.status).toMatchObject({ state: "scheduled", holdUntil: minutes(180) });
+		warmer.setHold(undefined);
+		// 54 minutes after the request is past the 30-minute idle limit.
+		expect(warmer.status).toMatchObject({ state: "inactive", reason: "30-minute idle safety limit reached" });
+		expect(warmer.status.holdUntil).toBeUndefined();
+		expect(states.at(-1)).toBe("inactive");
+
+		const off = fakeRuntime({ mode: "off" });
+		off.warmer.setHold(Date.now() + minutes(30));
+		off.warmer.start(request(), current);
+		expect(off.warmer.status.state).toBe("scheduled");
+		off.warmer.setHold(undefined);
+		expect(off.warmer.status.reason).toBe("cache warming disabled");
+
+		// A hold in the past is no hold.
+		const past = fakeRuntime();
+		past.warmer.setHold(-1);
+		past.warmer.start(request(adaptiveModel, { cacheRetention: "long" }), current);
+		past.warmer.onAgentSettled();
+		expect(past.warmer.status.reason).toBe("30-minute idle safety limit reached");
+		expect(() => past.warmer.setHold(Number.NaN)).toThrow(/Invalid cache warming hold/);
 	});
 });
 

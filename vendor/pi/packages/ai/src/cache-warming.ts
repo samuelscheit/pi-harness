@@ -23,7 +23,12 @@ export interface CacheWarmingDecision {
 	expectedSavings: number;
 	/** False when the prompt size or the model's prices are unknown. */
 	economicsAvailable: boolean;
-	/** "warm" when `expectedSavings` is at least `CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS`. */
+	/**
+	 * True while the session holds its cache warm (a host's explicit request): the user counts as returning
+	 * (`continuationProbability` 1) and every refresh is sent.
+	 */
+	held: boolean;
+	/** "warm" when held or when `expectedSavings` is at least `CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS`. */
 	action: CacheWarmingAction;
 }
 
@@ -84,12 +89,16 @@ export function getCacheWarmingRequestOptions<T extends SimpleStreamOptions>(opt
 	return { ...options, maxTokens: 1, disableContinuation: true, maxRetries: 0, signal };
 }
 
-/** Decide whether refreshing the cache entry of a `promptTokens`-token request pays for itself in `phase`. */
+/**
+ * Decide whether refreshing the cache entry of a `promptTokens`-token request pays for itself in `phase`. `held`: the
+ * session holds its cache warm, so the user counts as returning and the refresh is sent whatever it saves.
+ */
 export function evaluateCacheWarming(
 	model: Model<Api>,
 	promptTokens: number,
 	phase: CacheWarmingPhase,
 	retention: CacheRetention = "short",
+	held = false,
 ): CacheWarmingDecision {
 	const cacheHitCost = price(model, { cacheRead: promptTokens });
 	// A miss writes the prompt again with the same retention; a one-hour write costs twice the input price.
@@ -103,7 +112,7 @@ export function evaluateCacheWarming(
 	);
 	const warmCost = price(model, { cacheRead: promptTokens, output: 1 });
 	const missCost = Math.max(0, cacheMissCost - cacheHitCost);
-	const continuationProbability = phase === "idle" ? CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY : 1;
+	const continuationProbability = phase === "idle" && !held ? CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY : 1;
 	const economicsAvailable = promptTokens > 0 && (cacheHitCost > 0 || cacheMissCost > 0);
 	const expectedSavings = continuationProbability * missCost - warmCost;
 	return {
@@ -113,7 +122,8 @@ export function evaluateCacheWarming(
 		continuationProbability,
 		expectedSavings,
 		economicsAvailable,
-		action: expectedSavings >= CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS ? "warm" : "stop",
+		held,
+		action: held || expectedSavings >= CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS ? "warm" : "stop",
 	};
 }
 

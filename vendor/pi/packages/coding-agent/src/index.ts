@@ -81,6 +81,7 @@ export type {
 	BoundaryState,
 	BuildSystemPromptOptions,
 	CacheWarmingDecisionEvent,
+	CacheWarmingEvent,
 	CacheWarmingDecisionEventResult,
 	CompactionEntryDraft,
 	CompactOptions,

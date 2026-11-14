@@ -187,6 +187,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setActiveTools: notInitialized,
 		requestReload: notInitialized,
 		setBackgroundWork: notInitialized,
+		setCacheWarmingHold: notInitialized,
+		getCacheWarmingStatus: notInitialized,
 		// registerTool() is valid during extension load; refresh is only needed post-bind.
 		refreshTools: () => {},
 		getCommands: notInitialized,
@@ -462,6 +464,16 @@ function createExtensionAPI(
 		setBackgroundWork(key: string, pending: number): void {
 			assertActive();
 			runtime.setBackgroundWork(key, pending);
+		},
+
+		setCacheWarmingHold(untilMs: number | undefined): void {
+			assertActive();
+			runtime.setCacheWarmingHold(untilMs);
+		},
+
+		getCacheWarmingStatus() {
+			assertActive();
+			return runtime.getCacheWarmingStatus();
 		},
 
 		getCommands() {
