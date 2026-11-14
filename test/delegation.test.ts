@@ -535,8 +535,9 @@ describe("the child side", () => {
 
 describe("durable agents in t3", () => {
 	for (const variant of [
-		{ name: "its run id known: the resume waits for that run", waitMs: 80, childMs: 600, delegates: 1 },
-		{ name: "its start still in flight: the resume repeats delegate_task with the same clientRequestId, which t3 dedupes", waitMs: 5000, childMs: 2500, delegates: 2 },
+		{ name: "its run id known: the resume waits for that run", waitMs: 80, childMs: 600, idsKnown: true, childStarted: true, delegates: 1 },
+		{ name: "its start in flight, the child started: the resume waits for the child's report without calling t3 again (t3 dedupes only per process)", waitMs: 5000, childMs: 2500, idsKnown: false, childStarted: true, delegates: 1 },
+		{ name: "its start in flight, the child not started: the resume repeats delegate_task with the same clientRequestId", waitMs: 5000, childMs: 2500, idsKnown: false, childStarted: false, delegates: 2 },
 	])
 	test(`an agent in flight when the parent's session ended reattaches to the same t3 task when the session starts again; the result arrives once (${variant.name})`, async () => {
 		const background = (await import("../extensions/background/index.ts")).default;
@@ -568,7 +569,7 @@ describe("durable agents in t3", () => {
 		const journals = join(fx.agentDir, "workflows");
 		const journalOf = () => (existsSync(journals) && readdirSync(journals)[0] ? join(journals, readdirSync(journals)[0]!, "journal.jsonl") : undefined);
 		// The parent's Pi quits while the child works: after t3 answered with the run (variant 1), or while delegate_task waits.
-		const ready = () => fx.threads.size > 0 && (variant.delegates === 2 || readFileSync(journalOf()!, "utf8").includes('"runId"'));
+		const ready = () => fx.threads.size > 0 && (!variant.idsKnown || readFileSync(journalOf()!, "utf8").includes('"runId"'));
 		while (!ready()) await new Promise((r) => setTimeout(r, 20));
 		await first.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		const journal = journalOf()!;
@@ -576,12 +577,13 @@ describe("durable agents in t3", () => {
 		assert.match(readFileSync(journal, "utf8"), /"status":"interrupted"/);
 		const file = first.sessionManager.getSessionFile()!;
 		first.dispose();
+		const spec = /"spec":\{"id":"([\w-]+)"/.exec(readFileSync(journal, "utf8"))![1]!;
+		// As if the parent died before the child's Pi reported anything.
+		if (!variant.childStarted) rmSync(statePath(delegationsDir(fx.agentDir), spec), { force: true });
 
 		const second = await newSession(extensions(), SessionManager.open(file));
 		const deadline = Date.now() + 15_000;
 		while (!parentSays.some((line) => line.startsWith("parent got")) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-
-
 		assert.deepEqual(parentSays.filter((line) => line.startsWith("parent got")), ["parent got: agent said: child finished"], "the result arrives once");
 		assert.equal(fx.threads.size, 1, "no second task");
 		assert.equal(childRuns, 1, "the child's run was not repeated");
@@ -589,7 +591,7 @@ describe("durable agents in t3", () => {
 		const delegates = callsOf("delegate_task");
 		assert.equal(delegates.length, variant.delegates);
 		assert.equal(new Set(delegates.map((d) => d.args.clientRequestId)).size, 1);
-		if (variant.delegates === 1) assert.ok(callsOf("t3_thread_wait").some((c) => c.args.runId === "run-2"), "waited for the recorded run");
+		if (variant.idsKnown) assert.ok(callsOf("t3_thread_wait").some((c) => c.args.runId === "run-2"), "waited for the recorded run");
 		const entries = readFileSync(journal, "utf8");
 		assert.match(entries, /"t":"attempt","n":2/);
 		assert.match(entries, /"status":"completed"/);

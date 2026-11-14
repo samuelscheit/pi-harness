@@ -3,11 +3,12 @@
 // bridge registers them as `mcp__t3-code__<name>`); a workflow script reaches them like any session
 // tool (ctx.executeTool), where they resolve to the MCP result: `structuredContent` is t3's data.
 //
-// The first run is `delegate_task` in wait mode; later runs go to the same thread with
-// `t3_thread_send` (a resume: the child's context and prompt cache are warm). Both carry a
-// `clientRequestId` per run, which t3 dedupes: repeating the call with the same id returns the same
-// task and run, so a workflow resumed after its process died reattaches to a child whose start was
-// in flight by making the same call again. A wait that times out
+// The first run is `delegate_task` in wait mode, waiting only START_WAIT_MS, so the task, thread
+// and run ids reach the workflow's journal within seconds (a resume after a crash reattaches with
+// them); later runs go to the same thread with `t3_thread_send` (a resume: the child's context and
+// prompt cache are warm). Both carry a `clientRequestId` per run, which t3 dedupes within one MCP
+// session (one Pi process; a new process gets a new task for the same id, seen 2026-11-14). A wait
+// that times out
 // does not end the run: it continues with `t3_thread_wait` until the run is over. A question or an
 // approval the child waits for also ends a wait; the code keeps waiting for the user to answer.
 // Afterwards `task_status` reads the task, which marks its result delivered, so t3 does not wake
@@ -19,6 +20,8 @@ export const T3_PREFIX = "mcp__t3-code__";
 export const T3_DELEGATE = `${T3_PREFIX}delegate_task`;
 /** How long one t3 wait call blocks. */
 export const WAIT_MS = 10 * 60_000;
+/** How long the starting delegate_task waits: short, so the ids are known (and journaled) early. */
+export const START_WAIT_MS = 5_000;
 /** A wait that returns sooner without the run being over (a pending question) is repeated after this. */
 const RETRY_MS = 5_000;
 /** Thread statuses after which the run is over. */
@@ -162,7 +165,8 @@ export class T3Child {
 
 	/**
 	 * Reattach to a run whose call was in flight when the workflow's process died: a run whose id is
-	 * known is waited for; otherwise the call is repeated with the same request id, which t3 dedupes.
+	 * known is waited for; otherwise the call is repeated with the same request id (t3 dedupes it
+	 * within one MCP session; the caller checks first that the child did not start the run).
 	 */
 	async reattach(message: string, requestId: string, runId: string | undefined, signal: AbortSignal, started: (ids: T3ChildIds) => void): Promise<void> {
 		if (!runId) return this.run(message, requestId, signal, started);
@@ -179,7 +183,7 @@ export class T3Child {
 	async run(message: string, requestId: string, signal: AbortSignal, started: (ids: T3ChildIds) => void): Promise<void> {
 		if (!this.threadId) {
 			const target = await this.t3.target(this.request.model, this.request.thinking, signal);
-			const task = await this.t3.call("delegate_task", { task: message, title: this.request.title, role: this.request.role, target, mode: "wait", timeoutMs: WAIT_MS, clientRequestId: requestId }, signal);
+			const task = await this.t3.call("delegate_task", { task: message, title: this.request.title, role: this.request.role, target, mode: "wait", timeoutMs: START_WAIT_MS, clientRequestId: requestId }, signal);
 			this.taskId = str(task.taskId);
 			this.threadId = str(task.childThreadId);
 			this.link = str(task.link);

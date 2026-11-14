@@ -15,9 +15,11 @@
 // Each run is a durable call (durable.ts). Its journal records the spec and, as soon as they are
 // known, the child's t3 task and thread or its session file; the run's outcome records the agent's
 // state, so a replayed run restores the agent and its later runs go to the same child. A run in
-// flight when the workflow's process died reattaches: in t3 it repeats the same idempotent call
-// (same clientRequestId) and waits for the run; in-process it reopens the child's session file. A
-// child whose run was cut off (its own process ended too) gets a message to continue.
+// flight when the workflow's process died reattaches: in t3 it waits for the recorded run; without
+// one, it waits for the child's report when the child started the run (its state file says so),
+// and otherwise repeats the call with the same clientRequestId (t3 dedupes it within one Pi process
+// only). In-process it reopens the child's session file. A child whose run was cut off (its own
+// process ended too) gets a message to continue.
 
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -392,9 +394,15 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 			};
 			if (!reattach) await transport.run(runMessage, requestId, message, remember);
 			else if (!done()) {
-				await transport.reattach(runMessage, continuation, requestId, message, recorded, remember);
-				// The child's own run was cut off too (its process ended): ask it to go on.
-				if (!(await finalState(n, 2000))) await transport.run(continuation, `${requestId}-continue`, message, remember);
+				if (env.t3 && !recorded.runId && readState(dir, spec.id)?.run === n) {
+					// The child runs this run (its state says so) but its t3 run is unknown: t3 dedupes a repeated call only
+					// within the Pi process that made it, so repeating it here would start the work again. Its report comes in its state.
+					await finalState(n, Number.POSITIVE_INFINITY);
+				} else {
+					await transport.reattach(runMessage, continuation, requestId, message, recorded, remember);
+					// The child's own run was cut off too (its process ended): ask it to go on.
+					if (!(await finalState(n, 2000))) await transport.run(continuation, `${requestId}-continue`, message, remember);
+				}
 			}
 		} finally {
 			running = false;
