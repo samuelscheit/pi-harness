@@ -16,6 +16,8 @@ Coding agents are usually tuned by gut feeling: someone edits the system prompt,
 
 The design is grounded in a literature and source-code survey of how other harnesses manage context, and in an analysis of 1,616 of the author's own sessions. See [docs/research](docs/research/context-engineering/README.md).
 
+![Usage dashboard, overview: a week of the author's Pi sessions, with spend ranked by cause and split by billing rate](docs/images/dashboard-overview.png)
+
 ## Features
 
 | Area | What it does | Docs |

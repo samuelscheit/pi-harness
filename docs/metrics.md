@@ -55,6 +55,8 @@ npm run metrics -- [--all] [--cwd <dir>] [--since <date>] [--until <date>] [--so
 
 A web UI at `http://127.0.0.1:4317`, served by [`dashboard/server`](../dashboard/server) (`node:http`, JSON under `/api/`, host-checked) with a React frontend. It also answers on the machine's LAN addresses, without authentication: see [SECURITY.md](../SECURITY.md).
 
+![Waste view: cache rebuilds explained by cause, cold resumes, cache warming and the compaction opportunity, from the author's sessions](images/dashboard-waste.png)
+
 | View | Shows |
 | --- | --- |
 | Overview | KPIs against the previous period, findings ranked in dollars, spend by billing rate over time, top sessions |
