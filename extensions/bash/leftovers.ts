@@ -18,6 +18,11 @@
 // A non-child's exit code is unknown: the message says when it ended, and its output is wherever
 // the command redirected it. Leftovers stop with the session (not on a harness reload;
 // ../background/index.ts).
+//
+// A `tool` command left running is a leftover too (counted, stopped with the session), but the
+// bridge serving its call reports its end, with its exit code and result (bridge.ts). One rule
+// keeps every end reported once: whoever removes a leftover from the map reports it, the sweep
+// here when the process is gone, the bridge (`release`) when the call answers or its client dies.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -60,17 +65,19 @@ export interface Leftover {
 	/** The bash command that left it, as the agent wrote it. */
 	startedBy: string;
 	adoptedAt: number;
+	/** A `tool` command: the bridge reports its end with its exit code and result. */
+	tool?: boolean;
 }
-
 
 const list = (processes: readonly Pick<Leftover, "pid" | "command">[]) => processes.map((p) => `- pid ${p.pid}: \`${clip(p.command, 160)}\``);
 
 /** The note a call's result gets when the call left processes running. */
 export function leftText(processes: readonly Leftover[]): string {
+	const tools = processes.some((p) => p.tool) ? " (a `tool` command's with its exit code and result)" : "";
 	return [
 		`Still running in the background, left by this command (${processes.length === 1 ? "1 process" : `${processes.length} processes`}):`,
 		...list(processes),
-		"Each one's end reaches you as a new message, also after your turn: do not wait or poll for them. Stop one with `kill <pid>`. They stop when the session ends.",
+		`Each one's end reaches you as a new message${tools}, also after your turn: do not wait or poll for them. Stop one with \`kill <pid>\`. They stop when the session ends.`,
 	].join("\n");
 }
 
@@ -111,14 +118,29 @@ export function sweep(leftovers: Leftovers, rows: readonly PsRow[], now: number)
 const execFileAsync = promisify(execFile);
 export const defaultPs = async () => (await execFileAsync("ps", PS_ARGS, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).stdout;
 
+const stopPollWhenEmpty = (jobs: SessionJobs) => {
+	if (jobs.leftovers.size > 0) return;
+	clearInterval(jobs.poll);
+	jobs.poll = undefined;
+};
+
+/**
+ * Take leftover `pid` of group `pgid` out of tracking, so the caller reports its end; whether it
+ * was tracked (else its end is reported already, or it is no leftover).
+ */
+export function release(jobs: SessionJobs, pid: number, pgid: number): boolean {
+	if (jobs.leftovers.get(pid)?.pgid !== pgid) return false;
+	jobs.leftovers.delete(pid);
+	stopPollWhenEmpty(jobs);
+	reportWork(jobs);
+	return true;
+}
+
 /** One check of the session's leftovers: each one that ended wakes the session with its own message. */
 async function checkLeftovers(jobs: SessionJobs, ps: () => Promise<string>): Promise<void> {
 	const ended = sweep(jobs.leftovers, parsePs(await ps()), Date.now());
 	if (ended.length === 0) return;
-	if (jobs.leftovers.size === 0) {
-		clearInterval(jobs.poll);
-		jobs.poll = undefined;
-	}
+	stopPollWhenEmpty(jobs);
 	reportWork(jobs);
 	for (const { ended: leftover, orphans } of ended) wake(jobs, endedText(leftover, orphans, Date.now()), `the end of pid ${leftover.pid}`);
 }

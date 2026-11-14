@@ -12,8 +12,16 @@
 // hooks and permissions as for a call the model made, recorded as a nested call of the bash call.
 // Text results go to stdout and failures to stderr with exit code 1, so `&&`, `if` and `set -e`
 // work. Images (a screenshot read with `tool read`) cannot pass through a pipe: they are attached
-// to the bash call's result, and stdout says so. The socket closes when the bash call ends; a
-// nested call still running is aborted, as is one whose client went away (`timeout 5 tool …`).
+// to the bash call's result, and stdout says so. A call whose client went away (`timeout 5 tool …`,
+// `kill`) is aborted.
+//
+// `tool <name> … &`: a client the command leaves running keeps its call. The socket stays open
+// after the command returns while its process group lives, so a client that connects late is
+// served too. Such a client is a leftover process (leftovers.ts: counted as background work,
+// stopped with the session); the bridge reports its end as a message with its exit code and the
+// tool's result (text and images), and takes it out of the leftovers first, so the sweep does not
+// report it again. Calls that end while the leftovers are being adopted wait for that, so each
+// call is either answered within the bash call or reported as a job, never lost between the two.
 
 import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
@@ -22,15 +30,15 @@ import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import type { createBashToolDefinition, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { clip, minutes, type SessionJobs, wake } from "../background/jobs.ts";
 import { EDIT_BLOCKS_HELP, runEditBlocks } from "./edit-blocks.ts";
-
-type BashDefinition = ReturnType<typeof createBashToolDefinition>;
+import { type Leftover, release } from "./leftovers.ts";
 
 export const TOOL_COMMAND = "tool";
 export const SOCKET_ENV = "PI_TOOL_SOCKET";
 
-export const TOOL_GUIDELINE = `Inside a bash command, \`${TOOL_COMMAND} <name> [arguments]\` calls any of your tools, for example \`${TOOL_COMMAND} read shot.png\` or \`${TOOL_COMMAND} web_fetch --url https://…\` (\`${TOOL_COMMAND} --help\` lists them, \`${TOOL_COMMAND} <name> --help\` shows a tool's arguments). Text results go to stdout; a failed call prints to stderr and exits 1; images are attached to the bash call's result. So steps that depend on each other go in one command: \`cargo build && ./target/debug/app && ${TOOL_COMMAND} read shot.png\`. To change files and then check them in one command, \`${TOOL_COMMAND} edit - <<'EOF'\` takes SEARCH/REPLACE blocks for several files (format in \`${TOOL_COMMAND} edit --help\`; each file's path alone on the line above its blocks), followed by the build or test joined with \`&&\` after the closing \`EOF\` line, so that a refused edit stops the command instead of testing the old code.`;
+export const TOOL_GUIDELINE = `Inside a bash command, \`${TOOL_COMMAND} <name> [arguments]\` calls any of your tools, for example \`${TOOL_COMMAND} read shot.png\` or \`${TOOL_COMMAND} web_fetch --url https://…\` (\`${TOOL_COMMAND} --help\` lists them, \`${TOOL_COMMAND} <name> --help\` shows a tool's arguments). Text results go to stdout; a failed call prints to stderr and exits 1; images are attached to the bash call's result. \`${TOOL_COMMAND} <name> … > out 2>&1 &\` runs any tool in the background: its end reaches you as a new message with its exit code and result. So steps that depend on each other go in one command: \`cargo build && ./target/debug/app && ${TOOL_COMMAND} read shot.png\`. To change files and then check them in one command, \`${TOOL_COMMAND} edit - <<'EOF'\` takes SEARCH/REPLACE blocks for several files (format in \`${TOOL_COMMAND} edit --help\`; each file's path alone on the line above its blocks), followed by the build or test joined with \`&&\` after the closing \`EOF\` line, so that a refused edit stops the command instead of testing the old code.`;
 
 /** A JSON schema as tool parameters declare them (TypeBox). */
 interface Schema {
@@ -245,13 +253,13 @@ export interface ToolRequest {
 }
 
 /**
- * Run one `tool` invocation: argv as the client sent it. Images of the result go to `images`
- * (attached to the bash call's result); the response names them.
+ * Run one `tool` invocation: argv as the client sent it. Each image of the result goes to
+ * `attach`, which returns the line that stands for it in the output.
  */
 export async function runToolCommand(
 	ctx: Pick<ExtensionToolContext, "tools" | "executeTool" | "cwd">,
 	request: ToolRequest,
-	images: ImageContent[],
+	attach: (image: ImageContent) => string,
 	signal: AbortSignal,
 ): Promise<ToolResponse> {
 	const [name, ...rest] = request.argv;
@@ -283,10 +291,7 @@ export async function runToolCommand(
 	const lines: string[] = [];
 	for (const block of result.content ?? []) {
 		if (block.type === "text") lines.push(block.text);
-		else if (block.type === "image") {
-			images.push(block);
-			lines.push(`[image ${images.length} (${block.mimeType}) is attached to this bash call's result]`);
-		}
+		else if (block.type === "image") lines.push(attach(block));
 	}
 	const text = withNewline(parsed.json && result.structuredContent !== undefined ? JSON.stringify(result.structuredContent, null, 2) : lines.join("\n"));
 	return outcome.isError ? { stdout: "", stderr: text || `${TOOL_COMMAND} ${name} failed\n`, code: 1 } : { stdout: text, stderr: "", code: 0 };
@@ -295,6 +300,7 @@ export async function runToolCommand(
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 
 const state = globalThis as { __harnessToolBin?: string; __harnessToolSockets?: number };
+const CLIENT = fileURLToPath(new URL("./cli.mjs", import.meta.url));
 
 /**
  * The directory holding the `tool` command, per process. Rewritten on each load, so it runs the
@@ -303,9 +309,8 @@ const state = globalThis as { __harnessToolBin?: string; __harnessToolSockets?: 
 export function toolBinDir(): string {
 	const dir = (state.__harnessToolBin ??= join(tmpdir(), "pi-harness-tool", String(process.pid)));
 	mkdirSync(dir, { recursive: true });
-	const client = fileURLToPath(new URL("./cli.mjs", import.meta.url));
 	const temp = join(dir, `.${TOOL_COMMAND}.${process.hrtime.bigint()}`);
-	writeFileSync(temp, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(client)} "$@"\n`, { mode: 0o755 });
+	writeFileSync(temp, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(CLIENT)} "$@"\n`, { mode: 0o755 });
 	renameSync(temp, join(dir, TOOL_COMMAND));
 	return dir;
 }
@@ -313,80 +318,227 @@ export function toolBinDir(): string {
 /** The line put before a bash command: the `tool` command on PATH and the call's socket. */
 export const bridgeLine = (binDir: string, socket: string) => `export ${SOCKET_ENV}=${quote(socket)} PATH=${quote(binDir)}:"$PATH"\n`;
 
-/**
- * Read one request (a JSON line), answer, close. The client keeps its side open until the answer:
- * after a half-close, its death would go unnoticed until the answer is written.
- */
-function serve(socket: Socket, handle: (request: ToolRequest, signal: AbortSignal) => Promise<ToolResponse>, parent: AbortSignal) {
-	const controller = new AbortController();
-	const abort = () => controller.abort(parent.reason);
-	parent.addEventListener("abort", abort, { once: true });
-	let buffered = "";
-	let received = false;
-	let answered = false;
-	// The client went away before its answer (killed by `timeout`, the shell ended): stop its call.
-	socket.on("close", () => {
-		parent.removeEventListener("abort", abort);
-		if (!answered) controller.abort(new Error("the tool command exited"));
-	});
-	socket.on("error", () => {});
-	socket.setEncoding("utf8");
-	socket.on("data", async (chunk: string) => {
-		if (received) return;
-		buffered += chunk;
-		const newline = buffered.indexOf("\n");
-		if (newline < 0) return;
-		received = true;
-		let response: ToolResponse;
-		try {
-			const request = JSON.parse(buffered.slice(0, newline)) as { argv?: unknown; stdin?: unknown; cwd?: unknown };
-			if (!Array.isArray(request.argv) || !request.argv.every((arg) => typeof arg === "string")) throw new Error("argv must be strings");
-			response = await handle(
-				{
-					argv: request.argv,
-					...(typeof request.stdin === "string" ? { stdin: request.stdin } : {}),
-					...(typeof request.cwd === "string" ? { cwd: request.cwd } : {}),
-				},
-				controller.signal,
-			);
-		} catch (error) {
-			response = { stdout: "", stderr: `${TOOL_COMMAND}: ${error instanceof Error ? error.message : String(error)}\n`, code: 1 };
-		}
-		answered = true;
-		if (!socket.destroyed) socket.end(JSON.stringify(response));
-	});
+const shellWord = (word: string) => (/^[\w@%+=:,./-]+$/.test(word) ? word : quote(word));
+
+/** A `tool` command as the shell ran it. */
+export const toolLabel = (argv: readonly string[]) => [TOOL_COMMAND, ...argv.map(shellWord)].join(" ");
+
+/** `tool …` for the `ps` command line of a `tool` client (before or after the wrapper's `exec`); undefined for another process. */
+export function clientCommand(command: string, binDir = state.__harnessToolBin): string | undefined {
+	const prefixes = [`${process.execPath} ${CLIENT}`, ...(binDir === undefined ? [] : [`/bin/sh ${join(binDir, TOOL_COMMAND)}`])];
+	for (const prefix of prefixes) if (command === prefix || command.startsWith(`${prefix} `)) return TOOL_COMMAND + command.slice(prefix.length);
+	return undefined;
+}
+
+/** The message a `tool` command left running sends when its call ends, or when it was killed first. */
+export function toolEndedText(job: Pick<Leftover, "pid" | "startedBy">, label: string, end: ToolResponse | "killed", ms: number): string {
+	const head = `Your background \`${clip(label, 160)}\` (pid ${job.pid}, left running by your command \`${clip(job.startedBy, 160)}\`)`;
+	if (end === "killed") return `${head} was killed after ${minutes(ms)}, so its call was aborted.`;
+	return `${head} exited with code ${end.code} after ${minutes(ms)}:\n\n${(end.stdout + end.stderr).trimEnd() || "(no output)"}`;
+}
+
+/** Whether process group `pgid` still has a live process. */
+function groupAlive(pgid: number): boolean {
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/** One `tool` client of a bridge. */
+interface Client {
+	pid: number | undefined;
+	label: string;
+	startedAt: number;
+	answered: boolean;
+	/** Aborts its call: the client went away, or the bash call was aborted while it ran. */
+	controller: AbortController;
+	/** Images of a call that ended after the command returned: they come with its message. */
+	images: ImageContent[];
+}
+
+/** What a bash call left running, once it returned. */
+export interface Adopted {
+	/** The call's process group; undefined when unknown. */
+	pgid: number | undefined;
+	left: Leftover[];
 }
 
 export interface Bridge {
 	/** Put before the command. */
 	line: string;
-	images: ImageContent[];
-	close(): Promise<void>;
+	/**
+	 * The command returned: adopt what it left running (`adopt`), then serve its `tool` commands as
+	 * jobs while its process group lives. Returns the images of the calls answered within the bash
+	 * call and the leftovers, the `tool` commands among them named as such.
+	 */
+	ended(adopt: () => Promise<Adopted>): Promise<{ images: ImageContent[]; left: Leftover[] }>;
 }
 
-/** Open the socket of one bash call. */
-export async function openBridge(ctx: Pick<ExtensionToolContext, "tools" | "executeTool" | "cwd">, signal: AbortSignal, binDir: string): Promise<Bridge> {
+/**
+ * Open the socket of one bash call. `signal` (the bash call's) aborts the calls of its `tool`
+ * commands while the command runs; afterwards only a client's death (also at the session's end,
+ * which kills the leftovers) aborts its call.
+ */
+export async function openBridge(
+	ctx: Pick<ExtensionToolContext, "tools" | "executeTool" | "cwd">,
+	signal: AbortSignal | undefined,
+	binDir: string,
+	jobs: SessionJobs,
+	pollMs: number,
+): Promise<Bridge> {
 	const images: ImageContent[] = [];
 	const path = join(tmpdir(), `pi-tool-${process.pid}-${(state.__harnessToolSockets = (state.__harnessToolSockets ?? 0) + 1)}.sock`);
 	rmSync(path, { force: true });
-	const open = new Set<Socket>();
-	const server = createServer((socket) => {
-		open.add(socket);
-		socket.on("close", () => open.delete(socket));
-		serve(socket, (request, callSignal) => runToolCommand(ctx, request, images, callSignal), signal);
-	});
+	const clients = new Set<Client>();
+	const sockets = new Set<Socket>();
+	/** Pids of clients answered: what is left of them when the command returns is no job. */
+	const answered = new Set<number>();
+	let phase: "running" | "adopting" | "ended" = "running";
+	let pgid: number | undefined;
+	let adopted!: () => void;
+	const gate = new Promise<void>((resolve) => (adopted = resolve));
+	/** Wait while the leftovers are adopted: then a call knows whether it is a job. */
+	const settled = () => (phase === "adopting" ? gate : undefined);
+
+	const abortAll = () => {
+		for (const client of clients) client.controller.abort(signal?.reason);
+	};
+	signal?.addEventListener("abort", abortAll, { once: true });
+
+	/** The client's leftover when it is a job (left running by the command, its end not reported yet). */
+	const jobOf = (client: Client) => {
+		const leftover = phase === "ended" && client.pid !== undefined ? jobs.leftovers.get(client.pid) : undefined;
+		return leftover?.pgid === pgid ? leftover : undefined;
+	};
+
+	const attach = (client: Client) => (image: ImageContent) => {
+		if (phase === "running") {
+			images.push(image);
+			return `[image ${images.length} (${image.mimeType}) is attached to this bash call's result]`;
+		}
+		if (!jobOf(client)) return `[image (${image.mimeType}) not shown: the bash call that started this command has ended]`;
+		client.images.push(image);
+		return `[image ${client.images.length} (${image.mimeType}) is attached to the message that reports this command's end]`;
+	};
+
+	/** A job's end: take it out of the leftovers (so the sweep does not report it too) and report it. */
+	const reportEnd = (client: Client, end: ToolResponse | "killed") => {
+		const job = jobOf(client);
+		if (!job || !release(jobs, job.pid, job.pgid)) return;
+		const text = toolEndedText(job, client.label, end, Date.now() - client.startedAt);
+		const images = end === "killed" ? [] : client.images;
+		wake(jobs, images.length ? [{ type: "text", text }, ...images] : text, `the end of ${client.label}`);
+	};
+
+	const serve = (socket: Socket) => {
+		const client: Client = { pid: undefined, label: TOOL_COMMAND, startedAt: Date.now(), answered: false, controller: new AbortController(), images: [] };
+		if (phase === "running" && signal?.aborted) client.controller.abort(signal.reason);
+		clients.add(client);
+		sockets.add(socket);
+		// The client keeps its side open until the answer: closing it first means it was killed (`timeout`, `kill`, the session's end).
+		socket.on("close", () => {
+			clients.delete(client);
+			sockets.delete(socket);
+			if (client.answered) return;
+			client.controller.abort(new Error("the tool command exited"));
+			reportEnd(client, "killed");
+		});
+		socket.on("error", () => {});
+		socket.setEncoding("utf8");
+		let buffered = "";
+		let received = false;
+		socket.on("data", async (chunk: string) => {
+			if (received) return;
+			buffered += chunk;
+			const newline = buffered.indexOf("\n");
+			if (newline < 0) return;
+			received = true;
+			let response: ToolResponse;
+			try {
+				const request = JSON.parse(buffered.slice(0, newline)) as { argv?: unknown; stdin?: unknown; cwd?: unknown; pid?: unknown };
+				if (!Array.isArray(request.argv) || !request.argv.every((arg) => typeof arg === "string")) throw new Error("argv must be strings");
+				if (Number.isInteger(request.pid)) client.pid = request.pid as number;
+				client.label = toolLabel(request.argv);
+				const toolRequest: ToolRequest = {
+					argv: request.argv,
+					...(typeof request.stdin === "string" ? { stdin: request.stdin } : {}),
+					...(typeof request.cwd === "string" ? { cwd: request.cwd } : {}),
+				};
+				// A call that ends while the leftovers are adopted waits for that, so its images go where its result goes.
+				const callContext = {
+					get tools() {
+						return ctx.tools;
+					},
+					get cwd() {
+						return ctx.cwd;
+					},
+					executeTool: async (...args: Parameters<typeof ctx.executeTool>) => {
+						const outcome = await ctx.executeTool(...args);
+						await settled();
+						return outcome;
+					},
+				};
+				response = await runToolCommand(callContext, toolRequest, attach(client), client.controller.signal);
+			} catch (error) {
+				response = { stdout: "", stderr: `${TOOL_COMMAND}: ${error instanceof Error ? error.message : String(error)}\n`, code: 1 };
+			}
+			await settled();
+			if (socket.destroyed) return;
+			client.answered = true;
+			if (client.pid !== undefined) answered.add(client.pid);
+			reportEnd(client, response);
+			socket.end(JSON.stringify(response));
+		});
+	};
+
+	const server = createServer(serve);
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(path, () => resolve());
 	});
 	chmodSync(path, 0o600);
+
+	const close = () => {
+		for (const socket of sockets) socket.destroy();
+		server.close();
+		rmSync(path, { force: true });
+	};
+
 	return {
 		line: bridgeLine(binDir, path),
-		images,
-		close: async () => {
-			for (const socket of open) socket.destroy();
-			await new Promise<void>((resolve) => server.close(() => resolve()));
-			rmSync(path, { force: true });
+		async ended(adopt) {
+			phase = "adopting";
+			signal?.removeEventListener("abort", abortAll);
+			const result = await adopt();
+			pgid = result.pgid;
+			const left = result.left.filter((leftover) => {
+				// Answered already and about to exit: nothing to track.
+				if (answered.has(leftover.pid)) {
+					release(jobs, leftover.pid, leftover.pgid);
+					return false;
+				}
+				const client = [...clients].find((c) => c.pid === leftover.pid);
+				const command = client ? client.label : clientCommand(leftover.command);
+				if (command !== undefined) Object.assign(leftover, { command, tool: true });
+				return true;
+			});
+			phase = "ended";
+			adopted();
+			// Late clients (`tool x &` as the last command still starting) connect while the group lives.
+			if (pgid === undefined || !groupAlive(pgid)) close();
+			else {
+				const group = pgid;
+				const poll = setInterval(() => {
+					if (groupAlive(group)) return;
+					clearInterval(poll);
+					close();
+				}, pollMs);
+				poll.unref?.();
+			}
+			return { images, left };
 		},
 	};
 }
@@ -397,30 +549,4 @@ type Result<T> = AgentToolResult<T>;
 export function withImages<T>(result: Result<T>, images: readonly ImageContent[]): Result<T> {
 	if (images.length === 0) return result;
 	return { ...result, content: [...(result.content as (TextContent | ImageContent)[]), ...images] };
-}
-
-/** `definition` (bash) with `tool` available inside its commands. Without a tool context (no session), it runs as is. */
-export function withToolBridge(definition: BashDefinition): BashDefinition {
-	const binDir = toolBinDir();
-	return {
-		...definition,
-		async execute(callId, params, signal, onUpdate, ctx) {
-			const toolContext = ctx as Partial<ExtensionToolContext> | undefined;
-			if (typeof toolContext?.executeTool !== "function") return definition.execute(callId, params, signal, onUpdate, ctx);
-			const lifetime = new AbortController();
-			const forward = () => lifetime.abort(signal?.reason);
-			if (signal?.aborted) forward();
-			else signal?.addEventListener("abort", forward, { once: true });
-			const bridge = await openBridge(toolContext as ExtensionToolContext, lifetime.signal, binDir);
-			try {
-				const result = await definition.execute(callId, { ...params, command: bridge.line + params.command }, signal, onUpdate, ctx);
-				return withImages(result, bridge.images);
-			} finally {
-				signal?.removeEventListener("abort", forward);
-				// Calls still running when the command ended have no one to answer to.
-				lifetime.abort(new Error("the bash command ended"));
-				await bridge.close();
-			}
-		},
-	};
 }

@@ -72,6 +72,7 @@ after(() => faux.unregister());
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "bg-"));
 	mkdirSync(join(dir, "repo"));
+	slowCalls.clear();
 });
 afterEach(async () => {
 	assert.deepEqual(extensionErrors.splice(0), [], "no extension errors");
@@ -86,8 +87,28 @@ afterEach(async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-/** A tool that runs bash through `ctx.executeTool`, as codemode and workflow scripts do. */
+/** Calls of the `slow` tool, by their `text`. */
+const slowCalls = new Map<string, { signal: AbortSignal | undefined; ended: boolean }>();
+
+/** A tool that runs bash through `ctx.executeTool`, as codemode and workflow scripts do; and `slow`, which sleeps. */
 function nestedBash(pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "slow",
+		label: "slow",
+		description: "Sleeps, then answers, fails or returns an image.",
+		parameters: Type.Object({ ms: Type.Number(), text: Type.String(), image: Type.Optional(Type.Boolean()), fail: Type.Optional(Type.Boolean()) }),
+		async execute(_id, params, signal) {
+			const call = { signal, ended: false };
+			slowCalls.set(params.text, call);
+			await new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(resolve, params.ms);
+				signal?.addEventListener("abort", () => (clearTimeout(timer), reject(new Error("slow: aborted"))), { once: true });
+			});
+			call.ended = true;
+			if (params.fail) throw new Error(`slow failed: ${params.text}`);
+			return { content: [{ type: "text", text: `slept: ${params.text}` }, ...(params.image ? [{ type: "image" as const, data: PNG.toString("base64"), mimeType: "image/png" }] : [])], details: undefined };
+		},
+	});
 	pi.registerTool({
 		name: "script",
 		label: "script",
@@ -546,5 +567,132 @@ describe("tools from bash", () => {
 		const after = run({ PATH: process.env.PATH, PI_TOOL_SOCKET: socket });
 		assert.equal(after.status, 2);
 		assert.match(after.stderr, /cannot reach the agent/);
+	});
+});
+
+const alivePid = (pid: number) => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+/** Wait past a few leftover checks, so a second report of an end would have arrived. */
+const quiet = () => new Promise((r) => setTimeout(r, 600));
+
+describe("tool commands left running (`tool … &`)", () => {
+	test("returns at once, the job is listed, and its end brings its exit code and result; its output still goes where it was sent", async () => {
+		const s = await newSession();
+		const work = workEvents(s);
+		const command = "tool slow --ms 1000 --text a > a.out 2>&1 &";
+		respond(bash(command), fauxAssistantMessage("It runs."), fauxAssistantMessage("It ended."));
+		const t0 = Date.now();
+		await s.prompt("go");
+		assert.ok(Date.now() - t0 < 1000, "the command did not wait for the tool");
+		const [listed] = toolTexts(s);
+		assert.match(listed!, /^\(no output\)\n\nStill running in the background, left by this command \(1 process\):\n- pid (\d+): `tool slow --ms 1000 --text a`\nEach one's end reaches you as a new message \(a `tool` command's with its exit code and result\), also after your turn/);
+		const pid = Number(/pid (\d+)/.exec(listed!)![1]);
+		assert.deepEqual([...leftoversOf(s).keys()], [pid]);
+		assert.equal(jobsOf(s).size, 0, "no tool call of the model's runs in the background");
+
+		await until("its end message", () => jobMessages(s).length === 1 && settled(s, "It ended.")());
+		assert.equal(jobMessages(s)[0], `Your background \`tool slow --ms 1000 --text a\` (pid ${pid}, left running by your command \`${command}\`) exited with code 0 after 1 s:\n\nslept: a`);
+		// The message goes out before the client writes its answer.
+		await until("the client's output", () => readFileSync(repoFile("a.out"), "utf8") === "slept: a\n");
+		await quiet();
+		assert.equal(jobMessages(s).length, 1, "reported once");
+		assert.equal(leftoversOf(s).size, 0);
+		assert.equal(work.at(-1), 0);
+		assert.equal(work.filter((n) => n > 1).length, 0, "counted once");
+	});
+
+	test("two jobs started in one command, with more work after them, give two messages; a failing call exits 1 with its error", async () => {
+		const s = await newSession(FOREGROUND_MS);
+		respond(
+			bash("tool slow --ms 900 --text a > a.out 2>&1 &\ntool slow --ms 1300 --text b --fail > b.out 2>&1 &\nsleep 0.5; echo more"),
+			fauxAssistantMessage("Both run."),
+			fauxAssistantMessage("One."),
+			fauxAssistantMessage("Two."),
+		);
+		await s.prompt("go");
+		const [listed] = toolTexts(s);
+		assert.match(listed!, /^more\n\n\nStill running in the background, left by this command \(2 processes\):\n- pid \d+: `tool slow --ms 900 --text a`\n- pid \d+: `tool slow --ms 1300 --text b --fail`\n/);
+		await until("both end messages", () => jobMessages(s).length === 2 && settled(s, "Two.")());
+		const [a, b] = jobMessages(s);
+		assert.match(a!, /^Your background `tool slow --ms 900 --text a` \(pid \d+, .*\) exited with code 0 after \d s:\n\nslept: a$/);
+		assert.match(b!, /^Your background `tool slow --ms 1300 --text b --fail` \(pid \d+, .*\) exited with code 1 after \d s:\n\nslow failed: b$/);
+		await until("the client's error output", () => readFileSync(repoFile("b.out"), "utf8") === "slow failed: b\n");
+		await quiet();
+		assert.equal(jobMessages(s).length, 2, "each reported once");
+	});
+
+	test("images come with the end message", async () => {
+		const s = await newSession();
+		respond(bash("tool slow --ms 300 --text shot --image > shot.out &"), fauxAssistantMessage("Started."), fauxAssistantMessage("Seen it."));
+		await s.prompt("go");
+		await until("the end message", settled(s, "Seen it."));
+		const report = s.messages.find((m) => m.role === "custom" && m.customType === JOB_MESSAGE_TYPE);
+		assert.ok(report?.role === "custom");
+		assert.match(textOf(report.content), /exited with code 0 after \d s:\n\nslept: shot\n\[image 1 \(image\/png\) is attached to the message that reports this command's end\]$/);
+		assert.deepEqual(imagesOf(report.content).map((c) => c.mimeType), ["image/png"]);
+		await until("the client's output", () => /\[image 1 \(image\/png\) is attached/.test(readFileSync(repoFile("shot.out"), "utf8")));
+	});
+
+	test("a job waited for and a fast one that ends before the command returns leave nothing", async () => {
+		const s = await newSession(FOREGROUND_MS);
+		const work = workEvents(s);
+		respond(bash("tool slow --ms 300 --text w > w.out & wait; tool slow --ms 10 --text f > f.out & sleep 1.5; cat w.out f.out"), fauxAssistantMessage("Done."));
+		await s.prompt("go");
+		assert.equal(toolTexts(s)[0], "slept: w\nslept: f\n");
+		await quiet();
+		assert.equal(leftoversOf(s).size, 0);
+		assert.deepEqual(jobMessages(s), []);
+		assert.deepEqual(work, []);
+	});
+
+	test("killing the client aborts its call, and the message says so once", async () => {
+		const s = await newSession();
+		respond(bash("tool slow --ms 30000 --text k > k.out 2>&1 &"), fauxAssistantMessage("Started."), fauxAssistantMessage("Killed."));
+		await s.prompt("go");
+		await until("the call", () => slowCalls.has("k"));
+		const [pid] = [...leftoversOf(s).keys()];
+		process.kill(pid!, "SIGTERM");
+		await until("the end message", () => jobMessages(s).length === 1 && settled(s, "Killed.")());
+		assert.equal(slowCalls.get("k")!.signal?.aborted, true);
+		assert.match(jobMessages(s)[0]!, new RegExp(`^Your background \`tool slow --ms 30000 --text k\` \\(pid ${pid}, .*\\) was killed after \\d s, so its call was aborted\\.$`));
+		await quiet();
+		assert.equal(jobMessages(s).length, 1);
+		assert.equal(leftoversOf(s).size, 0);
+	});
+
+	test("a reload keeps the jobs and their ends reach the reloaded extension; the session's end stops them", async () => {
+		const s = await newSession();
+		respond(bash("tool slow --ms 1200 --text short > s.out & tool slow --ms 30000 --text long > l.out &"), fauxAssistantMessage("Started."), fauxAssistantMessage("Short ended."));
+		await s.prompt("go");
+		await until("both calls", () => slowCalls.size === 2);
+		const provider = getApiProvider(faux.api);
+		await s.reload();
+		if (!getApiProvider(faux.api)) registerApiProvider(provider as never);
+		await until("the short one's end", () => jobMessages(s).length === 1 && settled(s, "Short ended.")());
+		assert.match(jobMessages(s)[0]!, /`tool slow --ms 1200 --text short` .* exited with code 0 after \d s:\n\nslept: short$/);
+		const [pid] = [...leftoversOf(s).keys()];
+		await s.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		await until("the long call aborted", () => slowCalls.get("long")!.signal?.aborted === true, 3000);
+		await until("its client gone", () => !alivePid(pid!), 3000);
+	});
+
+	test("a tool started in the background from a script's bash (nested) is a job too; without `&` it stays in the foreground", async () => {
+		const s = await newSession(FOREGROUND_MS);
+		respond(
+			fauxAssistantMessage([fauxToolCall("script", { command: "tool slow --ms 200 --text fg; tool slow --ms 600 --text bg > bg.out &" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("ok"),
+			fauxAssistantMessage("Ended."),
+		);
+		await s.prompt("go");
+		assert.match(toolTexts(s)[0]!, /^slept: fg\n\n\nStill running in the background, left by this command \(1 process\):\n- pid \d+: `tool slow --ms 600 --text bg`/);
+		assert.equal(slowCalls.get("fg")!.ended, true, "without `&` the call ended within the command");
+		await until("the end message", () => jobMessages(s).length === 1 && settled(s, "Ended.")());
+		assert.match(jobMessages(s)[0]!, /exited with code 0 after \d s:\n\nslept: bg$/);
 	});
 });

@@ -17,7 +17,8 @@ const TAIL_LINES = 20;
 /** Least time between two writes of a job's log. */
 const LOG_EVERY_MS = 1000;
 
-export type DetachReason = "time" | "message";
+/** Why a call moved to the background: it ran too long, a message arrived, or its tool always runs there. */
+export type DetachReason = "time" | "message" | "start";
 
 export interface Job {
 	callId: string;
@@ -105,11 +106,14 @@ export function callLabel(toolName: string, input: Record<string, unknown>): str
 
 /** The tool result of a call that moved to the background. */
 export function detachedText(job: Job, reason: DetachReason, output: string, now: number): string {
-	const why = reason === "time" ? `It still ran after ${minutes(now - job.startedAt)}, so the call` : "A new message arrived while it ran, so the call";
 	const stop = job.stop === undefined ? "" : ` (${job.stop})`;
+	const where = `Its latest output is in ${job.log}.`;
+	const after = "When it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Do the work that does not depend on it, or end your turn.";
+	if (reason === "start") return [`\`${job.toolName}\` always runs in the background: the call started and keeps running${stop}. ${where}`, after].join("\n\n");
+	const why = reason === "time" ? `It still ran after ${minutes(now - job.startedAt)}, so the call` : "A new message arrived while it ran, so the call";
 	return [
-		`${why} moved to the background and keeps running${stop}. Its latest output is in ${job.log}.`,
-		"When it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Do the work that does not depend on it, or end your turn.",
+		`${why} moved to the background and keeps running${stop}. ${where}`,
+		after,
 		output.trim() ? `Output so far:\n${tail(output, TAIL_LINES)}` : "No output so far.",
 	].join("\n\n");
 }

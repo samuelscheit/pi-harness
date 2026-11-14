@@ -8,7 +8,8 @@
 //   background, and its end wakes the session with its result: ../background does that for every
 //   tool; here a command's process group is added to how to stop it;
 // - every process a command leaves running (`cmd &`, a script's server) is tracked, and each one's
-//   end wakes the session (leftovers.ts);
+//   end wakes the session (leftovers.ts); a `tool` command left running (`tool workflow … &`)
+//   keeps its call, and its end brings its exit code and result (bridge.ts);
 // - `setsid`, which would move a job out of reach, is refused (detach.ts).
 //
 // Both rely on the process group: Pi runs every bash command as the leader of its own group
@@ -20,10 +21,10 @@
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createBashToolDefinition, type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, type ExtensionAPI, type ExtensionToolContext, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { BACKGROUND_GUIDELINE, DETACH_AFTER_MS } from "../background/index.ts";
 import { sessionJobs, setStopHint } from "../background/jobs.ts";
-import { TOOL_GUIDELINE, withToolBridge } from "./bridge.ts";
+import { openBridge, TOOL_GUIDELINE, toolBinDir, withImages } from "./bridge.ts";
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
 import { adoptLeftovers, defaultPs, leftText } from "./leftovers.ts";
 
@@ -61,7 +62,8 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 	const groupFile = (id: string, callId: string) => join(sessionDir(id), encodeURIComponent(callId));
 	const ps = options.ps ?? defaultPs;
 	const pollMs = options.pollMs ?? POLL_MS;
-	const builtin = withToolBridge(createBashToolDefinition(process.cwd()));
+	const builtin = createBashToolDefinition(process.cwd());
+	const binDir = toolBinDir();
 
 	setStopHint("bash", (sessionId, callId) => {
 		const pgid = readGroup(groupFile(sessionId, callId));
@@ -90,7 +92,8 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 		const file = groupFile(sessionId, callId);
 		const pgid = readGroup(file);
 		rmSync(file, { force: true });
-		return pgid === undefined ? [] : adoptLeftovers(sessionJobs(sessionId), pgid, command, ps, pollMs);
+		const left = pgid === undefined ? [] : await adoptLeftovers(sessionJobs(sessionId), pgid, command, ps, pollMs).catch(() => []);
+		return { pgid, left };
 	};
 
 	pi.registerTool({
@@ -102,26 +105,28 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 			BACKGROUND_GUIDELINE(options.detachAfterMs ?? DETACH_AFTER_MS),
 			"Jobs a command starts with `&` (a server for a test, parallel jobs) may keep running after it: the tool tracks each one and its end reaches you as a new message. Redirect their output to a file (`./server > server.log 2>&1 &`): output to the tool's pipe is lost once the command returns. `setsid` is refused.",
 		],
-		// Run the built-in call and adopt what it left; the result (or error) names the leftovers.
+		// Run the built-in call with `tool` on its PATH and adopt what it left; the result (or error) names the leftovers.
 		async execute(callId, params, signal, onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
 			// The command as written, after the record line the tool_call handler put before it.
 			const line = recordLine(groupFile(sessionId, callId));
 			if (!params.command.startsWith(line)) return builtin.execute(callId, params, signal, onUpdate, ctx);
 			const command = params.command.slice(line.length);
+			const bridge = await openBridge(ctx as ExtensionToolContext, signal, binDir, sessionJobs(sessionId), pollMs);
 			let outcome: { result: Awaited<ReturnType<typeof builtin.execute>> } | { error: unknown };
 			try {
-				outcome = { result: await builtin.execute(callId, params, signal, onUpdate, ctx) };
+				outcome = { result: await builtin.execute(callId, { ...params, command: bridge.line + params.command }, signal, onUpdate, ctx) };
 			} catch (error) {
 				outcome = { error };
 			}
-			const left = await leave(sessionId, callId, command).catch(() => []);
+			const { images, left } = await bridge.ended(() => leave(sessionId, callId, command));
 			const note = left.length ? leftText(left) : undefined;
 			if ("error" in outcome) {
 				if (!note) throw outcome.error;
 				throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}\n\n${note}`);
 			}
-			return note ? { ...outcome.result, content: [...outcome.result.content, { type: "text", text: `\n\n${note}` }] } : outcome.result;
+			const result = withImages(outcome.result, images);
+			return note ? { ...result, content: [...result.content, { type: "text", text: `\n\n${note}` }] } : result;
 		},
 	});
 }

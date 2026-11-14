@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describeTool, listTools, parseArguments, runToolCommand } from "../extensions/bash/bridge.ts";
+import { clientCommand, describeTool, listTools, parseArguments, runToolCommand, toolEndedText, toolLabel } from "../extensions/bash/bridge.ts";
 
 const schema = Type.Object({
 	path: Type.String({ description: "File to read." }),
@@ -113,6 +113,7 @@ describe("help", () => {
 describe("runToolCommand", () => {
 	const tools = [{ name: "read", label: "read", description: "Read.", parameters: schema, execute: async () => assert.fail("not run directly") }] as never;
 	const signal = new AbortController().signal;
+	const none = () => assert.fail("no image");
 	const ctx = (result: { content: unknown[]; structuredContent?: unknown }, isError = false, calls: unknown[] = []) => ({
 		tools,
 		cwd: "/repo",
@@ -122,29 +123,26 @@ describe("runToolCommand", () => {
 		},
 	});
 
-	test("text to stdout, images collected and named, --json prints the structured result", async () => {
+	test("text to stdout, each image to attach in its place, --json prints the structured result", async () => {
 		const images: ImageContent[] = [];
+		const attach = (image: ImageContent) => `[image ${images.push(image)}]`;
 		const calls: unknown[] = [];
 		const result = { content: [{ type: "text", text: "note" }, { type: "image", data: "AAAA", mimeType: "image/png" }], structuredContent: { ok: true } };
-		assert.deepEqual(await runToolCommand(ctx(result, false, calls), { argv: ["read", "a.png"] }, images, signal), {
-			stdout: "note\n[image 1 (image/png) is attached to this bash call's result]\n",
-			stderr: "",
-			code: 0,
-		});
+		assert.deepEqual(await runToolCommand(ctx(result, false, calls), { argv: ["read", "a.png"] }, attach, signal), { stdout: "note\n[image 1]\n", stderr: "", code: 0 });
 		assert.deepEqual(calls, [{ name: "read", args: { path: "/repo/a.png" } }]);
 		assert.equal(images.length, 1);
-		assert.equal((await runToolCommand(ctx(result), { argv: ["read", "a", "--json"] }, images, signal)).stdout, '{\n  "ok": true\n}\n');
-		assert.equal(images.length, 2, "numbered across the bash call");
+		assert.equal((await runToolCommand(ctx(result), { argv: ["read", "a", "--json"] }, attach, signal)).stdout, '{\n  "ok": true\n}\n');
+		assert.equal(images.length, 2, "--json still attaches the images");
 	});
 
 	test("a relative path resolves against the shell's directory; absolute and home paths stay", async () => {
 		const calls: { args: unknown }[] = [];
 		const c = ctx({ content: [] }, false, calls);
-		await runToolCommand(c, { argv: ["read", "a.ts"], cwd: "/repo/sub" }, [], signal);
-		await runToolCommand(c, { argv: ["read", "../b.ts"], cwd: "/repo/sub" }, [], signal);
-		await runToolCommand(c, { argv: ["read", "/abs/c.ts"], cwd: "/repo/sub" }, [], signal);
-		await runToolCommand(c, { argv: ["read", "~/d.ts"], cwd: "/repo/sub" }, [], signal);
-		await runToolCommand(c, { argv: ["read", "e.ts"] }, [], signal);
+		await runToolCommand(c, { argv: ["read", "a.ts"], cwd: "/repo/sub" }, none, signal);
+		await runToolCommand(c, { argv: ["read", "../b.ts"], cwd: "/repo/sub" }, none, signal);
+		await runToolCommand(c, { argv: ["read", "/abs/c.ts"], cwd: "/repo/sub" }, none, signal);
+		await runToolCommand(c, { argv: ["read", "~/d.ts"], cwd: "/repo/sub" }, none, signal);
+		await runToolCommand(c, { argv: ["read", "e.ts"] }, none, signal);
 		assert.deepEqual(
 			calls.map((call) => (call.args as { path: string }).path),
 			["/repo/sub/a.ts", "/repo/b.ts", "/abs/c.ts", "~/d.ts", "/repo/e.ts"],
@@ -152,21 +150,49 @@ describe("runToolCommand", () => {
 	});
 
 	test("a failed call goes to stderr with exit code 1, also without text", async () => {
-		assert.deepEqual(await runToolCommand(ctx({ content: [{ type: "text", text: "ENOENT" }] }, true), { argv: ["read", "a"] }, [], signal), { stdout: "", stderr: "ENOENT\n", code: 1 });
-		assert.deepEqual(await runToolCommand(ctx({ content: [] }, true), { argv: ["read", "a"] }, [], signal), { stdout: "", stderr: "tool read failed\n", code: 1 });
+		assert.deepEqual(await runToolCommand(ctx({ content: [{ type: "text", text: "ENOENT" }] }, true), { argv: ["read", "a"] }, none, signal), { stdout: "", stderr: "ENOENT\n", code: 1 });
+		assert.deepEqual(await runToolCommand(ctx({ content: [] }, true), { argv: ["read", "a"] }, none, signal), { stdout: "", stderr: "tool read failed\n", code: 1 });
 	});
 
 	test("no name, help, an unknown tool and a usage error answer without a call", async () => {
 		const calls: unknown[] = [];
 		const c = ctx({ content: [] }, false, calls);
-		for (const argv of [[], ["--help"], ["help"]]) assert.match((await runToolCommand(c, { argv }, [], signal)).stdout, /^Usage: tool <name>/);
-		assert.match((await runToolCommand(c, { argv: ["read", "--help"] }, [], signal)).stdout, /^read: Read\./);
-		assert.deepEqual(await runToolCommand(c, { argv: ["nope"] }, [], signal), { stdout: "", stderr: 'tool: unknown tool "nope". Tools: read\n', code: 2 });
-		assert.deepEqual(await runToolCommand(c, { argv: ["read", "--offset", "x"] }, [], signal), {
+		for (const argv of [[], ["--help"], ["help"]]) assert.match((await runToolCommand(c, { argv }, none, signal)).stdout, /^Usage: tool <name>/);
+		assert.match((await runToolCommand(c, { argv: ["read", "--help"] }, none, signal)).stdout, /^read: Read\./);
+		assert.deepEqual(await runToolCommand(c, { argv: ["nope"] }, none, signal), { stdout: "", stderr: 'tool: unknown tool "nope". Tools: read\n', code: 2 });
+		assert.deepEqual(await runToolCommand(c, { argv: ["read", "--offset", "x"] }, none, signal), {
 			stdout: "",
 			stderr: 'tool read: --offset must be a number, got "x"\nRun `tool read --help` for its arguments.\n',
 			code: 2,
 		});
 		assert.deepEqual(calls, []);
+	});
+});
+
+describe("tool commands left running", () => {
+	test("a client's label is its command as the shell ran it, quoted where needed", () => {
+		assert.equal(toolLabel(["read", "a.txt"]), "tool read a.txt");
+		assert.equal(toolLabel(["workflow", "--code", "return 'x'", "--budget", "1"]), "tool workflow --code 'return '\\''x'\\''' --budget 1");
+		assert.equal(toolLabel([]), "tool");
+	});
+
+	test("a client is recognised in ps output before and after the wrapper's exec; other processes are not", () => {
+		const client = new URL("../extensions/bash/cli.mjs", import.meta.url).pathname;
+		assert.equal(clientCommand(`${process.execPath} ${client} slow --ms 5`), "tool slow --ms 5");
+		assert.equal(clientCommand(`${process.execPath} ${client}`), "tool");
+		assert.equal(clientCommand("/bin/sh /tmp/bin/tool read x", "/tmp/bin"), "tool read x");
+		assert.equal(clientCommand(`${process.execPath} ${client}x`), undefined);
+		assert.equal(clientCommand("sleep 30", "/tmp/bin"), undefined);
+	});
+
+	test("the end message names the command, its pid and the bash command, then the exit code and output; or that it was killed", () => {
+		const job = { pid: 7, startedBy: "tool slow > out &\necho started" };
+		assert.equal(
+			toolEndedText(job, "tool slow", { stdout: "done\n", stderr: "", code: 0 }, 61_000),
+			"Your background `tool slow` (pid 7, left running by your command `tool slow > out & echo started`) exited with code 0 after 1 min 1 s:\n\ndone",
+		);
+		assert.match(toolEndedText(job, "tool slow", { stdout: "", stderr: "ENOENT\n", code: 1 }, 1000), /exited with code 1 after 1 s:\n\nENOENT$/);
+		assert.match(toolEndedText(job, "tool slow", { stdout: "", stderr: "", code: 0 }, 1000), /:\n\n\(no output\)$/);
+		assert.match(toolEndedText(job, "tool slow", "killed", 2000), /\) was killed after 2 s, so its call was aborted\.$/);
 	});
 });

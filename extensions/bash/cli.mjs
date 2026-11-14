@@ -38,4 +38,5 @@ socket.on("end", () => {
 	process.stdout.write(response.stdout, () => process.stderr.write(response.stderr, () => process.exit(response.code)));
 });
 // One line, and the socket stays open: closing it is how the agent learns this command was killed.
-socket.write(`${JSON.stringify({ argv, cwd: process.cwd(), ...(stdin === undefined ? {} : { stdin }) })}\n`);
+// The pid tells the agent whether the bash command left this one running (`tool … &`).
+socket.write(`${JSON.stringify({ argv, cwd: process.cwd(), pid: process.pid, ...(stdin === undefined ? {} : { stdin }) })}\n`);

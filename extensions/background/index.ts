@@ -14,6 +14,11 @@
 // reports background work (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated
 // child's run open.
 //
+// Some tools (`BACKGROUND_TOOLS`: `workflow`) run long as a rule and their caller rarely needs the
+// result before other work: a model's call of one moves to the background as soon as it starts.
+// Their nested calls (a script's, or `tool workflow …` in bash) stay in the foreground of their
+// caller, which needs the result; `tool workflow … &` in bash makes one a job of its own.
+//
 // The turn's abort stops a call in the foreground, not one in the background. A background call
 // stops at the session's end (its AbortSignal), not on a harness reload: its end reaches the
 // reloaded extension (jobs.ts keeps the state in process state).
@@ -42,12 +47,17 @@ import {
 /** How long a call runs in the foreground before it moves to the background. */
 export const DETACH_AFTER_MS = 2 * 60_000;
 
+/** Tools whose calls the model makes run in the background from their start. */
+export const BACKGROUND_TOOLS: readonly string[] = ["workflow"];
+
 export const BACKGROUND_GUIDELINE = (detachAfterMs: number) =>
-	`No tool call blocks you for more than ${detachAfterMs / 60_000} minutes: a call still running then, or when the user sends a message, moves to the background and keeps running, and its result reaches you as a new message when it ends, also after your turn. So run long builds, tests, workflows and waits in the foreground, with no sleep or poll loops (\`until grep …; do sleep …; done\`) waiting for them.`;
+	`No tool call blocks you for more than ${detachAfterMs / 60_000} minutes: a call still running then, or when the user sends a message, moves to the background and keeps running, and its result reaches you as a new message when it ends, also after your turn. \`workflow\` always starts in the background. To start other work in the background at once: \`cmd > log 2>&1 &\` in bash, \`tool <name> … > out 2>&1 &\` in bash for any tool, or \`delegate_task\` in async mode. Never wait for background work with sleep or poll loops (\`until grep …; do sleep …; done\`): its end wakes you.`;
 
 export interface BackgroundOptions {
 	/** Foreground time before a call moves to the background. */
 	detachAfterMs?: number;
+	/** Tools that run in the background from their start; default {@link BACKGROUND_TOOLS}. */
+	backgroundTools?: readonly string[];
 	/** Directory for job logs; default a per-process directory in the system temp dir. */
 	logRoot?: string;
 }
@@ -62,6 +72,7 @@ const killProcess = (pid: number) => {
 
 export default function background(pi: ExtensionAPI, options: BackgroundOptions = {}) {
 	const detachAfterMs = options.detachAfterMs ?? DETACH_AFTER_MS;
+	const backgroundTools = new Set(options.backgroundTools ?? BACKGROUND_TOOLS);
 	const logRoot = options.logRoot ?? join(tmpdir(), "pi-harness-jobs", String(process.pid));
 	const logDir = (sessionId: string) => {
 		const dir = join(logRoot, encodeURIComponent(sessionId));
@@ -118,7 +129,8 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 		let detach!: (reason: DetachReason) => void;
 		const detached = new Promise<DetachReason>((resolve) => (detach = resolve));
 		jobs.foreground.set(callId, detach);
-		const timer = setTimeout(() => detach("time"), detachAfterMs);
+		const timer = backgroundTools.has(toolName) ? undefined : setTimeout(() => detach("time"), detachAfterMs);
+		if (timer === undefined) detach("start");
 		const run: Promise<Outcome> = execution.execute(controller.signal, update).then(
 			(result) => ({ result }),
 			(error: unknown) => ({ error }),

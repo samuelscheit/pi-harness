@@ -45,6 +45,10 @@ describe("messages and state", () => {
 		const byMessage = detachedText(job(), "message", "  \n", 3000);
 		assert.match(byMessage, /^A new message arrived while it ran, so the call moved to the background and keeps running\. /);
 		assert.match(byMessage, /No output so far\.$/);
+		assert.equal(
+			detachedText(job(), "start", "ignored", 0),
+			"`workflow` always runs in the background: the call started and keeps running. Its latest output is in /tmp/c1.log.\n\nWhen it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Do the work that does not depend on it, or end your turn.",
+		);
 	});
 
 	test("a job's end names the call, how it ended and its result; images come along", () => {
@@ -150,7 +154,7 @@ function tools(pi: ExtensionAPI) {
 	});
 }
 
-async function newSession(): Promise<AgentSession> {
+async function newSession(backgroundTools: readonly string[] = []): Promise<AgentSession> {
 	const cwd = mkdtempSync(join(dir, "repo-"));
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
@@ -160,7 +164,7 @@ async function newSession(): Promise<AgentSession> {
 		noExtensions: true,
 		noSkills: true,
 		noContextFiles: true,
-		extensionFactories: [(pi: ExtensionAPI) => background(pi, { detachAfterMs: DETACH_MS, logRoot: join(dir, "logs") }), tools],
+		extensionFactories: [(pi: ExtensionAPI) => background(pi, { detachAfterMs: DETACH_MS, logRoot: join(dir, "logs"), backgroundTools }), tools],
 	});
 	await resourceLoader.reload();
 	const { session } = await createAgentSession({
@@ -343,6 +347,24 @@ describe("long tool calls move to the background", () => {
 		assert.equal(existsSync(join(dir, "logs")), false);
 		await new Promise((r) => setTimeout(r, DETACH_MS + 100));
 		assert.equal(reports(s).length, 0);
+	});
+
+	test("a tool of the background set starts there at once, and its result arrives as a message; called nested, it stays in the foreground", async () => {
+		const s = await newSession(["slow"]);
+		respond(slow(200, "bg"), fauxAssistantMessage("Started."), fauxAssistantMessage("Seen."));
+		const t0 = Date.now();
+		await s.prompt("go");
+		assert.ok(Date.now() - t0 < 200, "the call returned before the tool ended");
+		assert.match(toolTexts(s)[0]!, /^`slow` always runs in the background: the call started and keeps running\. Its latest output is in \S+\.log\.\n\nWhen it ends/);
+		assert.deepEqual([...jobsOf(s).values()].map((j) => j.toolName), ["slow"]);
+		await until("its report", settled(s, "Seen."));
+		assert.match(textOf(reports(s)[0]!.content), /^Your background `slow` call `\{"ms":200,"text":"bg"\}` \(call [^)]+\) finished after \d s:\n\nslept: bg$/);
+
+		respond(call("caller", { ms: 50 }), fauxAssistantMessage("Nested done."));
+		await s.prompt("again");
+		assert.equal(toolTexts(s)[1], "slept: nested", "the caller got the nested result");
+		assert.equal(reports(s).length, 1);
+		assert.equal(jobsOf(s).size, 0);
 	});
 
 	test("a call that fails fast fails as before", async () => {

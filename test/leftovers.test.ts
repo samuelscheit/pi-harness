@@ -77,6 +77,7 @@ describe("texts", () => {
 		assert.match(text, /^Still running in the background, left by this command \(2 processes\):\n- pid 101: `sleep 30`\n- pid 102: `x{159}…`\n/);
 		assert.match(text, /Each one's end reaches you as a new message, also after your turn: do not wait or poll for them\. Stop one with `kill <pid>`\. They stop when the session ends\.$/);
 		assert.match(leftText([leftover]), /\(1 process\)/);
+		assert.match(leftText([leftover, { ...leftover, pid: 104, command: "tool workflow", tool: true }]), /- pid 104: `tool workflow`\nEach one's end reaches you as a new message \(a `tool` command's with its exit code and result\), also after/);
 	});
 
 	test("the end message names the process, the command that left it and what it left in turn", () => {
