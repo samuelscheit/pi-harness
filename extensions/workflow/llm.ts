@@ -9,11 +9,15 @@
 //
 // Results are cached for the session by their exact input (model, system, prompt, schema,
 // thinking): rerunning an edited script repeats only the calls that changed.
+//
+// The model is checked against its endpoint's listing before the first request (models.ts). A
+// failed request (an error stop reason: a 404 for an unknown model, an auth error) fails the call
+// at once; only invalid structured answers are asked again.
 
 import { createHash } from "node:crypto";
 import { type AssistantMessage, type Message, type Tool, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { CACHE_RETENTION, resolveModel, type Thinking, thinkingOption } from "./models.ts";
+import { CACHE_RETENTION, checkServed, resolveModel, type Thinking, thinkingOption } from "./models.ts";
 
 export const DEFAULT_LLM_MODEL = "anthropic/claude-haiku-5-5";
 const MAX_ATTEMPTS = 3;
@@ -83,6 +87,8 @@ export async function llm(promptArg: unknown, optionsArg: unknown, env: LlmEnv):
 		return structuredClone(env.cache.get(key));
 	}
 	env.counted(false);
+	// A model its endpoint does not serve fails here, without a request; one that fails anyway (a 404) is not retried below.
+	await checkServed(env.runtime, model, env.signal);
 
 	const tool: Tool | undefined = schema && { name: RESPOND, description: "Give your answer as this tool's arguments.", parameters: schema };
 	const instruction = tool ? `Answer only by calling the ${RESPOND} tool once; its arguments are your answer.` : undefined;

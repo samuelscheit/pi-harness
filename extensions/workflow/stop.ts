@@ -96,7 +96,8 @@ export function takeLingering(id: string): { works: Map<string, Work>; unlock: (
 
 const resumeHint = (id: string) => `Continue it with workflow { resume: "${id}" }, or with changed code: workflow { resume: "${id}", code: "…" }.`;
 
-async function until(ok: () => boolean, ms: number): Promise<boolean> {
+/** Whether `ok` came true within `ms`, checked every 50 ms. */
+export async function until(ok: () => boolean, ms: number): Promise<boolean> {
 	const deadline = Date.now() + ms;
 	while (!ok()) {
 		if (Date.now() > deadline) return false;

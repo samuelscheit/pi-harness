@@ -27,7 +27,7 @@ import { stringify } from "yaml";
 import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
 import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
-import { createDelegate } from "./delegate.ts";
+import { createDelegate, type SteerTarget } from "./delegate.ts";
 import { Phases } from "./phases.ts";
 import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
 import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, WorkflowStopped } from "./durable.ts";
@@ -35,6 +35,7 @@ import { codeHash, currentSource, Journal, type JournalEntry, journalPath, newRu
 import type { SavedWorkflow } from "./library.ts";
 import { DEFAULT_LLM_MODEL, llm } from "./llm.ts";
 import { sh } from "./sh.ts";
+import { watchSteer } from "./steer.ts";
 import { clearStopRequest, linger, lockPath, takeLingering, watchStop } from "./stop.ts";
 import { cancelTask, T3, T3_DELEGATE, T3_PREFIX, type T3Options, t3Data, waitSliceMs } from "./t3.ts";
 
@@ -416,6 +417,8 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		controller.abort(reason);
 		if (request.children) for (const work of durable.unsettled().values()) work.cancel(reason);
 	});
+	/** The script's delegates, for `workflow { steer }` (steer.ts). */
+	const steerable: SteerTarget[] = [];
 	const host: ScriptHost = { now: () => durable.now(), random: () => durable.random(), hold: () => durable.hold() };
 	const disposers: ((interrupted: boolean) => void)[] = [];
 	const root = await gitRoot(env.cwd);
@@ -556,6 +559,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				progress,
 				warn: (line) => details.warnings.push(line),
 				onDispose: (dispose) => disposers.push(dispose),
+				track: (child) => steerable.push(child),
 			}),
 		phase: (name: unknown, fn: unknown, options: unknown) => phases.run(name, fn, options),
 		plan: Object.freeze({ expect: (names: unknown) => phases.expect(names) }),
@@ -600,6 +604,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	let value: unknown;
 	let failure: unknown;
 	const ended = new Error("the workflow ended");
+	const steerWatch = watchSteer(dir, () => steerable, children.signal, progress);
 	try {
 		const module = load(entry);
 		env.onStart?.({ id: header.id, journal: journal.path, attempt });
@@ -641,6 +646,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		journal.close();
 	};
 	stopWatch.close();
+	steerWatch.close();
 	if (keep && unsettled.size) linger(dir, header.id, unsettled, unlock, release);
 	else {
 		release();

@@ -45,6 +45,7 @@ import { T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
 import { questionsUi } from "../extensions/workflow/ask.ts";
 import { toolsDeclaration, tsType } from "../extensions/workflow/signatures.ts";
 import { parseCompact } from "../extensions/workflow/delegate.ts";
+import { parse as parseYaml } from "yaml";
 import { priced } from "./priced.ts";
 
 let dir: string;
@@ -1307,6 +1308,40 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		assert.equal(callsOf("delegate_task").length, 1);
 		assert.match(await act({ stop: id }), new RegExp(`workflow run ${id} already ended \\(completed\\); there is nothing to stop`));
 		assert.match(await act({ stop: "20260101-000000-abcdef" }), /no workflow run 20260101-000000-abcdef/);
+	});
+
+	test("status lists the open delegates with title, thread and task id; steer reaches all running ones or those named, through t3", async () => {
+		const { gate, act, start, message } = await parentInT3();
+		const [a, b] = [gate("slow work A"), gate("slow work B")];
+		const id = await start("const out = await Promise.all([delegate({ target: { model: 'faux/faux-1' }, title: 'Review A' }).run('slow work A'), delegate({ target: { model: 'faux/faux-1' } }).run('slow work B')]);\nreturn out.map((r) => r.text).join(' | ');");
+		await until("both agents to run", () => a.runs === 1 && b.runs === 1);
+		await until("both task ids recorded", () => journalOf(id).filter((e) => e.t === "meta" && typeof e.data.taskId === "string").length === 2);
+		const status = parseYaml(await act({ status: id })) as { calls: { open: number }; delegates: Record<string, unknown>[] };
+		assert.equal(status.calls.open, 2);
+		const threadOf = (title: string) => fx.requests.get(String(callsOf("delegate_task").find((c) => c.args.title === title)!.args.clientRequestId))!.threadId;
+		const [threadA, threadB] = [threadOf("Review A"), threadOf("workflow delegate 2: slow work B")];
+		assert.notEqual(threadA, threadB);
+		assert.deepEqual(status.delegates.map(({ seconds, ...rest }) => (assert.equal(typeof seconds, "number"), rest)), [
+			{ call: "#1: slow work A", status: "running", title: "Review A", threadId: threadA, taskId: `task-${threadA}` },
+			{ call: "#2: slow work B", status: "running", title: "workflow delegate 2: slow work B", threadId: threadB, taskId: `task-${threadB}` },
+		]);
+		const steers = () => callsOf("t3_thread_send").filter((c) => c.args.mode === "steer").map((c) => [c.args.threadId, c.args.message]);
+		assert.match(await act({ steer: id, text: "only B: be brief", delegates: [threadB] }), new RegExp(`Workflow run ${id}: Steered 1 delegate: delegate 2 "workflow delegate 2: slow work B" \\(thread ${threadB}\\)\\.`));
+		assert.match(await act({ steer: id, text: "everyone: cite lines" }), /Steered 2 delegates/);
+		assert.match(await act({ steer: id, text: "x", delegates: ["review a"] }), /Steered 1 delegate: delegate 1 "Review A"/, "a title matches without case");
+		assert.deepEqual(steers(), [[threadB, "only B: be brief"], [threadA, "everyone: cite lines"], [threadB, "everyone: cite lines"], [threadA, "x"]]);
+		assert.match(await act({ steer: id, text: "x", delegates: ["Review C"] }), /No running delegate matches "Review C"; nothing was steered/);
+		assert.match(await act({ steer: id }), /steer needs text/);
+		assert.match(await act({ status: id, text: "x" }), /text and delegates go with steer/);
+		assert.equal(steers().length, 4);
+		a.release();
+		b.release();
+		const completed = await message(/Workflow completed/);
+		assert.match(completed.split("\n\n").at(-1)!, /slow work A done \| slow work B done/);
+		const ended = parseYaml(await act({ status: id })) as { status: string; delegates?: unknown };
+		assert.equal(ended.status, "completed");
+		assert.equal(ended.delegates, undefined, "no open delegate calls");
+		assert.match(await act({ steer: id, text: "late" }), new RegExp(`workflow run ${id} already ended \\(completed\\)`));
 	});
 
 	test("stopChildren cancels the agents; a resume asks the stopped child to continue", async () => {

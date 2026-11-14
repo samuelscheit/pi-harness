@@ -33,6 +33,7 @@
 // within one Pi process only). In-process it reopens the child's session file. A child whose run
 // was cut off (its process ended too) gets a message to continue.
 
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { relative } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
@@ -45,7 +46,7 @@ import { type Ask, answerPending, answersInOrder, type Question, questionsUi } f
 import { delegatedChild, RUN_STOPPED } from "./child.ts";
 import { type DelegationSpec, type DelegationState, delegateProblem, type TemplateUse, delegationMessage, delegationsDir, HARNESS_KEYS, templateArgs, prepareDelegation, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
 import { type CallContext, type Durable, isInterruption } from "./durable.ts";
-import { CACHE_RETENTION, resolveModel, THINKING, type Thinking } from "./models.ts";
+import { CACHE_RETENTION, resolveModel, servedModel, THINKING, type Thinking } from "./models.ts";
 import { type T3, T3Child, type T3ChildIds } from "./t3.ts";
 
 /** The model of an in-process child without `target.model` when the caller's is unknown. */
@@ -116,6 +117,20 @@ export interface DelegateEnv {
 	warn: (line: string) => void;
 	/** Register cleanup for the end of the workflow run; `interrupted`: the run will be resumed, children keep their state. */
 	onDispose: (dispose: (interrupted: boolean) => void) => void;
+	/** Each delegate as `workflow { steer }` reaches it. */
+	track: (child: SteerTarget) => void;
+}
+
+/** A delegate as `workflow { steer }` sees it: who it is, whether a run is in flight, and how to steer that run. */
+export interface SteerTarget {
+	/** "delegate 3". */
+	readonly label: string;
+	/** Its title (t3's task title): the script's, else from its first run's message; undefined before the first run. */
+	readonly title: string | undefined;
+	readonly threadId: string | undefined;
+	/** A run is in flight. */
+	readonly running: boolean;
+	steer(text: string, signal: AbortSignal): Promise<void>;
 }
 
 export interface DelegateRun {
@@ -150,11 +165,13 @@ interface HandleState {
 	counted: Record<string, number>;
 	t3?: T3ChildIds;
 	sessionFile?: string;
+	title?: string;
 }
 
-/** What a run's journal meta records while it runs, to reattach. */
+/** What a run's journal meta records while it runs, to reattach (and `title`, for `workflow { status }`). */
 interface RunMeta {
 	spec?: DelegationSpec;
+	title?: string;
 	sessionFile?: string;
 	taskId?: string;
 	threadId?: string;
@@ -256,7 +273,8 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 		const { session } = await createAgentSession({
 			cwd: env.cwd,
 			agentDir: env.agentDir,
-			model: resolveModel(env.runtime, model),
+			// Checked against what its endpoint serves before the child's first request.
+			model: await servedModel(env.runtime, model),
 			thinkingLevel: thinking,
 			modelRuntime: env.runtime,
 			resourceLoader,
@@ -319,15 +337,15 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 	};
 }
 
-function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask, template: () => TemplateUse | undefined): Transport {
+function inT3(t3: T3, options: DelegateOptions, label: string, title: () => string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask, template: () => TemplateUse | undefined): Transport {
 	let task: T3Child | undefined;
 	let restored: T3ChildIds = {};
 	/** Pending requests answered or passed up: each is handled once. */
 	const handled = new Set<string>();
-	const child = (title: string) => {
+	const child = () => {
 		if (task) return task;
 		const from = template();
-		const params = { title, ...options.t3, ...(from ? templateArgs((options.t3.target ?? {}) as { options?: unknown }, from) : {}), ...(fork ? { fork: true, forkThreadId: fork.threadId } : {}) };
+		const params = { title: title(), ...options.t3, ...(from ? templateArgs((options.t3.target ?? {}) as { options?: unknown }, from) : {}), ...(fork ? { fork: true, forkThreadId: fork.threadId } : {}) };
 		// Without onAsk every question goes up, as t3 reports it: nothing to read.
 		task = new T3Child(t3, params, options.onAsk ? (current, signal) => answerPending(t3.call, current.threadId!, handled, ask, signal) : undefined);
 		task.restore(restored);
@@ -335,7 +353,7 @@ function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv,
 	};
 	const existing = () => {
 		if (!task?.threadId && !restored.threadId) throw new Error(`${label} has no thread yet: run it first`);
-		return child("");
+		return child();
 	};
 	const started = (known: string | undefined, remember: (meta: RunMeta) => void) => (ids: T3ChildIds) => {
 		remember(ids);
@@ -344,15 +362,10 @@ function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv,
 			env.progress(`${label} · t3 thread ${ids.link ?? ids.threadId}`);
 		}
 	};
-	// The prepared first message: the marker and summary, a blank line, maybe the phase header, then the script's message.
-	const titled = (message: string) => {
-		const body = message.slice(message.indexOf("\n\n") + 2).replace(/^\[workflow phase: [^\n]*\]\n\n/, "");
-		return child(`workflow ${label}: ${headline(body).slice(0, 60)}`);
-	};
 	return {
-		run: (message, requestId, remember, signal) => titled(message).run(message, requestId, signal, started(titled(message).threadId, remember)),
+		run: (message, requestId, remember, signal) => child().run(message, requestId, signal, started(child().threadId, remember)),
 		// A run whose id the journal has is waited for; else t3 dedupes the repeated call on its request id.
-		reattach: (message, _continuation, requestId, recorded, remember, signal) => titled(message).reattach(message, requestId, recorded.runId, signal, started(titled(message).threadId, remember)),
+		reattach: (message, _continuation, requestId, recorded, remember, signal) => child().reattach(message, requestId, recorded.runId, signal, started(child().threadId, remember)),
 		command: (text, requestId, signal) => existing().send(text, "queue", requestId, signal),
 		steer: (text, requestId, signal) => existing().send(text, "steer", requestId, signal),
 		state: () => {
@@ -402,7 +415,10 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	};
 	/** The template, resolved (built when stale) at the first run. */
 	let template: TemplateUse | undefined;
-	const transport = env.t3 ? inT3(env.t3, options, label, env, fork, ask, () => template) : inProcess(options, dir, label, env, fork, ask, () => template);
+	/** The child's title (t3 names its task so): the script's, else from the first run's message. */
+	let title = typeof options.t3.title === "string" ? options.t3.title : undefined;
+	const titleFor = (raw: string) => (title ??= `workflow ${label}: ${headline(raw).slice(0, 60)}`);
+	const transport = env.t3 ? inT3(env.t3, options, label, () => title ?? label, env, fork, ask, () => template) : inProcess(options, dir, label, env, fork, ask, () => template);
 	let spec: DelegationSpec | undefined;
 	let runs = 0;
 	let cost = 0;
@@ -461,9 +477,10 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		return (await changedPaths(before, after)).map((path) => relative(canonical(env.cwd), path));
 	};
 
-	const handleState = (): HandleState => ({ firstKey: firstKey!, spec: spec!, runs, cost, counted: Object.fromEntries(counted), ...transport.state() });
+	const handleState = (): HandleState => ({ firstKey: firstKey!, spec: spec!, runs, cost, counted: Object.fromEntries(counted), ...(title ? { title } : {}), ...transport.state() });
 	const restore = (state: HandleState) => {
 		firstKey = state.firstKey;
+		title = state.title ?? title;
 		spec = state.spec;
 		runs = state.runs;
 		cost = state.cost;
@@ -500,6 +517,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		const message = head ? `${head}\n\n${raw}` : raw;
 		const { signal } = call;
 		if (n === 1) firstKey = call.key;
+		titleFor(raw);
 		const recorded = call.recorded as RunMeta;
 		let runMessage: string;
 		if (reattach && recorded.spec) {
@@ -512,8 +530,11 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			env.warn(`${label}: run ${n} reattached after the workflow stopped; its changed files are those since the resume`);
 		} else if (n === 1) {
 			({ message: runMessage, spec } = await firstMessage(message));
-			call.meta({ spec });
-		} else runMessage = delegationMessage(spec!, n, message);
+			call.meta({ spec, title });
+		} else {
+			runMessage = delegationMessage(spec!, n, message);
+			call.meta({ title });
+		}
 		const current = spec!;
 		// The spec is gone when the sweep took it; the child reads it on every run.
 		if (!readSpec(dir, current.id)) writeSpec(dir, current);
@@ -616,6 +637,21 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		};
 		return env.durable.call({ kind: "delegate", args: { delegate: firstKey, op, ...(text === undefined ? {} : { text }) }, label: `${tag} ${op}${text ? `: ${headline(text).slice(0, 80)}` : ""}` }, live, live).then(() => undefined);
 	};
+
+	env.track({
+		label,
+		get title() {
+			return title;
+		},
+		get threadId() {
+			return transport.threadId;
+		},
+		get running() {
+			return running && !disposed;
+		},
+		// Not journaled: a steer from outside the script is no call of it, a resume must not expect it.
+		steer: (text, signal) => transport.steer(text, `${spec!.id}-steer-${randomUUID()}`, signal),
+	});
 
 	const handle: DelegateHandle = {
 		run: (message: unknown, runOptions?: unknown) => {

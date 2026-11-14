@@ -17,6 +17,9 @@
 // Runs are durable (run.ts, durable.ts) and visible (render.ts, runs.ts): the session records each
 // run's start and end, the thread shows the run's page at its start and end, the dashboard serves
 // it live, and a run whose process died is offered for resuming when its session starts again.
+// By id, the tool also acts on a run: `status` (render.ts: phases and open delegate calls with
+// their titles, thread and task ids), `show`, `stop` (stop.ts) and `steer` (steer.ts: a message
+// to the running delegates).
 
 import { readFileSync } from "node:fs";
 import { relative } from "node:path";
@@ -35,7 +38,8 @@ import { sessionJobs } from "../background/jobs.ts";
 import { reportWork } from "../background/work.ts";
 import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, liveUrl, offerInterrupted, recordRun, renderEnd, runHeadline, runName, setLatestApi, showRun, startViews } from "./runs.ts";
 import { type SignatureTool, toolsDeclaration } from "./signatures.ts";
-import { stopRun } from "./stop.ts";
+import { lockHeld, stopRun } from "./stop.ts";
+import { steerRun } from "./steer.ts";
 import { phaseStatus } from "./render.ts";
 import { runState, sweepRuns } from "./journal.ts";
 import { stringify } from "yaml";
@@ -52,6 +56,8 @@ function describe(tools?: readonly SignatureTool[]): string {
 	const api = tools ? API.replace(TOOLS_DECLARATION, toolsDeclaration(tools)) : API;
 	return [
 		"Run a TypeScript script that does a procedure with code and calls a model only where a judgment is needed. `code` is the body of an async function: top-level await and `return` work; only the returned value (a string, or data shown as YAML) reaches you, plus cost and changed files. An object with `ok: false` marks the goal as missed.",
+		"A run's id (in its result and live view) also lets you act on it: `status` (its phases and its open delegate calls with their titles, thread and task ids), `show`, `steer` (send its running delegates a message: a new rule or correction), `stop` and `resume`.",
+		"Models of llm() and delegate() are checked against what their provider serves before the first request: an unknown one fails at once and the error lists the models served.",
 		"Globals:",
 		api,
 	].join("\n\n");
@@ -178,6 +184,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			'In a longer workflow, name its steps with phase() and what comes next with plan.expect(): the page shows the tree, and workflow { status: "<id>" } returns it as data.',
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
 			'A run that was interrupted or stopped continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
+			'To tell a running run\'s delegates something new (a rule, a correction), steer them with workflow { steer: "<id>", text: "…" }; `delegates` narrows it to some, by title (or a part of it) or thread id as workflow { status: "<id>" } lists them. Do not look for the delegates\' threads with other tools.',
 			'Stop a running run with workflow { stop: "<id>" }: its agents keep running and their results are recorded; stopChildren: true cancels them. To change a run\'s script without losing its paid work, resume it with workflow { resume: "<id>", code: "<new code>" }: calls the new code makes as before come from the journal, from its first other call it runs live. Effects of the old code (commits, files) stay; the new code must cope with them.',
 			"When a session template exists for the kind of task a child gets (`template` of delegate() and delegate_task names those here), start the child from it: its prepared context is cached once for every task.",
 			"When you are about to run the same kind of long shell command again with different arguments, save it as a workflow with the arguments as parameters (built with sh`…`) and call that tool from then on.",
@@ -192,15 +199,23 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 				Type.Union([Type.Literal("rerun"), Type.Literal("fail")], { description: "With resume: what shell and tools calls that were in flight do: run again, or throw InterruptedCallError. Needed when the resume names such calls." }),
 			),
 			show: Type.Optional(Type.String({ description: "The id of a run: show its page (calls, status, cost) in the thread now." })),
-			status: Type.Optional(Type.String({ description: "The id of a run: its status and phase tree (done, running, expected; time and cost) as data." })),
+			status: Type.Optional(Type.String({ description: "The id of a run: its status, phase tree (done, running, expected; time and cost) and open delegate calls (title, threadId, taskId) as data." })),
+			steer: Type.Optional(Type.String({ description: "The id of a running run: send `text` to its delegates whose run is in flight, as a steering message of their current turn." })),
+			text: Type.Optional(Type.String({ description: "With steer: the message for the delegates." })),
+			delegates: Type.Optional(Type.Array(Type.String(), { description: "With steer: only these delegates, each named by its title (or a part of it), thread id or label (`delegate 2`); default all running ones." })),
 			stop: Type.Optional(Type.String({ description: "The id of a running run: stop it, keeping its journal for a resume." })),
 			stopChildren: Type.Optional(Type.Boolean({ description: "With stop: cancel its agents too (default: they keep running and their results are recorded)." })),
 		}),
 		execute: async (callId, params, signal, onUpdate, ctx) => {
-			const modes = [params.code !== undefined && params.resume === undefined, params.resume !== undefined, params.show !== undefined, params.stop !== undefined, params.status !== undefined].filter(Boolean).length;
-			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume (optionally with code), show, status or stop");
+			const modes = [params.code !== undefined && params.resume === undefined, params.resume !== undefined, params.show !== undefined, params.stop !== undefined, params.status !== undefined, params.steer !== undefined].filter(Boolean).length;
+			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume (optionally with code), show, status, steer (with text) or stop");
+			if ((params.text !== undefined || params.delegates !== undefined) && params.steer === undefined) throw new Error("text and delegates go with steer");
 			const answer = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
-			if (params.status !== undefined) return answer(stringify(phaseStatus(runState(agentDir, params.status).entries), { lineWidth: 0 }).trimEnd());
+			if (params.status !== undefined) return answer(stringify(phaseStatus(runState(agentDir, params.status).entries, { processEnded: !lockHeld(agentDir, params.status) }), { lineWidth: 0 }).trimEnd());
+			if (params.steer !== undefined) {
+				if (!params.text?.trim()) throw new Error("steer needs text: the message for the delegates");
+				return answer(await steerRun(agentDir, params.steer, { text: params.text, ...(params.delegates?.length ? { delegates: params.delegates } : {}) }));
+			}
 			if (params.show !== undefined) return answer(await showRun({ agentDir, id: params.show, toolNames: ctx.tools.map((t) => t.name), execute: executor(ctx), dashboardUrl }));
 			if (params.stop !== undefined) return answer(await stopRun(agentDir, params.stop, params.stopChildren === true));
 			if (params.resume !== undefined) {

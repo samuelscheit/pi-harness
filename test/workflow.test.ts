@@ -6,6 +6,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
@@ -18,6 +20,7 @@ import { HARNESS_WORKFLOWS, loadWorkflows, metaProblem, type SavedWorkflow } fro
 import { readJournal } from "../extensions/workflow/journal.ts";
 import { phaseStatus, renderWorkflow } from "../extensions/workflow/render.ts";
 import { INLINE_FILE, type RunEnv, resumeWorkflow, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
+import { steerRun } from "../extensions/workflow/steer.ts";
 import { priced } from "./priced.ts";
 
 let faux: ReturnType<typeof registerFauxProvider>;
@@ -396,6 +399,121 @@ describe("delegate()", () => {
 		const aborted = await run("await delegate({ target: { model: 'faux/faux-1' } }).run('wait');", 1, { signal: controller.signal });
 		assert.ok(Date.now() - started < 8000);
 		assert.equal(aborted.details.status, "aborted");
+	});
+});
+
+describe("models are checked against what their endpoint serves", () => {
+	/**
+	 * An Anthropic-style gateway as on 2026-11-14: GET /v1/models lists its aliases (`listing: false`:
+	 * it has no listing), every message request answers 404 "model alias … is not configured".
+	 */
+	async function gateway(served: string[], listing = true) {
+		const requests: string[] = [];
+		const server = createServer((req, res) => {
+			requests.push(`${req.method} ${req.url}`);
+			req.resume();
+			req.on("end", () => {
+				const listed = listing && req.method === "GET" && req.url?.startsWith("/v1/models");
+				res.writeHead(listed ? 200 : 404, { "content-type": "application/json" });
+				res.end(JSON.stringify(listed ? { data: served.map((id) => ({ type: "model", id })), has_more: false, first_id: served[0], last_id: served.at(-1) } : { type: "error", error: { type: "not_found_error", message: "model alias 'gone-1' is not configured" } }));
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		// A runtime of its own: listings are cached per runtime.
+		const gwRuntime = await ModelRuntime.create({ authPath: join(dir, "gw-auth.json"), modelsPath: null });
+		const model = (id: string) => ({ id, name: id, api: "anthropic-messages", reasoning: false, input: ["text" as const], cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 8000 });
+		gwRuntime.registerProvider("gw", { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, apiKey: "gw-key", api: "anthropic-messages", models: [model("served-1"), model("gone-1")] });
+		const posts = () => requests.filter((r) => r.startsWith("POST")).length;
+		const lists = () => requests.filter((r) => r.startsWith("GET /v1/models")).length;
+		return { runtime: gwRuntime, requests, posts, lists, close: () => new Promise((resolve) => server.close(resolve)) };
+	}
+
+	test("an unknown model fails llm() and delegate() before any request, naming the models served; the listing is read once", async () => {
+		const gw = await gateway(["served-1"]);
+		try {
+			const unknownLlm = await run("await llm('x', { model: 'gw/gone-1' });", 1, { runtime: gw.runtime });
+			assert.equal(unknownLlm.details.status, "failed");
+			assert.match(unknownLlm.details.error!, /^Error: unknown model gw\/gone-1: its endpoint serves gw\/served-1/);
+			const unknownDelegate = await run("await delegate({ target: { model: 'gw/gone-1' } }).run('work');", 1, { runtime: gw.runtime });
+			assert.equal(unknownDelegate.details.status, "failed");
+			assert.match(unknownDelegate.details.error!, /unknown model gw\/gone-1: its endpoint serves gw\/served-1/);
+			assert.equal(gw.posts(), 0, "no message request");
+			assert.equal(gw.lists(), 1, "one listing for both runs");
+			assert.match(gw.requests[0]!, /^GET \/v1\/models\?limit=1000$/);
+			// Not in the catalog either: the provider's catalog models are named.
+			const notInCatalog = await run("await llm('x', { model: 'gw/typo' });", 1, { runtime: gw.runtime });
+			assert.match(notInCatalog.details.error!, /unknown model gw\/typo; gw has gw\/served-1, gw\/gone-1/);
+			const noProvider = await run("await llm('x', { model: 'nobody/m' });", 1, { runtime: gw.runtime });
+			assert.match(noProvider.details.error!, /unknown model nobody\/m: no provider nobody/);
+		} finally {
+			await gw.close();
+		}
+	});
+
+	test("a 404 is not retried: llm() and an in-process delegate make one request each and fail at once", async () => {
+		// The gateway lists the model but refuses it (aliases changed meanwhile), and one without a listing: neither is checked out.
+		for (const gw of [await gateway(["served-1", "gone-1"]), await gateway([], false)]) {
+			try {
+				const started = Date.now();
+				const viaLlm = await run("await llm('x', { model: 'gw/gone-1' });", 1, { runtime: gw.runtime });
+				assert.equal(viaLlm.details.status, "failed");
+				assert.match(viaLlm.details.error!, /llm\(\): 404 .*model alias 'gone-1' is not configured/);
+				assert.equal(gw.posts(), 1, "one request, not retried");
+				const viaDelegate = await run("await delegate({ target: { model: 'gw/gone-1' } }).run('work');", 1, { runtime: gw.runtime });
+				assert.equal(viaDelegate.details.status, "failed");
+				assert.match(viaDelegate.details.error!, /delegate 1: .*404.*not configured/);
+				assert.equal(gw.posts(), 2, "the child's session does not retry it either");
+				assert.ok(Date.now() - started < 10_000, "no backoff");
+			} finally {
+				await gw.close();
+			}
+		}
+	});
+});
+
+describe("steering a run's delegates", () => {
+	test("steer reaches every running delegate, or only the one named; a name that matches none steers nothing; status lists them", async () => {
+		let release!: () => void;
+		const open = new Promise<void>((resolve) => (release = resolve));
+		const contexts: Record<string, string[]> = { a: [], b: [] };
+		const step = async (context: unknown) => {
+			const text = seen(context);
+			const own = /work on (\w)/.exec(text)![1]!;
+			contexts[own]!.push(text);
+			if (contexts[own]!.length === 1) await open;
+			return say(`${own} answer ${contexts[own]!.length}`);
+		};
+		respond(...Array.from({ length: 8 }, () => step));
+		let id = "";
+		const running = runWorkflow(
+			inline("const out = await Promise.all(['a', 'b'].map((f) => delegate({ target: { model: 'faux/faux-1' }, title: `review ${f}` }).run(`work on ${f}`)));\nreturn out.map((r) => r.text).join(' | ');"),
+			1,
+			env({ onStart: (run) => (id = run.id) }),
+		);
+		const deadline = Date.now() + 10_000;
+		while (contexts.a!.length + contexts.b!.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+		const agentDir = join(dir, "agent");
+
+		const status = phaseStatus(readJournal(join(agentDir, "workflows", id, "journal.jsonl"))) as { delegates?: { call: string; status: string; title?: string }[] };
+		assert.deepEqual(status.delegates?.map((d) => [d.call, d.status, d.title]), [["#1: work on a", "running", "review a"], ["#2: work on b", "running", "review b"]]);
+
+		await assert.rejects(steerRun(agentDir, id, { text: "RULE-X", delegates: ["review b", "nope"] }), /No running delegate matches "nope"; nothing was steered\. Running: delegate 1 "review a"; delegate 2 "review b"\./);
+		assert.match(await steerRun(agentDir, id, { text: "RULE-B", delegates: ["review b"] }), new RegExp(`^Workflow run ${id}: Steered 1 delegate: delegate 2 "review b"\\.$`));
+		assert.match(await steerRun(agentDir, id, { text: "RULE-ALL" }), /Steered 2 delegates: delegate 1 "review a"; delegate 2 "review b"\./);
+		assert.match(await steerRun(agentDir, id, { text: "RULE-2", delegates: ["#1"] }), /Steered 1 delegate: delegate 1 "review a"\./, "by label too");
+		await assert.rejects(steerRun(agentDir, id, { text: " " }), /steer needs a non-empty text/);
+		release();
+		const { text, details } = await running;
+		assert.equal(details.status, "completed", details.error);
+		const a = contexts.a!.slice(1).join("\n");
+		const b = contexts.b!.slice(1).join("\n");
+		assert.match(a, /RULE-ALL/);
+		assert.match(a, /RULE-2/);
+		assert.doesNotMatch(a, /RULE-B|RULE-X/, "only the named delegate got RULE-B");
+		assert.match(b, /RULE-B[\s\S]*RULE-ALL/);
+		assert.doesNotMatch(b, /RULE-2|RULE-X/);
+		assert.match(text, /a answer \d \| b answer \d$/, "the steered turns' answers are the runs' results");
+		await assert.rejects(steerRun(agentDir, id, { text: "late" }), new RegExp(`workflow run ${id} already ended \\(completed\\)`));
 	});
 });
 

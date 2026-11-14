@@ -33,6 +33,10 @@ export interface CallView {
 	cost: number;
 	/** An agent's t3 thread link (`t3-thread://…`) or thread id. */
 	link?: string;
+	/** A delegate's title, t3 thread id and t3 task id, as its meta recorded them. */
+	title?: string;
+	threadId?: string;
+	taskId?: string;
 	error?: string;
 	/** The code version whose live part made the call (1: the start's). */
 	version: number;
@@ -159,14 +163,22 @@ export function viewOf(entries: readonly JournalEntry[], options: ViewOptions = 
 					startAt: entry.at,
 					cost: 0,
 					...(known?.link ? { link: known.link } : {}),
+					...(known?.title ? { title: known.title } : {}),
+					...(known?.threadId ? { threadId: known.threadId } : {}),
+					...(known?.taskId ? { taskId: known.taskId } : {}),
 					version: known?.version ?? live,
 				});
 				break;
 			}
 			case "meta": {
 				const call = calls.get(entry.key);
+				if (!call) break;
 				const link = entry.data.link ?? entry.data.threadId;
-				if (call && typeof link === "string") call.link = linkUrl(link);
+				if (typeof link === "string") call.link = linkUrl(link);
+				for (const field of ["title", "threadId", "taskId"] as const) {
+					const value = entry.data[field];
+					if (typeof value === "string") call[field] = value;
+				}
 				break;
 			}
 			case "done":
@@ -249,8 +261,8 @@ function phaseTree(phases: Map<string, PhaseView & { parent?: string }>, plans: 
 }
 
 /** `workflow { status }`: the run and its phase tree as data. */
-export function phaseStatus(entries: readonly JournalEntry[]) {
-	const view = viewOf(entries);
+export function phaseStatus(entries: readonly JournalEntry[], options: ViewOptions = {}) {
+	const view = viewOf(entries, options);
 	const seconds = (from?: number, to?: number) => (from === undefined ? undefined : Math.round(((to ?? view.lastAt) - from) / 100) / 10);
 	const node = (phase: PhaseView): Record<string, unknown> => ({
 		phase: phase.label,
@@ -259,6 +271,16 @@ export function phaseStatus(entries: readonly JournalEntry[]) {
 		...(phase.budget !== undefined ? { budget: phase.budget } : {}),
 		...(phase.phases.length ? { phases: phase.phases.map(node) } : {}),
 	});
+	const delegates = view.calls
+		.filter((call) => call.kind === "delegate" && (call.status === "running" || call.status === "interrupted" || call.status === "stopped"))
+		.map((call) => ({
+			call: call.label,
+			status: call.status,
+			...(call.title ? { title: call.title } : {}),
+			...(call.threadId ? { threadId: call.threadId } : {}),
+			...(call.taskId ? { taskId: call.taskId } : {}),
+			seconds: seconds(call.startAt, call.endAt),
+		}));
 	return {
 		run: view.header.id,
 		status: view.status,
@@ -266,6 +288,8 @@ export function phaseStatus(entries: readonly JournalEntry[]) {
 		cost: Number(view.cost.toFixed(4)),
 		budget: view.header.budget,
 		calls: { open: view.open, done: view.done },
+		// What `workflow { steer }` and t3's thread tools name them by.
+		...(delegates.length ? { delegates } : {}),
 		phases: view.phases.map(node),
 	};
 }
