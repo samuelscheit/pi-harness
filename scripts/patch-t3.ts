@@ -34,6 +34,12 @@
 //   code from before its `questions` patch (patches take effect on restart) dropped the unknown
 //   dialog silently, so `ask_user` reported its questions shown while no card appeared
 //   (2026-11-14, three reports).
+// - background-caller (same branch, "fix(provider-pi): an idle Pi thread with background work stays
+//   a live MCP caller"): t3 takes MCP tool calls from a thread only while it has an active run or a
+//   pending `subagent` background task. A harness workflow runs in the background after its run
+//   ended, so its agent() calls (`delegate_task`, `t3_thread_wait`) and its page (`html_render`)
+//   failed with `parent_not_active` (2026-11-14, a real thread). While Pi reports background work,
+//   the thread now lists the pending subagent task `pi-background-work`.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -158,6 +164,37 @@ export const PATCHES: Patch[] = [
 		name: "questions-capability",
 		marker: "PI_RPC_DIALOGS",
 		edits: [["\treturn {\n\t\targs,\n\t\tenv: {\n\t\t\t...environment,\n", '\treturn {\n\t\targs,\n\t\tenv: {\n\t\t\t...environment,\n\t\t\tPI_RPC_DIALOGS: "questions",\n']],
+	},
+	{
+		name: "background-caller",
+		marker: "pi-background-work",
+		edits: [
+			[
+				'const PI_INHERIT_MODEL_SLUG = "default";',
+				'const PI_INHERIT_MODEL_SLUG = "default";\nconst PI_BACKGROUND_WORK_TASK = {\n\ttaskId: "pi-background-work",\n\tkind: "subagent",\n\tdescription: "Pi background work (a workflow or a command that moved to the background)"\n};',
+			],
+			[
+				"const updateProviderThread = fnUntraced(function* (state, patch, retainedNativeTurnIds) {",
+				[
+					"const publishBackgroundWork = fnUntraced(function* () {",
+					"\t\t\t\tif (threadState === null) return;",
+					"\t\t\t\tconst current = threadState.providerThread.pendingBackgroundTasks ?? [];",
+					"\t\t\t\tif (current.some((task) => task.taskId === PI_BACKGROUND_WORK_TASK.taskId) === backgroundWorkPending) return;",
+					"\t\t\t\tconst others = current.filter((task) => task.taskId !== PI_BACKGROUND_WORK_TASK.taskId);",
+					"\t\t\t\tyield* updateProviderThread(threadState, { pendingBackgroundTasks: backgroundWorkPending ? [...others, PI_BACKGROUND_WORK_TASK] : others });",
+					"\t\t\t});",
+					"\t\t\tconst updateProviderThread = fnUntraced(function* (state, patch, retainedNativeTurnIds) {",
+				].join("\n"),
+			],
+			[
+				'backgroundWorkPending = typeof pending === "number" && pending > 0;\n\t\t\t\t\treturn;',
+				'backgroundWorkPending = typeof pending === "number" && pending > 0;\n\t\t\t\t\tyield* publishBackgroundWork();\n\t\t\t\t\treturn;',
+			],
+			[
+				"forkedFrom: null,\n\t\t\t\t\tpendingBackgroundTasks: [],\n\t\t\t\t\tcreatedAt,\n\t\t\t\t\tupdatedAt: createdAt\n\t\t\t\t};\n\t\t\t\tthreadState = {",
+				"forkedFrom: null,\n\t\t\t\t\tpendingBackgroundTasks: backgroundWorkPending ? [PI_BACKGROUND_WORK_TASK] : [],\n\t\t\t\t\tcreatedAt,\n\t\t\t\t\tupdatedAt: createdAt\n\t\t\t\t};\n\t\t\t\tthreadState = {",
+			],
+		],
 	},
 	{
 		name: "session-questions",
