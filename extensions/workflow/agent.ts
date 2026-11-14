@@ -26,7 +26,7 @@ import { existsSync } from "node:fs";
 import { relative } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { canonical, changedPaths, type Snapshot, snapshot } from "../lib/workspace.ts";
-import { delegatedChild } from "./child.ts";
+import { delegatedChild, RUN_STOPPED } from "./child.ts";
 import { type DelegationSpec, type DelegationState, delegationMessage, delegationsDir, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
 import { type CallContext, type Durable, isInterruption } from "./durable.ts";
 import { CACHE_RETENTION, resolveModel, type Thinking, thinkingOption } from "./models.ts";
@@ -39,7 +39,7 @@ const DEFAULT_SYSTEM = [
 	"Do what each message asks. When done, answer briefly: your final message is returned to the script as text.",
 ].join("\n");
 /** Sent to a child whose run was cut off when processes ended, as a run with the same number. */
-export const CONTINUE_MESSAGE = "Your previous run was interrupted before it finished (a process ended). Continue the task of this run where you left off, and finish it as the run asked.";
+export const CONTINUE_MESSAGE = "Your previous run was interrupted before it finished (it was stopped, or a process ended). Continue the task of this run where you left off, and finish it as the run asked.";
 /** How often the child's state is read while it runs (cost, session). */
 const POLL_MS = 500;
 /** How long a run's state may lag behind the end of the run (t3 reports the end on its own path). */
@@ -70,7 +70,6 @@ export interface AgentEnv {
 	durable: Durable;
 	/** This agent's number in its workflow run (agent() calls in script order). */
 	number: number;
-	signal: AbortSignal;
 	/** Each response's cost in USD. */
 	spend: (usd: number) => void;
 	/** A child session started. */
@@ -168,9 +167,9 @@ const headline = (text: string) => (text.split("\n").find((line) => line.trim())
 /** How a child's runs are carried out: a t3 task or an in-process session. */
 interface Transport {
 	/** Send one run's message (`script`: the script's own message, for a title); resolves when the run is over. */
-	run(message: string, requestId: string, script: string, remember: (meta: RunMeta) => void): Promise<void>;
-	/** Continue a run that was in flight when the process died (`recorded`: what its journal knew): `message` may have been sent already, `continuation` asks to go on. */
-	reattach(message: string, continuation: string, requestId: string, script: string, recorded: RunMeta, remember: (meta: RunMeta) => void): Promise<void>;
+	run(message: string, requestId: string, script: string, remember: (meta: RunMeta) => void, signal: AbortSignal): Promise<void>;
+	/** Continue a run that was in flight when the run stopped (`recorded`: what its journal knew): `message` may have been sent already, `continuation` asks to go on. */
+	reattach(message: string, continuation: string, requestId: string, script: string, recorded: RunMeta, remember: (meta: RunMeta) => void, signal: AbortSignal): Promise<void>;
 	/** What identifies the child, for the journal. */
 	state(): Pick<AgentState, "t3" | "sessionFile">;
 	restore(state: Pick<AgentState, "t3" | "sessionFile">): void;
@@ -215,21 +214,21 @@ function inProcess(options: AgentOptions, dir: string, label: string, env: Agent
 		return session;
 	};
 	const fresh = () => (env.sessionDir ? SessionManager.create(env.cwd, env.sessionDir, { parentSession: env.parentSessionFile }) : SessionManager.inMemory(env.cwd));
-	const prompt = async (message: string, manager: () => SessionManager, remember: (meta: RunMeta) => void) => {
+	const prompt = async (message: string, manager: () => SessionManager, remember: (meta: RunMeta) => void, signal: AbortSignal) => {
 		const session = await (child ??= create(manager()));
 		if (session.sessionFile && session.sessionFile !== sessionFile) {
 			sessionFile = session.sessionFile;
 			remember({ sessionFile });
 		}
 		// Checked right before prompt(): an abort while the session was created would reach no run.
-		if (env.signal.aborted) throw env.signal.reason;
+		if (signal.aborted) throw signal.reason;
 		await session.prompt(message);
 	};
 	const recorded = () => (sessionFile && existsSync(sessionFile) ? SessionManager.open(sessionFile) : fresh());
 	return {
-		run: (message, _requestId, _script, remember) => prompt(message, recorded, remember),
-		// The child died with the parent's process: reopen its session and ask it to go on; without one, nothing ran yet.
-		reattach: (message, continuation, _requestId, _script, _recorded, remember) => prompt(sessionFile && existsSync(sessionFile) ? continuation : message, recorded, remember),
+		run: (message, _requestId, _script, remember, signal) => prompt(message, recorded, remember, signal),
+		// The child died with the parent's process or was stopped: reopen its session and ask it to go on; without one, nothing ran yet.
+		reattach: (message, continuation, _requestId, _script, _recorded, remember, signal) => prompt(sessionFile && existsSync(sessionFile) ? continuation : message, recorded, remember, signal),
 		state: () => (sessionFile ? { sessionFile } : {}),
 		restore: (state) => {
 			sessionFile = state.sessionFile ?? sessionFile;
@@ -262,9 +261,9 @@ function inT3(t3: T3, options: AgentOptions, label: string, env: AgentEnv): Tran
 		}
 	};
 	return {
-		run: (message, requestId, script, remember) => child(script).run(message, requestId, env.signal, started(child(script).threadId, remember)),
+		run: (message, requestId, script, remember, signal) => child(script).run(message, requestId, signal, started(child(script).threadId, remember)),
 		// A run whose id the journal has is waited for; else t3 dedupes the repeated call on its request id.
-		reattach: (message, _continuation, requestId, script, recorded, remember) => child(script).reattach(message, requestId, recorded.runId, env.signal, started(child(script).threadId, remember)),
+		reattach: (message, _continuation, requestId, script, recorded, remember, signal) => child(script).reattach(message, requestId, recorded.runId, signal, started(child(script).threadId, remember)),
 		state: () => {
 			const ids = task?.ids ?? restored;
 			return Object.keys(ids).length ? { t3: ids } : {};
@@ -332,15 +331,17 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 	};
 
 	/** The state of run `n` once it is done; undefined when the child does not report it in time. */
-	const finalState = async (n: number, waitMs = STATE_WAIT_MS): Promise<DelegationState | undefined> => {
+	const finalState = async (n: number, signal: AbortSignal, waitMs = STATE_WAIT_MS): Promise<DelegationState | undefined> => {
 		const deadline = Date.now() + waitMs;
 		for (;;) {
 			const state = sync();
 			if (state && (state.run > n || (state.run === n && state.done))) return state;
-			if (Date.now() >= deadline || env.signal.aborted) return undefined;
+			if (Date.now() >= deadline || signal.aborted) return undefined;
 			await new Promise((r) => setTimeout(r, 100));
 		}
 	};
+	/** A run the child ended because it was stopped (cancelled) is no result: a reattach asks it to go on. */
+	const stoppedRun = (state: DelegationState | undefined, n: number) => state?.run === n && state.done && state.error === RUN_STOPPED;
 
 	const changedSince = async (before: Snapshot | undefined): Promise<string[]> => {
 		if (!before) return [];
@@ -359,15 +360,16 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 		transport.restore(state);
 	};
 
-	/** Run `n` live, or reattach to it when it was in flight at a crash. */
+	/** Run `n` live, or reattach to it when it was in flight when the run stopped. */
 	const execute = async (n: number, message: string, call: CallContext, reattach: boolean) => {
+		const { signal } = call;
 		if (n === 1) firstKey = call.key;
 		const recorded = call.recorded as RunMeta;
 		if (reattach) {
 			if (recorded.spec) spec = recorded.spec;
 			transport.restore({ ...(recorded.sessionFile ? { sessionFile: recorded.sessionFile } : {}), ...(recorded.threadId ? { t3: { taskId: recorded.taskId, threadId: recorded.threadId, link: recorded.link } } : {}) });
 			if (env.t3 && recorded.threadId && !recorded.runId) env.warn(`${label}: run ${n} had no run id recorded; repeating its call with the same request id`);
-			env.warn(`${label}: run ${n} reattached after the workflow's process ended; its changed files are those since the resume`);
+			env.warn(`${label}: run ${n} reattached after the workflow stopped; its changed files are those since the resume`);
 		} else call.meta({ spec });
 		// The spec is gone when the sweep took it; the child reads it on every run.
 		if (!readSpec(dir, spec.id)) writeSpec(dir, spec);
@@ -378,9 +380,9 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 		const poll = setInterval(sync, POLL_MS);
 		// An interrupted run leaves the child working: the resume reattaches to it.
 		const cancel = () => {
-			if (!isInterruption(env.signal.reason)) transport.cancel();
+			if (!isInterruption(signal.reason)) transport.cancel();
 		};
-		env.signal.addEventListener("abort", cancel, { once: true });
+		signal.addEventListener("abort", cancel, { once: true });
 		running = true;
 		const requestId = `${spec.id}-run-${n}`;
 		const remember = (meta: RunMeta) => call.meta({ ...meta });
@@ -390,28 +392,30 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 			const continuation = delegationMessage(spec, n, CONTINUE_MESSAGE);
 			const done = () => {
 				const state = readState(dir, spec.id);
-				return state !== undefined && (state.run > n || (state.run === n && state.done));
+				return state !== undefined && (state.run > n || (state.run === n && state.done)) && !stoppedRun(state, n);
 			};
-			if (!reattach) await transport.run(runMessage, requestId, message, remember);
+			if (!reattach) await transport.run(runMessage, requestId, message, remember, signal);
 			else if (!done()) {
-				if (env.t3 && !recorded.runId && readState(dir, spec.id)?.run === n) {
+				const state = readState(dir, spec.id);
+				if (env.t3 && !recorded.runId && state?.run === n && !stoppedRun(state, n)) {
 					// The child runs this run (its state says so) but its t3 run is unknown: t3 dedupes a repeated call only
 					// within the Pi process that made it, so repeating it here would start the work again. Its report comes in its state.
-					await finalState(n, Number.POSITIVE_INFINITY);
+					await finalState(n, signal, Number.POSITIVE_INFINITY);
 				} else {
-					await transport.reattach(runMessage, continuation, requestId, message, recorded, remember);
-					// The child's own run was cut off too (its process ended): ask it to go on.
-					if (!(await finalState(n, 2000))) await transport.run(continuation, `${requestId}-continue`, message, remember);
+					await transport.reattach(runMessage, continuation, requestId, message, recorded, remember, signal);
+					// The child's own run was cut off too (its process ended, or it was stopped): ask it to go on.
+					const after = await finalState(n, signal, 2000);
+					if (!after || stoppedRun(after, n)) await transport.run(continuation, `${requestId}-continue`, message, remember, signal);
 				}
 			}
 		} finally {
 			running = false;
 			clearInterval(poll);
-			env.signal.removeEventListener("abort", cancel);
+			signal.removeEventListener("abort", cancel);
 			env.ran();
 		}
-		if (env.signal.aborted) throw env.signal.reason;
-		const state = await finalState(n);
+		if (signal.aborted) throw signal.reason;
+		const state = await finalState(n, signal);
 		const changed = await changedSince(before);
 		if (!state || state.run !== n) throw new Error(`${label}: the child reported no end of run ${n}; ${transport.describe()}`);
 		if (state.error) throw new Error(`${label}: ${state.error}`);
@@ -429,7 +433,6 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 	// Runs of one agent are one conversation: they go one after the other.
 	let queue: Promise<unknown> = Promise.resolve();
 	const runOnce = async (message: string): Promise<AgentRun> => {
-		if (env.signal.aborted) throw env.signal.reason;
 		if (disposed) throw new Error(`${label} was used after its workflow ended`);
 		const n = runs + 1;
 		const args = n === 1 ? { options, message } : { agent: firstKey, run: n, message };

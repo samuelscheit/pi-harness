@@ -9,6 +9,10 @@
 // call on every replay. The journal records `start` before a call and `done` or `failed` after it;
 // `meta` entries carry what a call learned while running (an agent's thread and task), so a resume
 // can reattach to it. Entries that change what a resume does are fsynced before the call goes on.
+//
+// A resume may bring edited code: an `edit` entry holds it (the latest one is the run's code from
+// then on), and a `takeover` entry marks where it took over from the recorded calls, listing the
+// recorded calls it did not use (`dropped`). Later replays forget those (durable.ts, foldJournal).
 
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeSync } from "node:fs";
@@ -42,8 +46,16 @@ export interface RunHeader {
 
 export type JournalEntry =
 	| RunHeader
-	/** One execution of the script: 1 at the start, then one per resume. */
-	| { t: "attempt"; n: number; at: number; pid: number }
+	/** One execution of the script: 1 at the start, then one per resume, with its budget for the whole run. */
+	| { t: "attempt"; n: number; at: number; pid: number; budget?: number }
+	/** A resume with edited code (attempt `n`): from now on the run's code. */
+	| { t: "edit"; at: number; n: number; hash: string; source: string }
+	/**
+	 * The edited code took over at call `key` (absent: it returned without a live call) after
+	 * `replayed` calls from the journal; `dropped` recorded calls it did not use; the clock values it
+	 * had used (later ones are live).
+	 */
+	| { t: "takeover"; at: number; n: number; key?: string; label?: string; replayed: number; dropped: string[]; clocks: { now: number; random: number } }
 	| { t: "start"; key: string; kind: CallKind; label: string; at: number; idempotent?: true; model?: string }
 	| { t: "meta"; key: string; at: number; data: Record<string, unknown> }
 	/** `value` is absent when the call returned undefined. */
@@ -51,7 +63,8 @@ export type JournalEntry =
 	| { t: "failed"; key: string; at: number; error: SerializedError; cost?: number }
 	/** A value of Date.now()/new Date() or Math.random() the script saw, by occurrence. */
 	| { t: "clock"; kind: "now" | "random"; n: number; value: number }
-	| { t: "end"; at: number; status: string; ok: boolean; cost: number; text: string };
+	/** `lingering`: agent calls a stop left running; their outcomes may follow. */
+	| { t: "end"; at: number; status: string; ok: boolean; cost: number; text: string; lingering?: string[] };
 
 export const workflowsDir = (agentDir: string) => join(agentDir, "workflows");
 export const runDir = (agentDir: string, id: string) => join(workflowsDir(agentDir), id);
@@ -72,6 +85,19 @@ export function canonicalJson(value: unknown): string {
 }
 
 export const argsHash = (args: unknown) => createHash("sha256").update(canonicalJson(args)).digest("hex").slice(0, 12);
+export const codeHash = (source: string) => createHash("sha256").update(source).digest("hex").slice(0, 12);
+
+/** The run's code now: the latest edit's, else the start's. */
+export function currentSource(entries: readonly JournalEntry[]): string {
+	const edit = entries.findLast((e) => e.t === "edit");
+	if (edit?.t === "edit") return edit.source;
+	const header = entries[0];
+	if (header?.t !== "run") throw new Error("not a workflow journal: the first entry is no run header");
+	return header.entry.source;
+}
+
+/** Statuses a run can be resumed from without new code. */
+export const RESUMABLE = new Set(["interrupted", "stopped", "aborted", "over budget"]);
 
 export function serializeError(error: unknown): SerializedError {
 	// Errors thrown in the script's realm are no `instanceof Error` here.
@@ -108,6 +134,26 @@ export function parseJournal(text: string): JournalEntry[] {
 
 export function readJournal(path: string): JournalEntry[] {
 	return parseJournal(readFileSync(path, "utf8"));
+}
+
+type End = Extract<JournalEntry, { t: "end" }>;
+
+/** The end of the latest execution, if it ended (an end before a newer attempt belongs to an earlier one). */
+export function lastEnd(entries: readonly JournalEntry[]): End | undefined {
+	const lastAttempt = entries.findLastIndex((e) => e.t === "attempt");
+	const endAt = entries.findLastIndex((e) => e.t === "end");
+	return endAt > lastAttempt ? (entries[endAt] as End) : undefined;
+}
+
+/** The state of a run as its journal tells it; throws when there is no such run. */
+export function runState(agentDir: string, id: string): { entries: JournalEntry[]; header: RunHeader; end?: End } {
+	const path = journalPath(agentDir, id);
+	if (!existsSync(path)) throw new Error(`no workflow run ${id} (no journal ${path})`);
+	const entries = readJournal(path);
+	const header = entries[0];
+	if (header?.t !== "run") throw new Error(`the journal ${path} has no run header`);
+	const end = lastEnd(entries);
+	return { entries, header, ...(end ? { end } : {}) };
 }
 
 /** An open journal file; appends are synchronous, so the order of lines is the order of events. */
@@ -167,11 +213,8 @@ export function listRuns(agentDir: string): RunSummary[] {
 			const entries = readJournal(path);
 			const header = entries[0];
 			if (header?.t !== "run") continue;
-			const end = entries.findLast((e): e is Extract<JournalEntry, { t: "end" }> => e.t === "end");
-			// An end followed by a newer attempt is a resumed run that runs again.
-			const lastAttempt = entries.findLastIndex((e) => e.t === "attempt");
-			const ended = end && entries.lastIndexOf(end) > lastAttempt ? end : undefined;
-			runs.push({ id, header, ...(ended ? { end: ended } : {}), modified: statSync(path).mtimeMs });
+			const end = lastEnd(entries);
+			runs.push({ id, header, ...(end ? { end } : {}), modified: statSync(path).mtimeMs });
 		} catch {
 			// Removed meanwhile, or not a journal.
 		}
@@ -180,14 +223,14 @@ export function listRuns(agentDir: string): RunSummary[] {
 }
 
 /**
- * Remove journals no one needs: runs that completed more than KEEP_DONE_MS ago, and any run (an
- * interrupted one never resumed) untouched for KEEP_INTERRUPTED_MS. Returns the removed ids.
+ * Remove journals no one needs: runs that ended more than KEEP_DONE_MS ago, and any run (an
+ * interrupted or stopped one never resumed) untouched for KEEP_INTERRUPTED_MS. Returns the removed ids.
  */
 export function sweepRuns(agentDir: string, now = Date.now()): string[] {
 	const removed: string[] = [];
 	for (const run of listRuns(agentDir)) {
 		const age = now - run.modified;
-		const finished = run.end && run.end.status !== "interrupted";
+		const finished = run.end && run.end.status !== "interrupted" && run.end.status !== "stopped";
 		if ((finished && age > KEEP_DONE_MS) || age > KEEP_INTERRUPTED_MS) {
 			rmSync(runDir(agentDir, run.id), { recursive: true, force: true });
 			removed.push(run.id);

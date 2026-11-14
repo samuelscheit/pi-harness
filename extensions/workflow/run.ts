@@ -3,13 +3,16 @@
 //
 // Every run is durable (durable.ts): it gets an id and a journal (journal.ts) in
 // `<agentDir>/workflows/<id>/`, and every call to the outside goes through the journal. A run whose
-// process died, or that stopped because its session ended or its extension context went stale (a
-// harness reload), is resumed by `resumeWorkflow`: the same script runs again from its start, and
-// the calls the journal answers run nothing. A lock in the run's directory keeps two processes from
-// running it at once.
+// process died, that stopped because its session ended or its extension context went stale (a
+// harness reload), or that was stopped on request (stop.ts), is resumed by `resumeWorkflow`: the
+// script runs again from its start, and the calls the journal answers run nothing. A resume may
+// bring edited code, which runs live from its first call the journal cannot answer (durable.ts).
+// A lock in the run's directory keeps two processes from running it at once.
 //
-// The run owns an abort signal that every call uses: the tool's abort, an exceeded budget and the
-// script's end all fire it, so calls still in flight stop and child agents are disposed. Costs of
+// The run owns an abort signal that every call uses: the tool's abort, a stop, an exceeded budget
+// and the script's end all fire it, so calls still in flight stop. Agents run under a signal of
+// their own, which a stop leaves alone unless it asks to stop the children too: they go on, and
+// the process waits for them before it releases the run (stop.ts, linger). Costs of
 // llm() (also reported as the tool result's usage) and of child agents (their own session files)
 // count against the budget, replayed calls with their recorded cost. In a git repository the run
 // takes a snapshot first (kept with the journal for a resume), for `changes()` and the changed
@@ -26,12 +29,13 @@ import { runShell } from "../lib/process.ts";
 import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { createAgent } from "./agent.ts";
 import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
-import { blockingCalls, Durable, type InFlightPolicy, isInterruption } from "./durable.ts";
-import { Journal, type JournalEntry, journalPath, newRunId, readJournal, type RunHeader, runDir, SNAPSHOT_FILE } from "./journal.ts";
+import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, WorkflowStopped } from "./durable.ts";
+import { codeHash, currentSource, Journal, type JournalEntry, journalPath, newRunId, readJournal, RESUMABLE, type RunHeader, runDir, runState, SNAPSHOT_FILE } from "./journal.ts";
 import type { SavedWorkflow } from "./library.ts";
 import { DEFAULT_LLM_MODEL, llm } from "./llm.ts";
 import { sh } from "./sh.ts";
-import { T3, T3_DELEGATE, T3_PREFIX, t3Data } from "./t3.ts";
+import { clearStopRequest, linger, lockPath, takeLingering, watchStop } from "./stop.ts";
+import { cancelTask, T3, T3_DELEGATE, T3_PREFIX, t3Data } from "./t3.ts";
 
 const DEFAULT_CONCURRENCY = 4;
 const MAX_LLM_IN_FLIGHT = 8;
@@ -72,7 +76,7 @@ export interface RunEnv {
 	onStart?: (run: { id: string; journal: string; attempt: number }) => void;
 }
 
-export type WorkflowStatus = "running" | "completed" | "failed" | "aborted" | "over budget" | "interrupted" | "diverged";
+export type WorkflowStatus = "running" | "completed" | "failed" | "aborted" | "over budget" | "interrupted" | "stopped" | "diverged";
 
 export interface WorkflowDetails {
 	/** The goal was reached (details.ok for the metrics index): the script returned, without `ok: false`, within budget. */
@@ -93,6 +97,10 @@ export interface WorkflowDetails {
 	agentRuns: number;
 	/** Calls answered from the journal in this execution. */
 	replayedCalls: number;
+	/** Recorded calls the (edited) script did not use. */
+	unusedCalls: number;
+	/** Agent runs a stop left running; their outcomes are recorded when they end. */
+	lingeringAgents: number;
 	/** Child agent sessions (details.childSessions for the metrics index). */
 	childSessions: string[];
 	/** The t3 threads of child agents (links). */
@@ -121,6 +129,8 @@ export interface ResumeRequest {
 	inFlight?: "rerun" | "fail";
 	/** A new budget for the whole run (the recorded spend counts against it). */
 	budget?: number;
+	/** Edited code: answered from the journal while it makes the recorded calls, live from its first other one. */
+	code?: string;
 }
 
 export interface WorkflowResult {
@@ -248,29 +258,18 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 	return execute(header, [header], journal, budgetLimit, "stop", env);
 }
 
-/** The state of a run as its journal tells it; throws when there is no such run. */
-export function runState(agentDir: string, id: string): { entries: JournalEntry[]; header: RunHeader; end?: Extract<JournalEntry, { t: "end" }> } {
-	const path = journalPath(agentDir, id);
-	if (!existsSync(path)) throw new Error(`no workflow run ${id} (no journal ${path})`);
-	const entries = readJournal(path);
-	const header = entries[0];
-	if (header?.t !== "run") throw new Error(`the journal ${path} has no run header`);
-	const lastAttempt = entries.findLastIndex((e) => e.t === "attempt");
-	const endAt = entries.findLastIndex((e) => e.t === "end");
-	const end = endAt > lastAttempt ? (entries[endAt] as Extract<JournalEntry, { t: "end" }>) : undefined;
-	return { entries, header, ...(end ? { end } : {}) };
-}
-
 /**
- * Resume a run from its journal: the same script from its start, recorded calls answered from the
- * journal. Throws (nothing ran) when the run is unknown, running in a live process, finished, or
- * has shell or tools.* calls in flight and no `inFlight` decision.
+ * Resume a run from its journal: its script (or `code`) from its start, recorded calls answered from
+ * the journal. Throws (nothing ran) when the run is unknown, running in a live process, finished
+ * (without `code`), the code does not compile, or it has shell or tools.* calls in flight and no
+ * `inFlight` decision.
  */
 export async function resumeWorkflow(request: ResumeRequest, env: RunEnv): Promise<WorkflowResult> {
 	const { entries, header, end } = runState(env.agentDir, request.id);
-	if (end && end.status !== "interrupted" && end.status !== "aborted" && end.status !== "over budget") {
-		throw new Error(`workflow run ${request.id} ended (${end.status}); there is nothing to resume. Its result:\n\n${end.text}`);
+	if (end && request.code === undefined && !RESUMABLE.has(end.status)) {
+		throw new Error(`workflow run ${request.id} ended (${end.status}); there is nothing to resume (pass code to continue it with changed code). Its result:\n\n${end.text}`);
 	}
+	if (request.code !== undefined) compile(header.entry.inline ? inlineModule(request.code) : request.code, header.entry.filename);
 	const blocking = blockingCalls(entries);
 	if (blocking.length && !request.inFlight) {
 		throw new Error(
@@ -281,28 +280,56 @@ export async function resumeWorkflow(request: ResumeRequest, env: RunEnv): Promi
 			].join("\n"),
 		);
 	}
-	const budget = request.budget ?? header.budget;
+	const lastBudget = entries.findLast((e) => e.t === "attempt" && e.budget !== undefined);
+	const budget = request.budget ?? (lastBudget?.t === "attempt" ? lastBudget.budget : undefined) ?? header.budget;
 	if (!Number.isFinite(budget) || budget <= 0) throw new Error("budget must be a positive number of USD");
-	return execute(header, entries, new Journal(journalPath(env.agentDir, request.id)), budget, request.inFlight ?? "stop", { ...env, cwd: header.cwd });
+	return execute(header, entries, new Journal(journalPath(env.agentDir, request.id)), budget, request.inFlight ?? "stop", { ...env, cwd: header.cwd }, request.code);
 }
 
-async function execute(header: RunHeader, entries: readonly JournalEntry[], journal: Journal, budgetLimit: number, inFlight: InFlightPolicy, env: RunEnv): Promise<WorkflowResult> {
+/** Why a run's lock is taken, for the refused resume. */
+function lockedMessage(agentDir: string, id: string, dir: string): string {
+	let pid = "";
+	try {
+		pid = ` (pid ${readFileSync(join(lockPath(dir), "pid"), "utf8").trim()})`;
+	} catch {
+		// Just released or taken.
+	}
+	return runState(agentDir, id).end?.status === "stopped"
+		? `workflow run ${id} is stopped, and another process${pid} still waits for its agents; resume it from that session, or stop its agents with workflow { stop: "${id}", stopChildren: true } first`
+		: `workflow run ${id} is running in another process${pid}`;
+}
+
+async function execute(header: RunHeader, recorded: readonly JournalEntry[], journal: Journal, budgetLimit: number, inFlight: InFlightPolicy, env: RunEnv, code?: string): Promise<WorkflowResult> {
 	const dir = runDir(env.agentDir, header.id);
-	const unlock = acquireLock(join(dir, "lock"));
+	// A stopped run's agents still running in this process are handed over with its lock.
+	const handed = takeLingering(header.id);
+	const unlock = handed?.unlock ?? acquireLock(lockPath(dir));
 	if (!unlock) {
 		journal.close();
-		throw new Error(`workflow run ${header.id} is running in another process`);
+		throw new Error(lockedMessage(env.agentDir, header.id, dir));
 	}
-	const entry: WorkflowEntry = header.entry;
-	const attempt = entries.filter((e) => e.t === "attempt").length + 1;
-	journal.append({ t: "attempt", n: attempt, at: Date.now(), pid: process.pid }, true);
+	clearStopRequest(dir);
+	const attempt = recorded.filter((e) => e.t === "attempt").length + 1;
+	journal.append({ t: "attempt", n: attempt, at: Date.now(), pid: process.pid, budget: budgetLimit }, true);
+	const entries = [...recorded];
+	if (code !== undefined) {
+		const edit: JournalEntry = { t: "edit", at: Date.now(), n: attempt, hash: codeHash(code), source: code };
+		journal.append(edit, true);
+		entries.push(edit);
+	}
+	const entry: WorkflowEntry = { ...header.entry, source: currentSource(entries) };
 
 	const started = performance.now();
 	const controller = new AbortController();
+	const signal = controller.signal;
+	// Agents' work: aborted with the run, except by a stop that keeps them running.
+	const children = new AbortController();
+	signal.addEventListener("abort", () => {
+		if (!isStop(signal.reason) || signal.reason.children) children.abort(signal.reason);
+	});
 	const forwardAbort = () => controller.abort(env.signal?.reason ?? new Error("aborted"));
 	if (env.signal?.aborted) forwardAbort();
 	env.signal?.addEventListener("abort", forwardAbort, { once: true });
-	const signal = controller.signal;
 
 	const details: WorkflowDetails = {
 		ok: false,
@@ -318,6 +345,8 @@ async function execute(header: RunHeader, entries: readonly JournalEntry[], jour
 		cachedCalls: 0,
 		agentRuns: 0,
 		replayedCalls: 0,
+		unusedCalls: 0,
+		lingeringAgents: 0,
 		childSessions: [],
 		childThreads: [],
 		changedFiles: [],
@@ -337,21 +366,37 @@ async function execute(header: RunHeader, entries: readonly JournalEntry[], jour
 		details.cost += usd;
 		if (!overBudget && details.cost > budgetLimit) {
 			overBudget = true;
-			controller.abort(new BudgetExceeded(budgetLimit, details.cost));
+			const exceeded = new BudgetExceeded(budgetLimit, details.cost);
+			controller.abort(exceeded);
+			// Also agents a stop left running.
+			children.abort(exceeded);
 		}
 		publish();
 	};
+	let t3: T3 | undefined;
 	const durable = new Durable({
 		journal,
 		entries,
 		inFlight,
+		attempt,
+		signal,
+		signalFor: (kind) => (kind === "agent" ? children.signal : signal),
+		...(handed ? { inherited: handed.works } : {}),
 		replayed: (kind, cost) => {
 			if (kind === "llm") details.llmCalls++;
 			if (kind === "agent") details.agentRuns++;
 			if (cost > 0) spend(cost);
 		},
 		diverged: (error) => controller.abort(error),
-		stopped: () => signal.aborted,
+		// Agent runs the edited code does not use, whose t3 children run on without a process waiting for them.
+		dropped: (calls) => {
+			for (const { meta } of calls) if (t3 && typeof meta.taskId === "string") cancelTask(t3, meta.taskId, "the workflow's edited code does not use this agent run");
+		},
+	});
+	const stopWatch = watchStop(dir, (request) => {
+		const reason = new WorkflowStopped(request.children);
+		controller.abort(reason);
+		if (request.children) for (const work of durable.unsettled().values()) work.cancel(reason);
 	});
 	const host: ScriptHost = { now: () => durable.now(), random: () => durable.random(), hold: () => durable.hold() };
 	const disposers: ((interrupted: boolean) => void)[] = [];
@@ -372,12 +417,15 @@ async function execute(header: RunHeader, entries: readonly JournalEntry[], jour
 				try {
 					return await env.executeTool!(name, args, callSignal);
 				} catch (error) {
-					if (isInterruption(error)) controller.abort(error);
+					if (isInterruption(error)) {
+						controller.abort(error);
+						children.abort(error);
+					}
 					throw error;
 				}
 			}
 		: undefined;
-	const t3 =
+	t3 =
 		executeTool && env.toolNames?.includes(T3_DELEGATE)
 			? new T3(async (name, args, callSignal) => {
 					const outcome = await executeTool(`${T3_PREFIX}${name}`, args, callSignal);
@@ -459,7 +507,6 @@ async function execute(header: RunHeader, entries: readonly JournalEntry[], jour
 				t3,
 				durable,
 				number: ++agents,
-				signal,
 				spend,
 				started: (id) => {
 					if (!details.childSessions.includes(id)) details.childSessions.push(id);
@@ -510,6 +557,7 @@ async function execute(header: RunHeader, entries: readonly JournalEntry[], jour
 
 	let value: unknown;
 	let failure: unknown;
+	const ended = new Error("the workflow ended");
 	try {
 		const module = load(entry);
 		env.onStart?.({ id: header.id, journal: journal.path, attempt });
@@ -519,29 +567,47 @@ async function execute(header: RunHeader, entries: readonly JournalEntry[], jour
 		failure = error;
 	} finally {
 		env.signal?.removeEventListener("abort", forwardAbort);
-		if (!signal.aborted) controller.abort(new Error("the workflow ended"));
+		if (!signal.aborted) controller.abort(ended);
 	}
 	const reason: unknown = signal.reason;
+	if (reason === ended && failure === undefined) durable.finish();
 	const diverged = (reason as { name?: unknown } | null)?.name === "DivergenceError";
-	const interrupted = !overBudget && !diverged && (isInterruption(reason) || isInterruption(env.signal?.reason));
-	for (const dispose of disposers) dispose(interrupted);
+	const stopped = !overBudget && !diverged && isStop(reason);
+	const interrupted = !overBudget && !diverged && !stopped && (isInterruption(reason) || isInterruption(env.signal?.reason));
+	// Work still running: agents a plain stop keeps linger; any other end stops them (an interruption leaves t3 children running).
+	const unsettled = durable.unsettled();
+	const keep = stopped && !(reason as WorkflowStopped).children;
+	if (!keep) for (const work of unsettled.values()) work.cancel(reason);
+	const lingering = keep ? [...unsettled].filter(([, work]) => work.kind === "agent").map(([key]) => key) : [];
 	if (diverged) failure = reason;
 	if (root && start) details.changedFiles = await changedPaths(start, await snapshot(root));
 	details.durationMs = performance.now() - started;
 	details.replayedCalls = durable.replayedCalls;
-	details.status = overBudget ? "over budget" : diverged ? "diverged" : interrupted ? "interrupted" : env.signal?.aborted ? "aborted" : failure !== undefined ? "failed" : "completed";
+	details.unusedCalls = durable.unused.length;
+	details.lingeringAgents = lingering.length;
+	details.status = overBudget ? "over budget" : diverged ? "diverged" : stopped ? "stopped" : interrupted ? "interrupted" : env.signal?.aborted ? "aborted" : failure !== undefined ? "failed" : "completed";
 	const declaredOk = value && typeof value === "object" && typeof (value as { ok?: unknown }).ok === "boolean" ? (value as { ok: boolean }).ok : true;
 	details.ok = details.status === "completed" && declaredOk;
-	if (failure !== undefined) details.error = interrupted ? `interrupted: ${(reason as Error).message}` : scriptStack(failure, entry.filename);
+	if (failure !== undefined) details.error = interrupted ? `interrupted: ${(reason as Error).message}` : stopped ? (reason as Error).message : scriptStack(failure, entry.filename);
 	details.log = lines.slice(-PROGRESS_LINES);
-	const text = report(details, value, failure !== undefined, lines, env.cwd);
-	journal.append({ t: "end", at: Date.now(), status: details.status, ok: details.ok, cost: details.cost, text }, true);
-	journal.close();
-	unlock();
+	const cutOff = stopped ? blockingCalls(readJournal(journal.path)).map((call) => `${call.kind} ${call.label}`) : [];
+	const text = report(details, value, failure !== undefined, lines, env.cwd, { unused: durable.unused.map((call) => `${call.kind} ${call.label}`), cutOff });
+	journal.append({ t: "end", at: Date.now(), status: details.status, ok: details.ok, cost: details.cost, text, ...(lingering.length ? { lingering } : {}) }, true);
+	// Delegation state stays for a resume (interrupted, stopped): reattaching agents need it.
+	const release = () => {
+		for (const dispose of disposers) dispose(interrupted || stopped);
+		journal.close();
+	};
+	stopWatch.close();
+	if (keep && unsettled.size) linger(dir, header.id, unsettled, unlock, release);
+	else {
+		release();
+		unlock();
+	}
 	return { text, details, ...(usage ? { usage } : {}) };
 }
 
-function report(details: WorkflowDetails, value: unknown, failed: boolean, lines: string[], cwd: string): string {
+function report(details: WorkflowDetails, value: unknown, failed: boolean, lines: string[], cwd: string, calls: { unused: string[]; cutOff: string[] }): string {
 	const stats = [
 		`${(details.durationMs / 1000).toFixed(1)} s`,
 		`$${details.cost.toFixed(4)} of $${details.budget.toFixed(2)}`,
@@ -552,6 +618,14 @@ function report(details: WorkflowDetails, value: unknown, failed: boolean, lines
 	];
 	const out = [`Workflow ${details.workflow ? `${details.workflow} ` : ""}${details.status} · ${stats.join(" · ")}`];
 	if (details.status === "interrupted") out.push(`It can continue from its journal: call workflow with resume: "${details.id}".`);
+	if (details.status === "stopped") {
+		if (details.lingeringAgents) out.push(`${details.lingeringAgents} agent run${details.lingeringAgents === 1 ? " keeps" : "s keep"} running; results are recorded when they end (workflow { stop: "${details.id}", stopChildren: true } cancels them).`);
+		if (calls.cutOff.length) out.push(`Cut off by the stop, may have taken effect partly: ${calls.cutOff.join("; ")}. A resume asks whether to run them again (inFlight).`);
+		out.push(
+			`Continue with workflow { resume: "${details.id}" }, or change the script and continue with workflow { resume: "${details.id}", code: "…" }: calls the new code makes as before are answered from the journal; from its first other call it runs live. Effects so far (commits, files) stay.`,
+		);
+	}
+	if (calls.unused.length) out.push(`${calls.unused.length} recorded call${calls.unused.length === 1 ? "" : "s"} not used by the new code: ${calls.unused.slice(0, 10).join("; ")}${calls.unused.length > 10 ? "; …" : ""}`);
 	if (details.changedFiles.length) out.push(`Changed files: ${details.changedFiles.map((f) => relative(canonical(cwd), f)).join(", ")}`);
 	for (const warning of details.warnings) out.push(`Warning: ${warning}`);
 	if (details.childThreads.length) out.push(`Child threads: ${details.childThreads.join(", ")}`);

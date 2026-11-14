@@ -98,6 +98,11 @@ export class T3 {
 	}
 }
 
+/** Stop a t3 task (its running and queued turns); with a signal of its own, since the caller's may be aborted. Never throws. */
+export function cancelTask(t3: T3, taskId: string, reason: string): void {
+	void t3.call("task_cancel", { taskId, reason }, AbortSignal.timeout(30_000)).catch(() => undefined);
+}
+
 const sleep = (ms: number, signal: AbortSignal) =>
 	new Promise<void>((resolve, reject) => {
 		if (signal.aborted) return reject(signal.reason);
@@ -224,9 +229,8 @@ export class T3Child {
 		}
 	}
 
-	/** Stop the task (its running and queued turns); with a signal of its own, since the run's is aborted. */
+	/** Stop the task (its running and queued turns). */
 	cancel(): void {
-		if (!this.taskId) return;
-		void this.t3.call("task_cancel", { taskId: this.taskId, reason: "the workflow that started it stopped" }, AbortSignal.timeout(30_000)).catch(() => undefined);
+		if (this.taskId) cancelTask(this.t3, this.taskId, "the workflow that started it stopped");
 	}
 }

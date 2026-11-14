@@ -31,7 +31,11 @@ import {
 	writeState,
 } from "../extensions/workflow/delegation.ts";
 import workflow from "../extensions/workflow/index.ts";
+import { readJournal } from "../extensions/workflow/journal.ts";
+import { renderWorkflow, viewOf } from "../extensions/workflow/render.ts";
 import { INLINE_FILE, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
+import { lockHeld } from "../extensions/workflow/stop.ts";
+import { livePage } from "../dashboard/server/workflows.ts";
 import { nearestThinking, T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
 import { priced } from "./priced.ts";
 
@@ -597,5 +601,196 @@ describe("durable agents in t3", () => {
 		assert.match(entries, /"status":"completed"/);
 		const runEntries = second.sessionManager.getEntries().flatMap((e) => (e.type === "custom" && e.customType === "workflow-run" ? [(e.data as { state: string }).state] : []));
 		assert.deepEqual(runEntries, ["started", "ended", "offered", "started", "ended"]);
+	});
+});
+
+describe("stopping a run and resuming it with edited code, in t3", () => {
+	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+	const until = async (what: string, ok: () => boolean, ms = 15_000) => {
+		const deadline = Date.now() + ms;
+		while (!ok()) {
+			if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+			await sleep(20);
+		}
+	};
+	const count = (name: string) => (existsSync(join(fx.repo, name)) ? readFileSync(join(fx.repo, name), "utf8").split("\n").filter(Boolean).length : 0);
+	const journalOf = (id: string) => readJournal(join(fx.agentDir, "workflows", id, "journal.jsonl"));
+	/** Gates still closed: released after each test, so its child runs end. */
+	const closed: (() => void)[] = [];
+	afterEach(() => {
+		for (const release of closed.splice(0)) release();
+	});
+
+	/**
+	 * A parent session in "t3" (background, workflow and fake t3 tools) whose model makes each
+	 * `do <json>` prompt one workflow call and answers everything else with "ok"; a child whose task
+	 * names a gate waits until it is released.
+	 */
+	async function parentInT3() {
+		const background = (await import("../extensions/background/index.ts")).default;
+		const told: { role: string; text: string }[] = [];
+		const gates = new Map<string, { open: Promise<void>; release: () => void; runs: number }>();
+		const gate = (name: string) => {
+			let release!: () => void;
+			const open = new Promise<void>((resolve) => (release = resolve));
+			closed.push(release);
+			gates.set(name, { open, release, runs: 0 });
+			return gates.get(name)!;
+		};
+		const dispatch: FauxResponseStep = async (context) => {
+			const last = lastMessage(context);
+			const text = textOf(last.content);
+			if (firstUser(context).includes("harness-delegation:")) {
+				if (last.role === "user" && text.includes("interrupted before it finished")) return say("continued");
+				const name = [...gates.keys()].find((n) => firstUser(context).includes(n));
+				if (!name) return say("child done");
+				const g = gates.get(name)!;
+				g.runs++;
+				await g.open;
+				return say(`${name} done`);
+			}
+			told.push({ role: last.role, text });
+			if (last.role === "user" && text.startsWith("do ")) return call("workflow", JSON.parse(text.slice(3)) as JsonObject);
+			return say("ok");
+		};
+		faux.setResponses(Array.from({ length: 200 }, () => dispatch));
+		const parent = await newSession([(pi) => background(pi, { logRoot: join(dir, "logs") }), workflowExtension(runtime), fakeT3(runtime)]);
+		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
+		/** One workflow call; resolves to its tool result. */
+		const act = async (args: Record<string, unknown>) => {
+			await until("an idle parent", () => !parent.isStreaming);
+			const before = parent.messages.length;
+			await parent.prompt(`do ${JSON.stringify(args)}`);
+			const result = parent.messages.slice(before).find((m) => m.role === "toolResult" && m.toolName === "workflow");
+			return result?.role === "toolResult" ? textOf(result.content) : "";
+		};
+		const start = async (code: string) => /Workflow run (\d{8}-\d{6}-[0-9a-f]{6}) /.exec(await act({ code, budget: 5 }))![1]!;
+		const message = async (pattern: RegExp) => {
+			await until(`a message ${pattern}`, () => told.some((t) => pattern.test(t.text)));
+			return told.find((t) => pattern.test(t.text))!.text;
+		};
+		return { told, gate, act, start, message };
+	}
+
+	test("a stop cuts off shell calls and keeps agents running, whose results are recorded; stopping a stopped or finished run fails clearly", async () => {
+		const { gate, act, start, message } = await parentInT3();
+		const slow = gate("slow work A");
+		const id = await start(
+			[
+				"await shell('echo s >> shell-count');",
+				"await tools.bash({ command: 'echo t >> tool-count' });",
+				"const a = agent({ model: 'faux/faux-1', tools: ['read'] });",
+				"const [one] = await Promise.all([a.run('slow work A'), shell('echo x >> cut; if [ ! -f go ]; then sleep 2; echo late >> late; fi')]);",
+				"return 'result: ' + one.text;",
+			].join("\n"),
+		);
+		await until("the agent and the shell call to run", () => slow.runs === 1 && count("cut") === 1);
+		const stopped = await act({ stop: id });
+		assert.match(stopped, new RegExp(`Stopped workflow run ${id}; its result arrives as a message\\. Continue it with workflow \\{ resume: "${id}" \\}, or with changed code`));
+		const result = await message(/Workflow stopped/);
+		assert.match(result, /1 agent run keeps running; results are recorded when they end/);
+		assert.match(result, /Cut off by the stop, may have taken effect partly: shell echo x >> cut;.*A resume asks whether to run them again \(inFlight\)/);
+		assert.match(result, new RegExp(`workflow \\{ resume: "${id}", code: "…" \\}: calls the new code makes as before are answered from the journal.*Effects so far \\(commits, files\\) stay`));
+		await sleep(2500);
+		assert.equal(count("late"), 0, "the shell call's process group was killed");
+		assert.equal(callsOf("task_cancel").length, 0, "the agent keeps running");
+		const end = journalOf(id).findLast((e) => e.t === "end");
+		assert.ok(end?.t === "end");
+		assert.equal(end.status, "stopped");
+		assert.equal(end.lingering?.length, 1);
+		const agentKey = end.lingering![0]!;
+		assert.match(agentKey, /^agent:/);
+		assert.equal(lockHeld(fx.agentDir, id), true, "the process waits for its agent");
+		assert.match(await act({ stop: id }), /is stopped already; its agents still run: pass stopChildren: true to cancel them/);
+
+		slow.release();
+		await until("the agent's result in the journal", () => journalOf(id).some((e, i, all) => e.t === "done" && e.key === agentKey && i > all.indexOf(end)));
+		await until("the run released", () => !lockHeld(fx.agentDir, id));
+		assert.match(await act({ stop: id }), new RegExp(`workflow run ${id} is stopped already\\. Continue it with`));
+
+		writeFileSync(join(fx.repo, "go"), "");
+		await act({ resume: id, inFlight: "rerun" });
+		const completed = await message(/Workflow completed/);
+		assert.equal(completed.split("\n\n").at(-1), "result: slow work A done", "the result the agent recorded after the stop");
+		assert.deepEqual([count("shell-count"), count("tool-count"), count("cut"), count("late")], [1, 1, 2, 0], "only the cut-off call ran again");
+		assert.equal(slow.runs, 1, "the agent did not run again");
+		assert.equal(callsOf("delegate_task").length, 1);
+		assert.match(await act({ stop: id }), new RegExp(`workflow run ${id} already ended \\(completed\\); there is nothing to stop`));
+		assert.match(await act({ stop: "20260101-000000-abcdef" }), /no workflow run 20260101-000000-abcdef/);
+	});
+
+	test("stopChildren cancels the agents; a resume asks the stopped child to continue", async () => {
+		const { gate, act, start, message } = await parentInT3();
+		const slow = gate("slow work A");
+		const id = await start("const one = await agent({ model: 'faux/faux-1', tools: ['read'] }).run('slow work A');\nreturn 'result: ' + one.text;");
+		await until("the agent to run", () => slow.runs === 1);
+		assert.match(await act({ stop: id, stopChildren: true }), new RegExp(`Stopped workflow run ${id} and cancelled its agents`));
+		const result = await message(/Workflow stopped/);
+		assert.doesNotMatch(result, /keeps running/);
+		assert.equal(callsOf("task_cancel").length, 1);
+		slow.release();
+		const end = journalOf(id).findLast((e) => e.t === "end");
+		assert.ok(end?.t === "end" && end.status === "stopped" && end.lingering === undefined);
+		await until("the run released", () => !lockHeld(fx.agentDir, id));
+
+		await act({ resume: id });
+		const completed = await message(/Workflow completed/);
+		assert.equal(completed.split("\n\n").at(-1), "result: continued");
+		assert.match(String(callsOf("t3_thread_send")[0]?.args.message), /^harness-delegation: [\w-]+\n.*\n\nYour previous run was interrupted before it finished \(it was stopped, or a process ended\)/);
+		assert.equal(callsOf("delegate_task").length, 1, "the same task");
+	});
+
+	test("resume with edited code: calls before the edit are not repeated, an unchanged agent in flight is adopted, a changed one is cancelled and runs anew; page and live view mark the edit", async () => {
+		const { gate, act, start, message } = await parentInT3();
+		const slowA = gate("slow work A");
+		const slowB = gate("slow work B");
+		const script = (taskB: string, marker: string) =>
+			[
+				"await shell('echo s >> shell-count');",
+				"await tools.bash({ command: 'echo t >> tool-count' });",
+				"const a = agent({ model: 'faux/faux-1', tools: ['read'] });",
+				"const b = agent({ model: 'faux/faux-1', tools: ['read'], system: 'You are B.' });",
+				`const [one, two] = await Promise.all([a.run('slow work A'), b.run('${taskB}')]);`,
+				`await shell('echo ${marker} >> after');`,
+				"return one.text + ' / ' + two.text;",
+			].join("\n");
+		const id = await start(script("slow work B", "v1"));
+		await until("both agents to run", () => slowA.runs === 1 && slowB.runs === 1);
+		await act({ stop: id });
+		await message(/Workflow stopped/);
+
+		const v2 = script("changed work B", "v2");
+		assert.match(await act({ resume: id, code: v2 }), new RegExp(`Workflow run ${id} \\(resume 1\\)`));
+		await sleep(300);
+		assert.equal(callsOf("task_cancel").length, 0, "the old agent B runs until agent A, which may still bring recorded calls, settled");
+		slowA.release();
+		const completed = await message(/Workflow completed/);
+		slowB.release();
+		assert.equal(completed.split("\n\n").at(-1), "slow work A done / child done");
+		assert.match(completed, /1 recorded call not used by the new code: agent agent 2: slow work B/);
+		assert.deepEqual([count("shell-count"), count("tool-count")], [1, 1], "shell and tool calls before the edit were not repeated");
+		assert.equal(readFileSync(join(fx.repo, "after"), "utf8"), "v2\n", "the edited part ran live");
+		assert.equal(slowA.runs, 1, "agent A was adopted, not run again");
+		const delegates = callsOf("delegate_task");
+		assert.equal(delegates.length, 3);
+		assert.match(String(delegates[2]!.args.task), /changed work B/);
+		const cancels = callsOf("task_cancel");
+		assert.equal(cancels.length, 1, "the old agent B was cancelled");
+		const oldB = delegates.find((d) => String(d.args.task).includes("slow work B"))!;
+		assert.equal(cancels[0]!.args.taskId, `task-${fx.requests.get(String(oldB.args.clientRequestId))!.threadId}`);
+
+		const journal = journalOf(id);
+		const view = viewOf(journal);
+		assert.deepEqual(view.calls.map((c) => [c.label.slice(0, 30), c.status, c.version]), [
+			["echo s >> shell-count", "replayed", 1],
+			['bash {"command":"echo t >> too', "replayed", 1],
+			["agent 1: slow work A", "done", 1],
+			["agent 2: slow work B", "unused", 1],
+			["agent 2: changed work B", "done", 2],
+			["echo v2 >> after", "done", 2],
+		]);
+		const marker = /<div class="edit-marker" data-version="2">new code from here · v2 <code>\w{12}<\/code><\/div>/;
+		assert.match(renderWorkflow(journal), marker, "the page");
+		assert.match(livePage(journal, id), marker, "the dashboard's live view");
 	});
 });

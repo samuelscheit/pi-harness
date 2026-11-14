@@ -30,6 +30,7 @@ import { sweepRuns } from "./journal.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
 import { INLINE_FILE, type ResumeRequest, type RunEnv, resumeWorkflow, runWorkflow, type ToolOutcome, type WorkflowDetails, type WorkflowResult } from "./run.ts";
 import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, offerInterrupted, recordRun, renderEnd, runHeadline, setLatestApi, showRun, startViews } from "./runs.ts";
+import { stopRun } from "./stop.ts";
 
 export const WORKFLOW_TOOL = "workflow";
 
@@ -117,7 +118,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		const { details, usage } = result;
 		recordRun(pi, sessionId, { id: details.id, state: "ended", status: details.status });
 		const text = renderEnd({ agentDir, id: details.id, sessionId, toolNames, execute, live: () => contextLive(ctx), text: result.text });
-		return { content: [{ type: "text" as const, text }], details, ...(usage ? { usage } : {}), ...(details.status === "completed" ? {} : { isError: true }) };
+		return { content: [{ type: "text" as const, text }], details, ...(usage ? { usage } : {}), ...(details.status === "completed" || details.status === "stopped" ? {} : { isError: true }) };
 	};
 
 	const common = {
@@ -142,26 +143,36 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		promptGuidelines: [
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
-			'A run that was interrupted (its result or a message says so) continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
+			'A run that was interrupted or stopped continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
+			'Stop a running run with workflow { stop: "<id>" }: its agents keep running and their results are recorded; stopChildren: true cancels them. To change a run\'s script without losing its paid work, resume it with workflow { resume: "<id>", code: "<new code>" }: calls the new code makes as before come from the journal, from its first other call it runs live. Effects of the old code (commits, files) stay; the new code must cope with them.',
 			"When you are about to run the same kind of long shell command again with different arguments, save it as a workflow with the arguments as parameters (built with sh`…`) and call that tool from then on.",
 		],
 		parameters: Type.Object({
-			code: Type.Optional(Type.String({ description: "TypeScript: the body of an async function using the globals above. With budget; not with resume or show." })),
+			code: Type.Optional(Type.String({ description: "TypeScript: the body of an async function using the globals above. With budget, or with resume: the run's changed code." })),
 			budget: Type.Optional(
 				Type.Number({ exclusiveMinimum: 0, description: "Spending limit of this run in USD for llm() and agent(); the run stops when it is used up. Small llm() calls cost fractions of a cent, an agent run cents to dollars. With resume: a new limit for the whole run." }),
 			),
-			resume: Type.Optional(Type.String({ description: "The id of a run that was interrupted (its process ended): continue it from its journal; calls it recorded are not repeated." })),
+			resume: Type.Optional(Type.String({ description: "The id of a run that was interrupted or stopped: continue it from its journal; calls it recorded are not repeated. With code, any ended run." })),
 			inFlight: Type.Optional(
 				Type.Union([Type.Literal("rerun"), Type.Literal("fail")], { description: "With resume: what shell and tools calls that were in flight do: run again, or throw InterruptedCallError. Needed when the resume names such calls." }),
 			),
 			show: Type.Optional(Type.String({ description: "The id of a run: show its page (calls, status, cost) in the thread now." })),
+			stop: Type.Optional(Type.String({ description: "The id of a running run: stop it, keeping its journal for a resume." })),
+			stopChildren: Type.Optional(Type.Boolean({ description: "With stop: cancel its agents too (default: they keep running and their results are recorded)." })),
 		}),
 		execute: async (_id, params, signal, onUpdate, ctx) => {
-			const modes = [params.code !== undefined, params.resume !== undefined, params.show !== undefined].filter(Boolean).length;
-			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume or show");
-			if (params.show !== undefined) return { content: [{ type: "text" as const, text: await showRun({ agentDir, id: params.show, toolNames: ctx.tools.map((t) => t.name), execute: executor(ctx), dashboardUrl }) }], details: undefined };
+			const modes = [params.code !== undefined && params.resume === undefined, params.resume !== undefined, params.show !== undefined, params.stop !== undefined].filter(Boolean).length;
+			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume (optionally with code), show or stop");
+			const answer = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+			if (params.show !== undefined) return answer(await showRun({ agentDir, id: params.show, toolNames: ctx.tools.map((t) => t.name), execute: executor(ctx), dashboardUrl }));
+			if (params.stop !== undefined) return answer(await stopRun(agentDir, params.stop, params.stopChildren === true));
 			if (params.resume !== undefined) {
-				const request: ResumeRequest = { id: params.resume, ...(params.inFlight ? { inFlight: params.inFlight } : {}), ...(params.budget !== undefined ? { budget: params.budget } : {}) };
+				const request: ResumeRequest = {
+					id: params.resume,
+					...(params.inFlight ? { inFlight: params.inFlight } : {}),
+					...(params.budget !== undefined ? { budget: params.budget } : {}),
+					...(params.code !== undefined ? { code: params.code } : {}),
+				};
 				return run({ kind: "resume", request }, signal, onUpdate, ctx);
 			}
 			if (params.budget === undefined) throw new Error("code needs a budget (USD)");

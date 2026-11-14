@@ -11,10 +11,11 @@ import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { blockingCalls, type CallSpec, DivergenceError, Durable, type InFlightPolicy, inFlightCalls, InterruptedCallError } from "../extensions/workflow/durable.ts";
-import { argsHash, canonicalJson, Journal, type JournalEntry, journalPath, listRuns, parseJournal, readJournal, runDir, sweepRuns } from "../extensions/workflow/journal.ts";
+import { blockingCalls, type CallSpec, DivergenceError, Durable, foldJournal, type InFlightPolicy, inFlightCalls, InterruptedCallError, type Settled, type Work } from "../extensions/workflow/durable.ts";
+import { argsHash, canonicalJson, codeHash, Journal, type JournalEntry, journalPath, listRuns, parseJournal, readJournal, runDir, sweepRuns } from "../extensions/workflow/journal.ts";
 import { layout, pageHeight, renderWorkflow, viewOf } from "../extensions/workflow/render.ts";
 import { INLINE_FILE, type RunEnv, resumeWorkflow, runWorkflow } from "../extensions/workflow/run.ts";
+import { lockHeld, STOP_FILE } from "../extensions/workflow/stop.ts";
 
 let dir: string;
 beforeEach(() => {
@@ -25,12 +26,26 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 // ---- Durable over a journal ------------------------------------------------------------------------
 
 let journals = 0;
-function durable(entries: readonly JournalEntry[] = [], inFlight: InFlightPolicy = "stop") {
+const EDIT: JournalEntry = { t: "edit", at: 1, n: 2, hash: "h", source: "edited" };
+function durable(entries: readonly JournalEntry[] = [], inFlight: InFlightPolicy = "stop", extra: { edit?: boolean; inherited?: Map<string, Work> } = {}) {
 	const journal = new Journal(join(dir, `j${++journals}.jsonl`));
 	const diverged: DivergenceError[] = [];
 	const replayed: string[] = [];
-	const d = new Durable({ journal, entries, inFlight, replayed: (kind) => replayed.push(kind), diverged: (e) => diverged.push(e), stopped: () => false });
-	return { d, journal, diverged, replayed, entries: () => readJournal(journal.path) };
+	const dropped: { key: string; meta: Record<string, unknown> }[] = [];
+	const signal = new AbortController().signal;
+	const d = new Durable({
+		journal,
+		entries: extra.edit ? [...entries, EDIT] : entries,
+		inFlight,
+		attempt: 2,
+		signal,
+		signalFor: () => signal,
+		...(extra.inherited ? { inherited: extra.inherited } : {}),
+		replayed: (kind) => replayed.push(kind),
+		diverged: (e) => diverged.push(e),
+		dropped: (calls) => dropped.push(...calls.map((c) => ({ key: c.start.key, meta: c.meta }))),
+	});
+	return { d, journal, diverged, replayed, dropped, entries: () => readJournal(journal.path) };
 }
 const spec = (kind: CallSpec["kind"], args: unknown, extra: Partial<CallSpec> = {}): CallSpec => ({ kind, args, label: `${kind} ${JSON.stringify(args)}`, ...extra });
 const value = (v: unknown) => async () => ({ value: v });
@@ -184,12 +199,12 @@ describe("replay", () => {
 		let reattached: Record<string, unknown> | undefined;
 		assert.equal(await stop.d.call(spec("agent", { message: "m" }), never, async (call) => ((reattached = call.recorded), { value: "reattached" })), "reattached");
 		assert.deepEqual(reattached, { threadId: "thread-9" });
-		await assert.rejects(stop.d.call(spec("shell", { command: "deploy" }), never), /in flight when the process ended/);
+		await assert.rejects(stop.d.call(spec("shell", { command: "deploy" }), never), /in flight when the run stopped/);
 		await assert.rejects(stop.d.call(spec("tool", { name: "write" }), never), /in flight/);
 		assert.equal(await stop.d.call(spec("shell", { command: "build" }), value("rebuilt")), "rebuilt", "marked idempotent at its start");
 
 		const fail = durable(entries, "fail");
-		await assert.rejects(fail.d.call(spec("shell", { command: "deploy" }), never), (error: Error) => error instanceof InterruptedCallError && /shell \{"command":"deploy"\} was running when the workflow's process ended/.test(error.message));
+		await assert.rejects(fail.d.call(spec("shell", { command: "deploy" }), never), (error: Error) => error instanceof InterruptedCallError && /shell \{"command":"deploy"\} was cut off when the workflow stopped/.test(error.message));
 		const rerun = durable(entries, "rerun");
 		assert.equal(await rerun.d.call(spec("shell", { command: "deploy" }), value("deployed again")), "deployed again");
 		assert.equal(await rerun.d.call(spec("tool", { name: "write" }, { idempotent: true }), value("written")), "written");
@@ -203,6 +218,145 @@ describe("replay", () => {
 		const later = replay.d.now();
 		assert.ok(Math.abs(later - Date.now()) < 1000);
 		assert.deepEqual(replay.entries(), [{ t: "clock", kind: "now", n: 3, value: later }]);
+	});
+});
+
+describe("edited code", () => {
+	const key = (kind: CallSpec["kind"], args: unknown, n = 1) => `${kind}:${argsHash(args)}#${n}`;
+	/** Record calls one after the other. */
+	async function recorded(...calls: unknown[]) {
+		const first = durable();
+		for (const args of calls) await first.d.call(spec("shell", args), value(`recorded ${JSON.stringify(args)}`));
+		return first.entries();
+	}
+	/** Make calls one after the other; returns what each got and which ran live. */
+	async function replay(edited: ReturnType<typeof durable>, ...calls: unknown[]) {
+		const live: string[] = [];
+		const got: unknown[] = [];
+		for (const args of calls) got.push(await edited.d.call(spec("shell", args), async () => (live.push(JSON.stringify(args)), { value: `live ${JSON.stringify(args)}` })));
+		return { got, live };
+	}
+
+	test("a prefix is answered from the journal, then the new code takes over: every later call runs live, also one the journal has", async () => {
+		const entries = await recorded({ c: "a" }, { c: "b" }, { c: "c" });
+		const edited = durable(entries, "stop", { edit: true });
+		assert.equal(edited.d.editing, true);
+		const { got, live } = await replay(edited, { c: "a" }, { c: "x" }, { c: "b" });
+		assert.deepEqual(got, ['recorded {"c":"a"}', 'live {"c":"x"}', 'live {"c":"b"}']);
+		assert.deepEqual(live, ['{"c":"x"}', '{"c":"b"}']);
+		assert.deepEqual(edited.diverged, []);
+		const takeovers = edited.entries().filter((e) => e.t === "takeover");
+		assert.deepEqual(takeovers.map((e) => e.t === "takeover" && [e.key, e.replayed, e.dropped]), [[key("shell", { c: "x" }), 1, [key("shell", { c: "b" }), key("shell", { c: "c" })]]]);
+		assert.deepEqual(edited.d.unused.map((s) => s.label), ['shell {"c":"b"}', 'shell {"c":"c"}']);
+
+		// A later resume sees the edited history: a (recorded first), x and b (live); the unused ones are gone.
+		const later = foldJournal([...entries, EDIT, ...edited.entries()]);
+		assert.deepEqual(later.order, [key("shell", { c: "a" }), key("shell", { c: "x" }), key("shell", { c: "b" })]);
+		assert.equal(later.editPending, false, "taken over: the next resume without code is strict");
+		const strict = durable([...entries, EDIT, ...edited.entries()]);
+		assert.equal(strict.d.editing, false);
+		assert.deepEqual((await replay(strict, { c: "a" }, { c: "x" }, { c: "b" })).got, ['recorded {"c":"a"}', 'live {"c":"x"}', 'live {"c":"b"}'], "the edited run's values");
+		assert.deepEqual(strict.replayed.length, 3);
+	});
+
+
+	test("a call that started after a recorded call finished answers only once that call was asked; the script's return drops the rest", async () => {
+		const entries = await recorded({ c: "a" }, { c: "b" }, { c: "c" });
+		const edited = durable(entries, "stop", { edit: true });
+		const { got, live } = await replay(edited, { c: "a" }, { c: "c" });
+		assert.deepEqual(got, ['recorded {"c":"a"}', 'live {"c":"c"}'], "c without b is another call: it ran after b in the journal");
+		assert.deepEqual(live, ['{"c":"c"}']);
+		const returned = durable(entries, "stop", { edit: true });
+		await replay(returned, { c: "a" }, { c: "b" });
+		returned.d.finish();
+		const [takeover] = returned.entries().filter((e) => e.t === "takeover");
+		assert.ok(takeover?.t === "takeover");
+		assert.equal(takeover.key, undefined, "taken over at the return");
+		assert.deepEqual(takeover.dropped, [key("shell", { c: "c" })]);
+		assert.deepEqual(returned.d.unused.map((s) => s.label), ['shell {"c":"c"}']);
+		// The same code without edit (strict) reports such calls too, without dropping them.
+		const strict = durable(entries);
+		await replay(strict, { c: "a" }, { c: "b" });
+		strict.d.finish();
+		assert.deepEqual(strict.d.unused.map((s) => s.label), ['shell {"c":"c"}']);
+		assert.deepEqual(strict.entries(), []);
+	});
+
+	test("occurrence numbers: an equal call added or removed before a recorded one does not take that one's result", async () => {
+		// Recorded: a, b, a. The new code adds an `a` before b: its second `a` is not the recorded second one (that ran after b).
+		const added = durable(await recorded({ c: "a" }, { c: "b" }, { c: "a" }), "stop", { edit: true });
+		const one = await replay(added, { c: "a" }, { c: "a" }, { c: "b" }, { c: "a" });
+		assert.deepEqual(one.got, ['recorded {"c":"a"}', 'live {"c":"a"}', 'live {"c":"b"}', 'live {"c":"a"}']);
+		assert.equal(added.entries().find((e) => e.t === "takeover")?.t === "takeover" && added.entries().find((e) => e.t === "takeover")!.key, key("shell", { c: "a" }, 2));
+		// Recorded: a, a, b. The new code removes the second `a`: b ran after it, so b runs live.
+		const removed = durable(await recorded({ c: "a" }, { c: "a" }, { c: "b" }), "stop", { edit: true });
+		const two = await replay(removed, { c: "a" }, { c: "b" });
+		assert.deepEqual(two.got, ['recorded {"c":"a"}', 'live {"c":"b"}']);
+		assert.deepEqual(removed.d.unused.map((s) => s.key), [key("shell", { c: "a" }, 2), key("shell", { c: "b" })]);
+		// Unchanged code with an edit: everything replays, nothing is unused.
+		const same = durable(await recorded({ c: "a" }, { c: "a" }, { c: "b" }), "stop", { edit: true });
+		assert.deepEqual((await replay(same, { c: "a" }, { c: "a" }, { c: "b" })).live, []);
+		same.d.finish();
+		assert.deepEqual(same.d.unused, []);
+	});
+
+	test("parallel calls: recorded ones answer in any order; a new one waits until the others were asked, then takes over", async () => {
+		const first = durable();
+		const delays: Record<string, number> = { a: 60, b: 5, c: 30 };
+		await Promise.all(["a", "b", "c"].map((n) => first.d.call(spec("llm", { p: n }), async () => (await sleep(delays[n]!), { value: n }))));
+		await first.d.call(spec("llm", { p: "after" }), value("after"));
+		const entries = first.entries();
+
+		const reordered = durable(entries, "stop", { edit: true });
+		assert.deepEqual(await Promise.all(["c", "a", "b"].map((n) => reordered.d.call(spec("llm", { p: n }), never))), ["c", "a", "b"]);
+		assert.equal(await reordered.d.call(spec("llm", { p: "after" }), never), "after");
+		assert.equal(reordered.d.replayedCalls, 4);
+
+		const changed = durable(entries, "stop", { edit: true });
+		const order: string[] = [];
+		const results = await Promise.all(
+			["new", "a", "b"].map((n) => changed.d.call(spec("llm", { p: n }), async () => (order.push(n), { value: `live ${n}` }))),
+		);
+		assert.deepEqual(results, ["live new", "a", "b"]);
+		assert.deepEqual(order, ["new"], "the new call ran once a and b were answered");
+		assert.equal(await changed.d.call(spec("llm", { p: "after" }), async () => ({ value: "live after" })), "live after", "after the takeover, live");
+		assert.deepEqual(changed.d.unused.map((s) => s.label).sort(), ['llm {"p":"after"}', 'llm {"p":"c"}']);
+	});
+
+	test("without code a resume stays strict: another path stops it", async () => {
+		const entries = await recorded({ c: "a" }, { c: "b" });
+		const strict = durable(entries);
+		assert.equal(strict.d.editing, false);
+		await strict.d.call(spec("shell", { c: "a" }), never);
+		await assert.rejects(strict.d.call(spec("shell", { c: "x" }), never), (error: Error) => error instanceof DivergenceError && /If you changed the script on purpose, resume with code/.test(error.message));
+	});
+
+	test("agent runs in flight: the same call adopts work this process still runs; unused ones are cancelled, or named to cancel elsewhere", async () => {
+		const agentStart = (message: string): JournalEntry => ({ t: "start", key: key("agent", { message }), kind: "agent", label: `agent ${message}`, at: 1 });
+		const entries: JournalEntry[] = [
+			agentStart("kept"),
+			agentStart("lingering"),
+			agentStart("elsewhere"),
+			{ t: "meta", key: key("agent", { message: "elsewhere" }), at: 1, data: { taskId: "task-9" } },
+		];
+		let finish!: (settled: Settled) => void;
+		const cancelled: unknown[] = [];
+		const work = (settled: Promise<Settled>): Work => ({ kind: "agent", settled, cancel: (reason) => cancelled.push(reason) });
+		const inherited = new Map([
+			[key("agent", { message: "kept" }), work(new Promise((r) => (finish = r)))],
+			[key("agent", { message: "lingering" }), work(new Promise(() => undefined))],
+		]);
+		const edited = durable(entries, "stop", { edit: true, inherited });
+		const adopted = edited.d.call(spec("agent", { message: "kept" }), never, never);
+		await sleep(20);
+		finish({ outcome: "done", value: { text: "kept done" }, cost: 0.5 });
+		assert.deepEqual(await adopted, { text: "kept done" }, "the adopted work's outcome, no reattach");
+		assert.deepEqual(edited.replayed, ["agent"]);
+		assert.equal(await edited.d.call(spec("agent", { message: "changed" }), value("new agent")), "new agent");
+		assert.equal(cancelled.length, 1, "the unused lingering work was cancelled");
+		assert.match(String(cancelled[0]), /edited code does not use this call/);
+		assert.deepEqual(edited.dropped, [{ key: key("agent", { message: "elsewhere" }), meta: { taskId: "task-9" } }], "the one not running here is named with its task");
+		assert.equal(edited.d.unsettled().size, 0);
 	});
 });
 
@@ -327,6 +481,67 @@ describe("resume", () => {
 		assert.match(resumed.details.error!, /DivergenceError: the script took another path than its journal: the journal has shell call shell:\w+#1 \(echo b >> b\) next, the script asked for shell:\w+#1 \(echo c >> c\) instead/);
 		assert.equal(count("c"), 0, "nothing of the new path ran");
 		assert.equal(count("a"), 1);
+	});
+
+	test("resume with edited code: the calls before the edit are not repeated, the edited part runs live, unused calls are reported, every version is kept", async () => {
+		const v1 = "await shell('echo a >> a');\nconst x = await llm('first', { model: 'faux/faux-1' });\nawait shell('echo b >> b');\nreturn 'v1 ' + x;";
+		const v2 = "await shell('echo a >> a');\nconst x = await llm('first', { model: 'faux/faux-1' });\nawait shell('echo c >> c');\nreturn 'v2 ' + x;";
+		const first = await runWorkflow({ source: v1, filename: INLINE_FILE, inline: true }, 1, env());
+		assert.equal(first.details.status, "completed");
+		await assert.rejects(resumeWorkflow({ id: first.details.id }, env()), /ended \(completed\); there is nothing to resume \(pass code to continue it with changed code\)/);
+		await assert.rejects(resumeWorkflow({ id: first.details.id, code: "const = ;" }, env()), /SyntaxError|Unexpected/, "edited code that does not compile runs nothing");
+		const edited = await resumeWorkflow({ id: first.details.id, code: v2, budget: 3 }, env());
+		assert.equal(edited.details.status, "completed", edited.details.error);
+		assert.match(resultOf(edited.text), /^v2 answer 1/, "the recorded llm answer");
+		assert.deepEqual([count("a"), count("b"), count("c"), llmRequests], [1, 1, 1, 1]);
+		assert.equal(edited.details.replayedCalls, 2);
+		assert.equal(edited.details.unusedCalls, 1);
+		assert.equal(edited.details.budget, 3);
+		assert.match(edited.text, /1 recorded call not used by the new code: shell echo b >> b/);
+		const journal = readJournal(edited.details.journal);
+		assert.deepEqual(journal.filter((e) => e.t === "edit").map((e) => e.t === "edit" && [e.n, e.hash]), [[2, codeHash(v2)]]);
+		const view = viewOf(journal);
+		assert.deepEqual(view.versions.map((v) => [v.n, v.hash, v.takeover?.replayed, v.takeover?.unused]), [[1, codeHash(v1), undefined, undefined], [2, codeHash(v2), 2, 1]]);
+		assert.deepEqual(view.calls.map((c) => [c.label, c.status, c.version]), [["echo a >> a", "replayed", 1], ["first", "replayed", 1], ["echo b >> b", "unused", 1], ["echo c >> c", "done", 2]]);
+		const page = renderWorkflow(journal);
+		assert.match(page, new RegExp(`<div class="edit-marker" data-version="2">new code from here · v2 <code>${codeHash(v2)}</code></div><div class="group"><div class="lane"><div class="node k-shell s-done"[^>]*><div class="row"><span class="kind">shell</span><span class="label" title="echo c &gt;&gt; c">`), "the marker right before the first call of the new code");
+		assert.match(page, /2 versions of the code.*v1 <code>\w+<\/code> from the start.*v2 <code>\w+<\/code> from resume 1, new code from <code>echo c &gt;&gt; c<\/code> after 2 replayed calls, 1 recorded call unused/s);
+		assert.match(page, /<b>1<\/b> unused/);
+
+		// The edited code is the run's code now: a strict resume replays it, with the budget it set.
+		const again = await resumeWorkflow({ id: first.details.id, code: v2 }, env());
+		assert.equal(resultOf(again.text), resultOf(edited.text));
+		assert.deepEqual([count("a"), count("b"), count("c")], [1, 1, 1]);
+		assert.equal(again.details.budget, 3);
+		assert.equal(again.details.unusedCalls, 0);
+	});
+
+	test("a stop outside t3: the in-process agent keeps running and its result is recorded; a resume in this process adopts it", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		let childRequests = 0;
+		faux.setResponses(Array.from({ length: 5 }, () => async () => (childRequests++, await gate, fauxAssistantMessage("in-process child done"))));
+		let id = "";
+		const code = "await shell('echo s >> s');\nconst run = await agent({ model: 'faux/faux-1', tools: ['read'] }).run('work');\nreturn 'agent: ' + run.text;";
+		const running = runWorkflow({ source: code, filename: INLINE_FILE, inline: true }, 1, env({ onStart: (r) => (id = r.id) }));
+		while (childRequests === 0) await sleep(20);
+		writeFileSync(join(runDir(join(dir, "agent"), id), STOP_FILE), JSON.stringify({ children: false }));
+		const stopped = await running;
+		assert.equal(stopped.details.status, "stopped");
+		assert.equal(stopped.details.lingeringAgents, 1);
+		assert.match(stopped.text, /1 agent run keeps running/);
+		assert.equal(lockHeld(join(dir, "agent"), id), true);
+		const resumed = resumeWorkflow({ id }, env());
+		await sleep(100);
+		release();
+		const done = await resumed;
+		assert.equal(resultOf(done.text), "agent: in-process child done");
+		assert.deepEqual([count("s"), childRequests], [1, 1], "nothing ran twice");
+		assert.equal(lockHeld(join(dir, "agent"), id), false);
+		const journal = readJournal(done.details.journal);
+		const agentDone = journal.findIndex((e) => e.t === "done" && e.key.startsWith("agent:"));
+		assert.ok(agentDone > journal.findIndex((e) => e.t === "attempt" && e.n === 2), "the lingering work recorded its outcome during the resume");
+		assert.equal(journal.filter((e) => e.t === "start" && e.key.startsWith("agent:")).length, 1, "adopted, not started again");
 	});
 
 	test("nested workflows: a replayed one makes none of its calls; equal calls outside keep their occurrence", async () => {

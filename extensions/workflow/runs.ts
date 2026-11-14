@@ -18,10 +18,10 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { acquireLock } from "../lib/lock.ts";
-import { journalPath, readJournal, runDir } from "./journal.ts";
+import { journalPath, readJournal, runDir, runState } from "./journal.ts";
 import { pageHeight, renderWorkflow, viewOf } from "./render.ts";
-import { runState, type ToolOutcome } from "./run.ts";
+import type { ToolOutcome } from "./run.ts";
+import { lockHeld } from "./stop.ts";
 
 export const RUN_ENTRY = "workflow-run";
 export const RESUME_MESSAGE = "workflow-interrupted";
@@ -168,12 +168,6 @@ export async function showRun({ agentDir, id, toolNames, execute, dashboardUrl }
 	return problem ? `${where}\nhtml_render failed: ${problem}` : `${where}\nShown in the thread.`;
 }
 
-/** Whether a process holds the run's lock (it runs now). */
-function running(agentDir: string, id: string): boolean {
-	const unlock = acquireLock(join(runDir(agentDir, id), "lock"));
-	unlock?.();
-	return unlock === undefined;
-}
 
 /**
  * The runs this session started that stopped with their process: started and never recorded as
@@ -195,7 +189,7 @@ export function interruptedRuns(ctx: ExtensionContext, agentDir: string): string
 		.filter((id) => {
 			try {
 				const end = runState(agentDir, id).end;
-				return (!end || end.status === "interrupted") && !running(agentDir, id);
+				return (!end || end.status === "interrupted") && !lockHeld(agentDir, id);
 			} catch {
 				return false;
 			}

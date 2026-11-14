@@ -56,8 +56,8 @@ export const START_GRACE_MS = 5_000;
 /** Tools whose calls the model makes run in the background from their start. */
 export const BACKGROUND_TOOLS: readonly string[] = ["workflow"];
 
-/** Calls of a background tool that answer at once and stay in the foreground: `workflow { show }` renders a page. */
-export const foregroundCall = (toolName: string, input: Record<string, unknown>) => toolName === "workflow" && input.show !== undefined;
+/** Calls of a background tool that answer at once and stay in the foreground: `workflow { show }` renders a page, `workflow { stop }` stops a run. */
+export const foregroundCall = (toolName: string, input: Record<string, unknown>) => toolName === "workflow" && (input.show !== undefined || input.stop !== undefined);
 
 /** The reason background calls stop at the session's end; a workflow stopped by it can be resumed. */
 export class SessionEnded extends Error {

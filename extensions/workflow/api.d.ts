@@ -8,7 +8,9 @@
  * journaled, and a run whose process died is resumed by running the script again, with recorded
  * calls answered from the journal. So keep the script deterministic: act on the outside only
  * through these calls (Date.now(), new Date() and Math.random() are recorded too). A shell or tool
- * call that was running at the crash is not repeated unless marked `idempotent: true`.
+ * call that was running at the crash is not repeated unless marked `idempotent: true`. A resume with
+ * edited code answers the calls it makes as before from the journal and runs live from its first
+ * other call.
  */
 
 /**

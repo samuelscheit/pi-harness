@@ -80,6 +80,6 @@ flowchart TB
 | Pi configuration written by the installer | `~/.pi/agent/{settings,models,auth}.json` | no |
 | Sessions | `~/.pi/agent/sessions/` (Pi) | no; the source of truth for metrics |
 | Metrics index | `~/.pi/agent/metrics.db` | no; rebuilt from sessions |
-| Workflow journals, start snapshots and pages | `~/.pi/agent/workflows/<id>/` | no; a day after completion, a week when interrupted |
+| Workflow journals, start snapshots and pages | `~/.pi/agent/workflows/<id>/` | no; a day after the run ended, a week when interrupted or stopped |
 | Improvement notes, changelog, dream ledger and reports | `.agents/` in this repository (git-ignored in the public repository) | locally |
 | Project rules and settings | `<repo>/AGENTS.md`, `<repo>/.pi/`, `<repo>/.agents/` | in that project |

@@ -1,35 +1,44 @@
 // Durable execution of a workflow script: every call to the outside goes through `Durable.call`,
-// which journals it (journal.ts) and, when the run is resumed after its process died, answers it
-// from the journal instead of running it again.
+// which journals it (journal.ts) and, when the run is resumed, answers it from the journal instead
+// of running it again.
 //
-// A resume runs the same script from its start:
+// A resume runs the script from its start:
 // - a call with a recorded outcome (`done`, `failed`) runs nothing and returns or throws it;
-// - a call recorded as started without an outcome was in flight when the process died:
-//   agent runs reattach to their t3 task or child session (agent.ts, through `reattach`), llm(),
-//   changes() and workflows.* run again (no side effects of their own; a nested workflow's calls
-//   are journaled one by one), shell and tools.* run again only when made with
-//   `{ idempotent: true }` or when the resume says so (`inFlight: "rerun"`); with
-//   `inFlight: "fail"` they throw, and without a decision the resume does not start
-//   (`blockingCalls`, checked before the script runs);
+// - a call recorded as started without an outcome was in flight when the run stopped: an agent run
+//   a stop left running in this process is adopted (its outcome is awaited), other agent runs
+//   reattach to their t3 task or child session (agent.ts, through `reattach`); llm(), changes()
+//   and workflows.* run again (no side effects of their own; a nested workflow's calls are
+//   journaled one by one); shell and tools.* run again only when made with `{ idempotent: true }`
+//   or when the resume says so (`inFlight: "rerun"`); with `inFlight: "fail"` they throw, and
+//   without a decision the resume does not start (`blockingCalls`, checked before the script runs);
 // - the first call without an entry runs live.
 //
-// While recorded calls remain that the script has not asked for again, a new call waits: in
-// parallel code a recorded call may still come. When nothing can bring one any more (no call or
-// script timer runs), the script took another path than the journal: the resume stops with an
-// error naming the recorded call and the new one. It never continues silently.
+// The same code (strict): while recorded calls remain that the script has not asked for again, a
+// new call waits, since in parallel code a recorded call may still come. When nothing can bring one
+// any more (no call or script timer runs), the script took another path than the journal: the
+// resume stops with an error naming the recorded call and the new one.
+//
+// Edited code (a resume with `code`, until it took over): a recorded call answers only when the new
+// code asks for it after every recorded call that had finished before it started (it may have
+// depended on them; this keeps occurrence numbers honest when the new code adds or removes an equal
+// call before it). Where strict mode would stop, the new code takes over instead: a `takeover` entry
+// records the position and the recorded calls left unused, and from then on every call runs live.
+// Unused agent runs still in flight are cancelled.
 //
 // Date.now(), new Date() and Math.random() in the script return recorded values on replay
-// (`now`, `random`), by occurrence.
+// (`now`, `random`), by occurrence, and live ones after a takeover.
 //
 // The calls of a nested workflow (workflows.*) have keys inside its own: `<workflow key>/<kind>:…`,
 // counted on their own. A replayed nested workflow so skips its calls as a whole, and its calls do
 // not shift the occurrence numbers of equal calls outside it.
 //
-// A call that fails because the run was stopped (abort, budget, the session ended) records no
-// outcome: it stays in flight, as it would after a crash.
+// The script's calls reject as soon as the run stops. A call's work runs under its own signal
+// (`signalFor`): an agent run's goes on when a stop keeps the children, records its outcome when
+// it ends, and can be adopted by a resume (`unsettled`). Work that fails because its signal was
+// aborted records no outcome: it stays in flight, as after a crash.
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { argsHash, type CallKind, type Journal, type JournalEntry, reviveError, serializeError } from "./journal.ts";
+import { argsHash, type CallKind, type Journal, type JournalEntry, reviveError, type SerializedError, serializeError } from "./journal.ts";
 
 /** What a resume does with shell and tools.* calls that were in flight. */
 export type InFlightPolicy = "stop" | "rerun" | "fail";
@@ -57,11 +66,24 @@ export interface CallContext {
 	meta(data: Record<string, unknown>): void;
 	/** Whatever meta the journal had for this call (a reattach). */
 	recorded: Record<string, unknown>;
+	/** The signal the call's work runs under (it may outlive the run's: see `signalFor`). */
+	signal: AbortSignal;
 }
 
 /** Names of errors that interrupt a run rather than end it (its session ended, its context went stale): it can be resumed. */
 const INTERRUPTIONS = new Set(["SessionEnded", "ContextStale"]);
 export const isInterruption = (reason: unknown) => INTERRUPTIONS.has((reason as { name?: unknown } | null)?.name as string);
+
+/** The reason of a run stopped on request (`workflow { stop }`); `children`: its agents are cancelled too. */
+export class WorkflowStopped extends Error {
+	readonly children: boolean;
+	constructor(children: boolean) {
+		super(children ? "stopped on request, with its agents" : "stopped on request");
+		this.name = "WorkflowStopped";
+		this.children = children;
+	}
+}
+export const isStop = (reason: unknown): reason is WorkflowStopped => (reason as { name?: unknown } | null)?.name === "WorkflowStopped";
 
 export class DivergenceError extends Error {
 	constructor(message: string) {
@@ -72,7 +94,7 @@ export class DivergenceError extends Error {
 
 export class InterruptedCallError extends Error {
 	constructor(label: string) {
-		super(`${label} was running when the workflow's process ended; it may or may not have taken effect (the resume chose inFlight: "fail")`);
+		super(`${label} was cut off when the workflow stopped or its process ended; it may or may not have taken effect (the resume chose inFlight: "fail")`);
 		this.name = "InterruptedCallError";
 	}
 }
@@ -80,19 +102,81 @@ export class InterruptedCallError extends Error {
 type Start = Extract<JournalEntry, { t: "start" }>;
 type Outcome = Extract<JournalEntry, { t: "done" | "failed" }>;
 
+/** What a call's work came to: its outcome, or none (stopped before it had one). */
+export type Settled = { outcome: "done"; value: unknown; cost: number } | { outcome: "failed"; error: SerializedError; cost: number } | { outcome: "none" };
+
+/** A live call's work; an agent run's can outlive the execution that started it (a stop that keeps children). */
+export interface Work {
+	kind: CallKind;
+	settled: Promise<Settled>;
+	/** Stop the work; its outcome is not recorded. */
+	cancel(reason: unknown): void;
+}
+
 /** A value as JSON brings it back from the journal, so a live call and its replay return alike. */
 function roundTrip<T>(value: T): T {
 	return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
+/** The journal as a resume sees it: the latest start and outcome per call, takeovers applied. */
+export interface Folded {
+	starts: Map<string, Start>;
+	outcomes: Map<string, Outcome>;
+	metas: Map<string, Record<string, unknown>>;
+	/** Recorded calls in the order of their first start. */
+	order: string[];
+	/** Journal positions of each call's first start and of its outcome (happens-before for edited code). */
+	startAt: Map<string, number>;
+	outcomeAt: Map<string, number>;
+	clocks: { now: number[]; random: number[] };
+	/** An edit that has not taken over yet: the resume matches leniently. */
+	editPending: boolean;
+}
+
+export function foldJournal(entries: readonly JournalEntry[]): Folded {
+	const folded: Folded = { starts: new Map(), outcomes: new Map(), metas: new Map(), order: [], startAt: new Map(), outcomeAt: new Map(), clocks: { now: [], random: [] }, editPending: false };
+	entries.forEach((entry, at) => {
+		switch (entry.t) {
+			case "start":
+				if (!folded.starts.has(entry.key)) folded.order.push(entry.key);
+				if (!folded.startAt.has(entry.key)) folded.startAt.set(entry.key, at);
+				folded.starts.set(entry.key, entry);
+				folded.outcomes.delete(entry.key);
+				folded.outcomeAt.delete(entry.key);
+				break;
+			case "done":
+			case "failed":
+				if (!folded.starts.has(entry.key)) break;
+				folded.outcomes.set(entry.key, entry);
+				folded.outcomeAt.set(entry.key, at);
+				break;
+			case "meta":
+				folded.metas.set(entry.key, { ...folded.metas.get(entry.key), ...entry.data });
+				break;
+			case "clock":
+				folded.clocks[entry.kind][entry.n - 1] = entry.value;
+				break;
+			case "edit":
+				folded.editPending = true;
+				break;
+			case "takeover": {
+				const dropped = new Set(entry.dropped);
+				for (const map of [folded.starts, folded.outcomes, folded.metas, folded.startAt, folded.outcomeAt]) for (const key of dropped) map.delete(key);
+				folded.order = folded.order.filter((key) => !dropped.has(key));
+				folded.clocks.now.length = Math.min(folded.clocks.now.length, entry.clocks.now);
+				folded.clocks.random.length = Math.min(folded.clocks.random.length, entry.clocks.random);
+				folded.editPending = false;
+				break;
+			}
+		}
+	});
+	return folded;
+}
+
 /** The calls of a journal that were started and have no outcome, in journal order. */
 export function inFlightCalls(entries: readonly JournalEntry[]): Start[] {
-	const open = new Map<string, Start>();
-	for (const entry of entries) {
-		if (entry.t === "start") open.set(entry.key, entry);
-		else if (entry.t === "done" || entry.t === "failed") open.delete(entry.key);
-	}
-	return [...open.values()];
+	const { order, starts, outcomes } = foldJournal(entries);
+	return order.filter((key) => !outcomes.has(key)).map((key) => starts.get(key)!);
 }
 
 /** In-flight calls a resume may not run again without a decision: non-idempotent shell and tools.* calls. */
@@ -103,56 +187,71 @@ export interface DurableOptions {
 	/** The journal so far (empty for a new run). */
 	entries: readonly JournalEntry[];
 	inFlight: InFlightPolicy;
+	/** This execution's number (attempt), for the takeover entry. */
+	attempt: number;
+	/** The run's signal: the script's calls reject when it aborts. */
+	signal: AbortSignal;
+	/** The signal a call's work runs under: the run's, or for agents the children's, which a stop may leave running. */
+	signalFor: (kind: CallKind) => AbortSignal;
+	/** Work an earlier execution in this process left running (agents a stop kept), by key. */
+	inherited?: ReadonlyMap<string, Work>;
 	/** A replayed call's recorded cost and kind, to count. */
 	replayed: (kind: CallKind, cost: number) => void;
 	/** The script took another path: stop the run with this error. */
 	diverged: (error: DivergenceError) => void;
-	/** Whether the run was stopped: a call failing now records no outcome. */
-	stopped: () => boolean;
+	/** Edited code took over: recorded agent runs in flight it does not use, whose children are not run here (to cancel). */
+	dropped?: (calls: { start: Start; meta: Record<string, unknown> }[]) => void;
 }
 
 export class Durable {
 	private readonly journal: Journal;
 	private readonly policy: InFlightPolicy;
+	private readonly attempt: number;
+	private readonly signal: AbortSignal;
+	private readonly signalFor: DurableOptions["signalFor"];
 	private readonly onReplayed: DurableOptions["replayed"];
 	private readonly onDiverged: DurableOptions["diverged"];
-	private readonly stopped: DurableOptions["stopped"];
+	private readonly onDropped: DurableOptions["dropped"];
+	private readonly folded: Folded;
+	/** Matching leniently: edited code that has not taken over yet. */
+	readonly editing: boolean;
+	private tookOver = false;
 	/** The key of the nested workflow a call runs in. */
 	private readonly scope = new AsyncLocalStorage<string>();
-	private readonly starts = new Map<string, Start>();
-	private readonly outcomes = new Map<string, Outcome>();
-	private readonly metas = new Map<string, Record<string, unknown>>();
-	private readonly clocks = { now: [] as number[], random: [] as number[] };
 	private readonly counts = { now: 0, random: 0 };
 	private readonly occurrences = new Map<string, number>();
 	/** Recorded calls the script has not asked for again, in journal order. */
-	private readonly pending: string[];
-	/** New calls waiting until the recorded ones are all asked for. */
+	private pending: string[];
+	/** Journal positions of the pending calls' outcomes, ascending: the first is the happens-before frontier. */
+	private pendingOutcomes: number[];
+	/** New calls waiting until a recorded one may match, or the journal is used up. */
 	private readonly deferred: { key: string; label: string; release: (error?: Error) => void }[] = [];
+	/** Work of this execution not settled yet (and adopted work). */
+	private readonly works = new Map<string, Work>();
+	private readonly inherited: Map<string, Work>;
 	/** Live calls and script timers running: while any does, a recorded call may still come. */
 	private active = 0;
 	private checkScheduled = false;
 	private diverged: DivergenceError | undefined;
 	/** Calls answered from the journal in this execution. */
 	replayedCalls = 0;
+	/** Recorded calls the script did not use (edited code took over, or it returned without them). */
+	readonly unused: Start[] = [];
 
 	constructor(options: DurableOptions) {
 		this.journal = options.journal;
 		this.policy = options.inFlight;
+		this.attempt = options.attempt;
+		this.signal = options.signal;
+		this.signalFor = options.signalFor;
 		this.onReplayed = options.replayed;
 		this.onDiverged = options.diverged;
-		this.stopped = options.stopped;
-		const order: string[] = [];
-		for (const entry of options.entries) {
-			if (entry.t === "start") {
-				if (!this.starts.has(entry.key)) order.push(entry.key);
-				this.starts.set(entry.key, entry);
-				this.outcomes.delete(entry.key);
-			} else if (entry.t === "done" || entry.t === "failed") this.outcomes.set(entry.key, entry);
-			else if (entry.t === "meta") this.metas.set(entry.key, { ...this.metas.get(entry.key), ...entry.data });
-			else if (entry.t === "clock") this.clocks[entry.kind][entry.n - 1] = entry.value;
-		}
-		this.pending = order;
+		this.onDropped = options.dropped;
+		this.folded = foldJournal(options.entries);
+		this.editing = this.folded.editPending;
+		this.pending = [...this.folded.order];
+		this.pendingOutcomes = this.pending.flatMap((key) => (this.folded.outcomeAt.has(key) ? [this.folded.outcomeAt.get(key)!] : [])).sort((a, b) => a - b);
+		this.inherited = new Map(options.inherited);
 	}
 
 	/** Date.now() for the script: recorded on replay, else the host's, recorded. */
@@ -166,7 +265,7 @@ export class Durable {
 
 	private clock(kind: "now" | "random", live: () => number): number {
 		const n = ++this.counts[kind];
-		const recorded = this.clocks[kind][n - 1];
+		const recorded = this.tookOver ? undefined : this.folded.clocks[kind][n - 1];
 		if (recorded !== undefined) return recorded;
 		const value = live();
 		this.journal.append({ t: "clock", kind, n, value });
@@ -188,62 +287,169 @@ export class Durable {
 	/** Make one call: from the journal when recorded, else live (after the recorded calls). */
 	async call(spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>, reattach?: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
 		if (this.diverged) throw this.diverged;
+		if (this.signal.aborted) throw this.signal.reason;
 		const parent = this.scope.getStore();
 		const id = `${parent === undefined ? "" : `${parent}/`}${spec.kind}:${argsHash(spec.args)}`;
 		const occurrence = (this.occurrences.get(id) ?? 0) + 1;
 		this.occurrences.set(id, occurrence);
 		const key = `${id}#${occurrence}`;
-		const at = this.pending.indexOf(key);
-		const start = this.starts.get(key);
-		if (at >= 0) {
-			this.pending.splice(at, 1);
-			const outcome = this.outcomes.get(key);
-			// A nested workflow answered from the journal makes none of its calls again.
-			if (outcome && spec.kind === "workflow") for (let i = this.pending.length - 1; i >= 0; i--) if (this.pending[i]!.startsWith(`${key}/`)) this.pending.splice(i, 1);
-			if (this.pending.length === 0) this.release();
-			if (outcome) {
-				this.replayedCalls++;
-				this.onReplayed(spec.kind, outcome.cost ?? 0);
-				if (outcome.t === "failed") throw reviveError(outcome.error);
-				return roundTrip(outcome.value);
-			}
-			// In flight when the process died.
-			if (spec.kind === "agent" && reattach) return this.run(key, spec, reattach);
-			if ((spec.kind === "shell" || spec.kind === "tool") && !start?.idempotent && !spec.idempotent) {
-				if (this.policy === "fail") throw new InterruptedCallError(spec.label);
-				if (this.policy !== "rerun") throw new Error(`${spec.label} was in flight when the process ended; resume with inFlight "rerun" or "fail"`);
-			}
-			return this.run(key, spec, live);
+		for (;;) {
+			if (this.matches(key)) return this.answer(key, spec, live, reattach);
+			if (this.tookOver || this.pending.length === 0) break;
+			await this.wait(key, spec.label);
 		}
-		if (this.pending.length > 0) await this.wait(key, spec.label);
-		return this.run(key, spec, live);
+		if (this.editing && !this.tookOver) this.takeover(key, spec.label);
+		return this.guard(this.run(key, spec, live));
 	}
 
-	private async run(key: string, spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
-		this.journal.append({ t: "start", key, kind: spec.kind, label: spec.label, at: Date.now(), ...(spec.idempotent ? { idempotent: true as const } : {}), ...(spec.model ? { model: spec.model } : {}) }, true);
-		const context: CallContext = {
-			key,
-			recorded: { ...this.metas.get(key) },
-			meta: (data) => {
-				this.metas.set(key, { ...this.metas.get(key), ...data });
-				this.journal.append({ t: "meta", key, at: Date.now(), data }, true);
-			},
-		};
+	/** Work not settled yet: this execution's (and adopted) and inherited work no call asked for. */
+	unsettled(): Map<string, Work> {
+		return new Map([...this.inherited, ...this.works]);
+	}
+
+	/** The script returned: recorded calls it never asked for are not used (edited code takes over for good). */
+	finish(): void {
+		if (this.pending.length === 0) return;
+		if (this.editing && !this.tookOver) this.takeover();
+		else this.unused.push(...this.pending.map((key) => this.folded.starts.get(key)!));
+	}
+
+	private matches(key: string): boolean {
+		if (this.tookOver || !this.pending.includes(key)) return false;
+		return !this.editing || this.folded.startAt.get(key)! < (this.pendingOutcomes[0] ?? Number.POSITIVE_INFINITY);
+	}
+
+	private consume(key: string): void {
+		this.pending.splice(this.pending.indexOf(key), 1);
+		const at = this.folded.outcomeAt.get(key);
+		if (at !== undefined) this.pendingOutcomes.splice(this.pendingOutcomes.indexOf(at), 1);
+	}
+
+	private async answer(key: string, spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>, reattach?: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
+		this.consume(key);
+		const outcome = this.folded.outcomes.get(key);
+		// A nested workflow answered from the journal makes none of its calls again.
+		if (outcome && spec.kind === "workflow") for (const nested of this.pending.filter((k) => k.startsWith(`${key}/`))) this.consume(nested);
+		this.notify();
+		if (outcome) {
+			this.replayedCalls++;
+			this.onReplayed(spec.kind, outcome.cost ?? 0);
+			if (outcome.t === "failed") throw reviveError(outcome.error);
+			return roundTrip(outcome.value);
+		}
+		// In flight when the run stopped.
+		const work = this.inherited.get(key);
+		if (work) {
+			this.inherited.delete(key);
+			return this.guard(this.adopt(key, spec, work, reattach ?? live));
+		}
+		if (spec.kind === "agent" && reattach) return this.guard(this.run(key, spec, reattach));
+		const start = this.folded.starts.get(key);
+		if ((spec.kind === "shell" || spec.kind === "tool") && !start?.idempotent && !spec.idempotent) {
+			if (this.policy === "fail") throw new InterruptedCallError(spec.label);
+			if (this.policy !== "rerun") throw new Error(`${spec.label} was in flight when the run stopped; resume with inFlight "rerun" or "fail"`);
+		}
+		return this.guard(this.run(key, spec, live));
+	}
+
+	/** Await work an earlier execution left running; without an outcome (it was interrupted meanwhile) reattach. */
+	private async adopt(key: string, spec: CallSpec, work: Work, reattach: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
+		this.works.set(key, work);
 		this.active++;
+		let settled: Settled;
 		try {
-			const result = spec.kind === "workflow" ? await this.scope.run(key, () => live(context)) : await live(context);
-			const value = roundTrip(result.value);
-			this.journal.append({ t: "done", key, at: Date.now(), ...(value === undefined ? {} : { value }), ...(result.cost ? { cost: result.cost } : {}) }, true);
-			return value;
-		} catch (error) {
-			if (this.stopped()) throw error;
-			const cost = (error as { cost?: unknown } | null)?.cost;
-			this.journal.append({ t: "failed", key, at: Date.now(), error: serializeError(error), ...(typeof cost === "number" && cost > 0 ? { cost } : {}) }, true);
-			throw error;
+			settled = await work.settled;
 		} finally {
+			if (this.works.get(key) === work) this.works.delete(key);
 			this.active--;
 			this.scheduleCheck();
 		}
+		if (settled.outcome === "none") return this.run(key, spec, reattach);
+		this.replayedCalls++;
+		this.onReplayed(spec.kind, settled.cost);
+		if (settled.outcome === "failed") throw reviveError(settled.error);
+		return roundTrip(settled.value);
+	}
+
+	/** The script's side of a call: rejects as soon as the run stops, while the work may go on. */
+	private guard<T>(work: Promise<T>): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const stop = () => reject(this.signal.reason);
+			if (this.signal.aborted) stop();
+			else this.signal.addEventListener("abort", stop, { once: true });
+			work.then(
+				(value) => {
+					this.signal.removeEventListener("abort", stop);
+					resolve(value);
+				},
+				(error: unknown) => {
+					this.signal.removeEventListener("abort", stop);
+					reject(error);
+				},
+			);
+		});
+	}
+
+	private async run(key: string, spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
+		if (this.signal.aborted) throw this.signal.reason;
+		this.journal.append({ t: "start", key, kind: spec.kind, label: spec.label, at: Date.now(), ...(spec.idempotent ? { idempotent: true as const } : {}), ...(spec.model ? { model: spec.model } : {}) }, true);
+		const own = new AbortController();
+		const signal = AbortSignal.any([this.signalFor(spec.kind), own.signal]);
+		const context: CallContext = {
+			key,
+			recorded: { ...this.folded.metas.get(key) },
+			meta: (data) => {
+				this.folded.metas.set(key, { ...this.folded.metas.get(key), ...data });
+				this.journal.append({ t: "meta", key, at: Date.now(), data }, true);
+			},
+			signal,
+		};
+		let settle!: (settled: Settled) => void;
+		const work: Work = { kind: spec.kind, settled: new Promise((resolve) => (settle = resolve)), cancel: (reason) => own.abort(reason) };
+		this.works.set(key, work);
+		this.active++;
+		try {
+			const result = spec.kind === "workflow" ? await this.scope.run(key, () => live(context)) : await live(context);
+			// Cancelled after it finished (unused by edited code): its outcome is not recorded.
+			if (own.signal.aborted) throw own.signal.reason;
+			const value = roundTrip(result.value);
+			this.journal.append({ t: "done", key, at: Date.now(), ...(value === undefined ? {} : { value }), ...(result.cost ? { cost: result.cost } : {}) }, true);
+			settle({ outcome: "done", value, cost: result.cost ?? 0 });
+			return value;
+		} catch (error) {
+			if (signal.aborted) {
+				settle({ outcome: "none" });
+				throw error;
+			}
+			const cost = (error as { cost?: unknown } | null)?.cost;
+			const failed = serializeError(error);
+			this.journal.append({ t: "failed", key, at: Date.now(), error: failed, ...(typeof cost === "number" && cost > 0 ? { cost } : {}) }, true);
+			settle({ outcome: "failed", error: failed, cost: typeof cost === "number" ? cost : 0 });
+			throw error;
+		} finally {
+			if (this.works.get(key) === work) this.works.delete(key);
+			this.active--;
+			this.scheduleCheck();
+		}
+	}
+
+	/** Edited code takes over at `key` (or at its return): every recorded call not asked for yet is unused. */
+	private takeover(key?: string, label?: string): void {
+		this.tookOver = true;
+		const dropped = this.pending.splice(0);
+		this.pendingOutcomes = [];
+		this.unused.push(...dropped.map((k) => this.folded.starts.get(k)!));
+		this.journal.append({ t: "takeover", at: Date.now(), n: this.attempt, ...(key ? { key, label } : {}), replayed: this.replayedCalls, dropped, clocks: { ...this.counts } }, true);
+		const elsewhere: { start: Start; meta: Record<string, unknown> }[] = [];
+		for (const k of dropped) {
+			if (this.folded.outcomes.has(k)) continue;
+			const work = this.inherited.get(k);
+			if (work) {
+				this.inherited.delete(k);
+				work.cancel(new Error("the edited code does not use this call"));
+			} else if (this.folded.starts.get(k)!.kind === "agent") elsewhere.push({ start: this.folded.starts.get(k)!, meta: { ...this.folded.metas.get(k) } });
+		}
+		if (elsewhere.length) this.onDropped?.(elsewhere);
 	}
 
 	private wait(key: string, label: string): Promise<void> {
@@ -253,7 +459,8 @@ export class Durable {
 		});
 	}
 
-	private release(): void {
+	/** The recorded calls changed: waiting calls look again. */
+	private notify(): void {
 		for (const call of this.deferred.splice(0)) call.release();
 	}
 
@@ -264,10 +471,15 @@ export class Durable {
 		setImmediate(() => {
 			this.checkScheduled = false;
 			if (this.active > 0 || this.deferred.length === 0 || this.pending.length === 0) return;
-			const recorded = this.starts.get(this.pending[0]!)!;
 			const asked = this.deferred[0]!;
+			if (this.editing) {
+				this.takeover(asked.key, asked.label);
+				this.notify();
+				return;
+			}
+			const recorded = this.folded.starts.get(this.pending[0]!)!;
 			this.diverged = new DivergenceError(
-				`the script took another path than its journal: the journal has ${recorded.kind} call ${recorded.key} (${recorded.label}) next, the script asked for ${asked.key} (${asked.label}) instead. The resume stopped; nothing of the new path ran.`,
+				`the script took another path than its journal: the journal has ${recorded.kind} call ${recorded.key} (${recorded.label}) next, the script asked for ${asked.key} (${asked.label}) instead. The resume stopped; nothing of the new path ran. If you changed the script on purpose, resume with code.`,
 			);
 			for (const call of this.deferred.splice(0)) call.release(this.diverged);
 			this.onDiverged(this.diverged);

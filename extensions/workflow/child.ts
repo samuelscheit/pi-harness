@@ -19,6 +19,8 @@ import { TOOL_GUIDELINES_SECTION, toolGuidelinesSection } from "../prompt/index.
 import { type DelegationSpec, type DelegationState, parseMarker, readSpec, readState, SUBMIT_TOOL, writeState } from "./delegation.ts";
 
 export const REMINDER_TYPE = "delegation-result";
+/** A run's error when it was stopped (cancelled) before it finished. */
+export const RUN_STOPPED = "the run was stopped";
 /** Reminders to submit the result before a run without one fails. */
 export const MAX_REMINDERS = 2;
 
@@ -173,7 +175,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 		const last = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
 		const message = last?.type === "message" && last.message.role === "assistant" ? last.message : undefined;
 		let error = child.state.error;
-		if (!error && event.aborted) error = "the run was stopped";
+		if (!error && event.aborted) error = RUN_STOPPED;
 		else if (!error && message?.stopReason === "error") error = `the request failed: ${message.errorMessage ?? "unknown error"}`;
 		else if (!error && child.spec.schema && !child.state.submitted) error = `it finished without calling ${SUBMIT_TOOL} (reminded ${MAX_REMINDERS} times)`;
 		child.state = { ...child.state, done: true, text: message ? textOf(message.content) : "" };
