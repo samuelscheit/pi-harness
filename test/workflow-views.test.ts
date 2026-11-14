@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import background from "../extensions/background/index.ts";
 import workflow from "../extensions/workflow/index.ts";
 import { readJournal } from "../extensions/workflow/journal.ts";
+import { parse } from "yaml";
 import { renderWorkflow } from "../extensions/workflow/render.ts";
 
 let faux: ReturnType<typeof registerFauxProvider>;
@@ -161,6 +162,21 @@ describe("the run's page in the thread", () => {
 		assert.match(told.at(-1)!, new RegExp(`^Run ${id} is completed\\. Live view: http://dash/workflows/${id}\\. Page: .*page\\.html\\.\\nShown in the thread\\.$`));
 		assert.equal(renders().length, 3);
 		assert.equal(renders()[2]!.args.html, renderWorkflow(journal));
+	});
+
+	test("status: the run and its phase tree as data (YAML), at once", async () => {
+		model("plan.expect(['one', 'two']);\nawait phase('one', () => shell('echo hi'));\nreturn 'finished';");
+		const session = await newSession();
+		await session.prompt("go");
+		await until("the result", () => readdirSync(join(dir, "agent", "workflows")).some((id) => readFileSync(join(dir, "agent", "workflows", id, "journal.jsonl"), "utf8").includes('"t":"end"')));
+		const id = readdirSync(join(dir, "agent", "workflows"))[0]!;
+		const told: string[] = [];
+		faux.setResponses([call("workflow", { status: id }), (context: Context) => (told.push(textOf(context.messages.findLast((m) => m.role !== "system")!.content)), say("ok"))]);
+		await session.prompt("status?");
+		const data = parse(told[0]!) as { run: string; status: string; phases: { phase: string; status: string }[] };
+		assert.equal(data.run, id);
+		assert.equal(data.status, "completed");
+		assert.deepEqual(data.phases.map((p) => [p.phase, p.status]), [["one", "done"], ["two", "expected"]]);
 	});
 
 	test("a call whose context went stale (a harness reload) is interrupted, and its result asks the agent to show the page", async () => {

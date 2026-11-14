@@ -80,7 +80,8 @@ interface DelegateRun {
 }
 
 interface Delegate {
-	run(message: string): Promise<DelegateRun>;
+	/** Inside a phase the message starts with a short header (phase path, plan) unless `header: false`. */
+	run(message: string, options?: { header?: boolean }): Promise<DelegateRun>;
 	compact(instructions?: string): Promise<void>;
 	warm(duration: string): Promise<void>;
 	steer(text: string): Promise<void>;
@@ -90,6 +91,16 @@ interface Delegate {
 	readonly cost: number;
 	readonly threadId: string | undefined;
 }
+
+/**
+ * Run `fn` as a named phase: nestable and repeatable (iterations are numbered: "review · round 2").
+ * The run's page and `workflow { status }` show the phase tree with time and cost. Over its
+ * `budget` (USD) the phase throws PhaseBudgetExceeded, which you can catch; its calls are aborted.
+ */
+declare function phase<T>(name: string, fn: () => Promise<T>, options?: { budget?: number }): Promise<T>;
+
+/** The phases expected next in the current scope, shown as expected until they start; change it any time. Display only. */
+declare const plan: { expect(names: string[]): void };
 
 type Thinking = "off" | "minimal" | "low" | "medium" | "high";
 

@@ -76,6 +76,8 @@ export interface DelegateOptions {
 }
 
 export interface DelegateEnv {
+	/** The current phase's header for a run's message (phases.ts), or undefined outside phases. */
+	header?: () => string | undefined;
 	/** Ask whoever runs the workflow (its session's ask_user): where an in-process child's questions go up. */
 	askUp?: (questions: Question[], signal: AbortSignal) => Promise<(string | undefined)[] | undefined>;
 	cwd: string;
@@ -122,7 +124,7 @@ export interface DelegateRun {
 }
 
 export interface DelegateHandle {
-	run(message: string): Promise<DelegateRun>;
+	run(message: string, options?: { header?: boolean }): Promise<DelegateRun>;
 	compact(instructions?: string): Promise<void>;
 	warm(duration: string): Promise<void>;
 	steer(text: string): Promise<void>;
@@ -331,8 +333,11 @@ function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv,
 			env.progress(`${label} · t3 thread ${ids.link ?? ids.threadId}`);
 		}
 	};
-	// The prepared first message: the marker and summary, a blank line, then the script's message.
-	const titled = (message: string) => child(`workflow ${label}: ${headline(message.slice(message.indexOf("\n\n") + 2)).slice(0, 60)}`);
+	// The prepared first message: the marker and summary, a blank line, maybe the phase header, then the script's message.
+	const titled = (message: string) => {
+		const body = message.slice(message.indexOf("\n\n") + 2).replace(/^\[workflow phase: [^\n]*\]\n\n/, "");
+		return child(`workflow ${label}: ${headline(body).slice(0, 60)}`);
+	};
 	return {
 		run: (message, requestId, remember, signal) => titled(message).run(message, requestId, signal, started(titled(message).threadId, remember)),
 		// A run whose id the journal has is waited for; else t3 dedupes the repeated call on its request id.
@@ -462,7 +467,9 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	};
 
 	/** Run `n` live, or reattach to it when it was in flight when the run stopped. */
-	const execute = async (n: number, message: string, call: CallContext, reattach: boolean) => {
+	const execute = async (n: number, raw: string, head: string | undefined, call: CallContext, reattach: boolean) => {
+		// The phase header goes before the script's message (not into the call's key).
+		const message = head ? `${head}\n\n${raw}` : raw;
 		const { signal } = call;
 		if (n === 1) firstKey = call.key;
 		const recorded = call.recorded as RunMeta;
@@ -555,14 +562,14 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		return value;
 	};
 
-	const runOnce = async (message: string): Promise<DelegateRun> => {
+	const runOnce = async (message: string, head: string | undefined): Promise<DelegateRun> => {
 		usable();
 		const n = runs + 1;
 		const args = n === 1 ? { options, message, ...(fork ? { fork: fork.key } : {}) } : { delegate: firstKey, run: n, message };
 		const value = (await env.durable.call(
 			{ kind: "delegate", args, label: `${tag}${n > 1 ? ` run ${n}` : ""}: ${headline(message).slice(0, 100)}`, ...(env.t3 ? {} : { model: inProcessModel(options, env).model }) },
-			(call) => execute(n, message, call, false),
-			(call) => execute(n, message, call, true),
+			(call) => execute(n, message, head, call, false),
+			(call) => execute(n, message, head, call, true),
 		)) as { run: DelegateRun; handle: HandleState };
 		restore(value.handle);
 		return value.run;
@@ -580,9 +587,12 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	};
 
 	const handle: DelegateHandle = {
-		run: (message: unknown) => {
+		run: (message: unknown, runOptions?: unknown) => {
 			try {
-				return queued(() => runOnce(nonEmpty(message, "run(message)")));
+				const checked = nonEmpty(message, "run(message)");
+				// Read now: the phase the script calls run() in.
+				const head = (runOptions as { header?: unknown } | undefined)?.header === false ? undefined : env.header?.();
+				return queued(() => runOnce(checked, head));
 			} catch (error) {
 				return Promise.reject(error);
 			}

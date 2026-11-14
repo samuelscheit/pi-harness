@@ -28,6 +28,7 @@ import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
 import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { createDelegate } from "./delegate.ts";
+import { Phases } from "./phases.ts";
 import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
 import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, WorkflowStopped } from "./durable.ts";
 import { codeHash, currentSource, Journal, type JournalEntry, journalPath, newRunId, readJournal, RESUMABLE, type RunHeader, runDir, runState, SNAPSHOT_FILE } from "./journal.ts";
@@ -367,10 +368,12 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		if (lines.length > LOG_KEPT) lines.splice(0, lines.length - LOG_KEPT);
 		publish();
 	};
+	const phases = new Phases(journal, progress);
 	let usage: Usage | undefined;
 	let overBudget = false;
 	const spend = (usd: number) => {
 		details.cost += usd;
+		phases.spend(usd);
 		if (!overBudget && details.cost > budgetLimit) {
 			overBudget = true;
 			const exceeded = new BudgetExceeded(budgetLimit, details.cost);
@@ -387,7 +390,13 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		inFlight,
 		attempt,
 		signal,
-		signalFor: (kind) => (kind === "delegate" ? children.signal : signal),
+		// A phase over its budget aborts its calls too.
+		signalFor: (kind) => {
+			const base = kind === "delegate" ? children.signal : signal;
+			const phase = phases.signal();
+			return phase ? AbortSignal.any([base, phase]) : base;
+		},
+		phaseOf: () => phases.current(),
 		...(handed ? { inherited: handed.works } : {}),
 		replayed: (kind, cost) => {
 			if (kind === "llm") details.llmCalls++;
@@ -524,6 +533,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				agentDir: env.agentDir,
 				...(env.model ? { model: env.model } : {}),
 				...(executeTool ? { askUp: askUser } : {}),
+				header: () => phases.header(),
 				sessionDir: env.sessionDir,
 				parentSessionFile: env.parentSessionFile,
 				callerSessionId: env.sessionId,
@@ -540,6 +550,8 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				warn: (line) => details.warnings.push(line),
 				onDispose: (dispose) => disposers.push(dispose),
 			}),
+		phase: (name: unknown, fn: unknown, options: unknown) => phases.run(name, fn, options),
+		plan: Object.freeze({ expect: (names: unknown) => phases.expect(names) }),
 		map: mapItems,
 		sh,
 		log: (...values: unknown[]) => progress(values.map((v) => (typeof v === "string" ? v : show(v))).join(" ")),

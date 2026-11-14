@@ -56,7 +56,13 @@ export type JournalEntry =
 	 * had used (later ones are live).
 	 */
 	| { t: "takeover"; at: number; n: number; key?: string; label?: string; replayed: number; dropped: string[]; clocks: { now: number; random: number } }
-	| { t: "start"; key: string; kind: CallKind; label: string; at: number; idempotent?: true; model?: string }
+	/** `phase`: the id of the phase the call was made in (phases.ts). */
+	| { t: "start"; key: string; kind: CallKind; label: string; at: number; idempotent?: true; model?: string; phase?: string }
+	/** A phase entered (`n`: its iteration in its scope) or left; ids are paths like `build#1/review#2`. */
+	| { t: "phase"; ev: "enter"; id: string; name: string; n: number; at: number; parent?: string; budget?: number }
+	| { t: "phase"; ev: "exit"; id: string; at: number; status: "done" | "failed" | "over budget"; cost: number }
+	/** plan.expect(): the phases expected next in a scope (a phase's id, or the run's top level); display only. */
+	| { t: "plan"; at: number; phase?: string; expect: string[] }
 	| { t: "meta"; key: string; at: number; data: Record<string, unknown> }
 	/** `value` is absent when the call returned undefined. */
 	| { t: "done"; key: string; at: number; value?: unknown; cost?: number }

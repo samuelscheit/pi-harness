@@ -39,6 +39,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { argsHash, type CallKind, type Journal, type JournalEntry, reviveError, type SerializedError, serializeError } from "./journal.ts";
+import { recordable } from "./phases.ts";
 
 /** What a resume does with shell and tools.* calls that were in flight. */
 export type InFlightPolicy = "stop" | "rerun" | "fail";
@@ -201,6 +202,8 @@ export interface DurableOptions {
 	diverged: (error: DivergenceError) => void;
 	/** Edited code took over: recorded agent runs in flight it does not use, whose children are not run here (to cancel). */
 	dropped?: (calls: { start: Start; meta: Record<string, unknown> }[]) => void;
+	/** The phase the caller runs in (phases.ts), recorded with each call's start. */
+	phaseOf?: () => string | undefined;
 }
 
 export class Durable {
@@ -212,6 +215,7 @@ export class Durable {
 	private readonly onReplayed: DurableOptions["replayed"];
 	private readonly onDiverged: DurableOptions["diverged"];
 	private readonly onDropped: DurableOptions["dropped"];
+	private readonly phaseOf: DurableOptions["phaseOf"];
 	private readonly folded: Folded;
 	/** Matching leniently: edited code that has not taken over yet. */
 	readonly editing: boolean;
@@ -247,6 +251,7 @@ export class Durable {
 		this.onReplayed = options.replayed;
 		this.onDiverged = options.diverged;
 		this.onDropped = options.dropped;
+		this.phaseOf = options.phaseOf;
 		this.folded = foldJournal(options.entries);
 		this.editing = this.folded.editPending;
 		this.pending = [...this.folded.order];
@@ -392,7 +397,8 @@ export class Durable {
 
 	private async run(key: string, spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
 		if (this.signal.aborted) throw this.signal.reason;
-		this.journal.append({ t: "start", key, kind: spec.kind, label: spec.label, at: Date.now(), ...(spec.idempotent ? { idempotent: true as const } : {}), ...(spec.model ? { model: spec.model } : {}) }, true);
+		const phase = this.phaseOf?.();
+		this.journal.append({ t: "start", key, kind: spec.kind, label: spec.label, at: Date.now(), ...(spec.idempotent ? { idempotent: true as const } : {}), ...(spec.model ? { model: spec.model } : {}), ...(phase ? { phase } : {}) }, true);
 		const own = new AbortController();
 		const signal = AbortSignal.any([this.signalFor(spec.kind), own.signal]);
 		const context: CallContext = {
@@ -417,15 +423,17 @@ export class Durable {
 			settle({ outcome: "done", value, cost: result.cost ?? 0 });
 			return value;
 		} catch (error) {
-			if (signal.aborted) {
+			// Stopped by the run (a stop, an interruption): no outcome, a resume decides. A phase over its budget is the call's failure.
+			const reason: unknown = signal.aborted ? signal.reason : undefined;
+			if (signal.aborted && !recordable(reason)) {
 				settle({ outcome: "none" });
 				throw error;
 			}
 			const cost = (error as { cost?: unknown } | null)?.cost;
-			const failed = serializeError(error);
+			const failed = serializeError(signal.aborted ? reason : error);
 			this.journal.append({ t: "failed", key, at: Date.now(), error: failed, ...(typeof cost === "number" && cost > 0 ? { cost } : {}) }, true);
 			settle({ outcome: "failed", error: failed, cost: typeof cost === "number" ? cost : 0 });
-			throw error;
+			throw signal.aborted ? reason : error;
 		} finally {
 			if (this.works.get(key) === work) this.works.delete(key);
 			this.active--;

@@ -9,13 +9,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
-import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, JsonObject } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { compile, evaluate, inlineModule, scriptStack } from "../extensions/workflow/compile.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, metaProblem, type SavedWorkflow } from "../extensions/workflow/library.ts";
 
-import { INLINE_FILE, type RunEnv, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
+import { readJournal } from "../extensions/workflow/journal.ts";
+import { phaseStatus, renderWorkflow } from "../extensions/workflow/render.ts";
+import { INLINE_FILE, type RunEnv, resumeWorkflow, runWorkflow, type WorkflowDetails } from "../extensions/workflow/run.ts";
 import { priced } from "./priced.ts";
 
 let faux: ReturnType<typeof registerFauxProvider>;
@@ -394,6 +396,143 @@ describe("delegate()", () => {
 		const aborted = await run("await delegate({ target: { model: 'faux/faux-1' } }).run('wait');", 1, { signal: controller.signal });
 		assert.ok(Date.now() - started < 8000);
 		assert.equal(aborted.details.status, "aborted");
+	});
+});
+
+describe("phases", () => {
+	const answer = () => say("fine");
+	test("nested and repeated phases, a plan, cost and time per phase: the journal, the status data and the page", async () => {
+		respond(answer, answer, answer);
+		const code = [
+			"plan.expect(['build', 'review', 'deploy']);",
+			"await phase('build', async () => { await shell('echo built'); });",
+			"for (let round = 0; round < 2; round++) await phase('review', async () => { await phase('fix', () => llm(`fix ${round}`, { model: 'faux/faux-1' })); });",
+			"await phase('review', async () => llm('last look', { model: 'faux/faux-1' }));",
+			"plan.expect(['deploy', 'announce']);",
+			"return 'ok';",
+		].join("\n");
+		const { details } = await run(code, 1, { runtime: priced(runtime, 0.01) });
+		assert.equal(details.status, "completed", details.error);
+		const entries = readJournal(details.journal);
+		const phaseEntries = entries.flatMap((e) => (e.t === "phase" ? [`${e.ev} ${e.id}${e.ev === "exit" ? ` ${e.status} ${e.cost.toFixed(2)}` : ""}`] : []));
+		assert.deepEqual(phaseEntries, [
+			"enter build#1",
+			"exit build#1 done 0.00",
+			"enter review#1",
+			"enter review#1/fix#1",
+			"exit review#1/fix#1 done 0.01",
+			"exit review#1 done 0.01",
+			"enter review#2",
+			"enter review#2/fix#1",
+			"exit review#2/fix#1 done 0.01",
+			"exit review#2 done 0.01",
+			"enter review#3",
+			"exit review#3 done 0.01",
+		]);
+		const llmStarts = entries.flatMap((e) => (e.t === "start" && e.kind === "llm" ? [e.phase] : []));
+		assert.deepEqual(llmStarts, ["review#1/fix#1", "review#2/fix#1", "review#3"], "each call names its phase");
+		const status = phaseStatus(entries);
+		const shape = (nodes: Record<string, unknown>[]): unknown[] => nodes.map((n) => [n.phase, n.status, n.cost ?? null, ...(n.phases ? [shape(n.phases as Record<string, unknown>[])] : [])]);
+		assert.deepEqual(shape(status.phases), [
+			["build", "done", 0],
+			["review", "done", 0.01, [["fix", "done", 0.01]]],
+			["review · round 2", "done", 0.01, [["fix", "done", 0.01]]],
+			["review · round 3", "done", 0.01],
+			["deploy", "expected", null],
+			["announce", "expected", null],
+		]);
+		assert.equal(status.status, "completed");
+		assert.equal(status.cost, 0.03);
+		assert.ok(typeof (status.phases[0] as { seconds?: unknown }).seconds === "number");
+		const page = renderWorkflow(entries);
+		assert.match(page, /<div class="phases"><div class="phase ph-done" data-phase="build#1"><span class="name">build<\/span><span class="ps">done<\/span>/);
+		assert.match(page, /<span class="name">review · round 2<\/span><span class="ps">done<\/span><span class="pm">[^<]* · \$0\.01<\/span><\/div><div class="sub"><div class="phase ph-done" data-phase="review#2\/fix#1">/);
+		assert.match(page, /<div class="phase ph-expected" data-phase="deploy\?"><span class="name">deploy<\/span><span class="ps">expected<\/span><\/div>/);
+	});
+
+	test("a phase over its budget throws, its calls in flight are aborted and record the failure; the code can catch it, and a resume replays it", async () => {
+		respond(answer, answer, answer);
+		const code = [
+			"try {",
+			"  await phase('pricey', async () => {",
+			"    await llm('one', { model: 'faux/faux-1' });",
+			"    await Promise.all([llm('two', { model: 'faux/faux-1' }), shell('sleep 5; echo late > late.txt')]);",
+			"  }, { budget: 0.015 });",
+			"  return 'not thrown';",
+			"} catch (error) {",
+			"  return `${error.name}: ${error.message}`;",
+			"}",
+		].join("\n");
+		const started = Date.now();
+		const first = await run(code, 1, { runtime: priced(runtime, 0.01) });
+		assert.ok(Date.now() - started < 4000, "the sleep was cut off");
+		assert.equal(first.details.status, "completed", first.details.error);
+		assert.match(first.text.split("\n\n").at(-1)!, /^PhaseBudgetExceeded: phase pricey is over its budget of \$0\.01 \(\$0\.0200 spent\)$/);
+		const entries = readJournal(first.details.journal);
+		assert.ok(entries.some((e) => e.t === "phase" && e.ev === "exit" && e.status === "over budget"));
+		const shellKey = entries.find((e) => e.t === "start" && e.kind === "shell")!;
+		const shellEnd = entries.find((e) => (e.t === "failed" || e.t === "done") && e.t !== undefined && "key" in e && shellKey.t === "start" && e.key === shellKey.key);
+		assert.ok(shellEnd?.t === "failed" && shellEnd.error.name === "PhaseBudgetExceeded", "the aborted call records the failure");
+		assert.equal(existsSync(join(repo, "late.txt")), false);
+
+		const again = await resumeWorkflow({ id: first.details.id, code }, env({ runtime: priced(runtime, 0.01) }));
+		assert.equal(again.details.status, "completed", again.details.error);
+		assert.equal(again.text.split("\n\n").at(-1), first.text.split("\n\n").at(-1), "replayed: the same failure");
+		assert.equal(again.details.replayedCalls, 3);
+		assert.equal(again.details.llmCalls, 2, "nothing asked again");
+	});
+
+	test("a delegate's run inside a phase starts with the phase path and the plan, unless header: false; outside phases nothing", async () => {
+		const firsts: string[] = [];
+		const record = (context: Context) => {
+			const users = (context as { messages: { role: string; content: unknown }[] }).messages.filter((m) => m.role === "user");
+			firsts.push(JSON.stringify(users.at(-1)!.content));
+			return say("ok");
+		};
+		respond(record, record, record, record);
+		const code = [
+			"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
+			"await a.run('outside');",
+			"plan.expect(['build', 'review', 'deploy']);",
+			"await phase('build', async () => {});",
+			"await phase('review', async () => { await phase('fix', async () => { await a.run('inside'); await a.run('quiet', { header: false }); }); });",
+			"return 'ok';",
+		].join("\n");
+		const { details } = await run(code);
+		assert.equal(details.status, "completed", details.error);
+		assert.doesNotMatch(firsts[0]!, /workflow phase/);
+		assert.match(firsts[1]!, /\[workflow phase: review › fix\]\\n\\ninside/, "the plan of fix's own scope: none");
+		assert.doesNotMatch(firsts[2]!, /workflow phase/);
+		const journal = readJournal(details.journal);
+		assert.ok(journal.some((e) => e.t === "start" && e.kind === "delegate" && e.label === "#1 run 2: inside"), "the key and label keep the script's message");
+	});
+
+	test("the header shows the scope's plan with done, running and expected phases", async () => {
+		const firsts: string[] = [];
+		respond((context) => (firsts.push(seen(context)), say("ok")));
+		const code = [
+			"const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
+			"plan.expect(['build', 'review', 'deploy']);",
+			"await phase('build', async () => {});",
+			"await phase('review', () => a.run('look'));",
+			"return 'ok';",
+		].join("\n");
+		const { details } = await run(code);
+		assert.equal(details.status, "completed", details.error);
+		assert.match(firsts[0]!, /\[workflow phase: review \| plan: build ✓ · review \(running\) · deploy \(expected\)\]/);
+	});
+
+	test("invalid phase and plan arguments fail clearly", async () => {
+		for (const [code, error] of [
+			["await phase('', async () => {})", /name must be a non-empty string/],
+			["await phase('a/b', async () => {})", /without \/ or #/],
+			["await phase('x', 5)", /fn must be a function/],
+			["await phase('x', async () => {}, { budget: 0 })", /budget must be a positive number/],
+			["plan.expect('x')", /names must be an array/],
+		] as const) {
+			const { details } = await run(code);
+			assert.match(details.error!, error, code);
+		}
 	});
 });
 

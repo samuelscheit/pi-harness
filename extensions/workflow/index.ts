@@ -28,12 +28,15 @@ import { HARNESS_ROOT } from "../lib/repository.ts";
 import { delegatedChild } from "./child.ts";
 import { extendDelegateTool } from "./delegate-tool.ts";
 import { delegationsDir, sweepDelegations } from "./delegation.ts";
-import { sweepRuns } from "./journal.ts";
+
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
 import { INLINE_FILE, type ResumeRequest, type RunEnv, resumeWorkflow, runWorkflow, type ToolOutcome, type WorkflowDetails, type WorkflowResult } from "./run.ts";
 import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, offerInterrupted, recordRun, renderEnd, runHeadline, setLatestApi, showRun, startViews } from "./runs.ts";
 import { type SignatureTool, toolsDeclaration } from "./signatures.ts";
 import { stopRun } from "./stop.ts";
+import { phaseStatus } from "./render.ts";
+import { runState, sweepRuns } from "./journal.ts";
+import { stringify } from "yaml";
 
 export const WORKFLOW_TOOL = "workflow";
 
@@ -156,6 +159,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		promptSnippet: "Run a TypeScript workflow script: deterministic code with llm() and delegate() calls only where judgment is needed",
 		promptGuidelines: [
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",
+			'In a longer workflow, name its steps with phase() and what comes next with plan.expect(): the page shows the tree, and workflow { status: "<id>" } returns it as data.',
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
 			'A run that was interrupted or stopped continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
 			'Stop a running run with workflow { stop: "<id>" }: its agents keep running and their results are recorded; stopChildren: true cancels them. To change a run\'s script without losing its paid work, resume it with workflow { resume: "<id>", code: "<new code>" }: calls the new code makes as before come from the journal, from its first other call it runs live. Effects of the old code (commits, files) stay; the new code must cope with them.',
@@ -171,13 +175,15 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 				Type.Union([Type.Literal("rerun"), Type.Literal("fail")], { description: "With resume: what shell and tools calls that were in flight do: run again, or throw InterruptedCallError. Needed when the resume names such calls." }),
 			),
 			show: Type.Optional(Type.String({ description: "The id of a run: show its page (calls, status, cost) in the thread now." })),
+			status: Type.Optional(Type.String({ description: "The id of a run: its status and phase tree (done, running, expected; time and cost) as data." })),
 			stop: Type.Optional(Type.String({ description: "The id of a running run: stop it, keeping its journal for a resume." })),
 			stopChildren: Type.Optional(Type.Boolean({ description: "With stop: cancel its agents too (default: they keep running and their results are recorded)." })),
 		}),
 		execute: async (_id, params, signal, onUpdate, ctx) => {
-			const modes = [params.code !== undefined && params.resume === undefined, params.resume !== undefined, params.show !== undefined, params.stop !== undefined].filter(Boolean).length;
-			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume (optionally with code), show or stop");
+			const modes = [params.code !== undefined && params.resume === undefined, params.resume !== undefined, params.show !== undefined, params.stop !== undefined, params.status !== undefined].filter(Boolean).length;
+			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume (optionally with code), show, status or stop");
 			const answer = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+			if (params.status !== undefined) return answer(stringify(phaseStatus(runState(agentDir, params.status).entries), { lineWidth: 0 }).trimEnd());
 			if (params.show !== undefined) return answer(await showRun({ agentDir, id: params.show, toolNames: ctx.tools.map((t) => t.name), execute: executor(ctx), dashboardUrl }));
 			if (params.stop !== undefined) return answer(await stopRun(agentDir, params.stop, params.stopChildren === true));
 			if (params.resume !== undefined) {

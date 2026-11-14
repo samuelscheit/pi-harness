@@ -9,12 +9,15 @@
 // interrupted, stopped, unused by edited code), duration and cost; an agent node its model and t3
 // thread. The header has the total time, the cost against the budget, and open against done calls.
 // A run resumed with edited code shows "new code from here" where each version took over, and its
-// versions with their code.
+// versions with their code. Above the calls, the phase tree (phases.ts): done, running and expected
+// phases with their time and cost (their calls' and their sub-phases'), and their budget.
+// `phaseStatus` gives the same tree as data, for `workflow { status }`.
 //
 // Styling follows t3's html_render rules: only its theme variables, no page background, fluid
 // widths, no vh units.
 
 import { type CallKind, codeHash, type JournalEntry, type RunHeader } from "./journal.ts";
+import { phaseLabel } from "./phases.ts";
 
 export type CallStatus = "running" | "done" | "failed" | "replayed" | "interrupted" | "stopped" | "unused";
 
@@ -33,6 +36,24 @@ export interface CallView {
 	error?: string;
 	/** The code version whose live part made the call (1: the start's). */
 	version: number;
+	/** The id of the phase it was made in. */
+	phase?: string;
+}
+
+export type PhaseStatus = "running" | "done" | "failed" | "over budget" | "interrupted" | "stopped" | "expected";
+
+export interface PhaseView {
+	id: string;
+	name: string;
+	/** "review", "review · round 2". */
+	label: string;
+	status: PhaseStatus;
+	startAt?: number;
+	endAt?: number;
+	/** Its calls' cost, its sub-phases' included. */
+	cost: number;
+	budget?: number;
+	phases: PhaseView[];
 }
 
 /** One version of the run's code: the start's, then one per resume with code. */
@@ -53,6 +74,8 @@ export interface RunView {
 	attempts: number;
 	calls: CallView[];
 	versions: CodeVersion[];
+	/** The top-level phases, each with its sub-phases. */
+	phases: PhaseView[];
 	startAt: number;
 	/** The end, or the journal's last time while it runs. */
 	lastAt: number;
@@ -79,6 +102,8 @@ export function viewOf(entries: readonly JournalEntry[]): RunView {
 	/** Agent runs a stop left running: still running at the next attempt. */
 	let lingering = new Set<string>();
 	let lastAt = header.at;
+	const phases = new Map<string, PhaseView & { parent?: string }>();
+	const plans = new Map<string, { at: number; expect: string[] }>();
 	for (const entry of entries) {
 		if ("at" in entry) lastAt = Math.max(lastAt, entry.at);
 		switch (entry.t) {
@@ -116,6 +141,7 @@ export function viewOf(entries: readonly JournalEntry[]): RunView {
 					kind: entry.kind,
 					label: entry.label,
 					...(entry.model ? { model: entry.model } : {}),
+					...(entry.phase ? { phase: entry.phase } : {}),
 					status: "running",
 					startAt: entry.at,
 					cost: 0,
@@ -140,14 +166,29 @@ export function viewOf(entries: readonly JournalEntry[]): RunView {
 				if (entry.t === "failed") call.error = `${entry.error.name}: ${entry.error.message}`;
 				break;
 			}
+			case "phase": {
+				if (entry.ev === "enter") {
+					const known = phases.get(entry.id);
+					phases.set(entry.id, { id: entry.id, name: entry.name, label: phaseLabel(entry.name, entry.n), status: "running", startAt: known?.startAt ?? entry.at, cost: 0, ...(entry.budget !== undefined ? { budget: entry.budget } : {}), phases: [], ...(entry.parent ? { parent: entry.parent } : {}) });
+				} else {
+					const phase = phases.get(entry.id);
+					if (phase) Object.assign(phase, { status: entry.status, endAt: entry.at });
+				}
+				break;
+			}
+			case "plan":
+				plans.set(entry.phase ?? "", { at: entry.at, expect: entry.expect });
+				break;
 			case "end":
 				end = entry;
 				lingering = new Set(entry.lingering);
+				for (const phase of phases.values()) if (phase.status === "running") phase.status = entry.status === "stopped" ? "stopped" : entry.status === "completed" ? "done" : "interrupted";
 				for (const call of calls.values()) if (call.status === "running" && !lingering.has(call.key)) call.status = entry.status === "stopped" ? "stopped" : "interrupted";
 				break;
 		}
 	}
 	const list = order.map((key) => calls.get(key)!);
+	const tree = phaseTree(phases, plans, list, entries);
 	const open = list.filter((c) => c.status === "running" || c.status === "interrupted" || c.status === "stopped").length;
 	const unused = list.filter((c) => c.status === "unused").length;
 	return {
@@ -156,12 +197,57 @@ export function viewOf(entries: readonly JournalEntry[]): RunView {
 		attempts,
 		calls: list,
 		versions,
+		phases: tree,
 		startAt: header.at,
 		lastAt: end?.at ?? lastAt,
 		cost: list.reduce((sum, c) => sum + c.cost, 0),
 		open,
 		done: list.length - open - unused,
 		unused,
+	};
+}
+
+/** The phases as a tree, with their cost and the phases a plan expects that have not started since. */
+function phaseTree(phases: Map<string, PhaseView & { parent?: string }>, plans: Map<string, { at: number; expect: string[] }>, calls: readonly CallView[], entries: readonly JournalEntry[]): PhaseView[] {
+	const roots: PhaseView[] = [];
+	const enteredAt = new Map<string, number>();
+	for (const entry of entries) if (entry.t === "phase" && entry.ev === "enter") enteredAt.set(entry.id, entry.at);
+	for (const phase of phases.values()) {
+		phase.cost = calls.filter((call) => call.phase === phase.id || call.phase?.startsWith(`${phase.id}/`)).reduce((sum, call) => sum + call.cost, 0);
+		const parent = phase.parent ? phases.get(phase.parent) : undefined;
+		(parent?.phases ?? roots).push(phase);
+		delete phase.parent;
+	}
+	for (const [scope, plan] of plans) {
+		const list = scope ? phases.get(scope)?.phases : roots;
+		if (!list) continue;
+		for (const name of plan.expect) {
+			if (list.some((child) => child.name === name && (enteredAt.get(child.id) ?? 0) >= plan.at)) continue;
+			list.push({ id: `${scope ? `${scope}/` : ""}${name}?`, name, label: name, status: "expected", cost: 0, phases: [] });
+		}
+	}
+	return roots;
+}
+
+/** `workflow { status }`: the run and its phase tree as data. */
+export function phaseStatus(entries: readonly JournalEntry[]) {
+	const view = viewOf(entries);
+	const seconds = (from?: number, to?: number) => (from === undefined ? undefined : Math.round(((to ?? view.lastAt) - from) / 100) / 10);
+	const node = (phase: PhaseView): Record<string, unknown> => ({
+		phase: phase.label,
+		status: phase.status,
+		...(phase.status === "expected" ? {} : { seconds: seconds(phase.startAt, phase.endAt), cost: Number(phase.cost.toFixed(4)) }),
+		...(phase.budget !== undefined ? { budget: phase.budget } : {}),
+		...(phase.phases.length ? { phases: phase.phases.map(node) } : {}),
+	});
+	return {
+		run: view.header.id,
+		status: view.status,
+		seconds: seconds(view.startAt, view.lastAt),
+		cost: Number(view.cost.toFixed(4)),
+		budget: view.header.budget,
+		calls: { open: view.open, done: view.done },
+		phases: view.phases.map(node),
 	};
 }
 
@@ -240,6 +326,13 @@ const STYLE = `
 .wf .versions pre{font-family:var(--font-mono);font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px;margin:4px 0 8px}
 .wf code{font-family:var(--font-mono);font-size:11px}
 .wf .empty{font-size:12px;color:var(--muted-foreground)}
+.wf .phases{display:flex;flex-direction:column;gap:2px;font-size:12px}
+.wf .phases .sub{padding-left:16px;border-left:1px solid var(--border);margin-left:5px;display:flex;flex-direction:column;gap:2px}
+.wf .phase{display:flex;gap:10px;align-items:baseline}
+.wf .phase .name{font-weight:600}
+.wf .phase .pm{color:var(--muted-foreground)}
+.wf .ph-running .ps{color:var(--info)}.wf .ph-done .ps{color:var(--success)}.wf .ph-failed .ps,.wf .ph-over-budget .ps{color:var(--destructive)}
+.wf .ph-interrupted .ps,.wf .ph-stopped .ps{color:var(--warning)}.wf .ph-expected{opacity:.6}.wf .ph-expected .ps{color:var(--muted-foreground)}
 `.trim();
 
 function node(call: CallView, lastAt: number): string {
@@ -255,6 +348,16 @@ function node(call: CallView, lastAt: number): string {
 		call.error ? `<div class="error">${escape(clip(call.error, 300))}</div>` : "",
 		"</div>",
 	].join("");
+}
+
+/** One phase of the tree and its sub-phases. */
+function phaseRow(phase: PhaseView, lastAt: number): string {
+	const meta =
+		phase.status === "expected"
+			? ""
+			: [`${phase.endAt === undefined ? "for " : ""}${duration((phase.endAt ?? lastAt) - (phase.startAt ?? lastAt))}`, ...(phase.cost > 0 || phase.budget !== undefined ? [`${usd(phase.cost)}${phase.budget !== undefined ? ` of ${usd(phase.budget)}` : ""}`] : [])].join(" · ");
+	const row = `<div class="phase ph-${phase.status.replace(" ", "-")}" data-phase="${escape(phase.id)}"><span class="name">${escape(phase.label)}</span><span class="ps">${phase.status}</span>${meta ? `<span class="pm">${meta}</span>` : ""}</div>`;
+	return phase.phases.length ? `${row}<div class="sub">${phase.phases.map((sub) => phaseRow(sub, lastAt)).join("")}</div>` : row;
 }
 
 /** The body of the page: the header and the groups (no document around it). */
@@ -283,6 +386,7 @@ export function renderWorkflowBody(entries: readonly JournalEntry[]): string {
 	return [
 		`<div class="wf" data-run="${escape(view.header.id)}">`,
 		`<header><h1>${escape(name)} <span class="stat">${escape(view.header.id)}</span></h1>${stats.join("")}</header>`,
+		view.phases.length ? `<div class="phases">${view.phases.map((phase) => phaseRow(phase, view.lastAt)).join("")}</div>` : "",
 		`<div class="groups">${rows.join("") || '<div class="empty">No calls yet.</div>'}</div>`,
 		view.versions.length > 1 ? versionsSection(view.versions) : "",
 		"</div>",
@@ -313,5 +417,6 @@ export function pageHeight(entries: readonly JournalEntry[]): number {
 	const view = viewOf(entries);
 	const rows = layout(view.calls).reduce((sum, lanes) => sum + Math.max(...lanes.map((lane) => lane.length)), 0);
 	const markers = view.versions.filter((version) => version.takeover).length;
-	return Math.min(2000, Math.max(80, 60 + rows * 72 + markers * 28 + (view.versions.length > 1 ? 30 : 0)));
+	const count = (list: readonly PhaseView[]): number => list.reduce((sum, phase) => sum + 1 + count(phase.phases), 0);
+	return Math.min(2000, Math.max(80, 60 + rows * 72 + markers * 28 + (view.versions.length > 1 ? 30 : 0) + count(view.phases) * 20));
 }
