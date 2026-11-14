@@ -78,10 +78,19 @@ const killGroup = (pgid: number) => {
 
 const state = globalThis as { __harnessJobs?: Map<string, SessionJobs> };
 
+/**
+ * A session's jobs. The state outlives the extension instance that made it (a harness release
+ * reloads extensions while jobs run), so a field a newer release added is filled in on first use.
+ */
 export function sessionJobs(sessionId: string): SessionJobs {
 	const all = (state.__harnessJobs ??= new Map());
-	let jobs = all.get(sessionId);
-	if (!jobs) all.set(sessionId, (jobs = { calls: new Map(), foreground: new Map(), jobs: new Map(), leftovers: new Map(), poll: undefined, api: undefined }));
+	const fresh: SessionJobs = { calls: new Map(), foreground: new Map(), jobs: new Map(), leftovers: new Map(), poll: undefined, api: undefined };
+	const jobs = all.get(sessionId);
+	if (!jobs) {
+		all.set(sessionId, fresh);
+		return fresh;
+	}
+	for (const key of Object.keys(fresh) as (keyof SessionJobs)[]) if (!(key in jobs)) Object.assign(jobs, { [key]: fresh[key] });
 	return jobs;
 }
 

@@ -51,6 +51,21 @@ describe("record line and messages", () => {
 		assert.match(finishedText(job, { error: new Error("out\n\nCommand timed out after 90 seconds") }, 90_000), /failed after 1 min 30 s:\n\nout\n\nCommand timed out after 90 seconds$/);
 	});
 
+	test("session state made by an older release gets the fields a newer one added, and keeps its own", () => {
+		const all = ((globalThis as { __harnessJobs?: Map<string, unknown> }).__harnessJobs ??= new Map());
+		const jobs = new Map([["c1", { callId: "c1" }]]);
+		all.set("old-session", { topLevel: new Map(), foreground: new Map(), jobs, api: undefined });
+		try {
+			const state = sessionJobs("old-session");
+			assert.equal(state.jobs, jobs, "existing state stays");
+			assert.ok(state.calls instanceof Map && state.leftovers instanceof Map);
+			assert.ok("poll" in state);
+			assert.equal(sessionJobs("old-session").calls, state.calls, "filled in once");
+		} finally {
+			all.delete("old-session");
+		}
+	});
+
 	test("readGroup reads a positive integer, else nothing", () => {
 		const d = mkdtempSync(join(tmpdir(), "bg-group-"));
 		try {
