@@ -46,9 +46,10 @@ describe("messages and state", () => {
 		assert.match(byMessage, /^A new message arrived while it ran, so the call moved to the background and keeps running\. /);
 		assert.match(byMessage, /No output so far\.$/);
 		assert.equal(
-			detachedText(job(), "start", "ignored", 0),
+			detachedText(job(), "start", " \n", 0),
 			"`workflow` always runs in the background: the call started and keeps running. Its latest output is in /tmp/c1.log.\n\nWhen it ends, its result reaches you as a new message, also after your turn has ended: do not wait or poll for it. Do the work that does not depend on it, or end your turn.",
 		);
+		assert.match(detachedText(job(), "start", "Run 1 · live view http://x", 0), /end your turn\.\n\nRun 1 · live view http:\/\/x$/, "what the call reported at its start comes along");
 	});
 
 	test("a job's end names the call, how it ended and its result; images come along", () => {

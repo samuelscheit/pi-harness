@@ -15,7 +15,10 @@
 // child's run open.
 //
 // Some tools (`BACKGROUND_TOOLS`: `workflow`) run long as a rule and their caller rarely needs the
-// result before other work: a model's call of one moves to the background as soon as it starts.
+// result before other work: a model's call of one moves to the background at its first progress
+// update (which names what it started, e.g. a workflow's run and live view), at the latest after
+// START_GRACE_MS; one that ends sooner returns its result directly. `foregroundCall` names calls of
+// such a tool that answer at once (`workflow { show }`).
 // Their nested calls (a script's, or `tool workflow …` in bash) stay in the foreground of their
 // caller, which needs the result; `tool workflow … &` in bash makes one a job of its own.
 //
@@ -47,8 +50,22 @@ import {
 /** How long a call runs in the foreground before it moves to the background. */
 export const DETACH_AFTER_MS = 2 * 60_000;
 
+/** How long a call of a background tool may stay in the foreground at its start: until its first update, or it ends (a refusal answers at once). */
+export const START_GRACE_MS = 5_000;
+
 /** Tools whose calls the model makes run in the background from their start. */
 export const BACKGROUND_TOOLS: readonly string[] = ["workflow"];
+
+/** Calls of a background tool that answer at once and stay in the foreground: `workflow { show }` renders a page. */
+export const foregroundCall = (toolName: string, input: Record<string, unknown>) => toolName === "workflow" && input.show !== undefined;
+
+/** The reason background calls stop at the session's end; a workflow stopped by it can be resumed. */
+export class SessionEnded extends Error {
+	constructor() {
+		super("the session ended");
+		this.name = "SessionEnded";
+	}
+}
 
 export const BACKGROUND_GUIDELINE = (detachAfterMs: number) =>
 	`No tool call blocks you for more than ${detachAfterMs / 60_000} minutes: a call still running then, or when the user sends a message, moves to the background and keeps running, and its result reaches you as a new message when it ends, also after your turn. \`workflow\` always starts in the background. To start other work in the background at once: \`cmd > log 2>&1 &\` in bash, \`tool <name> … > out 2>&1 &\` in bash for any tool, or \`delegate_task\` in async mode. Never wait for background work with sleep or poll loops (\`until grep …; do sleep …; done\`): its end wakes you.`;
@@ -94,7 +111,7 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 		const jobs = sessionJobs(id);
 		jobs.api = undefined;
 		if (event.reason === "reload") return;
-		for (const job of jobs.jobs.values()) job.controller.abort(new Error("the session ended"));
+		for (const job of jobs.jobs.values()) job.controller.abort(new SessionEnded());
 		for (const pid of jobs.leftovers.keys()) killProcess(pid);
 		clearInterval(jobs.poll);
 		dropSession(id);
@@ -121,16 +138,17 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 
 		const startedAt = Date.now();
 		const output = new OutputLog();
-		// In the foreground, updates reach the tool's display; in the background, the log.
-		const update: AgentToolUpdateCallback = (partial) => {
-			if (!output.update(partial)) execution.onUpdate(partial);
-		};
-
 		let detach!: (reason: DetachReason) => void;
 		const detached = new Promise<DetachReason>((resolve) => (detach = resolve));
 		jobs.foreground.set(callId, detach);
-		const timer = backgroundTools.has(toolName) ? undefined : setTimeout(() => detach("time"), detachAfterMs);
-		if (timer === undefined) detach("start");
+		// A background tool's call moves at its first update (which names what it started), at the latest after START_GRACE_MS.
+		const atStart = backgroundTools.has(toolName) && !foregroundCall(toolName, input);
+		const timer = atStart ? setTimeout(() => detach("start"), START_GRACE_MS) : setTimeout(() => detach("time"), detachAfterMs);
+		// In the foreground, updates reach the tool's display; in the background, the log.
+		const update: AgentToolUpdateCallback = (partial) => {
+			if (!output.update(partial)) execution.onUpdate(partial);
+			if (atStart) detach("start");
+		};
 		const run: Promise<Outcome> = execution.execute(controller.signal, update).then(
 			(result) => ({ result }),
 			(error: unknown) => ({ error }),
