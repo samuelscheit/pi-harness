@@ -13,18 +13,21 @@
 // built-in call keeps running (its own `timeout` still applies) and, when it ends, its normal
 // result reaches the session as a message that starts a run if the session is idle: the agent is
 // woken, also after its turn ended. While jobs run, the session reports background work
-// (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated child's run open. A
-// command that detaches a job itself would lose that report: it is refused (detach.ts).
+// (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated child's run open. Processes
+// a call leaves running when it ends (`cmd &`) are tracked the same way (leftovers.ts).
 //
 // Jobs live in process state, not in the extension instance: a harness release reloads the
 // extensions while jobs run, and the job's end must reach the reloaded instance's API.
 
-import { writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
+import { promisify } from "node:util";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { type BashToolDetails, createBashToolDefinition, type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { TOOL_GUIDELINE, withToolBridge } from "./bridge.ts";
-import { detaches, refusal, systemGuideline } from "./detach.ts";
+import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
+import { adopt, endedText, type Leftovers, leftText, PS_ARGS, parsePs, sweep } from "./leftovers.ts";
 
 type BashResult = AgentToolResult<BashToolDetails | undefined>;
 
@@ -32,6 +35,8 @@ export const JOB_MESSAGE_TYPE = "background-job";
 export const BACKGROUND_WORK_KEY = "bash-jobs";
 /** How long a command runs in the foreground before it moves to the background. */
 export const DETACH_AFTER_MS = 2 * 60_000;
+/** How often leftover processes are checked for their end. */
+const POLL_MS = 1000;
 /** Lines of output so far shown when a command moves to the background; the log has the rest. */
 const TAIL_LINES = 20;
 /** Least time between two writes of a job's log. */
@@ -49,12 +54,16 @@ export interface Job {
 }
 
 interface SessionJobs {
-	/** Calls the model made (no parent tool call): only those may move to the background. Their command as the model wrote it, by id. */
-	topLevel: Map<string, string>;
+	/** Every bash call not yet ended: its command as written, and whether the model made it (no parent tool call; only those may move to the background). */
+	calls: Map<string, { command: string; topLevel: boolean }>;
 	/** Foreground calls that can still move to the background, by call id. */
 	foreground: Map<string, (reason: DetachReason) => void>;
 	/** Calls running in the background. */
 	jobs: Map<string, Job>;
+	/** Processes ended calls left running (leftovers.ts). */
+	leftovers: Leftovers;
+	/** The check for the leftovers' end, while there are any. */
+	poll: NodeJS.Timeout | undefined;
 	/** The API of the extension instance loaded last: the one a job's end reports through (none during a reload). */
 	api: ExtensionAPI | undefined;
 }
@@ -72,9 +81,17 @@ const state = globalThis as { __harnessJobs?: Map<string, SessionJobs> };
 export function sessionJobs(sessionId: string): SessionJobs {
 	const all = (state.__harnessJobs ??= new Map());
 	let jobs = all.get(sessionId);
-	if (!jobs) all.set(sessionId, (jobs = { topLevel: new Map(), foreground: new Map(), jobs: new Map(), api: undefined }));
+	if (!jobs) all.set(sessionId, (jobs = { calls: new Map(), foreground: new Map(), jobs: new Map(), leftovers: new Map(), poll: undefined, api: undefined }));
 	return jobs;
 }
+
+const killProcess = (pid: number) => {
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch {
+		// Already gone.
+	}
+};
 
 const textOf = (result: Pick<AgentToolResult<unknown>, "content"> | undefined) =>
 	(result?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
@@ -127,7 +144,14 @@ export interface DetachOptions {
 	/** Directory for job logs. */
 	logDir: (sessionId: string) => string;
 	readGroup: (file: string) => number | undefined;
+	/** `ps` with {@link PS_ARGS}. */
+	ps?: () => Promise<string>;
+	/** How often leftovers are checked. */
+	pollMs?: number;
 }
+
+const execFileAsync = promisify(execFile);
+const defaultPs = async () => (await execFileAsync("ps", PS_ARGS, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).stdout;
 
 /** A call's latest output; once opened, written to its log at most every `LOG_EVERY_MS`. */
 class OutputLog {
@@ -163,16 +187,92 @@ class OutputLog {
 	}
 }
 
-/** Report the session's job count to the host (Pi without `setBackgroundWork` predates it: skipped). */
+/**
+ * Report the session's background work (jobs and leftovers) to the host (Pi without
+ * `setBackgroundWork` predates it: skipped). Never throws: it also runs outside any call, where a
+ * throw would be an unhandled rejection in Pi's process (the API is stale once the session ended).
+ */
 function reportWork(jobs: SessionJobs): void {
 	const api = jobs.api as (ExtensionAPI & { setBackgroundWork?: (key: string, pending: number) => void }) | undefined;
-	if (typeof api?.setBackgroundWork === "function") api.setBackgroundWork(BACKGROUND_WORK_KEY, jobs.jobs.size);
+	try {
+		if (typeof api?.setBackgroundWork === "function") api.setBackgroundWork(BACKGROUND_WORK_KEY, jobs.jobs.size + jobs.leftovers.size);
+	} catch (error) {
+		console.error("[background] cannot report background work:", error);
+	}
+}
+
+/** One check of the session's leftovers: each one that ended wakes the session with its own message. */
+async function checkLeftovers(jobs: SessionJobs, ps: () => Promise<string>): Promise<void> {
+	const ended = sweep(jobs.leftovers, parsePs(await ps()), Date.now());
+	if (ended.length === 0) return;
+	if (jobs.leftovers.size === 0) {
+		clearInterval(jobs.poll);
+		jobs.poll = undefined;
+	}
+	reportWork(jobs);
+	for (const { ended: leftover, orphans } of ended) wake(jobs, endedText(leftover, orphans, Date.now()), `the end of pid ${leftover.pid}`);
+}
+
+/** Adopt what a call left running in group `pgid`, and check the session's leftovers while there are any. */
+async function adoptLeftovers(jobs: SessionJobs, pgid: number, command: string, ps: () => Promise<string>, pollMs: number) {
+	const adopted = adopt(jobs.leftovers, parsePs(await ps()), pgid, command, Date.now());
+	if (adopted.length === 0) return adopted;
+	if (jobs.poll === undefined) {
+		let busy = false;
+		jobs.poll = setInterval(() => {
+			if (busy) return;
+			busy = true;
+			checkLeftovers(jobs, ps)
+				.catch((error: unknown) => console.error("[background] cannot check leftover processes:", error))
+				.finally(() => (busy = false));
+		}, pollMs);
+		jobs.poll.unref?.();
+	}
+	reportWork(jobs);
+	return adopted;
+}
+
+/** Send `content` to the session as a message that wakes it. Never throws: it runs outside any call. */
+function wake(jobs: SessionJobs, content: string | (ImageContent | { type: "text"; text: string })[], what: string): void {
+	try {
+		jobs.api?.sendMessage({ customType: JOB_MESSAGE_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "steer" });
+	} catch (error) {
+		console.error(`[background] cannot report ${what}:`, error);
+	}
 }
 
 /** Register the detachable bash tool and its handlers. */
 export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 	const detachAfterMs = options.detachAfterMs ?? DETACH_AFTER_MS;
+	const ps = options.ps ?? defaultPs;
+	const pollMs = options.pollMs ?? POLL_MS;
 	const builtin = withToolBridge(createBashToolDefinition(process.cwd()));
+
+	/** The call has ended: adopt what it left running in its process group (and forget the group file). */
+	const leave = async (sessionId: string, callId: string, command: string) => {
+		const file = options.groupFileOf(sessionId, callId);
+		const pgid = options.readGroup(file);
+		rmSync(file, { force: true });
+		return pgid === undefined ? [] : adoptLeftovers(sessionJobs(sessionId), pgid, command, ps, pollMs);
+	};
+
+	/** Run the built-in call and adopt what it left; the result (or error) names the leftovers. */
+	const runCall = async (callId: string, params: Parameters<typeof builtin.execute>[1], signal: AbortSignal | undefined, update: AgentToolUpdateCallback<BashToolDetails | undefined> | undefined, ctx: Parameters<typeof builtin.execute>[4], command: string): Promise<BashResult> => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		let outcome: { result: BashResult } | { error: unknown };
+		try {
+			outcome = { result: await builtin.execute(callId, params, signal, update, ctx) };
+		} catch (error) {
+			outcome = { error };
+		}
+		const left = await leave(sessionId, callId, command).catch(() => []);
+		const note = left.length ? leftText(left) : undefined;
+		if ("error" in outcome) {
+			if (!note) throw outcome.error;
+			throw new Error(`${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}\n\n${note}`);
+		}
+		return note ? { ...outcome.result, content: [...outcome.result.content, { type: "text", text: `\n\n${note}` }] } : outcome.result;
+	};
 
 	pi.on("session_start", (_event, ctx) => {
 		const jobs = sessionJobs(ctx.sessionManager.getSessionId());
@@ -180,13 +280,13 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 		reportWork(jobs);
 	});
 
-	// Registered before the guard's handler, so the command is still the one the model wrote. A
-	// command that detaches a job is refused here (detach.ts); Pi then runs no later handler.
+	// Registered before index.ts's handler, so the command is still the one the model wrote. A
+	// command using `setsid` is refused here (detach.ts); Pi then runs no later handler.
 	pi.on("tool_call", (event, ctx) => {
 		if (!isToolCallEventType("bash", event)) return;
-		const detached = detaches(event.input.command);
-		if (detached.length > 0) return { block: true, reason: refusal(detached, detachAfterMs) };
-		if (event.parentToolCallId === undefined) sessionJobs(ctx.sessionManager.getSessionId()).topLevel.set(event.toolCallId, event.input.command);
+		const setsid = setsidCommands(event.input.command);
+		if (setsid.length > 0) return { block: true, reason: refusal(setsid) };
+		sessionJobs(ctx.sessionManager.getSessionId()).calls.set(event.toolCallId, { command: event.input.command, topLevel: event.parentToolCallId === undefined });
 	});
 
 	// A reload: this instance goes stale, so jobs report through the reloaded one (its
@@ -197,6 +297,8 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 		jobs.api = undefined;
 		if (event.reason === "reload") return;
 		for (const job of jobs.jobs.values()) if (job.pgid !== undefined) killGroup(job.pgid);
+		for (const pid of jobs.leftovers.keys()) killProcess(pid);
+		clearInterval(jobs.poll);
 		state.__harnessJobs?.delete(id);
 	});
 
@@ -213,14 +315,17 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 			...(builtin.promptGuidelines ?? []),
 			systemGuideline(),
 			TOOL_GUIDELINE,
-			`A command still running after ${detachAfterMs / 60_000} minutes, or when the user sends a message, moves to the background and keeps running; its result reaches you as a new message when it ends, also after your turn. So run long builds, tests and servers in the foreground, with no sleep or poll loops waiting for them: a command that detaches a job (\`&\` without \`wait\`, nohup, setsid, disown) is refused.`,
+			`A command still running after ${detachAfterMs / 60_000} minutes, or when the user sends a message, moves to the background and keeps running; its result reaches you as a new message when it ends, also after your turn. So run long builds and tests in the foreground, with no sleep or poll loops waiting for them.`,
+			"Jobs a command starts with `&` (a server for a test, parallel jobs) may keep running after it: the tool tracks each one and its end reaches you as a new message. Redirect their output to a file (`./server > server.log 2>&1 &`): output to the tool's pipe is lost once the command returns. `setsid` is refused.",
 		],
 		async execute(callId, params, signal, onUpdate, ctx): Promise<BashResult> {
 			const sessionId = ctx.sessionManager.getSessionId();
 			const jobs = sessionJobs(sessionId);
-			const command = jobs.topLevel.get(callId);
-			if (command === undefined) return builtin.execute(callId, params, signal, onUpdate, ctx);
-			jobs.topLevel.delete(callId);
+			const call = jobs.calls.get(callId);
+			jobs.calls.delete(callId);
+			if (call === undefined) return builtin.execute(callId, params, signal, onUpdate, ctx);
+			const { command } = call;
+			if (!call.topLevel) return runCall(callId, params, signal, onUpdate, ctx, command);
 
 			// The built-in call gets its own signal: an abort reaches it only while it is in the foreground.
 			const controller = new AbortController();
@@ -239,7 +344,7 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 			const detached = new Promise<DetachReason>((resolve) => (detach = resolve));
 			jobs.foreground.set(callId, detach);
 			const timer = setTimeout(() => detach("time"), detachAfterMs);
-			const run = builtin.execute(callId, params, controller.signal, update, ctx).then(
+			const run = runCall(callId, params, controller.signal, update, ctx, command).then(
 				(result) => ({ result }) as const,
 				(error: unknown) => ({ error }) as const,
 			);
@@ -270,17 +375,11 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 				if ("result" in outcome) output.update(outcome.result);
 				output.write();
 				if (!jobs.jobs.delete(callId)) return;
-				// Outside any call: a throw here would be an unhandled rejection in Pi's process.
-				try {
-					reportWork(jobs);
-					const text = finishedText(job, outcome, Date.now());
-					// Images its `tool` calls returned (bridge.ts) come with the text.
-					const images = "result" in outcome ? outcome.result.content.filter((c): c is ImageContent => c.type === "image") : [];
-					const content = images.length ? [{ type: "text" as const, text }, ...images] : text;
-					jobs.api?.sendMessage({ customType: JOB_MESSAGE_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "steer" });
-				} catch (error) {
-					console.error(`[background] cannot report the end of ${callId}:`, error);
-				}
+				reportWork(jobs);
+				const text = finishedText(job, outcome, Date.now());
+				// Images its `tool` calls returned (bridge.ts) come with the text.
+				const images = "result" in outcome ? outcome.result.content.filter((c): c is ImageContent => c.type === "image") : [];
+				wake(jobs, images.length ? [{ type: "text" as const, text }, ...images] : text, `the end of ${callId}`);
 			});
 			return { content: [{ type: "text", text }], details: output.latest?.details };
 		},

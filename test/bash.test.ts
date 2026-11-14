@@ -1,6 +1,7 @@
-// The background-work guard and the detachable bash (extensions/bash): parsing and messages,
-// then real Pi sessions (faux model, real bash) where the agent ends a run with a background job
-// still running, and where a long command moves to the background and its end wakes the session.
+// The harness's bash (extensions/bash): the record line and messages, then real Pi sessions (faux
+// model, real bash) where commands leave processes running and each one's end wakes the session,
+// where `setsid` is refused, and where a long command moves to the background and its end wakes
+// the session.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -12,38 +13,10 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, getApiProvider, registerApiProvider, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import background, { backgroundMessage, MESSAGE_TYPE, processesInGroups, readGroup, recordLine, scanGroups } from "../extensions/bash/index.ts";
+import background, { readGroup, recordLine } from "../extensions/bash/index.ts";
 import { detachedText, finishedText, JOB_MESSAGE_TYPE, sessionJobs } from "../extensions/bash/jobs.ts";
 
-const PS = [
-	"  101   101 Ss       01:00 /bin/bash -c sleep 300 &",
-	"  102   101 S        00:59 sleep 300",
-	"  103   101 Z        00:59 (defunct)",
-	"  201   200 S     1-02:03:04 node server.js --port 3000",
-	"  301   300 R        00:01 ps -A",
-	"garbage line",
-].join("\n");
-
-describe("parsing and messages", () => {
-	test("processesInGroups keeps live processes of the given groups only", () => {
-		assert.deepEqual(processesInGroups(PS, new Set([101, 200])), [
-			{ pid: 101, pgid: 101, elapsed: "01:00", command: "/bin/bash -c sleep 300 &" },
-			{ pid: 102, pgid: 101, elapsed: "00:59", command: "sleep 300" },
-			{ pid: 201, pgid: 200, elapsed: "1-02:03:04", command: "node server.js --port 3000" },
-		]);
-		assert.deepEqual(processesInGroups(PS, new Set([999])), []);
-	});
-
-	test("the message groups processes by the bash command that started them", () => {
-		const text = backgroundMessage(processesInGroups(PS, new Set([101, 200])), (pgid) => (pgid === 101 ? "sleep 300 &\n  echo started" : undefined));
-		assert.match(text, /^Your run is about to end/);
-		assert.match(text, /- from your bash command `sleep 300 & echo started`:\n {2}- pid 101, running 01:00: `\/bin\/bash -c sleep 300 &`\n {2}- pid 102, running 00:59: `sleep 300`\n- process group 200:\n {2}- pid 201, running 1-02:03:04: `node server\.js --port 3000`/);
-		assert.match(text, /wait for them with a bash command/);
-		assert.match(text, /moves to the background, and its end wakes you/);
-		const long = backgroundMessage([{ pid: 1, pgid: 1, elapsed: "00:01", command: "x".repeat(400) }], () => undefined);
-		assert.match(long, /`x{159}…`/);
-	});
-
+describe("record line and messages", () => {
 	test("the record line writes the shell's pid, also into a path with quotes", () => {
 		const dir = mkdtempSync(join(tmpdir(), "bg-line-"));
 		try {
@@ -91,22 +64,15 @@ describe("parsing and messages", () => {
 		}
 	});
 
-	test("scanGroups drops files of finished groups and unreadable ones", () => {
-		const dir = mkdtempSync(join(tmpdir(), "bg-scan-"));
-		try {
-			writeFileSync(join(dir, "call-live"), "101");
-			writeFileSync(join(dir, "call-done"), "500");
-			writeFileSync(join(dir, "call-bad"), "");
-			const { running, fileOf } = scanGroups(dir, () => PS);
-			assert.deepEqual(running.map((p) => p.pid), [101, 102]);
-			assert.equal(fileOf.get(101), "call-live");
-			assert.deepEqual(readdirSync(dir), ["call-live"]);
-			assert.deepEqual(scanGroups(join(dir, "missing"), () => assert.fail("no ps without groups")), { running: [], fileOf: new Map() });
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
 });
+
+const kill = (pid: number) => {
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		// Already gone.
+	}
+};
 
 let faux: ReturnType<typeof registerFauxProvider>;
 let runtime: ModelRuntime;
@@ -131,12 +97,13 @@ beforeEach(() => {
 });
 afterEach(() => {
 	assert.deepEqual(extensionErrors.splice(0), [], "no extension errors");
-	for (const session of open.splice(0)) session.dispose();
-	// Stop whatever a test left running: every group the guard recorded (session dirs may be gone).
-	const groups = join(dir, "groups");
-	const ps = () => execFileSync("ps", ["-A", "-o", "pid=,pgid=,stat=,etime=,command="], { encoding: "utf8" });
-	for (const session of existsSync(groups) ? readdirSync(groups) : []) {
-		for (const pgid of new Set(scanGroups(join(groups, session), ps).running.map((p) => p.pgid))) process.kill(-pgid, "SIGKILL");
+	// Stop whatever a test left running: its jobs' groups and its leftovers.
+	for (const session of open.splice(0)) {
+		const jobs = sessionJobs(session.sessionManager.getSessionId());
+		for (const pgid of [...jobs.jobs.values()].flatMap((j) => (j.pgid === undefined ? [] : [-j.pgid]))) kill(pgid);
+		for (const pid of jobs.leftovers.keys()) kill(pid);
+		clearInterval(jobs.poll);
+		session.dispose();
 	}
 	rmSync(dir, { recursive: true, force: true });
 });
@@ -168,7 +135,7 @@ async function newSession(detachAfterMs = DETACH_MS): Promise<AgentSession> {
 		noExtensions: true,
 		noSkills: true,
 		noContextFiles: true,
-		extensionFactories: [(pi: ExtensionAPI) => background(pi, { dir: join(dir, "groups"), detachAfterMs }), nestedBash],
+		extensionFactories: [(pi: ExtensionAPI) => background(pi, { dir: join(dir, "groups"), detachAfterMs, pollMs: 100 }), nestedBash],
 	});
 	await resourceLoader.reload();
 	const { session } = await createAgentSession({
@@ -189,88 +156,133 @@ async function newSession(detachAfterMs = DETACH_MS): Promise<AgentSession> {
 
 const bash = (command: string, timeout?: number) => fauxAssistantMessage([fauxToolCall("bash", timeout === undefined ? { command } : { command, timeout })], { stopReason: "toolUse" });
 const respond = (...steps: FauxResponseStep[]) => faux.setResponses(steps);
-const guardMessages = (s: AgentSession) => s.messages.filter((m) => m.role === "custom" && m.customType === MESSAGE_TYPE);
 const marker = () => join(dir, `marker-${Math.random().toString(36).slice(2)}`);
-/** A script that leaves `body` running in the background: a command may not detach a job itself, a program it runs can. */
-const script = (body: string) => {
-	const file = `${marker()}.sh`;
-	writeFileSync(file, `${body} > /dev/null 2>&1 &\n`);
-	return `bash '${file}'`;
-};
+const leftoversOf = (s: AgentSession) => sessionJobs(s.sessionManager.getSessionId()).leftovers;
+const groupFiles = () => (existsSync(join(dir, "groups")) ? readdirSync(join(dir, "groups")).flatMap((d) => readdirSync(join(dir, "groups", d))) : []);
 
-describe("in a Pi session", () => {
-	test("a run ending with a background job gets one more turn naming it; the agent's wait ends it", async () => {
+describe("processes a command leaves running", () => {
+	test("each is named in the result, and each one's end wakes the session with its own message", async () => {
 		const s = await newSession();
-		const done = marker();
-		let seen = "";
+		const work = workEvents(s);
 		respond(
-			bash(`${script(`(sleep 0.3; touch '${done}')`)}\necho started`),
-			fauxAssistantMessage("Started it; I'll report when it finishes."),
-			(context) => {
-				seen = JSON.stringify(context.messages.at(-1));
-				return bash(`for i in $(seq 50); do [ -e '${done}' ] && break; sleep 0.1; done; ls '${done}'`);
-			},
-			fauxAssistantMessage("It finished."),
+			bash("sleep 0.4 > /dev/null 2>&1 &\nsleep 1.4 > /dev/null 2>&1 &\necho started"),
+			fauxAssistantMessage("Both run."),
+			fauxAssistantMessage("The first ended."),
+			fauxAssistantMessage("The second ended."),
 		);
-		await s.prompt("run it");
-		assert.equal(guardMessages(s).length, 1);
-		assert.match(seen, /still running in the background/);
-		assert.match(seen, /from your bash command `bash '.*\.sh' echo started`/, "names the command as the agent wrote it");
-		assert.ok(existsSync(done));
+		await s.prompt("start them");
+		assert.match(toolTexts(s)[0]!, /^started\n\n\nStill running in the background, left by this command \(2 processes\):\n- pid \d+: `sleep 0\.4`\n- pid \d+: `sleep 1\.4`\nEach one's end reaches you/);
+		assert.equal(leftoversOf(s).size, 2);
+		assert.deepEqual(groupFiles(), [], "the call's group file is gone once its leftovers are adopted");
 		const call = s.messages.find((m) => m.role === "assistant" && m.content.some((c) => c.type === "toolCall"));
 		assert.doesNotMatch(JSON.stringify(call), /printf/, "the transcript keeps the original command");
-		assert.equal(s.messages.at(-1)?.role, "assistant");
+
+		await until("both end messages", () => jobMessages(s).length === 2 && settled(s, "The second ended.")());
+		const [first, second] = jobMessages(s);
+		assert.match(first!, /^Background process pid \d+ `sleep 0\.4` ended \(running at least \d s since your command `sleep 0\.4 > \/dev\/null 2>&1 & sleep 1\.4 > \/dev\/null 2>&1 & echo started` returned\)\. Its exit code is not known/);
+		assert.match(second!, /^Background process pid \d+ `sleep 1\.4` ended/);
+		assert.equal(leftoversOf(s).size, 0);
+		assert.equal(sessionJobs(s.sessionManager.getSessionId()).poll, undefined, "the check stops with the last leftover");
+		assert.deepEqual(work, [2, 1, 0]);
 	});
 
-	test("the same processes are reported once: the agent may end its turn on purpose", async () => {
+	test("a job that leaves a child when it ends: the child is tracked, and its end is reported too", async () => {
 		const s = await newSession();
-		respond(bash(script("sleep 30")), fauxAssistantMessage("Started."), fauxAssistantMessage("The server keeps running, as you asked."));
-		await s.prompt("start the server");
-		assert.equal(guardMessages(s).length, 1);
-		respond(fauxAssistantMessage("Still running."));
-		await s.prompt("ok");
-		assert.equal(guardMessages(s).length, 1, "no second report for the same process");
-	});
-
-	test("a command without background jobs, and a finished job, change nothing", async () => {
-		const s = await newSession();
-		respond(bash("echo hi; (sleep 0.1) & wait"), fauxAssistantMessage("Done."));
+		respond(bash("bash -c 'sleep 0.3; sleep 0.8 > /dev/null 2>&1 & exit 0' > /dev/null 2>&1 &"), fauxAssistantMessage("Started."), fauxAssistantMessage("Parent ended."), fauxAssistantMessage("Child ended."));
 		await s.prompt("go");
-		assert.equal(guardMessages(s).length, 0);
-		assert.deepEqual(readdirSync(readdirSync(join(dir, "groups")).map((d) => join(dir, "groups", d))[0]!), [], "finished groups are forgotten");
+		assert.match(toolTexts(s)[0]!, /\(1 process\):\n- pid \d+: `bash -c sleep 0\.3; sleep 0\.8 > \/dev\/null 2>&1 & exit 0`/);
+		await until("both end messages", () => jobMessages(s).length === 2 && settled(s, "Child ended.")());
+		const [parent, child] = jobMessages(s);
+		assert.match(parent!, /`bash -c sleep 0\.3; .*` ended .*\nIt left running, now tracked as well:\n- pid \d+: `sleep 0\.8`$/);
+		assert.match(child!, /^Background process pid \d+ `sleep 0\.8` ended/);
 	});
 
-	test("a command that detaches a job is refused before it runs, also from a script; the refusal says to run it in the foreground", async () => {
+	test("one entry per job: a subshell and its children are one process; a failing command names its leftovers too", async () => {
+		const s = await newSession();
+		const done = marker();
+		respond(bash(`(sleep 0.2; touch '${done}') > /dev/null 2>&1 &\nexit 3`), fauxAssistantMessage("Noted."), fauxAssistantMessage("Ended."));
+		await s.prompt("go");
+		const [result] = s.messages.filter((m) => m.role === "toolResult");
+		assert.equal(result!.isError, true);
+		assert.match(textOf(result!.content), /exited with code 3[\s\S]*\(1 process\):\n- pid \d+: /);
+		await until("the end message", () => jobMessages(s).length === 1 && settled(s, "Ended.")());
+		assert.ok(existsSync(done));
+	});
+
+	test("jobs the command waits for or stops leave nothing", async () => {
+		const s = await newSession();
+		respond(bash("sleep 0.2 & sleep 0.1 & wait; echo waited; sleep 30 & pid=$!; kill $pid; echo stopped"), fauxAssistantMessage("Done."));
+		await s.prompt("go");
+		assert.equal(toolTexts(s)[0], "waited\nstopped\n");
+		assert.equal(leftoversOf(s).size, 0);
+		assert.deepEqual(groupFiles(), []);
+	});
+
+	test("a script's command (ctx.executeTool) names its leftovers in its result, and their end wakes the session", async () => {
+		const s = await newSession();
+		respond(fauxAssistantMessage([fauxToolCall("script", { command: "sleep 0.3 > /dev/null 2>&1 & echo nested" })], { stopReason: "toolUse" }), fauxAssistantMessage("ok"), fauxAssistantMessage("Ended."));
+		await s.prompt("go");
+		assert.match(toolTexts(s)[0]!, /^nested\n\n\nStill running in the background, left by this command \(1 process\):\n- pid \d+: `sleep 0\.3`/);
+		await until("the end message", () => jobMessages(s).length === 1 && settled(s, "Ended.")());
+	});
+
+	test("a job that moved to the background names what it left in its report", async () => {
+		const s = await newSession();
+		respond(bash("sleep 2 > /dev/null 2>&1 & sleep 1; echo done"), fauxAssistantMessage("In the background."), fauxAssistantMessage("Job ended."), fauxAssistantMessage("Leftover ended."));
+		await s.prompt("go");
+		await until("both reports", () => jobMessages(s).length === 2 && settled(s, "Leftover ended.")());
+		const [job, leftover] = jobMessages(s);
+		assert.match(job!, /^Your background command .* finished after \d s:\n\ndone\n\n\nStill running in the background, left by this command \(1 process\):\n- pid \d+: `sleep 2`/);
+		assert.match(leftover!, /`sleep 2` ended/);
+	});
+
+	test("leftovers survive a reload and still report; the session's end stops them", async () => {
+		const s = await newSession();
+		respond(bash("sleep 0.8 > /dev/null 2>&1 & sleep 30 > /dev/null 2>&1 &"), fauxAssistantMessage("Started."), fauxAssistantMessage("Short one ended."));
+		await s.prompt("go");
+		const pids = [...leftoversOf(s).keys()];
+		assert.equal(pids.length, 2);
+		const provider = getApiProvider(faux.api);
+		await s.reload();
+		if (!getApiProvider(faux.api)) registerApiProvider(provider as never);
+		await until("the short one's report", () => jobMessages(s).length === 1 && settled(s, "Short one ended.")());
+		const [long] = [...leftoversOf(s).keys()];
+		assert.ok(long !== undefined && pids.includes(long));
+		await s.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		await until("the long one stopped", () => {
+			try {
+				process.kill(long!, 0);
+				return false;
+			} catch {
+				return true;
+			}
+		}, 3000);
+	});
+});
+
+describe("setsid", () => {
+	test("is refused before the command runs, also from a script; nohup and & run", async () => {
 		const s = await newSession();
 		const ran = marker();
 		const nested = marker();
+		const allowed = marker();
 		respond(
 			bash(`touch '${ran}'; setsid nohup bash -c 'sleep 30' > /dev/null 2>&1 &`),
-			fauxAssistantMessage([fauxToolCall("script", { command: `touch '${nested}'; sleep 30 &` })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("script", { command: `touch '${nested}'; setsid sleep 30` })], { stopReason: "toolUse" }),
+			bash(`nohup touch '${allowed}' > /dev/null 2>&1 & wait`),
 			fauxAssistantMessage("ok"),
 		);
 		await s.prompt("embed everything");
 		assert.ok(!existsSync(ran), "the refused command did not run");
 		assert.ok(!existsSync(nested), "the refused nested command did not run");
+		assert.ok(existsSync(allowed), "nohup and & run");
 		const results = s.messages.filter((m) => m.role === "toolResult");
-		assert.equal(results.length, 2);
 		assert.ok(results[0]?.isError, "the refusal is an error result");
-		const [top, fromScript] = results.map((m) => m.content.map((c) => (c.type === "text" ? c.text : "")).join(""));
-		assert.match(top!, /Not run: this command detaches a job/);
-		assert.match(top!, /`setsid nohup bash -c 'sleep 30' > \/dev\/null 2>&1`: `setsid` (does not exist on macOS|moves it out)/);
-		assert.match(top!, /Run it in the foreground instead/);
-		assert.match(fromScript!, /`sleep 30 &`: runs in the background/);
-		assert.equal(guardMessages(s).length, 0, "nothing was left running");
-		assert.equal(sessionJobs(s.sessionManager.getSessionId()).topLevel.size, 0, "a refused call leaves no state");
-	});
-
-	test("background jobs the command waits for or stops run", async () => {
-		const s = await newSession();
-		respond(bash("sleep 0.2 & sleep 0.1 & wait; echo waited; sleep 30 & pid=$!; kill $pid; echo stopped"), fauxAssistantMessage("Done."));
-		await s.prompt("go");
-		const result = s.messages.find((m) => m.role === "toolResult");
-		assert.match(JSON.stringify(result), /waited\\nstopped/);
-		assert.equal(guardMessages(s).length, 0);
+		const [top, fromScript] = results.map((m) => textOf(m.content));
+		assert.match(top!, /^Not run: this command uses `setsid`:\n- `setsid nohup bash -c 'sleep 30' > \/dev\/null 2>&1`\n/);
+		assert.match(top!, /Start the job with `&` instead/);
+		assert.match(fromScript!, /Not run: this command uses `setsid`:\n- `setsid sleep 30`/);
+		assert.equal(sessionJobs(s.sessionManager.getSessionId()).calls.size, 0, "a refused call leaves no state");
 	});
 });
 
@@ -324,7 +336,7 @@ describe("long commands move to the background", () => {
 		assert.match(detachedSeen, /It still ran after \d s, so it moved to the background/);
 		assert.match(detachedSeen, /process group \d+; stop it with `kill -- -\d+`/);
 		assert.match(detachedSeen, /Output so far:\\nfirst/);
-		assert.equal(guardMessages(s).length, 0, "the guard leaves tracked jobs alone");
+
 		const [job] = [...jobsOf(s).values()];
 		assert.ok(job?.pgid !== undefined && alive(job.pgid), "the run ended before the command");
 		assert.match(readFileSync(job.log, "utf8"), /first/);

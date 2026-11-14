@@ -14,15 +14,15 @@ While jobs run, the session reports background work (`pi.setBackgroundWork`), so
 
 Why: agents sat 37 and 40 minutes in a single build command, and the user's messages could not reach them.
 
-### Detaching is refused
+### Processes a command leaves running are tracked
 
-[`detach.ts`](../extensions/bash/detach.ts) parses each command with a Bash parser and refuses one that detaches a job: a statement ending in `&` that nothing waits for or stops, `setsid` or `disown`, also inside `bash -c '…'` and behind `nohup`, `env` or `sudo`. Such a job would lose the wake-up message. Detaching is never needed, because long commands move to the background on their own.
+[`index.ts`](../extensions/bash/index.ts) records each command's process group. When a call ends, [`leftovers.ts`](../extensions/bash/leftovers.ts) lists the live processes of that group whose parent is gone: the jobs the command left running (`./server > server.log 2>&1 &`, parallel jobs, a script's daemon). Each one is adopted, named in the call's result with its pid, and counted as background work. A check every second notices when each one ends and sends its own message that wakes the session, also after the turn. If it left children running in turn, they are adopted then. Leftovers stop when the session ends, not on a harness reload.
 
-### Background-process guard
+A plain `&` job is not the tool's child, so its exit code is unknown: the message says that it ended, and its output is wherever the command redirected it. Output a job writes to the tool's own pipe after the command returned is lost, so the tool guideline says to redirect it to a file.
 
-[`index.ts`](../extensions/bash/index.ts) records each command's process group. When a run is about to end while processes from those groups are still alive, it names them and asks for one more turn: wait for them, stop them, or say why they keep running. Each set of processes is reported once, so the agent can still end the turn deliberately. A process that leaves its group (`setsid`, a daemonizing server) is not seen.
+[`detach.ts`](../extensions/bash/detach.ts) refuses only `setsid` (parsed with a Bash parser, also behind `nohup`, `env` or `sudo` and inside `bash -c '…'`): it moves a job into its own process group, out of tracking, and on macOS it does not exist, so the job never starts.
 
-Why: the most repeated correction in the author's sessions was an agent ending its turn "waiting" on a background job that nothing would ever report (22 sessions over 10 days). Instructions alone did not stop it.
+Why: the most repeated correction in the author's sessions was an agent ending its turn "waiting" on a background job that nothing would ever report (22 sessions over 10 days). Instructions alone did not stop it, and refusing `&` (briefly, on 2026-11-14) made ordinary shell scripting impossible.
 
 ### `tool` inside bash
 

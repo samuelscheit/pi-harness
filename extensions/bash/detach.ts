@@ -1,36 +1,22 @@
-// Detached jobs: a bash command that starts a job and leaves it running is refused before it runs.
+// `setsid` is refused before a bash command runs.
 //
-// Child agents on macOS detached long jobs with Linux-only `setsid` (2026-11-13: `setsid nohup bash
-// -c '… embed …' > embed.log &` → "setsid: command not found"); the job never started and the agent
-// noticed three minutes later. Detaching is never needed: the bash tool moves a command that runs
-// long to the background itself (jobs.ts) and reports its end as a new message, which a job the
-// command detached loses.
+// Jobs a command leaves running (`cmd &`, `nohup cmd &`, `disown`) stay in the command's process
+// group, so the bash tool tracks each one and reports its end (leftovers.ts). `setsid` moves a job
+// into a new session and process group, out of that tracking; on macOS it does not even exist, so
+// the job never starts (2026-11-13: `setsid nohup bash -c '… embed …' > embed.log &` → "setsid:
+// command not found", noticed three minutes later).
 //
-// The command is parsed with unbash (a Bash 5.3 parser; pi-lens installs it), so `&&`, `2>&1`,
-// `&>`, `>&2`, `|&`, quoted text and heredoc bodies never count as backgrounding. A command detaches
-// a job when it
-// - ends a statement with `&` (`cmd &`, `( … ) &`, also inside `$( … )`, functions, loops), unless a
-//   later command waits for it or stops it (`wait`, `kill`, `pkill`, `killall`) or a `trap` does,
-// - runs `setsid` or `disown`,
-// also inside a literal `bash -c '…'` script, and behind wrappers such as `nohup`, `env` or `sudo`.
+// The command is parsed with unbash (a Bash 5.3 parser; pi-lens installs it), so `setsid` in quoted
+// text or a heredoc body does not count, while `setsid` behind wrappers (`nohup`, `env`, `sudo`) and
+// inside a literal `bash -c '…'` script does.
 
 import { type Command, forEachChild, parse, type SyntaxNode } from "../../vendor/pi-lens/node_modules/unbash/dist/parser.js";
-
-export type DetachKind = "background" | "setsid" | "disown";
-
-export interface Detach {
-	kind: DetachKind;
-	/** The statement (`background`) or command that detaches, as written. */
-	text: string;
-}
 
 /** Commands that run their arguments as a command. */
 const WRAPPERS = new Set(["builtin", "caffeinate", "command", "env", "exec", "gtimeout", "nice", "nohup", "stdbuf", "sudo", "time", "timeout"]);
 /** Words a wrapper takes before the command: options, `env` assignments and durations or priorities. */
 const WRAPPER_ARGUMENT = /^(?:-.*|[A-Za-z_][A-Za-z0-9_]*=.*|\d+(?:\.\d+)?[smhd]?)$/;
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
-/** Commands after which a background job no longer outlives the command. */
-const REAPERS = new Set(["wait", "kill", "pkill", "killall"]);
 
 /** The commands a simple command runs: its name, then the command each wrapper runs, with their arguments. */
 function commandsOf(command: Command): { name: string; args: string[] }[] {
@@ -54,29 +40,20 @@ function shellScript(name: string, args: readonly string[]): string | undefined 
 	return flag < 0 ? undefined : args[flag + 1];
 }
 
-/** What in `source` detaches a job, in source order. */
-export function detaches(source: string): Detach[] {
-	const background: { text: string; end: number }[] = [];
-	const found: Detach[] = [];
-	const reapers: number[] = [];
-	let trapped = false;
+/** The commands in `source` that run `setsid`, as written, in source order. */
+export function setsidCommands(source: string): string[] {
+	const found: string[] = [];
 	const visit = (node: SyntaxNode) => {
-		if (node.type === "Statement" && node.background) background.push({ text: source.slice(node.pos, node.end), end: node.end });
 		if (node.type === "Command") {
 			for (const { name, args } of commandsOf(node)) {
-				if (name === "setsid" || name === "disown") found.push({ kind: name, text: source.slice(node.pos, node.end) });
-				if (REAPERS.has(name)) reapers.push(node.pos);
-				if (name === "trap") trapped = true;
+				if (name === "setsid") found.push(source.slice(node.pos, node.end));
 				const script = shellScript(name, args);
-				if (script !== undefined) found.push(...detaches(script));
+				if (script !== undefined) found.push(...setsidCommands(script));
 			}
 		}
 		forEachChild(node, visit);
 	};
 	visit(parse(source));
-	if (!trapped) {
-		for (const job of background) if (!reapers.some((pos) => pos > job.end)) found.push({ kind: "background", text: job.text });
-	}
 	return found;
 }
 
@@ -85,20 +62,15 @@ const clip = (text: string, max: number) => {
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 };
 
-const REASONS: Record<DetachKind, (platform: NodeJS.Platform) => string> = {
-	background: () => "runs in the background (`&`), and nothing in the command waits for it (`wait`) or stops it (`kill`)",
-	setsid: (platform) => (platform === "darwin" ? "`setsid` does not exist on macOS (command not found), so the job would never start" : "`setsid` moves it out of the tool's process group"),
-	disown: () => "`disown` detaches it from the shell",
-};
-
-/** The tool result of a refused command: what detaches, and to run it in the foreground. */
-export function refusal(found: readonly Detach[], detachAfterMs: number, platform: NodeJS.Platform = process.platform): string {
-	const lines = [...new Map(found.map((d) => [`${d.kind}\0${d.text}`, d])).values()].map((d) => `- \`${clip(d.text, 120)}\`: ${REASONS[d.kind](platform)}`);
+/** The tool result of a refused command: why, and how to start the job instead. */
+export function refusal(commands: readonly string[], platform: NodeJS.Platform = process.platform): string {
 	return [
-		"Not run: this command detaches a job, so its result would reach no one.",
-		...lines,
-		`Run it in the foreground instead: the same command without setsid, nohup, disown and the trailing \`&\` (a redirect to a log and \`< /dev/null\` may stay). The bash tool backgrounds long commands itself: if the command still runs after ${detachAfterMs / 60_000} minutes, or when the user sends a message, the tool returns at once with the output so far, the process group and a log of the latest output, and the command keeps running, its shell included. It keeps running after your turn ends; when it ends, its exit code and output arrive as a new message, which starts a new turn if you are idle. It is stopped (SIGTERM to its process group) only when the session ends (quit, new session, resume, fork), not when the harness reloads; a \`timeout\` you give the call still applies. To run several jobs in parallel in one command, end it with \`wait\`.`,
-		...(platform === "darwin" && !found.some((d) => d.kind === "setsid") ? ["On macOS `setsid` does not exist."] : []),
+		"Not run: this command uses `setsid`:",
+		...[...new Set(commands)].map((c) => `- \`${clip(c, 120)}\``),
+		platform === "darwin"
+			? "`setsid` does not exist on macOS, so the job would never start."
+			: "`setsid` moves the job out of the command's process group, where the bash tool cannot track it.",
+		"Start the job with `&` instead (`nohup` is not needed), its output redirected to a file, e.g. `./job > job.log 2>&1 &`. The bash tool tracks every process a command leaves running and wakes you with a message when each one ends, also after your turn.",
 	].join("\n");
 }
 
