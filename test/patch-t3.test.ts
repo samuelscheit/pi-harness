@@ -104,7 +104,7 @@ describe("asar rewrite", () => {
 
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
-	const ALL = ["cache-warming", "dialogs", "background-work", "questions", "session-questions"];
+	const ALL = ["cache-warming", "dialogs", "background-work", "questions", "questions-capability", "session-questions"];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
 		const { text, applied } = patchBundle(bundle);
@@ -120,6 +120,7 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('method !== "editor" && method !== "questions") {'), "a questions dialog is still ignored");
 		assert.ok(text.includes('"dismiss",\n\t\t\t\t\t"questions"\n\t\t\t\t].includes'), "a questions dialog waits for a turn owner");
 		assert.ok(text.includes('questions: method === "questions" ? piQuestions(nativeRequestId, event)'));
+		assert.ok(text.includes('\t\t\t...environment,\n\t\t\tPI_RPC_DIALOGS: "questions",\n'), "Pi learns that t3 renders questions dialogs");
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -127,7 +128,7 @@ describe("patchBundle", () => {
 		const once = patchBundle(bundle, [cacheWarming]);
 		assert.deepEqual(once.applied, ["cache-warming"]);
 		const { text, applied } = patchBundle(once.text);
-		assert.deepEqual(applied, ["dialogs", "background-work", "questions", "session-questions"]);
+		assert.deepEqual(applied, ["dialogs", "background-work", "questions", "questions-capability", "session-questions"]);
 		assert.equal(text, patchBundle(bundle).text);
 	});
 
@@ -250,7 +251,7 @@ describe("keeping t3 patched", () => {
 			mkdirSync(dirname(archive), { recursive: true });
 			writeArchive(archive, { "apps/server/dist/runtime.mjs": bundle, "apps/server/dist/other.mjs": "export {};\n" });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /^patched apps\/server\/dist\/runtime\.mjs \(cache-warming, dialogs, background-work, questions, session-questions;/);
+			assert.match(await keepPatched(app), /^patched apps\/server\/dist\/runtime\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, session-questions;/);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			const patched = readFile(archive, "apps/server/dist/runtime.mjs").toString();
 			assert.equal(patched, patchBundle(bundle).text);

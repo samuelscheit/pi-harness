@@ -28,6 +28,12 @@
 //   dialogs carried one question each, so an `ask_user` call with four questions became four cards
 //   shown one after another. Pi (vendor/pi) now has a `questions` dialog (`ctx.ui.questions`): one
 //   card holding every question, each with its options or free text, answered as `values` in order.
+// - questions-capability (same branch, "feat(provider-pi): tell Pi which dialogs t3 renders"): t3
+//   starts Pi with `PI_RPC_DIALOGS=questions`. Pi (vendor/pi) sends a questions dialog only to a
+//   client that declares it, and otherwise one select or input per question. A t3 still running
+//   code from before its `questions` patch (patches take effect on restart) dropped the unknown
+//   dialog silently, so `ask_user` reported its questions shown while no card appeared
+//   (2026-11-14, three reports).
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -147,6 +153,11 @@ export const PATCHES: Patch[] = [
 				].join("\n"),
 			],
 		],
+	},
+	{
+		name: "questions-capability",
+		marker: "PI_RPC_DIALOGS",
+		edits: [["\treturn {\n\t\targs,\n\t\tenv: {\n\t\t\t...environment,\n", '\treturn {\n\t\targs,\n\t\tenv: {\n\t\t\t...environment,\n\t\t\tPI_RPC_DIALOGS: "questions",\n']],
 	},
 	{
 		name: "session-questions",

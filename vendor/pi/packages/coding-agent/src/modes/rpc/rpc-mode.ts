@@ -135,26 +135,57 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	}
 
 	/**
+	 * Dialog methods the client renders beyond select, confirm, input and editor, which every client
+	 * does. It declares them in `PI_RPC_DIALOGS` (comma-separated) when it starts Pi. A client that
+	 * does not know a method drops its request, so the dialog would wait for an answer that never
+	 * comes: a `questions` dialog then goes out as one select (with options) or input per question.
+	 * Removed from the environment once read: it describes this client, not the clients of processes
+	 * Pi starts.
+	 */
+	const clientDialogs = new Set(
+		(process.env.PI_RPC_DIALOGS ?? "")
+			.split(",")
+			.map((method) => method.trim())
+			.filter(Boolean),
+	);
+	delete process.env.PI_RPC_DIALOGS;
+
+	const select: ExtensionUIContext["select"] = (title, options, opts) =>
+		createDialogPromise(opts, undefined, { method: "select", title, options, timeout: opts?.timeout }, (r) =>
+			"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
+		);
+
+	const input: ExtensionUIContext["input"] = (title, placeholder, opts) =>
+		createDialogPromise(opts, undefined, { method: "input", title, placeholder, timeout: opts?.timeout }, (r) =>
+			"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
+		);
+
+	/**
 	 * Create an extension UI context that uses the RPC protocol.
 	 */
 	const createExtensionUIContext = (): ExtensionUIContext => ({
-		select: (title, options, opts) =>
-			createDialogPromise(opts, undefined, { method: "select", title, options, timeout: opts?.timeout }, (r) =>
-				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
-			),
+		select,
 
 		confirm: (title, message, opts) =>
 			createDialogPromise(opts, false, { method: "confirm", title, message, timeout: opts?.timeout }, (r) =>
 				"cancelled" in r && r.cancelled ? false : "confirmed" in r ? r.confirmed : false,
 			),
 
-		input: (title, placeholder, opts) =>
-			createDialogPromise(opts, undefined, { method: "input", title, placeholder, timeout: opts?.timeout }, (r) =>
-				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
-			),
+		input,
 
-		questions: (questions, opts) =>
-			createDialogPromise<(string | undefined)[] | undefined>(
+		questions: async (questions, opts) => {
+			if (!clientDialogs.has("questions")) {
+				// One dialog per question, in order; cancelling one cancels the rest, like the whole dialog.
+				const values: string[] = [];
+				for (const [i, { title, options }] of questions.entries()) {
+					const shown = questions.length > 1 ? `(${i + 1}/${questions.length}) ${title}` : title;
+					const value = options ? await select(shown, options, opts) : await input(shown, undefined, opts);
+					if (value === undefined) return undefined;
+					values.push(value);
+				}
+				return values;
+			}
+			return createDialogPromise<(string | undefined)[] | undefined>(
 				opts,
 				undefined,
 				{
@@ -164,7 +195,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					timeout: opts?.timeout,
 				},
 				(r) => ("values" in r ? questions.map((_, i) => r.values[i] ?? undefined) : undefined),
-			),
+			);
+		},
 
 		notify(message: string, type?: "info" | "warning" | "error"): void {
 			// Fire and forget - no response needed

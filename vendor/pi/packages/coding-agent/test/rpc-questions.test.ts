@@ -43,7 +43,7 @@ describe("RPC questions dialogs", () => {
 		const extension = join(dir, "ask.mjs");
 		writeFileSync(extension, EXTENSION);
 		const child = spawn("node", [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
-			env: { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent") },
+			env: { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent"), PI_RPC_DIALOGS: "questions" },
 			stdio: ["pipe", "pipe", "inherit"],
 		});
 		const send = (response: Record<string, unknown>) =>
@@ -95,5 +95,87 @@ describe("RPC questions dialogs", () => {
 		expect(abortedDismiss).toEqual({ type: "extension_ui_request", id: aborted!.id, method: "dismiss" });
 		expect(single).toMatchObject({ method: "questions", title: "Only one?", timeout: 60_000 });
 		expect(notify).toMatchObject({ method: "notify" });
+	}, 30_000);
+
+	test("go out as one select or input per question when the client did not declare them", async () => {
+		dir = mkdtempSync(join(tmpdir(), "pi-rpc-questions-"));
+		const extension = join(dir, "ask.mjs");
+		writeFileSync(extension, EXTENSION);
+		const env: Record<string, string | undefined> = { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent") };
+		delete env.PI_RPC_DIALOGS;
+		const child = spawn("node", [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
+			env,
+			stdio: ["pipe", "pipe", "inherit"],
+		});
+		const send = (response: Record<string, unknown>) =>
+			child.stdin!.write(`${JSON.stringify({ type: "extension_ui_response", ...response })}\n`);
+		const ui: Record<string, unknown>[] = [];
+		const lines = createInterface({ input: child.stdout! });
+		const done = new Promise<string>((resolve) => {
+			lines.on("line", (line) => {
+				const event = JSON.parse(line) as Record<string, unknown>;
+				if (event.type !== "extension_ui_request" || event.method === "setStatus") return;
+				ui.push(event);
+				// The first dialog: every question answered, the free-text one typed.
+				if (event.title === "(1/3) Which area?") send({ id: event.id, value: "Contracts" });
+				if (event.title === "(2/3) Anything else?") send({ id: event.id, value: "no" });
+				if (event.title === "(3/3) Skipped?") send({ id: event.id, value: "a" });
+				// The second: cancelled at its first question, so its second is never asked.
+				if (event.title === "(1/2) cancel me") send({ id: event.id, cancelled: true });
+				// The third is aborted by Pi; the single question has no position prefix.
+				if (event.title === "Only one?") send({ id: event.id, value: "yes" });
+				if (event.method === "notify") resolve(String(event.message));
+			});
+		});
+		child.stdin!.write(`${JSON.stringify({ type: "prompt", message: "/ask" })}\n`);
+		try {
+			expect(JSON.parse(await done)).toEqual({
+				answered: ["Contracts", "no", "a"],
+				cancelled: "undefined",
+				aborted: "undefined",
+				single: ["yes"],
+			});
+		} finally {
+			child.kill();
+		}
+		expect(ui.map((e) => [e.method, e.title])).toEqual([
+			["select", "(1/3) Which area?"],
+			["input", "(2/3) Anything else?"],
+			["select", "(3/3) Skipped?"],
+			["input", "(1/2) cancel me"],
+			["input", "(1/2) aborted"],
+			["dismiss", undefined],
+			["select", "Only one?"],
+			["notify", undefined],
+		]);
+		expect(ui[0]).toMatchObject({ options: ["Limitation", "Contracts"] });
+		expect(ui[6]).toMatchObject({ options: ["yes"], timeout: 60_000 });
+		expect(ui.some((e) => e.method === "questions")).toBe(false);
+	}, 30_000);
+
+	test("the declaration is not passed on to processes Pi starts", async () => {
+		dir = mkdtempSync(join(tmpdir(), "pi-rpc-questions-"));
+		const extension = join(dir, "env.mjs");
+		writeFileSync(
+			extension,
+			`export default function (pi) { pi.registerCommand("env", { description: "env", handler: async (_a, ctx) => ctx.ui.notify(String(process.env.PI_RPC_DIALOGS)) }); }`,
+		);
+		const child = spawn("node", [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
+			env: { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent"), PI_RPC_DIALOGS: "questions" },
+			stdio: ["pipe", "pipe", "inherit"],
+		});
+		const lines = createInterface({ input: child.stdout! });
+		const seen = new Promise<string>((resolve) => {
+			lines.on("line", (line) => {
+				const event = JSON.parse(line) as Record<string, unknown>;
+				if (event.type === "extension_ui_request" && event.method === "notify") resolve(String(event.message));
+			});
+		});
+		child.stdin!.write(`${JSON.stringify({ type: "prompt", message: "/env" })}\n`);
+		try {
+			expect(await seen).toBe("undefined");
+		} finally {
+			child.kill();
+		}
 	}, 30_000);
 });
