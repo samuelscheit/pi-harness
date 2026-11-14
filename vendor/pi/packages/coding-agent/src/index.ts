@@ -81,8 +81,8 @@ export type {
 	BoundaryState,
 	BuildSystemPromptOptions,
 	CacheWarmingDecisionEvent,
-	CacheWarmingEvent,
 	CacheWarmingDecisionEventResult,
+	CacheWarmingEvent,
 	CompactionEntryDraft,
 	CompactOptions,
 	ContextEditEntryDraft,
@@ -228,6 +228,7 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
+export { FileLocks } from "./core/file-lock.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
@@ -258,6 +259,17 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.ts";
 export { DefaultPackageManager } from "./core/package-manager.ts";
+export {
+	type BranchPrefix,
+	describeBranchPrefix,
+	type ModelRef,
+	type PrefixCacheRecord,
+	PrefixCacheRegistry,
+	type PrefixPoint,
+	promptHashOf,
+	READS_KEPT_MS,
+	writeFileAtomic,
+} from "./core/prefix-cache.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
@@ -303,6 +315,7 @@ export {
 	type CustomMessageEntry,
 	type FileEntry,
 	getLatestCompactionEntry,
+	hoistLeadingSystemEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
@@ -311,12 +324,14 @@ export {
 	type SessionContext,
 	type SessionEntry,
 	type SessionEntryBase,
+	type SessionFork,
 	type SessionHeader,
 	type SessionInfo,
 	type SessionInfoEntry,
 	SessionManager,
 	type SessionMessageEntry,
 	type SessionProjection,
+	type SessionTemplate,
 	type SessionTreeNode,
 	sessionEntryToContextMessages,
 	type ThinkingLevelChangeEntry,
@@ -335,6 +350,7 @@ export {
 	type SettingsManagerCreateOptions,
 	type TuiMode,
 } from "./core/settings-manager.ts";
+export { SharedPrefixCache } from "./core/shared-prefix.ts";
 // Skills
 export {
 	formatSkillsForPrompt,
@@ -346,6 +362,7 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+export { nextReadProbability, prefixWarmingDecision } from "./core/template-prefix.ts";
 export {
 	computeEditsDiff,
 	type EditDiffError,

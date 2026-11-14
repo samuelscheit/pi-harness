@@ -50,6 +50,18 @@ export interface SessionHeader {
 	parentSession?: string;
 	/** Set by `forkFrom`: where the fork was taken and how its context started. */
 	fork?: SessionFork;
+	/** Set on a template's session file: a prepared conversation that sessions fork from (see `SessionTemplate`). */
+	template?: SessionTemplate;
+}
+
+/**
+ * A template: a prepared conversation without a system prompt, meant to be forked many times. A fork
+ * runs it with its own current prompt and tools, which the projection puts in front of the template's
+ * entries (`hoistLeadingSystemEntry`). Its fork point is a prefix every fork shares, so the fork's
+ * first request writes or reads that prefix's prompt cache entry for all of them (template-prefix.ts).
+ */
+export interface SessionTemplate {
+	name: string;
 }
 
 /**
@@ -61,6 +73,8 @@ export interface SessionFork {
 	/** The source's last entry when the fork was taken. */
 	leafId: string | null;
 	base?: string;
+	/** The source was a template (its header's `template`). */
+	template?: SessionTemplate;
 }
 
 export interface NewSessionOptions {
@@ -562,6 +576,20 @@ export function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry 
 	});
 }
 
+/**
+ * Put the first system message in front when entries with model messages precede it: a session
+ * forked from a template (a conversation without a prompt) records its prompt and tools after the
+ * template's entries, at its first run. Providers carry the leading system message ahead of the
+ * conversation, so that is where it belongs; later system messages patch it in place.
+ */
+export function hoistLeadingSystemEntry(entries: ProjectedSessionEntry[]): ProjectedSessionEntry[] {
+	const first = entries.findIndex((entry) => entry.messages.length > 0);
+	if (first < 0 || entries[first]!.messages[0]!.role === "system") return entries;
+	const system = entries.findIndex((entry) => entry.messages.some((message) => message.role === "system"));
+	if (system < 0 || !entries[system]!.messages.every((message) => message.role === "system")) return entries;
+	return [entries[system]!, ...entries.slice(0, system), ...entries.slice(system + 1)];
+}
+
 /** Build provenance-preserving, compaction-aware model context. */
 export function buildSessionProjection(
 	entries: SessionEntry[],
@@ -575,17 +603,19 @@ export function buildSessionProjection(
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
-	const projectedEntries = contextEntries.map(
-		(sourceEntry, index): ProjectedSessionEntry => ({
-			sourceEntry,
-			// buildContextEntries() may retain an older compaction entry because its
-			// raw ID lies inside the newest retained range. Only the newest compaction
-			// at index zero contributes a checkpoint and summary.
-			messages:
-				sourceEntry.type === "compaction" && index > 0
-					? []
-					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
-		}),
+	const projectedEntries = hoistLeadingSystemEntry(
+		contextEntries.map(
+			(sourceEntry, index): ProjectedSessionEntry => ({
+				sourceEntry,
+				// buildContextEntries() may retain an older compaction entry because its
+				// raw ID lies inside the newest retained range. Only the newest compaction
+				// at index zero contributes a checkpoint and summary.
+				messages:
+					sourceEntry.type === "compaction" && index > 0
+						? []
+						: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+			}),
+		),
 	);
 	return {
 		entries: projectedEntries,
@@ -1915,7 +1945,10 @@ export class SessionManager {
 			timestamp,
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
-			fork: { leafId: sourceLeaf?.id ?? null },
+			fork: {
+				leafId: sourceLeaf?.id ?? null,
+				...(sourceHeader.template ? { template: sourceHeader.template } : {}),
+			},
 		};
 		// Write the header and all non-header entries through one fd. Reopening the file per entry
 		// is slow where open/close is expensive (e.g. filesystem security monitors).

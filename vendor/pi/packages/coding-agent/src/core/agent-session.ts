@@ -159,6 +159,7 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
+import { TemplatePrefix } from "./template-prefix.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
@@ -560,6 +561,10 @@ export class AgentSession {
 	private _pendingPrefixRequest?: { request: PrefixRequest; sentAt: number };
 	/** The last recorded request: the one the cache warmer refreshes. */
 	private _lastPrefixRequest?: PrefixRequest;
+	/** A template fork's shared prefix: written before its first request and kept warm while that pays. */
+	private _templatePrefix?: TemplatePrefix;
+	/** Whether this session's first request after it started was checked for a template prefix. */
+	private _templatePrefixChecked = false;
 	/** The last cache warming state emitted, to emit changes only. */
 	private _cacheWarmingEmitted?: string;
 	/** Pending background work by extension key (`pi.setBackgroundWork`); kept across reloads. */
@@ -604,6 +609,26 @@ export class AgentSession {
 					? this._sharedPrefix?.registry.get(last.model, last.prefix.promptHash, point)?.at
 					: undefined;
 			};
+		}
+		if (this._sharedPrefix) {
+			this._templatePrefix = new TemplatePrefix({
+				shared: this._sharedPrefix,
+				describe: (model, projection) => this._prefixRequest(model, projection),
+				send: (model, projection) =>
+					sendCachePrime(this.agent, model, projection.messages, {
+						cacheRetention: this.settingsManager.getCacheRetention(),
+					}),
+				sent: (result) => {
+					const entry = this.sessionManager.appendUsage(
+						"cache_prime",
+						result.provider,
+						result.model,
+						result.usage,
+					);
+					this._emit({ type: "entry_appended", entry });
+				},
+				retention: () => resolvePromptCacheRetention({ cacheRetention: this.settingsManager.getCacheRetention() }),
+			});
 		}
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -1069,6 +1094,27 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Before the first request of a fork of a template that has no reply after the template yet:
+	 * write the template prefix's shared cache entry when that pays (template-prefix.ts).
+	 */
+	private async _primeTemplatePrefix(model: Model<any>, projection: SessionProjection): Promise<void> {
+		if (this._templatePrefixChecked || !this._templatePrefix) return;
+		this._templatePrefixChecked = true;
+		const fork = this.sessionManager.getHeader()?.fork;
+		if (!fork?.template || !fork.leafId || isVirtualModel(model)) return;
+		const branch = this.sessionManager.getBranch();
+		const start = branch.findIndex((entry) => entry.id === fork.leafId);
+		if (start < 0) return;
+		const replied = branch
+			.slice(start + 1)
+			.some((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (replied) return;
+		const ttlMs = getPromptCacheTtlMs(model, { cacheRetention: this.settingsManager.getCacheRetention() });
+		if (ttlMs === undefined) return;
+		await this._templatePrefix.beforeFirstRequest(model, ttlMs, projection, fork.leafId);
+	}
+
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
@@ -1084,6 +1130,7 @@ export class AgentSession {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
 			const { update, projection } = await prepareRouted(request, signal);
+			await this._primeTemplatePrefix(update.model, projection);
 			const sentAt = Date.now();
 			const prefixRequest = this._prefixRequest(update.model, projection);
 			this._pendingPrefixRequest = prefixRequest && { request: prefixRequest, sentAt };
@@ -1753,6 +1800,7 @@ export class AgentSession {
 			this._cacheWarmer.onStatusChanged = undefined;
 			this._cacheWarmer.cancel();
 		}
+		this._templatePrefix?.dispose();
 		cleanupSessionResources(this.sessionId);
 	}
 

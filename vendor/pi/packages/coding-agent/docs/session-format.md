@@ -81,6 +81,12 @@ A session created by `pi --fork` also records the fork point (the source's last 
 {"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","parentSession":"/path/to/original/session.jsonl","fork":{"leafId":"a1b2c3d4","base":"full"}}
 ```
 
+A **template** is a prepared conversation meant to be forked many times, without a system message: its header names it under `template`, and a fork of it records the name in `fork.template`. A fork runs the template with its own prompt and tools; its first run records its system message after the template's entries, and the projection puts the first system message in front when other entries precede it (`hoistLeadingSystemEntry`), so providers receive it ahead of the conversation. See [Shared Prompt Cache and Fork Bases](compaction.md#shared-prompt-cache-and-fork-bases) for how forks share the template's cache entry.
+
+```json
+{"type":"session","version":3,"id":"template-review","timestamp":"1970-01-01T00:00:00.000Z","cwd":"/path/to/project","template":{"name":"review"}}
+```
+
 ### SessionMessageEntry
 
 A message in the conversation. The `message` field contains an `AgentMessage`. System messages carry the prompt and tool loadout: the first request of a session persists one with every prompt section and tool declaration, and later changes persist as system messages that patch `sections` by name (`null` removes one) and list `toolsAdded`/`toolsRemoved`. Replaying them in order yields the current prompt and tools; there is no separate prompt state entry.

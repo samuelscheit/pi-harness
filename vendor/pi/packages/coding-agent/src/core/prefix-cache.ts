@@ -12,7 +12,11 @@
  * After every provider request a session records which prefix it wrote or read and when it
  * expires. Coldness checks ask whether the next request of a branch would reach an entry that is
  * still alive, wherever it was written. One small JSON file per key, replaced atomically, keeps
- * concurrent writers safe; expired files are pruned.
+ * concurrent writers safe; expired files are pruned unless they hold reads of the last day.
+ *
+ * The leading system message (prompt and tools) is named by the prompt hash, not by its entry id:
+ * forks of a template record their own prompt entry, in front of the template's shared entries, so
+ * the same prompt over the same template is the same prefix in every fork.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -63,7 +67,17 @@ export interface PrefixCacheRecord {
 	at: number;
 	ttlMs: number;
 	expiresAt: number;
+	/**
+	 * Times sessions started from this prefix (a template fork's first request), within the last
+	 * READS_KEPT_MS, oldest first: their rate decides whether keeping the entry warm pays.
+	 */
+	reads?: number[];
 }
+
+/** How long a record keeps the times of its reads. */
+export const READS_KEPT_MS = 24 * 60 * 60_000;
+/** At most this many read times per record. */
+const MAX_READS = 500;
 
 /** A provider request and the prefix it covered. */
 export interface PrefixRequest {
@@ -147,6 +161,11 @@ export function describeBranchPrefix(projection: Pick<SessionProjection, "entrie
 	let lastReply: BranchPrefix["lastReply"];
 	for (const { sourceEntry, messages } of projection.entries) {
 		if (messages.length === 0) continue;
+		// The leading prompt entry: its content is the prompt hash, its id differs per template fork.
+		if (chain === "" && messages.every((message) => message.role === "system")) {
+			leading = false;
+			continue;
+		}
 		chain = sha256(`${chain}\n${sourceEntry.id}:${edits.get(sourceEntry.id) ?? ""}`);
 		for (const message of convertToLlm(messages as AgentMessage[])) {
 			if (leading && message.role === "system") {
@@ -261,7 +280,7 @@ export class PrefixCacheRegistry {
 	): void {
 		const existing = this.get(model, promptHash, point);
 		const expiresAt = Math.max(touch.at + touch.ttlMs, existing?.expiresAt ?? 0);
-		const record: PrefixCacheRecord = {
+		this.write(model, promptHash, point, {
 			provider: model.provider,
 			model: model.id,
 			promptHash,
@@ -271,10 +290,35 @@ export class PrefixCacheRegistry {
 			at: Math.max(touch.at, existing?.at ?? 0),
 			ttlMs: touch.ttlMs,
 			expiresAt,
-		};
+			...(existing?.reads ? { reads: existing.reads } : {}),
+		});
+		if (touch.at - this.lastPruneAt >= PRUNE_INTERVAL_MS) this.prune(touch.at);
+	}
+
+	/**
+	 * Record that a session started from the prefix at `at` (a read it made or wanted to make),
+	 * without changing its cache entry. `tokens`: the prefix's size, for a prefix without a record.
+	 */
+	noteRead(model: ModelRef, promptHash: string, point: PrefixPoint, at: number, tokens: number): void {
+		const existing = this.get(model, promptHash, point);
+		const reads = [...(existing?.reads ?? []).filter((time) => at - time < READS_KEPT_MS), at].slice(-MAX_READS);
+		this.write(model, promptHash, point, {
+			provider: model.provider,
+			model: model.id,
+			promptHash,
+			entryId: point.entryId,
+			tokens: existing?.tokens || tokens,
+			cache: existing?.cache ?? "read",
+			at: existing?.at ?? 0,
+			ttlMs: existing?.ttlMs ?? 0,
+			expiresAt: existing?.expiresAt ?? 0,
+			reads,
+		});
+	}
+
+	private write(model: ModelRef, promptHash: string, point: PrefixPoint, record: PrefixCacheRecord): void {
 		mkdirSync(this.dir, { recursive: true });
 		writeFileAtomic(this.path(model, promptHash, point), JSON.stringify(record));
-		if (touch.at - this.lastPruneAt >= PRUNE_INTERVAL_MS) this.prune(touch.at);
 	}
 
 	/**
@@ -338,13 +382,15 @@ export class PrefixCacheRegistry {
 				}
 				if (!name.endsWith(".json")) continue;
 				const text = readFileSync(path, "utf8");
-				let expiresAt: unknown;
+				let record: Partial<PrefixCacheRecord> | undefined;
 				try {
-					expiresAt = (JSON.parse(text) as Partial<PrefixCacheRecord>).expiresAt;
+					record = JSON.parse(text) as Partial<PrefixCacheRecord>;
 				} catch {
 					// Not a record: nothing reads it.
 				}
-				if (typeof expiresAt !== "number" || expiresAt <= now) unlinkSync(path);
+				const lastRead = record?.reads?.at(-1);
+				if (lastRead !== undefined && now - lastRead < READS_KEPT_MS) continue;
+				if (typeof record?.expiresAt !== "number" || record.expiresAt <= now) unlinkSync(path);
 			} catch {
 				// Another process removed or replaced it meanwhile.
 			}

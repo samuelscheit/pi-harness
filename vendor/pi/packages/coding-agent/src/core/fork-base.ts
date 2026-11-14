@@ -7,22 +7,14 @@
  * forked from the same point. A fork, or the source itself, that later reaches the same prefix cold
  * appends that compaction entry verbatim instead of summarising again, so its context is byte for
  * byte the base's and reads the base's prompt cache entry. Creating a base is serialised by a lock
- * file; parallel forks wait on it and then use the base.
+ * file (file-lock.ts); parallel forks wait on it and then use the base.
  */
-import { createHash, randomBytes } from "node:crypto";
-import {
-	closeSync,
-	mkdirSync,
-	openSync,
-	readdirSync,
-	readFileSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
-import { isProcessAlive, writeFileAtomic } from "./prefix-cache.ts";
+import { FileLocks, unlinkQuietly } from "./file-lock.ts";
+import { writeFileAtomic } from "./prefix-cache.ts";
 import {
 	type CompactionEntry,
 	CURRENT_SESSION_VERSION,
@@ -66,9 +58,6 @@ export interface ForkBase {
 
 /** Bases that no session took for this long are removed. */
 export const FORK_BASE_MAX_IDLE_MS = 24 * 60 * 60_000;
-/** A lock older than this is taken over even when its holder still runs (a compaction hung). */
-const LOCK_STALE_MS = 10 * 60_000;
-const LOCK_POLL_MS = 100;
 const PRUNE_INTERVAL_MS = 60 * 60_000;
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -79,10 +68,13 @@ export function forkBaseKey(key: ForkBaseKey): string {
 
 export class ForkBaseStore {
 	readonly dir: string;
+	/** Locks in the same directory, also for other prefixes' shared work (template-prefix.ts). */
+	readonly locks: FileLocks;
 	private lastPruneAt = 0;
 
 	constructor(dir: string) {
 		this.dir = dir;
+		this.locks = new FileLocks(dir);
 	}
 
 	private file(key: string, suffix: string): string {
@@ -157,67 +149,15 @@ export class ForkBaseStore {
 
 	/** Processes other than the caller waiting for the base's lock. */
 	waiters(key: string, own?: string): number {
-		let count = 0;
-		for (const name of this.list()) {
-			if (!name.startsWith(`${key}.wait-`) || name === own) continue;
-			const pid = Number(name.slice(`${key}.wait-`.length).split("-")[0]);
-			if (isProcessAlive(pid)) count++;
-		}
-		return count;
+		return this.locks.waiters(key, own);
 	}
 
-	/**
-	 * Run `task` holding the base's lock, waiting for other holders. While it waits, the caller is
-	 * counted in `waiters`. A lock whose holder died, or that is older than ten minutes, is taken over.
-	 */
+	/** Run `task` holding the base's lock, waiting for other holders (see `FileLocks.withLock`). */
 	async withLock<T>(key: string, task: (self: string) => Promise<T>, signal?: AbortSignal): Promise<T> {
-		mkdirSync(this.dir, { recursive: true });
-		const lock = this.file(key, ".lock");
-		const waiter = `${key}.wait-${process.pid}-${randomBytes(4).toString("hex")}`;
-		writeFileSync(this.file(waiter, ""), "");
 		try {
-			for (;;) {
-				signal?.throwIfAborted();
-				try {
-					const fd = openSync(lock, "wx");
-					writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-					closeSync(fd);
-					break;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				}
-				if (this.isStale(lock)) {
-					try {
-						unlinkSync(lock);
-					} catch {
-						// Another waiter took it over first.
-					}
-					continue;
-				}
-				await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
-			}
+			return await this.locks.withLock(key, task, signal);
 		} finally {
-			unlinkQuietly(this.file(waiter, ""));
-		}
-		try {
-			return await task(waiter);
-		} finally {
-			unlinkQuietly(lock);
 			this.pruneIfDue(Date.now());
-		}
-	}
-
-	private isStale(lock: string): boolean {
-		try {
-			const { pid, at } = JSON.parse(readFileSync(lock, "utf8")) as { pid: number; at: number };
-			return !isProcessAlive(pid) || Date.now() - at > LOCK_STALE_MS;
-		} catch {
-			// Written between open and write: give the holder a moment, unless the file is old.
-			try {
-				return Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS;
-			} catch {
-				return false;
-			}
 		}
 	}
 
@@ -240,7 +180,7 @@ export class ForkBaseStore {
 		for (const name of this.list()) {
 			if (name.endsWith(".json")) {
 				const key = name.slice(0, -".json".length);
-				if (existsLock(this.file(key, ".lock"))) continue;
+				if (this.locks.held(key)) continue;
 				try {
 					const meta = JSON.parse(readFileSync(this.file(key, ".json"), "utf8")) as ForkBaseMeta;
 					if (now - meta.lastUsedAt <= FORK_BASE_MAX_IDLE_MS) continue;
@@ -250,9 +190,6 @@ export class ForkBaseStore {
 				unlinkQuietly(this.file(key, ".jsonl"));
 				unlinkQuietly(this.file(key, ".json"));
 				removed.push(key);
-			} else if (name.includes(".wait-")) {
-				const pid = Number(name.split(".wait-")[1]?.split("-")[0]);
-				if (!isProcessAlive(pid)) unlinkQuietly(this.file(name, ""));
 			} else if (name.endsWith(".tmp")) {
 				try {
 					if (now - statSync(this.file(name, "")).mtimeMs > 60_000) unlinkQuietly(this.file(name, ""));
@@ -261,23 +198,7 @@ export class ForkBaseStore {
 				}
 			}
 		}
+		this.locks.pruneWaiters();
 		return removed;
-	}
-}
-
-function existsLock(path: string): boolean {
-	try {
-		statSync(path);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function unlinkQuietly(path: string): void {
-	try {
-		unlinkSync(path);
-	} catch {
-		// Already gone.
 	}
 }
