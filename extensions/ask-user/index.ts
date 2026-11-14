@@ -33,7 +33,7 @@ export const DEFAULT_WAIT_MINUTES = 15;
 // Codex's points that still hold (codex-rs/prompts/src/model_messages.rs): concise, self-contained
 // questions, options, free text always allowed.
 const DESCRIPTION =
-	"Ask whoever directs you one or more questions: at top level the user, as a delegated child your parent. Use it for missing information, preferences or approval, and whenever the plan no longer fits: ask rather than guess. The call waits for the answers, which are its result, up to `wait_minutes`; a reply in the chat answers too. Unanswered by then, it returns and the answers arrive later as a message. Set `wait_minutes: 0` when you have other work that does not depend on the answers. Keep questions concise and self-contained. A free-text answer is always possible, also when options are given; a preselected option is not submitted automatically.";
+	"Ask whoever directs you one or more questions: at top level the user, as a delegated child your parent. Use it for missing information, preferences or approval, and whenever the plan no longer fits: ask rather than guess. Only for questions that need an answer: a status report or result goes into your normal reply, never into ask_user. The call waits for the answers, which are its result, up to `wait_minutes`; a reply in the chat answers too. Unanswered by then, it returns and the answers arrive later as a message. Set `wait_minutes: 0` when you have other work that does not depend on the answers. Keep questions concise and self-contained. A free-text answer is always possible, also when options are given; a preselected option is not submitted automatically.";
 
 const parameters = Type.Object(
 	{
