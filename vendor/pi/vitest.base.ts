@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+import "./vitest.session-env.ts";
 
 export const workspaceSourcePaths = {
 	chordIndex: fileURLToPath(new URL("./packages/chord/src/index.ts", import.meta.url)),

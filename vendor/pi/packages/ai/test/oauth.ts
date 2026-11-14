@@ -8,6 +8,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
+import { resolveConfigValue } from "../../coding-agent/src/core/resolve-config-value.ts";
 import type { OAuthCredentials } from "../src/auth/types.ts";
 import { builtinProviders } from "../src/providers/all.ts";
 
@@ -61,7 +62,8 @@ export async function resolveApiKey(provider: string): Promise<string | undefine
 	if (!entry) return undefined;
 
 	if (entry.type === "api_key") {
-		return entry.key;
+		// Like Pi's auth storage: the key may be a "!command" or "$ENV_VAR" reference.
+		return resolveConfigValue(entry.key);
 	}
 
 	if (entry.type === "oauth") {

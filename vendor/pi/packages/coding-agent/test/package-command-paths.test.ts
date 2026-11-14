@@ -147,6 +147,10 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(projectDir, { recursive: true });
 		mkdirSync(packageDir, { recursive: true });
+		// User-level resources (~/.agents/skills) resolve from HOME: keep the user's real ones out.
+		const homeDir = join(tempDir, "home");
+		mkdirSync(homeDir, { recursive: true });
+		vi.stubEnv("HOME", homeDir);
 
 		originalCwd = process.cwd();
 		originalAgentDir = process.env[ENV_AGENT_DIR];

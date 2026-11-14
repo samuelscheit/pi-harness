@@ -83,16 +83,6 @@ function emitReftableChange(provider: FooterDataProvider): void {
 	reftableWatcher?.emit("change", "change", "tables.list");
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
-	const startedAt = Date.now();
-	while (!condition()) {
-		if (Date.now() - startedAt > timeoutMs) {
-			throw new Error("Timed out waiting for condition");
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-}
-
 describe("FooterDataProvider reftable branch detection", () => {
 	let originalCwd: string;
 	let tempDir: string;
@@ -235,13 +225,16 @@ describe("FooterDataProvider reftable branch detection", () => {
 			const onBranchChange = vi.fn();
 			provider.onBranchChange(onBranchChange);
 
-			writeFileSync(join(reftableDir, "tables.list"), "1\n");
-			// Real fs watcher events can arrive late under full-suite load.
-			await waitFor(() => vi.mocked(execFile).mock.calls.length === 1, 10_000);
-			await waitFor(() => provider.getGitBranch() === "foo", 10_000);
+			// The real watchers arm asynchronously (macOS FSEvents, watchFile's first stat), so a write
+			// made right after the provider starts can go unseen, mostly under full-suite load. Update
+			// tables.list as git does on every ref change until one change is seen.
+			for (let version = 1; provider.getGitBranch() !== "foo"; version++) {
+				if (version > 40) throw new Error("no reftable change reached the branch within 10 seconds");
+				writeFileSync(join(reftableDir, "tables.list"), `${version}\n`);
+				await new Promise((resolve) => setTimeout(resolve, 250));
+			}
 
-			expect(vi.mocked(execFile)).toHaveBeenCalledTimes(1);
-			expect(provider.getGitBranch()).toBe("foo");
+			expect(vi.mocked(execFile)).toHaveBeenCalled();
 			expect(onBranchChange).toHaveBeenCalledTimes(1);
 		} finally {
 			provider.dispose();

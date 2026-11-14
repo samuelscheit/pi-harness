@@ -145,6 +145,28 @@
             }
           },
           "description": "Per-model overrides keyed by exact \"provider/modelId\" strings."
+        },
+        "economic": {
+          "type": "object",
+          "required": [
+            "model"
+          ],
+          "properties": {
+            "model": {
+              "type": "string",
+              "description": "The model that writes the summary, as \"provider/modelId\" (a cheap one)."
+            },
+            "minSaving": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Compact only when the expected saving is at least this many dollars."
+            },
+            "warm": {
+              "type": "boolean",
+              "description": "Also compact while the prompt cache is warm. Off by default: what a summary loses is not priced, only the cache cost."
+            }
+          },
+          "description": "Before a run whose prompt cache expired (and with `warm`, before any run), compact when that saves more than it costs: not writing the whole context again, and carrying a smaller one over the expected rest of the session. Off when unset."
         }
       }
     },
@@ -686,6 +708,29 @@
       ],
       "description": "Cache-warming profile. \"idle\" also warms between agent runs. Global only because each refresh costs money.",
       "default": "idle"
+    },
+    "cacheWarmingIdleMinutes": {
+      "type": "number",
+      "minimum": 1,
+      "description": "How long after a request idle cache warming may still refresh the prompt cache, in minutes. With a one-hour cache, 60 allows one refresh. Global only because each refresh costs money.",
+      "default": 30
+    },
+    "cacheRetention": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "type": "string",
+          "const": "short"
+        },
+        {
+          "type": "string",
+          "const": "long"
+        }
+      ],
+      "description": "Prompt cache retention for providers that support it: \"short\" (Anthropic: 5 minutes), \"long\" (Anthropic: 1 hour, cache writes cost 2x input instead of 1.25x), \"none\". Defaults to PI_CACHE_RETENTION, else \"short\"."
     },
     "websocketConnectTimeoutMs": {
       "anyOf": [
