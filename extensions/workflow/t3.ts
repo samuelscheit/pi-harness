@@ -4,7 +4,10 @@
 // tool (ctx.executeTool), where they resolve to the MCP result: `structuredContent` is t3's data.
 //
 // The first run is `delegate_task` in wait mode; later runs go to the same thread with
-// `t3_thread_send` (a resume: the child's context and prompt cache are warm). A wait that times out
+// `t3_thread_send` (a resume: the child's context and prompt cache are warm). Both carry a
+// `clientRequestId` per run, which t3 dedupes: repeating the call with the same id returns the same
+// task and run, so a workflow resumed after its process died reattaches to a child whose start was
+// in flight by making the same call again. A wait that times out
 // does not end the run: it continues with `t3_thread_wait` until the run is over. A question or an
 // approval the child waits for also ends a wait; the code keeps waiting for the user to answer.
 // Afterwards `task_status` reads the task, which marks its result delivered, so t3 does not wake
@@ -115,11 +118,21 @@ export interface DelegateRequest {
 	thinking: Thinking;
 }
 
+/** What identifies a child's t3 task, kept in the workflow's journal to reattach. */
+export interface T3ChildIds {
+	taskId?: string;
+	threadId?: string;
+	link?: string;
+	/** The run of the latest message. */
+	runId?: string;
+}
+
 /** One child as a t3 task and its thread. */
 export class T3Child {
 	taskId: string | undefined;
 	threadId: string | undefined;
 	link: string | undefined;
+	runId: string | undefined;
 	/** The last run's thread status and t3's summary of it. */
 	status = "";
 	summary: string | undefined;
@@ -131,26 +144,57 @@ export class T3Child {
 		this.request = request;
 	}
 
-	/** Run one message: the first starts the task, later ones resume its thread. Resolves when the run is over. */
-	async run(message: string, first: boolean, signal: AbortSignal, started: (link: string) => void): Promise<void> {
-		let runId: string | undefined;
-		if (first) {
+	get ids(): T3ChildIds {
+		const ids: T3ChildIds = {};
+		if (this.taskId) ids.taskId = this.taskId;
+		if (this.threadId) ids.threadId = this.threadId;
+		if (this.link) ids.link = this.link;
+		if (this.runId) ids.runId = this.runId;
+		return ids;
+	}
+
+	restore(ids: T3ChildIds): void {
+		this.taskId = ids.taskId ?? this.taskId;
+		this.threadId = ids.threadId ?? this.threadId;
+		this.link = ids.link ?? this.link;
+		this.runId = ids.runId ?? this.runId;
+	}
+
+	/**
+	 * Reattach to a run whose call was in flight when the workflow's process died: a run whose id is
+	 * known is waited for; otherwise the call is repeated with the same request id, which t3 dedupes.
+	 */
+	async reattach(message: string, requestId: string, runId: string | undefined, signal: AbortSignal, started: (ids: T3ChildIds) => void): Promise<void> {
+		if (!runId) return this.run(message, requestId, signal, started);
+		this.runId = runId;
+		await this.wait(runId, signal);
+		await this.deliver(signal);
+	}
+
+	/**
+	 * Run one message: without a thread yet it starts the task, else it resumes the thread.
+	 * `requestId` makes the call idempotent: the same id reattaches to the same run. Resolves when
+	 * the run is over.
+	 */
+	async run(message: string, requestId: string, signal: AbortSignal, started: (ids: T3ChildIds) => void): Promise<void> {
+		if (!this.threadId) {
 			const target = await this.t3.target(this.request.model, this.request.thinking, signal);
-			const task = await this.t3.call("delegate_task", { task: message, title: this.request.title, role: this.request.role, target, mode: "wait", timeoutMs: WAIT_MS }, signal);
+			const task = await this.t3.call("delegate_task", { task: message, title: this.request.title, role: this.request.role, target, mode: "wait", timeoutMs: WAIT_MS, clientRequestId: requestId }, signal);
 			this.taskId = str(task.taskId);
 			this.threadId = str(task.childThreadId);
 			this.link = str(task.link);
+			this.runId = str(task.childRunId);
 			if (!this.taskId || !this.threadId) throw new Error(`t3 delegate_task started no thread: ${JSON.stringify(task).slice(0, 300)}`);
-			started(this.link ?? this.threadId);
+			started(this.ids);
 			this.status = String(task.status);
 			const finished = ["completed", "failed", "cancelled", "interrupted"].includes(this.status) && task.waitTimedOut !== true;
-			if (!finished) await this.wait(str(task.childRunId), signal);
+			if (!finished) await this.wait(this.runId, signal);
 		} else {
-			if (!this.threadId) throw new Error("the child's thread is unknown");
-			const sent = await this.t3.call("t3_thread_send", { threadId: this.threadId, message, mode: "queue" }, signal);
+			const sent = await this.t3.call("t3_thread_send", { threadId: this.threadId, message, mode: "queue", clientRequestId: requestId }, signal);
 			this.taskId = str(sent.taskId) ?? this.taskId;
-			runId = str(sent.runId);
-			await this.wait(runId, signal);
+			this.runId = str(sent.runId);
+			started(this.ids);
+			await this.wait(this.runId, signal);
 		}
 		await this.deliver(signal);
 	}

@@ -41,6 +41,55 @@ export function compile(source: string, filename: string): string {
 /** Host values a script may use besides the API: its own realm brings the language built-ins. */
 const STANDARD_GLOBALS = { setTimeout, clearTimeout, structuredClone, URL, URLSearchParams, TextEncoder, TextDecoder };
 
+/**
+ * What a durable run (durable.ts) puts into the script's realm: the clock and randomness the
+ * script sees (recorded on replay), and `hold`, which counts a pending timer as work that may still
+ * make a recorded call.
+ */
+export interface ScriptHost {
+	now: () => number;
+	random: () => number;
+	hold: () => () => void;
+}
+
+// Runs in the script's realm before the script: Date and Math.random read the host's clock.
+const PRELUDE = `(() => {
+	const host = globalThis.__host;
+	delete globalThis.__host;
+	const Real = Date;
+	class RecordedDate extends Real {
+		constructor(...args) { if (args.length === 0) super(host.now()); else super(...args); }
+		static now() { return host.now(); }
+	}
+	globalThis.Date = new Proxy(RecordedDate, { apply: () => new Real(host.now()).toString() });
+	Math.random = () => host.random();
+})();`;
+
+/** Timers that count as pending work while they wait. */
+function heldTimers(hold: ScriptHost["hold"]) {
+	const releases = new Map<NodeJS.Timeout, () => void>();
+	return {
+		setTimeout: (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+			const release = hold();
+			const timer = setTimeout(() => {
+				releases.delete(timer);
+				try {
+					fn(...args);
+				} finally {
+					release();
+				}
+			}, ms);
+			releases.set(timer, release);
+			return timer;
+		},
+		clearTimeout: (timer: NodeJS.Timeout) => {
+			clearTimeout(timer);
+			releases.get(timer)?.();
+			releases.delete(timer);
+		},
+	};
+}
+
 export interface WorkflowModule {
 	/** The module's `meta` export (saved workflows). */
 	meta: unknown;
@@ -52,12 +101,13 @@ export interface WorkflowModule {
  * Run a compiled module's top level in a new context with `globals`, and return its exports.
  * Throws for errors at the top level, imports, and a missing default function.
  */
-export function evaluate(js: string, filename: string, globals: Record<string, unknown>): WorkflowModule {
+export function evaluate(js: string, filename: string, globals: Record<string, unknown>, host?: ScriptHost): WorkflowModule {
 	const module = { exports: {} as Record<string, unknown> };
 	const require = (id: string) => {
 		throw new Error(`workflows cannot import modules ("${id}"); use tools, shell, llm, agent and workflows instead`);
 	};
-	const context = vm.createContext({ ...STANDARD_GLOBALS, ...globals, module, exports: module.exports, require });
+	const context = vm.createContext({ ...STANDARD_GLOBALS, ...(host ? heldTimers(host.hold) : {}), ...globals, module, exports: module.exports, require, ...(host ? { __host: host } : {}) });
+	if (host) new vm.Script(PRELUDE, { filename: "workflow-prelude.js" }).runInContext(context);
 	new vm.Script(js, { filename }).runInContext(context, { timeout: LOAD_TIMEOUT_MS });
 	const run = module.exports.default;
 	if (typeof run !== "function") throw new Error(`${filename} has no default export function (export default async function (input) { … })`);

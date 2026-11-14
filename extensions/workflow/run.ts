@@ -1,26 +1,37 @@
 // One workflow run: the script's globals (api.d.ts) bound to the run's state, then the report the
 // parent gets back.
 //
+// Every run is durable (durable.ts): it gets an id and a journal (journal.ts) in
+// `<agentDir>/workflows/<id>/`, and every call to the outside goes through the journal. A run whose
+// process died, or that stopped because its session ended or its extension context went stale (a
+// harness reload), is resumed by `resumeWorkflow`: the same script runs again from its start, and
+// the calls the journal answers run nothing. A lock in the run's directory keeps two processes from
+// running it at once.
+//
 // The run owns an abort signal that every call uses: the tool's abort, an exceeded budget and the
 // script's end all fire it, so calls still in flight stop and child agents are disposed. Costs of
 // llm() (also reported as the tool result's usage) and of child agents (their own session files)
-// count against the budget. In a git repository the run takes a snapshot first, for `changes()`
-// and the changed files the metrics index reads (details.changedFiles).
+// count against the budget, replayed calls with their recorded cost. In a git repository the run
+// takes a snapshot first (kept with the journal for a resume), for `changes()` and the changed
+// files the metrics index reads (details.changedFiles).
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { type ToolCall, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
 import { type ModelRuntime, truncateHead } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
+import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
-import { canonical, changedPaths, diffSince, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
+import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { createAgent } from "./agent.ts";
-import { T3, T3_DELEGATE, T3_PREFIX, t3Data } from "./t3.ts";
-import { compile, evaluate, inlineModule, scriptStack } from "./compile.ts";
+import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
+import { blockingCalls, Durable, type InFlightPolicy, isInterruption } from "./durable.ts";
+import { Journal, type JournalEntry, journalPath, newRunId, readJournal, type RunHeader, runDir, SNAPSHOT_FILE } from "./journal.ts";
 import type { SavedWorkflow } from "./library.ts";
-import { llm } from "./llm.ts";
+import { DEFAULT_LLM_MODEL, llm } from "./llm.ts";
 import { sh } from "./sh.ts";
+import { T3, T3_DELEGATE, T3_PREFIX, t3Data } from "./t3.ts";
 
 const DEFAULT_CONCURRENCY = 4;
 const MAX_LLM_IN_FLIGHT = 8;
@@ -49,7 +60,7 @@ export interface RunEnv {
 	executeTool?: (name: string, args: unknown, signal: AbortSignal) => Promise<ToolOutcome>;
 	/** The tools executeTool can call; with t3's, agent() children become t3 tasks. */
 	toolNames?: readonly string[];
-	/** The calling session's id. */
+	/** The calling session's id and file. */
 	sessionId?: string;
 	/** The saved workflows, for workflows.*. */
 	library: () => ReadonlyMap<string, SavedWorkflow>;
@@ -57,12 +68,20 @@ export interface RunEnv {
 	parentSessionFile?: string;
 	signal?: AbortSignal;
 	onUpdate?: (details: WorkflowDetails) => void;
+	/** The run has its id and journal; called before the script runs. */
+	onStart?: (run: { id: string; journal: string; attempt: number }) => void;
 }
+
+export type WorkflowStatus = "running" | "completed" | "failed" | "aborted" | "over budget" | "interrupted" | "diverged";
 
 export interface WorkflowDetails {
 	/** The goal was reached (details.ok for the metrics index): the script returned, without `ok: false`, within budget. */
 	ok: boolean;
-	status: "running" | "completed" | "failed" | "aborted" | "over budget";
+	status: WorkflowStatus;
+	/** The run's id and journal; `attempt` counts the resumes (1 for the first execution). */
+	id: string;
+	journal: string;
+	attempt: number;
 	/** The saved workflow's name; absent for inline code. */
 	workflow?: string;
 	error?: string;
@@ -72,6 +91,8 @@ export interface WorkflowDetails {
 	llmCalls: number;
 	cachedCalls: number;
 	agentRuns: number;
+	/** Calls answered from the journal in this execution. */
+	replayedCalls: number;
 	/** Child agent sessions (details.childSessions for the metrics index). */
 	childSessions: string[];
 	/** The t3 threads of child agents (links). */
@@ -94,12 +115,27 @@ export interface WorkflowEntry {
 	input?: unknown;
 }
 
+export interface ResumeRequest {
+	id: string;
+	/** What to do with shell and tools.* calls that were in flight; without, such calls stop the resume. */
+	inFlight?: "rerun" | "fail";
+	/** A new budget for the whole run (the recorded spend counts against it). */
+	budget?: number;
+}
+
+export interface WorkflowResult {
+	text: string;
+	details: WorkflowDetails;
+	usage?: Usage;
+}
+
 class BudgetExceeded extends Error {
 	constructor(limit: number, spent: number) {
 		super(`the budget of $${limit.toFixed(2)} is used up ($${spent.toFixed(4)} spent)`);
 		this.name = "BudgetExceeded";
 	}
 }
+
 
 const addUsage = (a: Usage | undefined, b: Usage): Usage =>
 	a
@@ -170,9 +206,97 @@ const show = (value: unknown): string => {
 	}
 };
 
-/** Run a workflow and report. Throws only when the entry does not compile or load (nothing ran). */
-export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env: RunEnv): Promise<{ text: string; details: WorkflowDetails; usage?: Usage }> {
+const firstLine = (text: string, max = 120) => text.split("\n")[0]!.slice(0, max);
+
+/** The options object a script passed last to shell() or a tool, and whether it marks the call idempotent. */
+function idempotentOption(options: unknown, where: string): boolean {
+	if (options === undefined) return false;
+	const value = (options as { idempotent?: unknown } | null)?.idempotent;
+	if (value !== undefined && typeof value !== "boolean") throw new TypeError(`${where}: idempotent must be a boolean`);
+	return value === true;
+}
+
+// The start snapshot, kept with the journal so changes() after a resume compares with the start.
+type StoredState = { exists: false } | { exists: true; hash: string; content?: string };
+function saveSnapshot(path: string, snap: Snapshot): void {
+	const files = [...snap.files].map(([file, state]): [string, StoredState] => [file, state.exists ? { exists: true, hash: state.hash, ...(state.content ? { content: state.content.toString("base64") } : {}) } : { exists: false }]);
+	writeFileSync(path, JSON.stringify({ root: snap.root, ...(snap.head ? { head: snap.head } : {}), files }));
+}
+function loadSnapshot(path: string): Snapshot | undefined {
+	if (!existsSync(path)) return undefined;
+	const stored = JSON.parse(readFileSync(path, "utf8")) as { root: string; head?: string; files: [string, StoredState][] };
+	const files = new Map<string, FileState>(stored.files.map(([file, state]) => [file, state.exists ? { exists: true, hash: state.hash, ...(state.content ? { content: Buffer.from(state.content, "base64") } : {}) } : { exists: false }]));
+	return { root: stored.root, ...(stored.head ? { head: stored.head } : {}), files };
+}
+
+/** Start a new run and report. Throws only when the entry does not compile or load (nothing ran). */
+export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env: RunEnv): Promise<WorkflowResult> {
 	if (!Number.isFinite(budgetLimit) || budgetLimit <= 0) throw new Error("budget must be a positive number of USD");
+	const id = newRunId();
+	const header: RunHeader = {
+		t: "run",
+		id,
+		at: Date.now(),
+		entry: { source: entry.source, filename: entry.filename, inline: entry.inline, ...(entry.name ? { name: entry.name } : {}), ...(entry.input === undefined ? {} : { input: entry.input }) },
+		budget: budgetLimit,
+		cwd: env.cwd,
+		...(env.sessionId ? { sessionId: env.sessionId } : {}),
+		...(env.parentSessionFile ? { sessionFile: env.parentSessionFile } : {}),
+	};
+	const journal = new Journal(journalPath(env.agentDir, id));
+	journal.append(header, true);
+	return execute(header, [header], journal, budgetLimit, "stop", env);
+}
+
+/** The state of a run as its journal tells it; throws when there is no such run. */
+export function runState(agentDir: string, id: string): { entries: JournalEntry[]; header: RunHeader; end?: Extract<JournalEntry, { t: "end" }> } {
+	const path = journalPath(agentDir, id);
+	if (!existsSync(path)) throw new Error(`no workflow run ${id} (no journal ${path})`);
+	const entries = readJournal(path);
+	const header = entries[0];
+	if (header?.t !== "run") throw new Error(`the journal ${path} has no run header`);
+	const lastAttempt = entries.findLastIndex((e) => e.t === "attempt");
+	const endAt = entries.findLastIndex((e) => e.t === "end");
+	const end = endAt > lastAttempt ? (entries[endAt] as Extract<JournalEntry, { t: "end" }>) : undefined;
+	return { entries, header, ...(end ? { end } : {}) };
+}
+
+/**
+ * Resume a run from its journal: the same script from its start, recorded calls answered from the
+ * journal. Throws (nothing ran) when the run is unknown, running in a live process, finished, or
+ * has shell or tools.* calls in flight and no `inFlight` decision.
+ */
+export async function resumeWorkflow(request: ResumeRequest, env: RunEnv): Promise<WorkflowResult> {
+	const { entries, header, end } = runState(env.agentDir, request.id);
+	if (end && end.status !== "interrupted" && end.status !== "aborted" && end.status !== "over budget") {
+		throw new Error(`workflow run ${request.id} ended (${end.status}); there is nothing to resume. Its result:\n\n${end.text}`);
+	}
+	const blocking = blockingCalls(entries);
+	if (blocking.length && !request.inFlight) {
+		throw new Error(
+			[
+				`workflow run ${request.id} was not resumed: these calls were in flight when it stopped, and running them again could repeat their effects:`,
+				...blocking.map((call) => `- ${call.kind} ${call.label} (${call.key})`),
+				'Check whether they took effect, then resume with inFlight: "rerun" (run them again) or inFlight: "fail" (they throw an InterruptedCallError the script can catch). Mark calls that are safe to repeat with { idempotent: true }.',
+			].join("\n"),
+		);
+	}
+	const budget = request.budget ?? header.budget;
+	if (!Number.isFinite(budget) || budget <= 0) throw new Error("budget must be a positive number of USD");
+	return execute(header, entries, new Journal(journalPath(env.agentDir, request.id)), budget, request.inFlight ?? "stop", { ...env, cwd: header.cwd });
+}
+
+async function execute(header: RunHeader, entries: readonly JournalEntry[], journal: Journal, budgetLimit: number, inFlight: InFlightPolicy, env: RunEnv): Promise<WorkflowResult> {
+	const dir = runDir(env.agentDir, header.id);
+	const unlock = acquireLock(join(dir, "lock"));
+	if (!unlock) {
+		journal.close();
+		throw new Error(`workflow run ${header.id} is running in another process`);
+	}
+	const entry: WorkflowEntry = header.entry;
+	const attempt = entries.filter((e) => e.t === "attempt").length + 1;
+	journal.append({ t: "attempt", n: attempt, at: Date.now(), pid: process.pid }, true);
+
 	const started = performance.now();
 	const controller = new AbortController();
 	const forwardAbort = () => controller.abort(env.signal?.reason ?? new Error("aborted"));
@@ -183,6 +307,9 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 	const details: WorkflowDetails = {
 		ok: false,
 		status: "running",
+		id: header.id,
+		journal: journal.path,
+		attempt,
 		...(entry.name ? { workflow: entry.name } : {}),
 		durationMs: 0,
 		budget: budgetLimit,
@@ -190,6 +317,7 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 		llmCalls: 0,
 		cachedCalls: 0,
 		agentRuns: 0,
+		replayedCalls: 0,
 		childSessions: [],
 		childThreads: [],
 		changedFiles: [],
@@ -213,11 +341,42 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 		}
 		publish();
 	};
-	const disposers: (() => void)[] = [];
+	const durable = new Durable({
+		journal,
+		entries,
+		inFlight,
+		replayed: (kind, cost) => {
+			if (kind === "llm") details.llmCalls++;
+			if (kind === "agent") details.agentRuns++;
+			if (cost > 0) spend(cost);
+		},
+		diverged: (error) => controller.abort(error),
+		stopped: () => signal.aborted,
+	});
+	const host: ScriptHost = { now: () => durable.now(), random: () => durable.random(), hold: () => durable.hold() };
+	const disposers: ((interrupted: boolean) => void)[] = [];
 	const root = await gitRoot(env.cwd);
-	const start: Snapshot | undefined = root ? await snapshot(root) : undefined;
+	const snapshotFile = join(dir, SNAPSHOT_FILE);
+	let start: Snapshot | undefined = root ? loadSnapshot(snapshotFile) : undefined;
+	if (root && !start) {
+		start = await snapshot(root);
+		saveSnapshot(snapshotFile, start);
+	}
 	const llmSlot = limiter(MAX_LLM_IN_FLIGHT);
-	const executeTool = env.executeTool;
+	const live = () => {
+		if (signal.aborted) throw signal.reason;
+	};
+	// A tool call that fails because the run is interrupted stops the whole run as interrupted.
+	const executeTool = env.executeTool
+		? async (name: string, args: unknown, callSignal: AbortSignal) => {
+				try {
+					return await env.executeTool!(name, args, callSignal);
+				} catch (error) {
+					if (isInterruption(error)) controller.abort(error);
+					throw error;
+				}
+			}
+		: undefined;
 	const t3 =
 		executeTool && env.toolNames?.includes(T3_DELEGATE)
 			? new T3(async (name, args, callSignal) => {
@@ -226,9 +385,7 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 					return t3Data(name, outcome.value, outcome.text);
 				})
 			: undefined;
-	const live = () => {
-		if (signal.aborted) throw signal.reason;
-	};
+	let agents = 0;
 
 	const globals: Record<string, unknown> = {
 		cwd: env.cwd,
@@ -238,13 +395,16 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 				get: (_target, name) =>
 					typeof name !== "string"
 						? undefined
-						: async (args: unknown = {}) => {
+						: async (args: unknown = {}, options?: unknown) => {
 								live();
-								if (!env.executeTool) throw new Error("tools are only available in a session");
-								const outcome = await env.executeTool(name, args, signal);
-								live();
-								if (outcome.isError && !outcome.structured) throw new Error(outcome.text || `tool ${name} failed`);
-								return outcome.value;
+								if (!executeTool) throw new Error("tools are only available in a session");
+								const idempotent = idempotentOption(options, `tools.${name}()`);
+								return durable.call({ kind: "tool", args: { name, args }, label: `${name} ${firstLine(JSON.stringify(args) ?? "", 100)}`, idempotent }, async () => {
+									const outcome = await executeTool(name, args, signal);
+									live();
+									if (outcome.isError && !outcome.structured) throw new Error(outcome.text || `tool ${name} failed`);
+									return { value: outcome.value };
+								});
 							},
 			},
 		),
@@ -254,29 +414,39 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 			const { cwd, timeoutSeconds } = (options ?? {}) as { cwd?: unknown; timeoutSeconds?: unknown };
 			if (cwd !== undefined && typeof cwd !== "string") throw new TypeError("shell(): cwd must be a string");
 			if (timeoutSeconds !== undefined && (typeof timeoutSeconds !== "number" || !(timeoutSeconds > 0))) throw new TypeError("shell(): timeoutSeconds must be a positive number");
-			progress(`shell ${command.split("\n")[0]!.slice(0, 120)}`);
-			const result = await runShell(command, { cwd: resolve(env.cwd, cwd ?? "."), signal, timeoutMs: timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000 });
-			live();
-			return { exitCode: result.exitCode, output: result.output, timedOut: result.timedOut };
-		},
-		llm: (prompt: unknown, options: unknown) =>
-			llmSlot(async () => {
+			const idempotent = idempotentOption(options, "shell()");
+			return durable.call({ kind: "shell", args: { command, cwd: cwd ?? null, timeoutSeconds: timeoutSeconds ?? null }, label: firstLine(command), idempotent }, async () => {
+				progress(`shell ${firstLine(command)}`);
+				const result = await runShell(command, { cwd: resolve(env.cwd, cwd ?? "."), signal, timeoutMs: timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000 });
 				live();
-				return llm(prompt, options, {
-					runtime: env.runtime,
-					cache: env.llmCache,
-					signal,
-					spend: (u) => {
-						usage = addUsage(usage, u);
-						spend(u.cost.total);
-					},
-					counted: (cached) => {
-						details.llmCalls++;
-						if (cached) details.cachedCalls++;
-						publish();
-					},
-				});
-			}),
+				return { value: { exitCode: result.exitCode, output: result.output, timedOut: result.timedOut } };
+			});
+		},
+		llm: (prompt: unknown, options: unknown) => {
+			const model = (options as { model?: unknown } | undefined)?.model;
+			return durable.call({ kind: "llm", args: { prompt, options: options ?? null }, label: typeof prompt === "string" ? firstLine(prompt, 100) : "llm()", model: typeof model === "string" ? model : DEFAULT_LLM_MODEL }, () =>
+				llmSlot(async () => {
+					live();
+					let cost = 0;
+					const value = await llm(prompt, options, {
+						runtime: env.runtime,
+						cache: env.llmCache,
+						signal,
+						spend: (u) => {
+							usage = addUsage(usage, u);
+							cost += u.cost.total;
+							spend(u.cost.total);
+						},
+						counted: (cached) => {
+							details.llmCalls++;
+							if (cached) details.cachedCalls++;
+							publish();
+						},
+					});
+					return { value, cost };
+				}),
+			);
+		},
 		agent: (options: unknown) =>
 			createAgent(options, {
 				cwd: env.cwd,
@@ -287,9 +457,13 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 				parentSessionFile: env.parentSessionFile,
 				callerSessionId: env.sessionId,
 				t3,
+				durable,
+				number: ++agents,
 				signal,
 				spend,
-				started: (id) => details.childSessions.push(id),
+				started: (id) => {
+					if (!details.childSessions.includes(id)) details.childSessions.push(id);
+				},
 				thread: (link) => details.childThreads.push(link),
 				ran: () => details.agentRuns++,
 				progress,
@@ -299,11 +473,12 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 		map: mapItems,
 		sh,
 		log: (...values: unknown[]) => progress(values.map((v) => (typeof v === "string" ? v : show(v))).join(" ")),
-		changes: async () => {
-			if (!root || !start) throw new Error(`changes() needs a git repository; ${env.cwd} is not in one`);
-			const files = await changedPaths(start, await snapshot(root));
-			return { files: files.map((f) => relative(canonical(env.cwd), f)), diff: await diffSince(start, files) };
-		},
+		changes: () =>
+			durable.call({ kind: "changes", args: {}, label: "changes()" }, async () => {
+				if (!root || !start) throw new Error(`changes() needs a git repository; ${env.cwd} is not in one`);
+				const files = await changedPaths(start, await snapshot(root));
+				return { value: { files: files.map((f) => relative(canonical(env.cwd), f)), diff: await diffSince(start, files) } };
+			}),
 		budget: Object.freeze({
 			limit: budgetLimit,
 			get spent() {
@@ -321,21 +496,23 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 						if (!saved) throw new Error(`no saved workflow ${name}; saved: ${[...env.library().keys()].join(", ") || "none"}`);
 						const call: ToolCall = { type: "toolCall", id: `workflow-${name}`, name, arguments: input as ToolCall["arguments"] };
 						const checked = validateToolArguments({ name, description: "", parameters: saved.meta.parameters }, call);
-						progress(`workflow ${name}`);
-						return load({ source: saved.source, filename: saved.file, inline: false }).run(checked);
+						return durable.call({ kind: "workflow", args: { name, input: checked }, label: `workflow ${name}` }, async () => {
+							progress(`workflow ${name}`);
+							return { value: await load({ source: saved.source, filename: saved.file, inline: false }).run(checked) };
+						});
 					};
 				},
 			},
 		),
 	};
 	globals.console = { log: globals.log, info: globals.log, warn: globals.log, error: globals.log, debug: globals.log };
-	const load = (e: Pick<WorkflowEntry, "source" | "filename" | "inline">) =>
-		evaluate(compile(e.inline ? inlineModule(e.source) : e.source, e.filename), e.filename, globals);
+	const load = (e: Pick<WorkflowEntry, "source" | "filename" | "inline">) => evaluate(compile(e.inline ? inlineModule(e.source) : e.source, e.filename), e.filename, globals, host);
 
 	let value: unknown;
 	let failure: unknown;
 	try {
 		const module = load(entry);
+		env.onStart?.({ id: header.id, journal: journal.path, attempt });
 		publish();
 		value = await module.run(entry.input);
 	} catch (error) {
@@ -343,16 +520,25 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
 	} finally {
 		env.signal?.removeEventListener("abort", forwardAbort);
 		if (!signal.aborted) controller.abort(new Error("the workflow ended"));
-		for (const dispose of disposers) dispose();
 	}
+	const reason: unknown = signal.reason;
+	const diverged = (reason as { name?: unknown } | null)?.name === "DivergenceError";
+	const interrupted = !overBudget && !diverged && (isInterruption(reason) || isInterruption(env.signal?.reason));
+	for (const dispose of disposers) dispose(interrupted);
+	if (diverged) failure = reason;
 	if (root && start) details.changedFiles = await changedPaths(start, await snapshot(root));
 	details.durationMs = performance.now() - started;
-	details.status = overBudget ? "over budget" : env.signal?.aborted ? "aborted" : failure !== undefined ? "failed" : "completed";
+	details.replayedCalls = durable.replayedCalls;
+	details.status = overBudget ? "over budget" : diverged ? "diverged" : interrupted ? "interrupted" : env.signal?.aborted ? "aborted" : failure !== undefined ? "failed" : "completed";
 	const declaredOk = value && typeof value === "object" && typeof (value as { ok?: unknown }).ok === "boolean" ? (value as { ok: boolean }).ok : true;
 	details.ok = details.status === "completed" && declaredOk;
-	if (failure !== undefined) details.error = scriptStack(failure, entry.filename);
+	if (failure !== undefined) details.error = interrupted ? `interrupted: ${(reason as Error).message}` : scriptStack(failure, entry.filename);
 	details.log = lines.slice(-PROGRESS_LINES);
-	return { text: report(details, value, failure !== undefined, lines, env.cwd), details, ...(usage ? { usage } : {}) };
+	const text = report(details, value, failure !== undefined, lines, env.cwd);
+	journal.append({ t: "end", at: Date.now(), status: details.status, ok: details.ok, cost: details.cost, text }, true);
+	journal.close();
+	unlock();
+	return { text, details, ...(usage ? { usage } : {}) };
 }
 
 function report(details: WorkflowDetails, value: unknown, failed: boolean, lines: string[], cwd: string): string {
@@ -361,8 +547,11 @@ function report(details: WorkflowDetails, value: unknown, failed: boolean, lines
 		`$${details.cost.toFixed(4)} of $${details.budget.toFixed(2)}`,
 		`${details.llmCalls} llm call${details.llmCalls === 1 ? "" : "s"}${details.cachedCalls ? ` (${details.cachedCalls} cached)` : ""}`,
 		`${details.agentRuns} agent run${details.agentRuns === 1 ? "" : "s"}`,
+		...(details.replayedCalls ? [`${details.replayedCalls} replayed from the journal`] : []),
+		`run ${details.id}`,
 	];
 	const out = [`Workflow ${details.workflow ? `${details.workflow} ` : ""}${details.status} · ${stats.join(" · ")}`];
+	if (details.status === "interrupted") out.push(`It can continue from its journal: call workflow with resume: "${details.id}".`);
 	if (details.changedFiles.length) out.push(`Changed files: ${details.changedFiles.map((f) => relative(canonical(cwd), f)).join(", ")}`);
 	for (const warning of details.warnings) out.push(`Warning: ${warning}`);
 	if (details.childThreads.length) out.push(`Child threads: ${details.childThreads.join(", ")}`);
@@ -378,7 +567,7 @@ function report(details: WorkflowDetails, value: unknown, failed: boolean, lines
 	if (!cut.truncated) return text;
 	const dir = join(tmpdir(), "pi-workflow");
 	mkdirSync(dir, { recursive: true });
-	details.outputFile = join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+	details.outputFile = join(dir, `${details.id}.txt`);
 	writeFileSync(details.outputFile, text);
 	return `${cut.content}\n[cut; the full report is in ${details.outputFile}]`;
 }

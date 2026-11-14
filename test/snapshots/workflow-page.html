@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><title>workflow 20261114-120000-abc123</title><style>.wf{font-family:var(--font-sans);color:var(--foreground);display:flex;flex-direction:column;gap:12px}
+.wf header{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline}
+.wf h1{font-size:15px;font-weight:600;margin:0}
+.wf .stat{font-size:12px;color:var(--muted-foreground)}
+.wf .stat b{color:var(--foreground);font-weight:600}
+.wf .run-status{font-size:12px;font-weight:600}
+.wf .groups{display:flex;flex-direction:column;gap:8px}
+.wf .group{display:flex;gap:8px;align-items:flex-start}
+.wf .group.parallel{border-left:2px solid var(--border);padding-left:8px}
+.wf .lane{flex:1 1 0;min-width:0;display:flex;flex-direction:column;gap:6px}
+.wf .node{background:var(--card);color:var(--card-foreground);border:1px solid var(--border);border-left:3px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;flex-direction:column;gap:3px;min-width:0}
+.wf .row{display:flex;gap:8px;align-items:baseline;min-width:0}
+.wf .kind{font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);flex:none}
+.wf .label{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.wf .meta{font-size:11px;color:var(--muted-foreground);display:flex;flex-wrap:wrap;gap:4px 10px}
+.wf .meta a{color:var(--primary)}
+.wf .error{font-family:var(--font-mono);font-size:11px;color:var(--destructive);overflow-wrap:anywhere}
+.wf .s-running{border-left-color:var(--info)}.wf .s-running .st{color:var(--info)}
+.wf .s-done{border-left-color:var(--success)}.wf .s-done .st{color:var(--success)}
+.wf .s-failed{border-left-color:var(--destructive)}.wf .s-failed .st{color:var(--destructive)}
+.wf .s-replayed{border-left-color:var(--muted-foreground)}.wf .s-replayed .st{color:var(--muted-foreground)}
+.wf .s-interrupted{border-left-color:var(--warning)}.wf .s-interrupted .st{color:var(--warning)}
+.wf .empty{font-size:12px;color:var(--muted-foreground)}</style></head><body><div class="wf" data-run="20261114-120000-abc123"><header><h1>inline workflow <span class="stat">20261114-120000-abc123</span></h1><span class="run-status">running</span><span class="stat"><b>6.3 s</b> total</span><span class="stat"><b>$0.0031</b> of $2.00</span><span class="stat"><b>2</b> open · <b>3</b> done</span></header><div class="groups"><div class="group"><div class="lane"><div class="node k-shell s-done" data-key="shell:aaa#1"><div class="row"><span class="kind">shell</span><span class="label" title="npm run build">npm run build</span></div><div class="meta"><span class="st">done</span><span>4.0 s</span></div></div></div></div><div class="group parallel"><div class="lane"><div class="node k-llm s-failed" data-key="llm:bbb#1"><div class="row"><span class="kind">llm</span><span class="label" title="Classify &lt;a&gt; &amp; &quot;b&quot;">Classify &lt;a&gt; &amp; &quot;b&quot;</span></div><div class="meta"><span class="st">failed</span><span>2.0 s</span><span>$0.0010</span><span>anthropic/claude-haiku-5-5</span></div><div class="error">Error: llm(): overloaded</div></div><div class="node k-tool s-running" data-key="tool:eee#1"><div class="row"><span class="kind">tool</span><span class="label" title="write {&quot;path&quot;:&quot;a&quot;}">write {&quot;path&quot;:&quot;a&quot;}</span></div><div class="meta"><span class="st">running</span><span>for 0 ms</span></div></div></div><div class="lane"><div class="node k-llm s-done" data-key="llm:ccc#1"><div class="row"><span class="kind">llm</span><span class="label" title="Classify c">Classify c</span></div><div class="meta"><span class="st">done</span><span>1.0 s</span><span>$0.0021</span><span>anthropic/claude-haiku-5-5</span></div></div></div><div class="lane"><div class="node k-agent s-running" data-key="agent:ddd#1"><div class="row"><span class="kind">agent</span><span class="label" title="agent 1: Review the diff">agent 1: Review the diff</span></div><div class="meta"><span class="st">running</span><span>for 2.0 s</span><span>anthropic/claude-sonnet-5-5</span><a href="t3-thread://v2/env/thread-1">thread</a></div></div></div></div></div></div></body></html>

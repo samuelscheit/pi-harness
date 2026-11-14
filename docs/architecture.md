@@ -50,7 +50,7 @@ flowchart TB
 | [`extensions/lib/experiments.ts`](../extensions/lib/experiments.ts), [`extensions/lib/rules.ts`](../extensions/lib/rules.ts) | A/B experiment assignment, and promoted rules. |
 | [`extensions/background`](../extensions/background/index.ts) | Moves every tool call still running after two minutes (or when a user message arrives) to the background; its end wakes the session. |
 | [`extensions/bash`](../extensions/bash/index.ts) | Owns the `bash` tool: tracking of processes a command leaves running, refusal of self-detaching commands, `tool` bridge. |
-| [`extensions/workflow`](../extensions/workflow/index.ts) | The `workflow` tool and saved workflows as tools. |
+| [`extensions/workflow`](../extensions/workflow/index.ts) | The `workflow` tool and saved workflows as tools; durable runs (journal, replay, resume) and their pages. |
 | [`extensions/ask-user`](../extensions/ask-user/index.ts) | Asynchronous `ask_user` on Pi dialogs. |
 | [`extensions/web`](../extensions/web/index.ts) | `web_search` and `web_fetch` through Anthropic server tools. |
 | [`extensions/improvements`](../extensions/improvements/index.ts) | `note_improvement`, the agent's friction log. |
@@ -79,5 +79,6 @@ flowchart TB
 | Pi configuration written by the installer | `~/.pi/agent/{settings,models,auth}.json` | no |
 | Sessions | `~/.pi/agent/sessions/` (Pi) | no; the source of truth for metrics |
 | Metrics index | `~/.pi/agent/metrics.db` | no; rebuilt from sessions |
+| Workflow journals, start snapshots and pages | `~/.pi/agent/workflows/<id>/` | no; a day after completion, a week when interrupted |
 | Improvement notes, changelog, dream ledger and reports | `.agents/` in this repository (git-ignored in the public repository) | locally |
 | Project rules and settings | `<repo>/AGENTS.md`, `<repo>/.pi/`, `<repo>/.agents/` | in that project |

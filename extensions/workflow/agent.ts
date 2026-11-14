@@ -11,15 +11,24 @@
 // tool (details.childSessions, for the metrics index), and returns the files the working tree
 // changed during each run. `files` is told to the child, not enforced: agents run in parallel in
 // one working tree, as t3 children do.
+//
+// Each run is a durable call (durable.ts). Its journal records the spec and, as soon as they are
+// known, the child's t3 task and thread or its session file; the run's outcome records the agent's
+// state, so a replayed run restores the agent and its later runs go to the same child. A run in
+// flight when the workflow's process died reattaches: in t3 it repeats the same idempotent call
+// (same clientRequestId) and waits for the run; in-process it reopens the child's session file. A
+// child whose run was cut off (its own process ended too) gets a message to continue.
 
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { relative } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { canonical, changedPaths, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { delegatedChild } from "./child.ts";
-import { type DelegationSpec, type DelegationState, delegationMessage, delegationsDir, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
+import { type DelegationSpec, type DelegationState, delegationMessage, delegationsDir, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
+import { type CallContext, type Durable, isInterruption } from "./durable.ts";
 import { CACHE_RETENTION, resolveModel, type Thinking, thinkingOption } from "./models.ts";
-import { type T3, T3Child } from "./t3.ts";
+import { type T3, T3Child, type T3ChildIds } from "./t3.ts";
 
 export const DEFAULT_AGENT_MODEL = "anthropic/claude-sonnet-5-5";
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
@@ -27,6 +36,8 @@ const DEFAULT_SYSTEM = [
 	"You are an agent started by a workflow script. You start without the conversation that led here: everything you need is in the messages you get or in the files.",
 	"Do what each message asks. When done, answer briefly: your final message is returned to the script as text.",
 ].join("\n");
+/** Sent to a child whose run was cut off when processes ended, as a run with the same number. */
+export const CONTINUE_MESSAGE = "Your previous run was interrupted before it finished (a process ended). Continue the task of this run where you left off, and finish it as the run asked.";
 /** How often the child's state is read while it runs (cost, session). */
 const POLL_MS = 500;
 /** How long a run's state may lag behind the end of the run (t3 reports the end on its own path). */
@@ -54,6 +65,9 @@ export interface AgentEnv {
 	callerSessionId?: string;
 	/** t3's tools, when the session runs in t3: children become t3 tasks. */
 	t3?: T3;
+	durable: Durable;
+	/** This agent's number in its workflow run (agent() calls in script order). */
+	number: number;
 	signal: AbortSignal;
 	/** Each response's cost in USD. */
 	spend: (usd: number) => void;
@@ -65,8 +79,8 @@ export interface AgentEnv {
 	ran: () => void;
 	progress: (line: string) => void;
 	warn: (line: string) => void;
-	/** Register cleanup for the end of the workflow run. */
-	onDispose: (dispose: () => void) => void;
+	/** Register cleanup for the end of the workflow run; `interrupted`: the run will be resumed, children keep their state. */
+	onDispose: (dispose: (interrupted: boolean) => void) => void;
 }
 
 export interface AgentRun {
@@ -84,6 +98,27 @@ export interface AgentRun {
 export interface AgentHandle {
 	run(message: string): Promise<AgentRun>;
 	readonly cost: number;
+}
+
+/** What a run's journal outcome records besides the run: the agent, to restore on replay. */
+interface AgentState {
+	firstKey: string;
+	spec: DelegationSpec;
+	runs: number;
+	cost: number;
+	counted: Record<string, number>;
+	t3?: T3ChildIds;
+	sessionFile?: string;
+}
+
+/** What a run's journal meta records while it runs, to reattach. */
+interface RunMeta {
+	spec?: DelegationSpec;
+	sessionFile?: string;
+	taskId?: string;
+	threadId?: string;
+	link?: string;
+	runId?: string;
 }
 
 const stringList = (value: unknown, name: string): string[] | undefined => {
@@ -126,10 +161,17 @@ function callLine(tool: string, args: unknown): string {
 	return `${tool} ${value.split("\n")[0]!.slice(0, 120)}`.trim();
 }
 
+const headline = (text: string) => (text.split("\n").find((line) => line.trim()) ?? "").trim();
+
 /** How a child's runs are carried out: a t3 task or an in-process session. */
 interface Transport {
 	/** Send one run's message (`script`: the script's own message, for a title); resolves when the run is over. */
-	run(message: string, first: boolean, script: string): Promise<void>;
+	run(message: string, requestId: string, script: string, remember: (meta: RunMeta) => void): Promise<void>;
+	/** Continue a run that was in flight when the process died (`recorded`: what its journal knew): `message` may have been sent already, `continuation` asks to go on. */
+	reattach(message: string, continuation: string, requestId: string, script: string, recorded: RunMeta, remember: (meta: RunMeta) => void): Promise<void>;
+	/** What identifies the child, for the journal. */
+	state(): Pick<AgentState, "t3" | "sessionFile">;
+	restore(state: Pick<AgentState, "t3" | "sessionFile">): void;
 	cancel(): void;
 	dispose(): void;
 	threadId?: string;
@@ -139,7 +181,8 @@ interface Transport {
 
 function inProcess(options: AgentOptions, dir: string, label: string, env: AgentEnv): Transport {
 	let child: Promise<AgentSession> | undefined;
-	const create = async () => {
+	let sessionFile: string | undefined;
+	const create = async (manager: SessionManager) => {
 		const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true, maxRetries: 3 }, cacheRetention: CACHE_RETENTION });
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: env.cwd,
@@ -161,7 +204,7 @@ function inProcess(options: AgentOptions, dir: string, label: string, env: Agent
 			modelRuntime: env.runtime,
 			resourceLoader,
 			tools: [...options.tools, ...(options.schema ? [SUBMIT_TOOL] : [])],
-			sessionManager: env.sessionDir ? SessionManager.create(env.cwd, env.sessionDir, { parentSession: env.parentSessionFile }) : SessionManager.inMemory(env.cwd),
+			sessionManager: manager,
 			settingsManager,
 		});
 		session.subscribe((event) => {
@@ -169,12 +212,25 @@ function inProcess(options: AgentOptions, dir: string, label: string, env: Agent
 		});
 		return session;
 	};
+	const fresh = () => (env.sessionDir ? SessionManager.create(env.cwd, env.sessionDir, { parentSession: env.parentSessionFile }) : SessionManager.inMemory(env.cwd));
+	const prompt = async (message: string, manager: () => SessionManager, remember: (meta: RunMeta) => void) => {
+		const session = await (child ??= create(manager()));
+		if (session.sessionFile && session.sessionFile !== sessionFile) {
+			sessionFile = session.sessionFile;
+			remember({ sessionFile });
+		}
+		// Checked right before prompt(): an abort while the session was created would reach no run.
+		if (env.signal.aborted) throw env.signal.reason;
+		await session.prompt(message);
+	};
+	const recorded = () => (sessionFile && existsSync(sessionFile) ? SessionManager.open(sessionFile) : fresh());
 	return {
-		async run(message) {
-			const session = await (child ??= create());
-			// Checked right before prompt(): an abort while the session was created would reach no run.
-			if (env.signal.aborted) throw env.signal.reason;
-			await session.prompt(message);
+		run: (message, _requestId, _script, remember) => prompt(message, recorded, remember),
+		// The child died with the parent's process: reopen its session and ask it to go on; without one, nothing ran yet.
+		reattach: (message, continuation, _requestId, _script, _recorded, remember) => prompt(sessionFile && existsSync(sessionFile) ? continuation : message, recorded, remember),
+		state: () => (sessionFile ? { sessionFile } : {}),
+		restore: (state) => {
+			sessionFile = state.sessionFile ?? sessionFile;
 		},
 		cancel: () => void child?.then((session) => session.abort(), () => undefined),
 		dispose: () => void child?.then((session) => session.dispose(), () => undefined),
@@ -184,38 +240,53 @@ function inProcess(options: AgentOptions, dir: string, label: string, env: Agent
 
 function inT3(t3: T3, options: AgentOptions, label: string, env: AgentEnv): Transport {
 	let task: T3Child | undefined;
+	let restored: T3ChildIds = {};
+	const child = (script: string) => {
+		if (task) return task;
+		task = new T3Child(t3, {
+			title: `workflow ${label}: ${headline(script).slice(0, 60)}`,
+			role: options.tools.some((tool) => tool === "edit" || tool === "write") ? "implementation" : "research",
+			model: options.model,
+			thinking: options.thinking,
+		});
+		task.restore(restored);
+		return task;
+	};
+	const started = (known: string | undefined, remember: (meta: RunMeta) => void) => (ids: T3ChildIds) => {
+		remember(ids);
+		if (!known && ids.threadId) {
+			env.thread(ids.link ?? ids.threadId);
+			env.progress(`${label} · t3 thread ${ids.link ?? ids.threadId}`);
+		}
+	};
 	return {
-		async run(message, first, script) {
-			const headline = script.split("\n").find((line) => line.trim()) ?? "";
-			task ??= new T3Child(t3, {
-				title: `workflow ${label}: ${headline.trim().slice(0, 60)}`,
-				role: options.tools.some((tool) => tool === "edit" || tool === "write") ? "implementation" : "research",
-				model: options.model,
-				thinking: options.thinking,
-			});
-			await task.run(message, first, env.signal, (link) => {
-				env.thread(link);
-				env.progress(`${label} · t3 thread ${link}`);
-			});
+		run: (message, requestId, script, remember) => child(script).run(message, requestId, env.signal, started(child(script).threadId, remember)),
+		// A run whose id the journal has is waited for; else t3 dedupes the repeated call on its request id.
+		reattach: (message, _continuation, requestId, script, recorded, remember) => child(script).reattach(message, requestId, recorded.runId, env.signal, started(child(script).threadId, remember)),
+		state: () => {
+			const ids = task?.ids ?? restored;
+			return Object.keys(ids).length ? { t3: ids } : {};
+		},
+		restore: (state) => {
+			restored = { ...restored, ...state.t3 };
+			task?.restore(restored);
 		},
 		cancel: () => task?.cancel(),
 		dispose: () => undefined,
 		get threadId() {
-			return task?.threadId;
+			return task?.threadId ?? restored.threadId;
 		},
 		describe: () => `its t3 task (thread ${task?.link ?? task?.threadId ?? "not started"}, status ${task?.status || "unknown"}${task?.summary ? `: ${task.summary.slice(0, 300)}` : ""})`,
 	};
 }
 
-let agentCount = 0;
-
 /** agent(options): checked at once; the child starts on the first run. */
 export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 	const options = agentOptions(raw);
 	resolveModel(env.runtime, options.model);
-	const label = `agent ${++agentCount}`;
+	const label = `agent ${env.number}`;
 	const dir = delegationsDir(env.agentDir);
-	const spec: DelegationSpec = {
+	let spec: DelegationSpec = {
 		id: randomUUID(),
 		system: options.system,
 		tools: options.tools,
@@ -228,12 +299,16 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 	let cost = 0;
 	let running = false;
 	let disposed = false;
+	/** The key of the first run: the agent's identity in the journal. */
+	let firstKey: string | undefined;
 	/** The cost of each child session counted so far. */
-	const counted = new Map<string, number>();
-	env.onDispose(() => {
+	let counted = new Map<string, number>();
+	env.onDispose((interrupted) => {
 		disposed = true;
-		if (running) transport.cancel();
 		transport.dispose();
+		// A resume reattaches to the child: it keeps running (t3) and keeps its spec and state.
+		if (interrupted) return;
+		if (running) transport.cancel();
 		removeDelegation(dir, spec.id);
 	});
 
@@ -255,8 +330,8 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 	};
 
 	/** The state of run `n` once it is done; undefined when the child does not report it in time. */
-	const finalState = async (n: number): Promise<DelegationState | undefined> => {
-		const deadline = Date.now() + STATE_WAIT_MS;
+	const finalState = async (n: number, waitMs = STATE_WAIT_MS): Promise<DelegationState | undefined> => {
+		const deadline = Date.now() + waitMs;
 		for (;;) {
 			const state = sync();
 			if (state && (state.run > n || (state.run === n && state.done))) return state;
@@ -272,23 +347,55 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 		return (await changedPaths(before, after)).map((path) => relative(canonical(env.cwd), path));
 	};
 
-	// Runs of one agent are one conversation: they go one after the other.
-	let queue: Promise<unknown> = Promise.resolve();
-	const runOnce = async (message: string): Promise<AgentRun> => {
-		if (env.signal.aborted) throw env.signal.reason;
-		if (disposed) throw new Error(`${label} was used after its workflow ended`);
-		const n = ++runs;
-		if (n === 1) writeSpec(dir, spec);
+	const agentState = (): AgentState => ({ firstKey: firstKey!, spec, runs, cost, counted: Object.fromEntries(counted), ...transport.state() });
+	const restore = (state: AgentState) => {
+		firstKey = state.firstKey;
+		spec = state.spec;
+		runs = state.runs;
+		cost = state.cost;
+		counted = new Map(Object.entries(state.counted));
+		transport.restore(state);
+	};
+
+	/** Run `n` live, or reattach to it when it was in flight at a crash. */
+	const execute = async (n: number, message: string, call: CallContext, reattach: boolean) => {
+		if (n === 1) firstKey = call.key;
+		const recorded = call.recorded as RunMeta;
+		if (reattach) {
+			if (recorded.spec) spec = recorded.spec;
+			transport.restore({ ...(recorded.sessionFile ? { sessionFile: recorded.sessionFile } : {}), ...(recorded.threadId ? { t3: { taskId: recorded.taskId, threadId: recorded.threadId, link: recorded.link } } : {}) });
+			if (env.t3 && recorded.threadId && !recorded.runId) env.warn(`${label}: run ${n} had no run id recorded; repeating its call with the same request id`);
+			env.warn(`${label}: run ${n} reattached after the workflow's process ended; its changed files are those since the resume`);
+		} else call.meta({ spec });
+		// The spec is gone when the sweep took it; the child reads it on every run.
+		if (!readSpec(dir, spec.id)) writeSpec(dir, spec);
 		else touchSpec(dir, spec.id);
+		runs = n;
 		const before = env.root ? await snapshot(env.root) : undefined;
 		const costBefore = cost;
 		const poll = setInterval(sync, POLL_MS);
-		const cancel = () => transport.cancel();
+		// An interrupted run leaves the child working: the resume reattaches to it.
+		const cancel = () => {
+			if (!isInterruption(env.signal.reason)) transport.cancel();
+		};
 		env.signal.addEventListener("abort", cancel, { once: true });
 		running = true;
+		const requestId = `${spec.id}-run-${n}`;
+		const remember = (meta: RunMeta) => call.meta({ ...meta });
 		try {
-			env.progress(`${label} · running`);
-			await transport.run(delegationMessage(spec, n, message), n === 1, message);
+			env.progress(`${label} · ${reattach ? "reattaching" : "running"}`);
+			const runMessage = delegationMessage(spec, n, message);
+			const continuation = delegationMessage(spec, n, CONTINUE_MESSAGE);
+			const done = () => {
+				const state = readState(dir, spec.id);
+				return state !== undefined && (state.run > n || (state.run === n && state.done));
+			};
+			if (!reattach) await transport.run(runMessage, requestId, message, remember);
+			else if (!done()) {
+				await transport.reattach(runMessage, continuation, requestId, message, recorded, remember);
+				// The child's own run was cut off too (its process ended): ask it to go on.
+				if (!(await finalState(n, 2000))) await transport.run(continuation, `${requestId}-continue`, message, remember);
+			}
 		} finally {
 			running = false;
 			clearInterval(poll);
@@ -300,7 +407,7 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 		const changed = await changedSince(before);
 		if (!state || state.run !== n) throw new Error(`${label}: the child reported no end of run ${n}; ${transport.describe()}`);
 		if (state.error) throw new Error(`${label}: ${state.error}`);
-		return {
+		const run: AgentRun = {
 			text: state.text ?? "",
 			...(options.schema ? { result: state.result } : {}),
 			changed,
@@ -308,6 +415,23 @@ export function createAgent(raw: unknown, env: AgentEnv): AgentHandle {
 			sessionId: state.sessionId,
 			...(transport.threadId ? { threadId: transport.threadId } : {}),
 		};
+		return { value: { run, agent: agentState() }, cost: run.cost };
+	};
+
+	// Runs of one agent are one conversation: they go one after the other.
+	let queue: Promise<unknown> = Promise.resolve();
+	const runOnce = async (message: string): Promise<AgentRun> => {
+		if (env.signal.aborted) throw env.signal.reason;
+		if (disposed) throw new Error(`${label} was used after its workflow ended`);
+		const n = runs + 1;
+		const args = n === 1 ? { options, message } : { agent: firstKey, run: n, message };
+		const value = (await env.durable.call(
+			{ kind: "agent", args, label: `${label}${n > 1 ? ` run ${n}` : ""}: ${headline(message).slice(0, 100)}`, model: options.model },
+			(call) => execute(n, message, call, false),
+			(call) => execute(n, message, call, true),
+		)) as { run: AgentRun; agent: AgentState };
+		restore(value.agent);
+		return value.run;
 	};
 
 	return {

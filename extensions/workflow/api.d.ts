@@ -3,15 +3,23 @@
 // type-checked against (workflows/tsconfig.json). Keep it short: it is sent with every request.
 // ---
 
+/*
+ * Runs are durable: every call below (tools, shell, llm, agent().run, workflows, changes) is
+ * journaled, and a run whose process died is resumed by running the script again, with recorded
+ * calls answered from the journal. So keep the script deterministic: act on the outside only
+ * through these calls (Date.now(), new Date() and Math.random() are recorded too). A shell or tool
+ * call that was running at the crash is not repeated unless marked `idempotent: true`.
+ */
+
 /**
  * The session's tools, called as you call them (same validation, hooks, permissions). A tool with a
  * structured result resolves to it, also when it fails (bash: `{ output, exit_code }`); others
  * resolve to their text and reject with their error.
  */
-declare const tools: Record<string, (args: Record<string, unknown>) => Promise<any>>;
+declare const tools: Record<string, (args: Record<string, unknown>, options?: { idempotent?: boolean }) => Promise<any>>;
 
 /** Run a bash command in `cwd`; resolves also for non-zero exits. Output is stdout and stderr interleaved. Build commands from values with `sh`. */
-declare function shell(command: string, options?: { cwd?: string; timeoutSeconds?: number }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
+declare function shell(command: string, options?: { cwd?: string; timeoutSeconds?: number; idempotent?: boolean }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
 
 /**
  * Template tag: the command with each `${value}` (string, number, or an array of them) inserted as

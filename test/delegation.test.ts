@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
@@ -150,6 +150,8 @@ interface Fixture {
 	calls: { name: string; args: Record<string, unknown> }[];
 	/** The child sessions by thread. */
 	threads: Map<string, { session: AgentSession; runs: Map<string, Promise<void>> }>;
+	/** What t3 answered per clientRequestId: a repeated call gets the same task and run (t3 dedupes). */
+	requests: Map<string, { threadId: string; runId: string }>;
 }
 
 let fx: Fixture;
@@ -160,7 +162,7 @@ beforeEach(() => {
 	execFileSync("git", ["init", "-q"], { cwd: repo });
 	execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "."], { cwd: repo });
 	execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: repo });
-	fx = { repo, agentDir: join(dir, "agent"), sessionsDir: join(dir, "sessions"), errors: [], sessions: [], calls: [], threads: new Map() };
+	fx = { repo, agentDir: join(dir, "agent"), sessionsDir: join(dir, "sessions"), errors: [], sessions: [], calls: [], threads: new Map(), requests: new Map() };
 	faux.setResponses([]);
 });
 afterEach(async () => {
@@ -201,9 +203,14 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 				description: name,
 				parameters: Type.Object({}, { additionalProperties: true }),
 				outputSchema: Type.Object({}, { additionalProperties: true }),
-				async execute(_id, params) {
+				async execute(_id, params, signal) {
 					fx.calls.push({ name, args: params as Record<string, unknown> });
-					const data = await run(params as Record<string, unknown>);
+					// As an MCP client does: an aborted call stops waiting; t3's work goes on.
+					const aborted = new Promise<never>((_resolve, reject) => {
+						if (signal?.aborted) reject(signal.reason);
+						signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
+					const data = await Promise.race([run(params as Record<string, unknown>), aborted]);
 					const content = [{ type: "text" as const, text: JSON.stringify(data) }];
 					// As the bridge returns it: the MCP result, whose structuredContent is t3's data.
 					return { content, structuredContent: { content, structuredContent: data } as unknown as JsonObject, details: undefined };
@@ -216,15 +223,26 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 			],
 		}));
 		tool("delegate_task", async (args) => {
-			const threadId = `thread-${++ids}`;
-			const session = await newSession([workflowExtension(childRuntime)], SessionManager.create(fx.repo, fx.sessionsDir), childRuntime);
-			fx.threads.set(threadId, { session, runs: new Map() });
-			// t3 sends a one-line role preamble, a blank line, then the task.
-			const runId = start(threadId, `You are a delegated ${String(args.role)} child.\n\n${String(args.task)}`);
+			const request = String(args.clientRequestId);
+			let known = fx.requests.get(request);
+			if (!known) {
+				const threadId = `thread-${++ids}`;
+				const session = await newSession([workflowExtension(childRuntime)], SessionManager.create(fx.repo, fx.sessionsDir), childRuntime);
+				fx.threads.set(threadId, { session, runs: new Map() });
+				// t3 sends a one-line role preamble, a blank line, then the task.
+				known = { threadId, runId: start(threadId, `You are a delegated ${String(args.role)} child.\n\n${String(args.task)}`) };
+				fx.requests.set(request, known);
+			}
+			const { threadId, runId } = known;
 			const done = await finishedWithin(fx.threads.get(threadId)!.runs.get(runId)!, waitMs);
 			return { taskId: `task-${threadId}`, childThreadId: threadId, childRunId: runId, link: `t3://${threadId}`, status: done ? "completed" : "running", waitTimedOut: !done };
 		});
-		tool("t3_thread_send", async (args) => ({ threadId: args.threadId, runId: start(String(args.threadId), String(args.message)), taskId: `task-${String(args.threadId)}-${ids}`, status: "running", delivery: "started" }));
+		tool("t3_thread_send", async (args) => {
+			const request = String(args.clientRequestId);
+			const known = fx.requests.get(request) ?? { threadId: String(args.threadId), runId: start(String(args.threadId), String(args.message)) };
+			fx.requests.set(request, known);
+			return { threadId: known.threadId, runId: known.runId, taskId: `task-${known.threadId}-${ids}`, status: "running", delivery: "started" };
+		});
 		tool("t3_thread_wait", async (args) => {
 			const thread = fx.threads.get(String(args.threadId))!;
 			const done = await finishedWithin(thread.runs.get(String(args.runId))!, waitMs);
@@ -512,5 +530,70 @@ describe("the child side", () => {
 			assert.ok(toolNames(context).includes("bash"), "the default tools");
 		}
 		assert.equal(existsSync(statePath(delegationsDir(fx.agentDir), "gone-1")), false, "no state for a spec that is gone");
+	});
+});
+
+describe("durable agents in t3", () => {
+	for (const variant of [
+		{ name: "its run id known: the resume waits for that run", waitMs: 80, childMs: 600, delegates: 1 },
+		{ name: "its start still in flight: the resume repeats delegate_task with the same clientRequestId, which t3 dedupes", waitMs: 5000, childMs: 2500, delegates: 2 },
+	])
+	test(`an agent in flight when the parent's session ended reattaches to the same t3 task when the session starts again; the result arrives once (${variant.name})`, async () => {
+		const background = (await import("../extensions/background/index.ts")).default;
+		const withBackground = (pi: ExtensionAPI) => background(pi, { logRoot: join(dir, "logs") });
+		const code = "const run = await agent({ model: 'faux/faux-1', tools: ['read'] }).run('slow work');\nreturn 'agent said: ' + run.text;";
+		let childRuns = 0;
+		const parentSays: string[] = [];
+		const dispatch: FauxResponseStep = async (context) => {
+			if (firstUser(context).includes("harness-delegation:")) {
+				childRuns++;
+				await new Promise((r) => setTimeout(r, variant.childMs));
+				return say("child finished");
+			}
+			const last = lastMessage(context);
+			const text = textOf(last.content);
+			const offered = /stopped when its Pi process ended:\n- (\d{8}-\d{6}-[0-9a-f]{6})/.exec(text);
+			const reply = (line: string) => (parentSays.push(line), say(line));
+			if (offered) return call("workflow", { resume: offered[1]! });
+			if (last.role === "toolResult") return reply("parent waiting");
+			if (text.includes("Workflow completed")) return reply(`parent got: ${text.split("\n\n").at(-1)}`);
+			return call("workflow", { code, budget: 5 });
+		};
+		faux.setResponses(Array.from({ length: 30 }, () => dispatch));
+
+		const extensions = () => [withBackground, workflowExtension(runtime), fakeT3(runtime, { waitMs: variant.waitMs })];
+		const first = await newSession(extensions());
+		first.setActiveToolsByName([...first.getActiveToolNames(), "workflow"]);
+		await first.prompt("go");
+		const journals = join(fx.agentDir, "workflows");
+		const journalOf = () => (existsSync(journals) && readdirSync(journals)[0] ? join(journals, readdirSync(journals)[0]!, "journal.jsonl") : undefined);
+		// The parent's Pi quits while the child works: after t3 answered with the run (variant 1), or while delegate_task waits.
+		const ready = () => fx.threads.size > 0 && (variant.delegates === 2 || readFileSync(journalOf()!, "utf8").includes('"runId"'));
+		while (!ready()) await new Promise((r) => setTimeout(r, 20));
+		await first.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		const journal = journalOf()!;
+		while (!readFileSync(journal, "utf8").includes('"t":"end"')) await new Promise((r) => setTimeout(r, 20));
+		assert.match(readFileSync(journal, "utf8"), /"status":"interrupted"/);
+		const file = first.sessionManager.getSessionFile()!;
+		first.dispose();
+
+		const second = await newSession(extensions(), SessionManager.open(file));
+		const deadline = Date.now() + 15_000;
+		while (!parentSays.some((line) => line.startsWith("parent got")) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+
+
+		assert.deepEqual(parentSays.filter((line) => line.startsWith("parent got")), ["parent got: agent said: child finished"], "the result arrives once");
+		assert.equal(fx.threads.size, 1, "no second task");
+		assert.equal(childRuns, 1, "the child's run was not repeated");
+		assert.equal(callsOf("t3_thread_send").length, 0, "no message was sent again");
+		const delegates = callsOf("delegate_task");
+		assert.equal(delegates.length, variant.delegates);
+		assert.equal(new Set(delegates.map((d) => d.args.clientRequestId)).size, 1);
+		if (variant.delegates === 1) assert.ok(callsOf("t3_thread_wait").some((c) => c.args.runId === "run-2"), "waited for the recorded run");
+		const entries = readFileSync(journal, "utf8");
+		assert.match(entries, /"t":"attempt","n":2/);
+		assert.match(entries, /"status":"completed"/);
+		const runEntries = second.sessionManager.getEntries().flatMap((e) => (e.type === "custom" && e.customType === "workflow-run" ? [(e.data as { state: string }).state] : []));
+		assert.deepEqual(runEntries, ["started", "ended", "offered", "started", "ended"]);
 	});
 });

@@ -80,7 +80,8 @@ describe("scripts", () => {
 		const text = await run("const n: number = await Promise.resolve(2);\ninterface X { a: string }\nreturn `n=${n as number}`;");
 		assert.equal(text.details.status, "completed");
 		assert.equal(text.details.ok, true);
-		assert.match(text.text, /^Workflow completed · [\d.]+ s · \$0\.0000 of \$1\.00 · 0 llm calls · 0 agent runs\n\nn=2$/);
+		assert.match(text.text, /^Workflow completed · [\d.]+ s · \$0\.0000 of \$1\.00 · 0 llm calls · 0 agent runs · run \d{8}-\d{6}-[0-9a-f]{6}\n\nn=2$/);
+		assert.match(text.details.journal, new RegExp(`/agent/workflows/${text.details.id}/journal\\.jsonl$`));
 		const data = await run('return { ok: false, items: ["a", "b"], diff: "line 1\\nline 2" };');
 		assert.equal(data.details.status, "completed");
 		assert.equal(data.details.ok, false);

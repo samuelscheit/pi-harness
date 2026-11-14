@@ -12,6 +12,10 @@
 // All are registered inactive. A rule (lib/rules.ts) switches them on for every session, an
 // experiment per arm (lib/experiments.ts): a saved workflow an experiment names follows that
 // experiment, the others follow `workflow` as the prompt extension selected it (it runs first).
+//
+// Runs are durable (run.ts, durable.ts) and visible (render.ts, runs.ts): the session records each
+// run's start and end, the thread shows the run's page at its start and end, the dashboard serves
+// it live, and a run whose process died is offered for resuming when its session starts again.
 
 import { readFileSync } from "node:fs";
 import { relative } from "node:path";
@@ -22,8 +26,10 @@ import { applyToolSwitches, EXPERIMENTS_DIR, listExperiments, recordedArms, tool
 import { HARNESS_ROOT } from "../lib/repository.ts";
 import { delegatedChild } from "./child.ts";
 import { delegationsDir, sweepDelegations } from "./delegation.ts";
+import { sweepRuns } from "./journal.ts";
 import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkflow } from "./library.ts";
-import { INLINE_FILE, type RunEnv, runWorkflow, type ToolOutcome, type WorkflowDetails } from "./run.ts";
+import { INLINE_FILE, type ResumeRequest, type RunEnv, resumeWorkflow, runWorkflow, type ToolOutcome, type WorkflowDetails, type WorkflowResult } from "./run.ts";
+import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, offerInterrupted, recordRun, renderEnd, runHeadline, setLatestApi, showRun, startViews } from "./runs.ts";
 
 export const WORKFLOW_TOOL = "workflow";
 
@@ -36,8 +42,10 @@ export interface WorkflowExtensionOptions {
 	workflowDirs?: (cwd: string) => string[];
 	/** Default: the agent dir's models and credentials, loaded once per process. */
 	modelRuntime?: () => Promise<ModelRuntime>;
-	/** Where agent() specs and child states live; default `<agentDir>/delegations`. */
+	/** Where agent() specs, child states and run journals live; default Pi's agent dir. */
 	agentDir?: string;
+	/** The dashboard's base URL for live views; default http://127.0.0.1:4317. */
+	dashboardUrl?: string;
 }
 
 let sharedRuntime: Promise<ModelRuntime> | undefined;
@@ -54,8 +62,10 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	const workflowDirs = options.workflowDirs ?? ((cwd: string) => [HARNESS_WORKFLOWS, projectWorkflowsDir(cwd)]);
 	const runtime = options.modelRuntime ?? (() => (sharedRuntime ??= ModelRuntime.create()));
 	const agentDir = options.agentDir ?? getAgentDir();
-	// Delegations of parents that never cleaned up (a crash): at most a day old.
+	const dashboardUrl = options.dashboardUrl ?? DEFAULT_DASHBOARD;
+	// Delegations of parents that never cleaned up (a crash): at most a day old. Journals: see sweepRuns.
 	sweepDelegations(delegationsDir(agentDir));
+	sweepRuns(agentDir);
 	/** llm() results per session. */
 	const caches = new Map<string, Map<string, unknown>>();
 	/** The saved workflows registered now, and every name this extension registered in this process. */
@@ -63,29 +73,50 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	const owned = new Set<string>();
 	let reported = "";
 
-	const run = async (entry: Parameters<typeof runWorkflow>[0], budget: number, signal: AbortSignal | undefined, onUpdate: ((r: { content: { type: "text"; text: string }[]; details: WorkflowDetails }) => void) | undefined, ctx: ExtensionToolContext) => {
+	/** The session's tools, called as the model calls them; a stale context (a harness reload) interrupts the run. */
+	const executor = (ctx: ExtensionToolContext): Executor => async (name, args, callSignal) => {
+		let result: Awaited<ReturnType<ExtensionToolContext["executeTool"]>>;
+		try {
+			result = await ctx.executeTool(name, args, { signal: callSignal });
+		} catch (error) {
+			if (error instanceof Error && /\bstale\b/.test(error.message)) throw Object.assign(new Error(`the harness reloaded: ${error.message}`), { name: "ContextStale" });
+			throw error;
+		}
+		return outcome(ctx.tools.find((t) => t.name === name), result.result as never, result.isError);
+	};
+
+	type Start = { kind: "new"; entry: Parameters<typeof runWorkflow>[0]; budget: number } | { kind: "resume"; request: ResumeRequest };
+	const run = async (start: Start, signal: AbortSignal | undefined, onUpdate: ((r: { content: { type: "text"; text: string }[]; details: WorkflowDetails }) => void) | undefined, ctx: ExtensionToolContext) => {
 		const session = ctx.sessionManager;
 		const sessionId = session.getSessionId();
 		const llmCache = caches.get(sessionId) ?? caches.set(sessionId, new Map()).get(sessionId)!;
 		const parentSessionFile = session.getSessionFile();
+		const execute = executor(ctx);
+		const toolNames = ctx.tools.map((t) => t.name);
+		let headline = "";
 		const env: RunEnv = {
 			cwd: ctx.cwd,
 			runtime: await runtime(),
 			agentDir,
 			llmCache,
-			executeTool: async (name, args, callSignal) => {
-				const result = await ctx.executeTool(name, args, { signal: callSignal });
-				return outcome(ctx.tools.find((t) => t.name === name), result.result as never, result.isError);
-			},
-			toolNames: ctx.tools.map((t) => t.name),
+			executeTool: execute,
+			toolNames,
 			sessionId,
 			library: () => library,
 			sessionDir: parentSessionFile ? session.getSessionDir() : undefined,
 			parentSessionFile,
 			signal,
-			onUpdate: (details) => onUpdate?.({ content: [{ type: "text", text: details.log.join("\n") }], details }),
+			onStart: ({ id, attempt }) => {
+				headline = runHeadline(id, attempt, dashboardUrl);
+				recordRun(pi, sessionId, { id, state: "started" });
+				startViews({ agentDir, id, toolNames, execute, dashboardUrl });
+			},
+			onUpdate: (details) => onUpdate?.({ content: [{ type: "text", text: [headline, ...details.log].filter(Boolean).join("\n") }], details }),
 		};
-		const { text, details, usage } = await runWorkflow(entry, budget, env);
+		const result: WorkflowResult = start.kind === "new" ? await runWorkflow(start.entry, start.budget, env) : await resumeWorkflow(start.request, env);
+		const { details, usage } = result;
+		recordRun(pi, sessionId, { id: details.id, state: "ended", status: details.status });
+		const text = renderEnd({ agentDir, id: details.id, sessionId, toolNames, execute, live: () => contextLive(ctx), text: result.text });
 		return { content: [{ type: "text" as const, text }], details, ...(usage ? { usage } : {}), ...(details.status === "completed" ? {} : { isError: true }) };
 	};
 
@@ -111,13 +142,31 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		promptGuidelines: [
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
+			'A run that was interrupted (its result or a message says so) continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
 			"When you are about to run the same kind of long shell command again with different arguments, save it as a workflow with the arguments as parameters (built with sh`…`) and call that tool from then on.",
 		],
 		parameters: Type.Object({
-			code: Type.String({ description: "TypeScript: the body of an async function using the globals above." }),
-			budget: Type.Number({ exclusiveMinimum: 0, description: "Spending limit of this run in USD for llm() and agent(); the run stops when it is used up. Small llm() calls cost fractions of a cent, an agent run cents to dollars." }),
+			code: Type.Optional(Type.String({ description: "TypeScript: the body of an async function using the globals above. With budget; not with resume or show." })),
+			budget: Type.Optional(
+				Type.Number({ exclusiveMinimum: 0, description: "Spending limit of this run in USD for llm() and agent(); the run stops when it is used up. Small llm() calls cost fractions of a cent, an agent run cents to dollars. With resume: a new limit for the whole run." }),
+			),
+			resume: Type.Optional(Type.String({ description: "The id of a run that was interrupted (its process ended): continue it from its journal; calls it recorded are not repeated." })),
+			inFlight: Type.Optional(
+				Type.Union([Type.Literal("rerun"), Type.Literal("fail")], { description: "With resume: what shell and tools calls that were in flight do: run again, or throw InterruptedCallError. Needed when the resume names such calls." }),
+			),
+			show: Type.Optional(Type.String({ description: "The id of a run: show its page (calls, status, cost) in the thread now." })),
 		}),
-		execute: (_id, params, signal, onUpdate, ctx) => run({ source: params.code, filename: INLINE_FILE, inline: true }, params.budget, signal, onUpdate, ctx),
+		execute: async (_id, params, signal, onUpdate, ctx) => {
+			const modes = [params.code !== undefined, params.resume !== undefined, params.show !== undefined].filter(Boolean).length;
+			if (modes !== 1) throw new Error("pass exactly one of code (with budget), resume or show");
+			if (params.show !== undefined) return { content: [{ type: "text" as const, text: await showRun({ agentDir, id: params.show, toolNames: ctx.tools.map((t) => t.name), execute: executor(ctx), dashboardUrl }) }], details: undefined };
+			if (params.resume !== undefined) {
+				const request: ResumeRequest = { id: params.resume, ...(params.inFlight ? { inFlight: params.inFlight } : {}), ...(params.budget !== undefined ? { budget: params.budget } : {}) };
+				return run({ kind: "resume", request }, signal, onUpdate, ctx);
+			}
+			if (params.budget === undefined) throw new Error("code needs a budget (USD)");
+			return run({ kind: "new", entry: { source: params.code!, filename: INLINE_FILE, inline: true }, budget: params.budget }, signal, onUpdate, ctx);
+		},
 	});
 
 	const register = (saved: SavedWorkflow) => {
@@ -132,7 +181,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			// SAFETY: Pi validates arguments against any JSON Schema (pi-schema), not only TypeBox values; metaProblem checked it is an object schema.
 			parameters: saved.meta.parameters as unknown as TSchema,
 			execute: (_id, params, signal, onUpdate, ctx) =>
-				run({ source: saved.source, filename: saved.file, inline: false, name: saved.name, input: params }, saved.meta.budget, signal, onUpdate, ctx),
+				run({ kind: "new", entry: { source: saved.source, filename: saved.file, inline: false, name: saved.name, input: params }, budget: saved.meta.budget }, signal, onUpdate, ctx),
 		});
 	};
 
@@ -163,7 +212,13 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		return applyToolSwitches(selected, new Map([...library.keys()].map((name) => [name, switches.get(name) ?? on])));
 	};
 
-	pi.on("session_start", (_event, ctx) => refresh(ctx));
+	pi.on("session_start", (_event, ctx) => {
+		setLatestApi(ctx.sessionManager.getSessionId(), pi);
+		refresh(ctx);
+		offerInterrupted(pi, ctx, agentDir);
+	});
+	// The run a finished workflow's message wakes shows its end page (t3 takes a page only while a run is active).
+	pi.on("turn_start", (_event, ctx) => flushEndRenders(ctx.sessionManager.getSessionId()));
 	pi.on("before_agent_start", (event, ctx) => {
 		event.systemPromptOptions.selectedTools = switched(ctx, event.systemPromptOptions.selectedTools);
 	});
