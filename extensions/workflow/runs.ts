@@ -50,7 +50,7 @@ interface EndRender {
 	attempts: number;
 }
 const apis = () => (state.__harnessWorkflowApis ??= new Map());
-const endRenders = () => (state.__harnessWorkflowRenders ??= new Map());
+const endRenders = (): Map<string, EndRender[]> => (state.__harnessWorkflowRenders ??= new Map());
 
 /** The extension API loaded last for a session: the one a run that outlived a reload reports through. */
 export function setLatestApi(sessionId: string, pi: ExtensionAPI): void {
