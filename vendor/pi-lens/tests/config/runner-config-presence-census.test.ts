@@ -51,6 +51,8 @@ const MEMBERS: Readonly<Record<string, string>> = {
 	"helm-render.ts":
 		"not config: Chart.yaml via findNearestDirWithMarker locates the chart directory, plus the chart-tree readdir (a target locator)",
 	"psscriptanalyzer.ts": "not config: writes and removes a temp script",
+	"pyright.ts":
+		"not config: readFileContent of a reported file, to see whether it extends sys.path at runtime (python-runtime-path.ts)",
 	"spotbugs.ts":
 		"not config: compiled-classes dir discovery by readdirSync (a build artifact the scan is pointed at)",
 	"trivy-config.ts": "not config: reads the edited file's content",

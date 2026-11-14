@@ -26,10 +26,6 @@ import {
 	RunnerRegistry,
 } from "../../../clients/dispatch/dispatcher.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
-import {
-	preEditSeedFactKey,
-	seedFromCapture,
-} from "../../../clients/dispatch/pre-edit-seed.js";
 import { TOOL_PLANS } from "../../../clients/dispatch/plan.js";
 import {
 	findingClassKey,
@@ -368,11 +364,6 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 			{ mode: "fallback", runnerIds: ["ruff-lint"], filterKinds: ["python"] },
 		];
 	}
-	const RUFF_GROUP: RunnerGroup = {
-		mode: "fallback",
-		runnerIds: ["ruff-lint"],
-		filterKinds: ["python"],
-	};
 	const OXLINT_GROUP: RunnerGroup = {
 		mode: "all",
 		runnerIds: ["oxlint"],
@@ -385,31 +376,6 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 		return registry;
 	}
 
-	/**
-	 * The production seed: the first edit's `tool_call` runs the file's inline
-	 * linters with the delta off (`capturePreEditLinterFindings`) and installs
-	 * their blockers (`seedFromCapture`).
-	 */
-	async function seedFrom(
-		facts: FactStore,
-		file: string,
-		text: string,
-		groups: RunnerGroup[],
-		linters: RunnerDefinition[],
-	): Promise<number> {
-		const captureFacts = new FactStore();
-		const ctx = {
-			...createDispatchContext(file, tmpDir, pi, captureFacts),
-			deltaMode: false,
-			preEditCapture: true as const,
-		};
-		captureFacts.setFileFact(ctx.filePath, "file.content", text);
-		const captured = await dispatchForFile(ctx, groups, registryOf(linters));
-		const seed = seedFromCapture(captured.blockers, text);
-		facts.setBoundedSessionFact(preEditSeedFactKey(ctx.filePath), seed);
-		return seed.length;
-	}
-
 	async function dispatchIn(
 		facts: FactStore,
 		file: string,
@@ -417,6 +383,7 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 		groups: RunnerGroup[],
 		runners: RunnerDefinition[],
 		projectRoot?: string,
+		modifiedRanges?: { start: number; end: number }[],
 	) {
 		const ctx = createDispatchContext(
 			file,
@@ -424,7 +391,7 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 			pi,
 			facts,
 			undefined,
-			undefined,
+			modifiedRanges,
 			projectRoot,
 		);
 		facts.setFileFact(ctx.filePath, "file.content", text);
@@ -488,23 +455,13 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 		);
 	}
 
-	it("keeps a legacy unused import pre-existing when the seed held ruff's copy and the language server warns", async () => {
-		// F1: the language server's warning displaced ruff's seeded copy in the
-		// dedupe and was raised, so the first edit stopped on a legacy import.
+	it("keeps a legacy unused import advisory when the edit changed other lines", async () => {
+		// F1, now by edit scope (blocker-policy.ts): ruff's blocking copy on an
+		// unchanged line is withheld, and the class raise leaves the language
+		// server's warning on that line a warning.
 		const file = path.join(tmpDir, "legacy.py");
 		const text = "import os\n\n\ndef f():\n    return 1\n";
 		fs.writeFileSync(file, text);
-		const ruff = ruffAt(file, "F401", "`os` imported but unused");
-		const facts = new FactStore();
-		expect(
-			await seedFrom(
-				facts,
-				file,
-				text,
-				[RUFF_GROUP],
-				[answering(ruffRunner, ruff)],
-			),
-		).toBe(1);
 		const lsp = lspAt(
 			file,
 			"reportUnusedImport",
@@ -512,18 +469,26 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 			2,
 		);
 
-		const result = await dispatchIn(facts, file, text, pythonGroups(), [
-			answering(lspRunner, lsp),
-			absent(pyrightRunner),
-			answering(ruffRunner, ruff),
-		]);
+		const result = await dispatchIn(
+			new FactStore(),
+			file,
+			text,
+			pythonGroups(),
+			[
+				answering(lspRunner, lsp),
+				absent(pyrightRunner),
+				answering(ruffRunner, ruffAt(file, "F401", "`os` imported but unused")),
+			],
+			undefined,
+			[{ start: 4, end: 5 }],
+		);
 
 		expect(result.hasBlockers).toBe(false);
-		expect(result.preExisting?.map((d) => d.rule)).toEqual(["F401"]);
+		expect(result.warnings.map((d) => [d.tool, d.line])).toEqual([["lsp", 1]]);
 	});
 
-	it("blocks a new unused import the language server warns about when nothing seeded it", async () => {
-		// The other side of F1: without a seed the class raise applies.
+	it("blocks an unused import on an edited line that the language server only warns about", async () => {
+		// The other side of F1: on an edited line the class raise applies.
 		const file = path.join(tmpDir, "fresh.py");
 		const text = "import os\n";
 		fs.writeFileSync(file, text);
@@ -628,38 +593,28 @@ describe("#5416: the class merge runs after every per-copy filter", () => {
 		);
 	});
 
-	it("keeps an unused value the capture seeded pre-existing though its tool only warned", async () => {
-		// The capture runs with the delta off, so the class raise makes oxlint's
-		// copy a seeded blocker; the edit then holds it as pre-existing.
+	it("does not raise an unused value its tool warned about on an unchanged line", async () => {
 		const file = path.join(tmpDir, "legacy.js");
-		const text = "const unused = 1;\n";
+		const text = "const unused = 1;\nexport const ok = 2;\n";
 		fs.writeFileSync(file, text);
 		const oxlint = oxlintAt(
 			file,
 			"no-unused-vars",
 			"Variable 'unused' is declared but never used.",
 		);
-		const facts = new FactStore();
-		expect(
-			await seedFrom(
-				facts,
-				file,
-				text,
-				[OXLINT_GROUP],
-				[answering(oxlintRunner, oxlint)],
-			),
-		).toBe(1);
 
 		const result = await dispatchIn(
-			facts,
+			new FactStore(),
 			file,
 			text,
 			[OXLINT_GROUP],
 			[answering(oxlintRunner, oxlint)],
+			undefined,
+			[{ start: 2, end: 2 }],
 		);
 
 		expect(result.hasBlockers).toBe(false);
-		expect(result.preExisting).toHaveLength(1);
+		expect(result.warnings.map((d) => d.rule)).toEqual(["no-unused-vars"]);
 	});
 
 	it("keeps an undefined name it raised observed while the delta calls it seen", async () => {

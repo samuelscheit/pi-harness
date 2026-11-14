@@ -144,23 +144,18 @@
   and nothing that holds an entry awaits the restore. Do not add a second
   whole-package fixer without it, and do not await a queue entry while holding
   another.
-- A file's first write in a session blocks on the linter delta, not on every
-  linter error. The `tool_call` of the first classified write or edit
-  runs the file's inline linters (`PRE_EDIT_SEED_RUNNER_IDS`, tied to the
-  edit-scope census's LINTER lanes) over the bytes still on disk, under
-  `bounded()` with `PRE_EDIT_CAPTURE_BUDGET_MS` (500 ms), and installs their blocking
-  findings as `session.preEdit.<file>` beside the delta baseline. The capture
-  admits at most four active captures, aborts their process groups on abandonment
-  or session reset, and retains slots until teardown settles. It
-  only creates that record, and only while no baseline, tombstone or seed
-  exists, the bytes are the ones it read, and its session is current; each
-  dispatch only shrinks it (`classifyPreExisting`, identity plus line text,
-  one current finding per entry). A matched finding is reported as
-  pre-existing, never as a blocker, unless the inline record already holds
-  it. Language servers, type checkers, gated runners and scanners are never
-  seeded (maintainer scope, 2026-10-15). Collect-later linters and the MCP
-  route have no seed. Proven by
-  `tests/index-4483-first-write-seed-witness.test.ts`.
+- A linter's own level never decides a blocker alone
+  (`clients/dispatch/blocker-policy.ts`, applied once in the dispatcher's
+  `runRunner`, so the inline and collect-later lanes agree). For the runners in
+  `LINTER_RUNNER_IDS` (tied to the edit-scope census's dispatcher-gated lanes):
+  a blocking finding on a line the edit did not change leaves as
+  `outOfEditScope` (still observed, never delivered); a parse error blocks; a
+  style linter with no project config (`STYLE_LINTER_CONFIG`) and a rule
+  outside the tool's correctness set (`BLOCKABLE_RULES`) are advisory.
+  Language servers, type checkers and compilers stay unscoped: an edit can
+  cause a type error on a line it never touched. This replaced the #4483
+  pre-edit seed, which ran the linters in `tool_call` and stopped classifying
+  past 1000 findings.
 - `clients/dispatch/runners/runner-spawn-cwd-sweep.test.ts` is the population
   guard for child cwd derivation. Add a reasoned migration row instead of a
   pin-only update.

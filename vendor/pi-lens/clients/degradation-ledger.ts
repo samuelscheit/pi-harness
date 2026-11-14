@@ -1362,6 +1362,14 @@ export type DegradationKind =
 	 */
 	| "lsp-sibling-announcement"
 	/**
+	 * `lsp-toolchain-environment-failure`: a language server could not check a
+	 * file because its toolchain or the filesystem failed (Lean's
+	 * `lake setup-file` hitting `permission denied`, a toolchain that is not
+	 * installed). `clients/lsp/toolchain-failure.ts` admits it; the runner drops
+	 * the row and reports no verdict. Subject is the server; once per server.
+	 */
+	| "lsp-toolchain-environment-failure"
+	/**
 	 * `lsp-unheld-dependency-unreadable`: #4532 gap 13: a module a diagnostics call's target imports, open in no
 	 * server, could not be read to compare its bytes with the ones last seen
 	 * (clients/lsp/index.ts `unheldBytesMoved`). Its stat alone is compared, so
@@ -1638,8 +1646,6 @@ export type DegradationKind =
 	 * latest reason. Only the execution-policy cause latches analysis off.
 	 */
 	| "powershell-run-failed"
-	/** `pre-edit-capture-incomplete`: #4543: first-write capture exceeded its deadline or capacity (once/session). */
-	| "pre-edit-capture-incomplete"
 	/** `process-bridge-unavailable`: A mounted process bridge refused calls during a primary-session gap. */
 	| "process-bridge-unavailable"
 	/**

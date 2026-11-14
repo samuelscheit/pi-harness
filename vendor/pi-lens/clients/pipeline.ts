@@ -487,14 +487,6 @@ export interface PipelineResult {
 	 */
 	withheldBlockerLine?: string;
 	/**
-	 * #4733 r5 G3: how many blocking findings the observation still holds that
-	 * the #4483 seed called pre-existing (`DispatchResult.preExisting`). Absent
-	 * when there are none. Not part of `currentBlockerCount`, which governs this
-	 * session's own entry; only the verdict that clears another session's section
-	 * reads it.
-	 */
-	preExistingBlockerCount?: number;
-	/**
 	 * #4733 r1 F2: true only when this dispatch checked the whole file as far
 	 * as this checkout can (`checkedWholeFile`). Absent on every return that
 	 * dispatched nothing. The commit gate's record lets a clean write of a file
@@ -1782,20 +1774,6 @@ export function formatWithheldBlockerLine(
 	return `\u26a0 ${count} blocking finding${count === 1 ? "" : "s"} in ${display} withheld: the file was changed by a script, so pi-lens cannot tell it was your edit and shows no fix prompt.${pointer}`;
 }
 
-/**
- * #4483: the one line a write gets for linter errors the file already held
- * before its first edit this session (`DispatchResult.preExisting`). They do
- * not stop the agent or shut the commit gate. Bounded and counted the same way
- * as the still-unfixed line (#5008).
- */
-function formatPreExistingLine(
-	findings: readonly Diagnostic[],
-	filePath: string,
-): string {
-	const count = findings.length;
-	return `ℹ Pre-existing: ${count} linter error${count === 1 ? "" : "s"} already in this file before its first edit this session${formatBlockerPlaces(findings, filePath)}; not blocking.`;
-}
-
 export interface FormatPhaseResult {
 	formatChanged: boolean;
 	formattersUsed: string[];
@@ -2588,13 +2566,11 @@ async function analysePipeline(
 	// copy).
 	// #4484 round 3: a recorded blocker is matched only at its own position.
 	const heldBackBlockers = dispatchResult.heldBackBlockers ?? [];
-	// #4483: linter errors the file held before its first edit this session.
-	const seededFindings = dispatchResult.preExisting ?? [];
 	const ownFile = normalizeEphemeralMapKey(filePath);
 	const { carried: carriedBlockers, matched: matchedBlockers } =
 		carryRecordedBlockers(
 			ctx.priorInlineBlockers?.() ?? [],
-			[...dispatchResult.blockers, ...heldBackBlockers, ...seededFindings],
+			[...dispatchResult.blockers, ...heldBackBlockers],
 			dispatchResult,
 			filePath,
 			(d) =>
@@ -2615,14 +2591,9 @@ async function analysePipeline(
 	const promotedBlockers = heldBackBlockers.flatMap((d) =>
 		matchedBlockers.has(d) ? [] : [d],
 	);
-	// #4483: the record wins over the seed. A pre-existing copy that a recorded
-	// blocker matched is still that blocker (recorded on another write, or
-	// carried over a session boundary), so it stays recorded and unfixed.
-	const preExisting = seededFindings.filter((d) => !matchedBlockers.has(d));
-	const recordedSeeded = seededFindings.filter((d) => matchedBlockers.has(d));
 	const keptBlockers =
-		carriedBlockers.length > 0 || recordedSeeded.length > 0
-			? [...heldBackBlockers, ...recordedSeeded, ...carriedBlockers]
+		carriedBlockers.length > 0
+			? [...heldBackBlockers, ...carriedBlockers]
 			: heldBackBlockers;
 	const storedDiagnostics =
 		keptBlockers.length > 0
@@ -2800,9 +2771,6 @@ async function analysePipeline(
 	}
 	if (stillUnfixed.length > 0) {
 		output += `\n\n${formatStillUnfixedLine(stillUnfixed, filePath)}`;
-	}
-	if (preExisting.length > 0) {
-		output += `\n\n${formatPreExistingLine(preExisting, filePath)}`;
 	}
 	// #5108: a run without authorship records and delivers no blocker, but the
 	// ones it withheld are still on the file. Say so before the all-clear below
@@ -3039,9 +3007,6 @@ async function analysePipeline(
 		// #4484: what a clear must find empty, whatever the authorship.
 		currentBlockerCount: liveBlockers.length,
 		...(withheldBlockerLine !== undefined && { withheldBlockerLine }),
-		...(preExisting.length > 0 && {
-			preExistingBlockerCount: preExisting.length,
-		}),
 		...(checkedWholeFile(dispatchResult) && {
 			fileVerdictComplete: true as const,
 		}),

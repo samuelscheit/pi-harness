@@ -52,7 +52,6 @@ export const PI_MOCK_IMPORTERS: Readonly<Record<string, string>> = {
 	"index-3748-advisory-scope-witness.test.ts": "internal-seam",
 	"index-3814-deferred-blocker-gate.test.ts": "internal-seam",
 	"index-3917-orphan-sweep-scope.test.ts": "internal-seam",
-	"index-4483-first-write-seed-witness.test.ts": "internal-seam",
 	"index-4484-unfixed-blocker-witness.test.ts": "internal-seam",
 	"index-4504-opaque-prescan-root-witness.test.ts": "internal-seam",
 	"index-drain-refresh-straddle.test.ts": "internal-seam",

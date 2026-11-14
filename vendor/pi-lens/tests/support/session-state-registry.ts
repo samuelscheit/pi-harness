@@ -674,15 +674,14 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "dispatch-integration:sessionCaches",
 		module: "dispatch/integration.ts",
-		state:
-			"primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts, preEditCaptureFacts",
+		state: "primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts",
 		policy: "session_start",
 		ownerKey: "session",
 		sessionSeamException:
 			"FactStore keeps one process-wide session-fact map and file-fact map keyed by fact id and path, plus per-process slop counters, with no session in any key (shape 72 member, no open issue)",
 		resetName: "resetDispatchBaselines",
 		reason:
-			"Every one of these is a claim about the tree as this session found it; `sessionFacts` and `preEditCaptureFacts` (#4483) are cleared by a method call inside this same reset, so the reset is the registered seam.",
+			"Every one of these is a claim about the tree as this session found it; `sessionFacts` is cleared by a method call inside this same reset, so the reset is the registered seam.",
 	},
 	{
 		id: "dispatcher:coverageNoticeSeen",
@@ -2467,12 +2466,10 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// file's other constant lookups above — SWEEP_HEURISTIC_LIMITS item 5.
 	// #4485: the recently-clean neighbour cache is deleted (11 -> 10); the
 	// pending record in cascade-format.ts replaces it.
-	// #4483 (10 -> 12): `preEditCaptureFacts`, the pre-edit capture's file
-	// facts, cleared by `resetDispatchBaselines` (the sessionCaches entry); and
-	// `preEditCapturesInFlight`, which holds an entry only while that file's
-	// capture runs (at most four); reset aborts each controller and each capture
-	// releases its slot after teardown, preventing overlap across resets.
-	"dispatch/integration.ts": 8,
+	// #4483 (+2) and its removal (-2): `preEditCaptureFacts` and
+	// `preEditCapturesInFlight` left with the pre-edit capture
+	// (clients/dispatch/blocker-policy.ts replaced it).
+	"dispatch/integration.ts": 6,
 	// #3968: the runner-id identity leaf beside the dispatcher — one Set fed
 	// by `RunnerRegistry.register` and re-derived at every process start
 	// (registration state, not session state); see the file-level exemption

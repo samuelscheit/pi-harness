@@ -609,10 +609,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 16 -> 17 (#4484): `heldBackBlockers` keeps the blocking findings the
 		// delta calls not new, an `Array.prototype.filter` call, not a delivery
 		// filter.
-		// 17 -> 21 (#4483): the pre-edit seed classification keeps the
-		// blocking findings it reports and removes its matches from the visible
-		// and held-back lists, `Array.prototype.filter` calls, not a delivery
-		// filter.
+		// 17 -> 21 (#4483) -> 17: the pre-edit seed classification left with
+		// the seed (replaced by clients/dispatch/blocker-policy.ts).
 		// 21 -> 22 (#5010): `buildCoverageNotice` keeps the rows
 		// `dispatch.disabledRunners` skipped, an `Array.prototype.filter` call,
 		// not a delivery filter.
@@ -622,7 +620,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 23 -> 25 (#5258 r2): the stated-cause rows and the unexplained subset
 		// the mixed notice names, `Array.prototype.filter` calls, not a
 		// delivery filter.
-		"clients/dispatch/dispatcher.ts": 25,
+		"clients/dispatch/dispatcher.ts": 21,
 		"clients/dispatch/fact-runner.ts": 1,
 		"clients/dispatch/fact-scheduler.ts": 2,
 		"clients/dispatch/facts/function-facts.ts": 2,
@@ -635,14 +633,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `Array.prototype.filter` calls, not a delivery filter.
 		// 20 -> 19 (#4485): the rolling delta's per-neighbour diagnostics
 		// `Array.prototype.filter` is deleted with the delta.
-		// 19 -> 20 (#4483): the pre-edit capture keeps a dispatch group's
-		// linter runner ids, an `Array.prototype.filter` call.
-		// 20 -> 21 (#5055): the unplaced-referrer check drops the files edited this
+		// 19 -> 20 (#5055): the unplaced-referrer check drops the files edited this
 		// turn with one `Array.prototype.filter`.
-		"clients/dispatch/integration.ts": 21,
-		// #4483: the seed's runner and line selection, `Array.prototype.filter`
-		// calls, not a delivery filter.
-		"clients/dispatch/pre-edit-seed.ts": 4,
+		"clients/dispatch/integration.ts": 20,
 		"clients/dispatch/rule-policy.ts": 1,
 		"clients/dispatch/rules/high-fan-out.ts": 1,
 		"clients/dispatch/rules/missing-error-propagation.ts": 3,
@@ -777,9 +770,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 4 -> 6 (#4484): `liveBlockers.filter` and `recordBlockers.filter` split the
 		// live blocking set into the delta's and the held-back ones, two
 		// `Array.prototype.filter` calls, not a delivery filter.
-		// 6 -> 8 (#4483): the seeded findings split into pre-existing and
-		// recorded ones, two `Array.prototype.filter` calls.
-		"clients/pipeline.ts": 8,
+		"clients/pipeline.ts": 6,
 		"clients/process-snapshot.ts": 5,
 		"clients/project-changes.ts": 3,
 		"clients/project-diagnostics/cache.ts": 2,

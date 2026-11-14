@@ -21,6 +21,7 @@ import {
 	createGenerationSource,
 } from "./generation-guard.js";
 import { rootMarkersForFile } from "./language-profile.js";
+import { findToolConfig, type ToolConfigId } from "./tool-config-presence.js";
 
 export type ToolCwdKind = "runner" | "formatter" | "lsp";
 
@@ -240,6 +241,51 @@ export function logRunnerAdvisoryOnce(
 	ctx.log(message, "debug");
 }
 
+/**
+ * Tools whose result depends on the directory they run in when the project
+ * has no config for them. Ruff resolves first-party modules for import
+ * sorting (I001) from its project root, which is the cwd when the config comes
+ * from `--config` (pi-lens's bundled fallback): run from a package directory
+ * that holds a `requirements.txt`, it sorted one test's imports one way, run
+ * from the repository root another. Such a tool runs where its own config
+ * lives, or at the repository root when there is none, whatever language
+ * markers sit in between.
+ */
+const CONFIG_ROOTED_TOOLS: Readonly<Partial<Record<string, ToolConfigId>>> = {
+	ruff: "ruff",
+};
+
+function configRootFor(
+	kind: ToolCwdKind,
+	tool: string,
+	fileDir: string,
+	homeDir: string,
+	gitRoot: () => string | null,
+): ToolCwdResolution | undefined {
+	const configId = CONFIG_ROOTED_TOOLS[tool];
+	if (configId === undefined || kind === "lsp") return undefined;
+	const hit = findToolConfig(configId, fileDir, { homeDir });
+	if (hit) return { cwd: hit.dir, marker: path.basename(hit.file) };
+	const root = gitRoot();
+	return root === null ? undefined : { cwd: root, marker: ".git" };
+}
+
+/** The repository root above `fileDir` (a real `.git`), memoized per dispatch. */
+function gitRootFor(
+	fileDir: string,
+	homeCeiling: string,
+	memo: ToolCwdContext["toolCwdMemo"],
+): string | null {
+	if (memo?.gitRoot !== undefined) return memo.gitRoot;
+	const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
+	const root =
+		gitResult.root && isRealGitMarker(path.join(gitResult.root, ".git"))
+			? gitResult.root
+			: null;
+	if (memo) memo.gitRoot = root;
+	return root;
+}
+
 /** Resolve every child process cwd/root through one bounded, synchronous seam. */
 export function resolveToolCwd(
 	kind: ToolCwdKind,
@@ -265,6 +311,19 @@ export function resolveToolCwd(
 	const homeDir = ctx.homeDir ?? os.homedir();
 	const homeCeiling = realpathOrResolve(homeDir);
 	const insideDispatch = isUnderDir(absoluteFile, dispatchRoot);
+	const configRoot = configRootFor(kind, tool, fileDir, homeDir, () =>
+		gitRootFor(fileDir, homeCeiling, ctx.toolCwdMemo),
+	);
+	if (configRoot) {
+		if (!ctx.suppressTelemetry)
+			emitResolution(
+				kind,
+				tool,
+				configRoot.cwd,
+				`config-root:${configRoot.marker}`,
+			);
+		return configRoot;
+	}
 	const markers = markersFor(kind, tool, absoluteFile, ctx);
 	const markerResult = markers.length
 		? findMarkerRoot(
@@ -288,24 +347,7 @@ export function resolveToolCwd(
 				: {}),
 		};
 	}
-	const memo = ctx.toolCwdMemo;
-	if (memo && memo.gitRoot === undefined) {
-		const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
-		memo.gitRoot =
-			gitResult.root && isRealGitMarker(path.join(gitResult.root, ".git"))
-				? gitResult.root
-				: null;
-	}
-	const gitRoot =
-		memo && memo.gitRoot !== undefined
-			? memo.gitRoot
-			: (() => {
-					const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
-					return gitResult.root &&
-						isRealGitMarker(path.join(gitResult.root, ".git"))
-						? gitResult.root
-						: null;
-				})();
+	const gitRoot = gitRootFor(fileDir, homeCeiling, ctx.toolCwdMemo);
 	if (gitRoot && (insideDispatch ? isUnderDir(gitRoot, dispatchRoot) : true)) {
 		if (!ctx.suppressTelemetry) emitResolution(kind, tool, gitRoot, "git-root");
 		return { cwd: gitRoot, marker: ".git" };

@@ -365,10 +365,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :15
 	"clients/dispatch/integration.ts": {
-		silent: 7,
-		identities: "07e8090abd2c7f84",
+		silent: 5,
+		identities: "1965bb6f6082ff2c",
 		reason: PRE_RULE,
-	}, // :323, :976, :1625, :1635, :2320, :3345, :3371
+	}, // :321, :1009, :1695, :1705, :2441 (7 -> 5: the pre-edit capture's two read catches went with the capture)
 	"clients/dispatch/pending-runner-findings.ts": {
 		silent: 2,
 		identities: "6376b0d0a47313f2",
@@ -1116,10 +1116,10 @@ const BASELINE: Readonly<Record<string, Admission>> = {
 		reason: PRE_RULE,
 	}, // :403, :648, :901, :949, :956, :1042, :1069, :1146, :1181, :1183, :1208, :1238, :1371, :1422, :1592, :2189, :2782, :2814, :2922, :2999, :3004, :3414, :3428, :3501
 	"clients/runtime-tool-call.ts": {
-		silent: 10,
-		identities: "042e838b36502579",
+		silent: 9,
+		identities: "f53bc2b53b2f0a4f",
 		reason: PRE_RULE,
-	}, // :269, :502, :526, :1049, :1216, :1441, :1832 and the rest (11 -> 10, #5120: the partial-apply rejection catch went with the in-tool_call writer)
+	}, // :279, :514, :538, :904, :1065, :1071, :1275, :1534, :1932 (11 -> 10, #5120: the partial-apply rejection catch went with the in-tool_call writer; 10 -> 9: the pre-edit capture's rejection catch went with the capture)
 	"clients/runtime-tool-result.ts": {
 		silent: 9,
 		identities: "b34b5e082d0b70b8",

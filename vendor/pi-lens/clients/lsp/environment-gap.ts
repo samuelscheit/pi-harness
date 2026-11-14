@@ -47,7 +47,17 @@ import * as path from "node:path";
 import type { LSPDiagnostic } from "./client.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
 import { logLatency } from "../latency-logger.js";
+import { readFileContent } from "../dispatch/runners/utils.js";
 import { realpathOrResolve, walkUpDirs } from "../path-utils.js";
+import {
+	isImportResolutionFinding,
+	modifiesSysPath,
+	RUNTIME_PATH_NOTICE,
+} from "../python-runtime-path.js";
+import {
+	isToolchainEnvironmentFailure,
+	TOOLCHAIN_FAILURE_NOTICE,
+} from "./toolchain-failure.js";
 
 /**
  * The stable, greppable half of the label. A finding that survives at reduced
@@ -315,14 +325,76 @@ export interface EnvironmentGapOptions {
 
 /**
  * Pure transform: demote every admitted environment gap to a warning and append
- * the label. Warnings, hints, auxiliary-sourced findings and every refused form
- * are returned untouched.
+ * the label: a TypeScript ambient-declaration gap (no dependency install), and
+ * a Pyright import-resolution finding in a Python file that extends
+ * `sys.path` at runtime (`python-runtime-path.ts`), and a toolchain or
+ * filesystem failure the server reported as a row (`toolchain-failure.ts`;
+ * the per-edit runner drops that row before it gets here). Warnings, hints,
+ * auxiliary-sourced findings and every refused form are returned untouched.
  *
  * Returns the SAME array reference when nothing changed, so callers can cheaply
  * skip rebuilding their result objects (the contract
  * `demoteInferredProjectDiagnostics` already follows).
  */
 export function demoteEnvironmentGapDiagnostics(
+	diagnostics: LSPDiagnostic[],
+	options: EnvironmentGapOptions,
+): LSPDiagnostic[] {
+	return demoteToolchainFailures(
+		demoteRuntimePathGaps(demoteNodeInstallGaps(diagnostics, options), options),
+	);
+}
+
+function demoteToolchainFailures(
+	diagnostics: LSPDiagnostic[],
+): LSPDiagnostic[] {
+	let changed = false;
+	const out = diagnostics.map((d) => {
+		if (d.severity !== 1 || !isToolchainEnvironmentFailure(d.message)) return d;
+		changed = true;
+		return {
+			...d,
+			severity: 2 as const,
+			message: `${d.message} ${TOOLCHAIN_FAILURE_NOTICE}`,
+		};
+	});
+	return changed ? out : diagnostics;
+}
+
+const PYRIGHT_DIAGNOSTIC_SOURCES = new Set(["pyright", "basedpyright"]);
+
+function demoteRuntimePathGaps(
+	diagnostics: LSPDiagnostic[],
+	options: EnvironmentGapOptions,
+): LSPDiagnostic[] {
+	const admitted = new Set<LSPDiagnostic>();
+	for (const d of diagnostics) {
+		if (
+			d.severity === 1 &&
+			PYRIGHT_DIAGNOSTIC_SOURCES.has((d.source ?? "").toLowerCase()) &&
+			isImportResolutionFinding(
+				d.code === undefined ? undefined : String(d.code),
+				d.message,
+			)
+		)
+			admitted.add(d);
+	}
+	if (admitted.size === 0) return diagnostics;
+	// One read, only when a candidate asks. Unreadable: unknown, keep severity.
+	const content = readFileContent(options.filePath);
+	if (content === undefined || !modifiesSysPath(content)) return diagnostics;
+	return diagnostics.map((d) =>
+		admitted.has(d)
+			? {
+					...d,
+					severity: 2 as const,
+					message: `${d.message} ${RUNTIME_PATH_NOTICE}`,
+				}
+			: d,
+	);
+}
+
+function demoteNodeInstallGaps(
 	diagnostics: LSPDiagnostic[],
 	options: EnvironmentGapOptions,
 ): LSPDiagnostic[] {

@@ -2138,12 +2138,11 @@ describe("runner status/semantic edge cases", () => {
 
 /**
  * #4481 — which blockers the per-edit pass scopes to the lines a write
- * changed. Only line-local rule runners (ast-grep, tree-sitter) are scoped: a
- * structural rule matches the lines it flags, so on a file's first write (no
- * delta baseline yet) its blocker on an unchanged line is pre-existing.
- * Language servers and linters stay unscoped by design: an edit causes a type
- * error at the callers of a changed signature, or an unused-declaration lint
- * at a line it never touched (maintainer decision, 2026-10-15). Each case
+ * changed. Line-local rule runners (ast-grep, tree-sitter) scope their own
+ * spans, and the dispatcher scopes every linter (blocker-policy.ts): a finding
+ * on a line the edit did not change never blocks. Language servers stay
+ * unscoped by design: an edit causes a type error at the callers of a changed
+ * signature, a line it never touched. Each case
  * drives the real dispatcher and runner, blocking-only with the ranges a host
  * `edit` produces; only the LSP service and the linter process are doubles.
  */
@@ -2209,6 +2208,60 @@ describe("per-edit blocker scope (#4481)", () => {
 			env.cleanup();
 		}
 	}
+
+	// Recurrence (2026-11-13): Lean's `lake setup-file` could not write a
+	// worktree's `.lake/build` (EACCES), and the one row the worker published
+	// for it stopped the agent on every edit. A toolchain or filesystem failure
+	// is no verdict about the code (lsp/toolchain-failure.ts).
+	const LAKE_EACCES = [
+		"`/Users/u/.elan/toolchains/leanprover--lean4---v4.34.1/bin/lake setup-file /repo/src/Law/P929/Norm.lean -` failed:",
+		"",
+		"stderr:",
+		"✖ [81/83] Building Library.Inertia (3.6s)",
+		"error: failed to write '/repo/.lake/build/lib/lean/Library/Inertia.ilean': permission denied (error code: 13)",
+	].join("\n");
+	const LAKE_BAD_IMPORT = [
+		"`/Users/u/.elan/toolchains/leanprover--lean4---v4.34.1/bin/lake setup-file /repo/src/Law/P185/Norm.lean -` failed:",
+		"",
+		"stderr:",
+		"error: no such file or directory (error code: 2)",
+		"  file: /repo/src/Law/P185/Wortlaut.lean",
+		"error: src/Law/P185/Norm.lean: bad import 'Law.P185.Wortlaut'",
+	].join("\n");
+	const leanRow = (message: string) => ({
+		severity: 1,
+		message,
+		range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+		source: "Lean 4",
+	});
+
+	it("reports a lake setup-file EACCES as no verdict, never as a blocker", async () => {
+		const result = await dispatchLsp([leanRow(LAKE_EACCES)]);
+
+		expect(result.blockers).toEqual([]);
+		// Only the coverage notice: the file was not checked, never clean.
+		expect(result.warnings.map((d) => d.tool)).toEqual(["pi-lens"]);
+		expect(result.warnings[0]?.message).toContain("not fully checked");
+		const row = result.latencyReport?.runners.find((r) => r.runnerId === "lsp");
+		expect(row?.status).toBe("skipped");
+		expect(result.inconclusiveSources?.runnerIds).toContain("lsp");
+	});
+
+	it("keeps a code error the same server reports beside a toolchain failure", async () => {
+		const result = await dispatchLsp([leanRow(LAKE_EACCES), lspDiag(2)]);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "lsp", line: 2 }),
+		]);
+	});
+
+	it("keeps a setup-file failure caused by the code (a bad import) blocking", async () => {
+		const result = await dispatchLsp([leanRow(LAKE_BAD_IMPORT)]);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "lsp", line: 1, semantic: "blocking" }),
+		]);
+	});
 
 	// Recurrence: #4481 through the ast-grep LSP lane — the same rule catalog
 	// as ast-grep-napi, delivered by `ast-grep lsp` when its binary is present.
@@ -2282,10 +2335,10 @@ describe("per-edit blocker scope (#4481)", () => {
 		]);
 	});
 
-	// Recurrence: a range gate added to a linter would hide a finding the edit
-	// caused at a line it never touched (an unused declaration after its last
-	// use is deleted, no-undef after a declaration is removed).
-	it("keeps a linter blocker on an unchanged line", async () => {
+	// The linter blocker policy (blocker-policy.ts): a linter finding on a line
+	// the edit did not change never blocks. It leaves as `stillObserved`, so a
+	// blocker recorded while its line was edited stays pending.
+	async function dispatchRubocop(offenseLine: number) {
 		const { createDispatchContext, dispatchForFile, RunnerRegistry } =
 			await import("../../../../clients/dispatch/dispatcher.js");
 		const runner = (
@@ -2294,7 +2347,7 @@ describe("per-edit blocker scope (#4481)", () => {
 		const env = setupTestEnvironment("pi-lens-rb-edit-scope-");
 		try {
 			const filePath = path.join(env.tmpDir, "main.rb");
-			fs.writeFileSync(filePath, "value = 1\nputs 'hi'\n");
+			fs.writeFileSync(filePath, "value = 1\nother = 2\nputs 'hi'\n");
 			safeSpawnAsync
 				.mockResolvedValueOnce({
 					error: null,
@@ -2312,10 +2365,10 @@ describe("per-edit blocker scope (#4481)", () => {
 								offenses: [
 									{
 										severity: "error",
-										message: "Useless assignment to variable - `value`.",
+										message: "Useless assignment to variable.",
 										cop_name: "Lint/UselessAssignment",
 										correctable: false,
-										location: { line: 1, column: 1 },
+										location: { line: offenseLine, column: 1 },
 									},
 								],
 							},
@@ -2325,8 +2378,7 @@ describe("per-edit blocker scope (#4481)", () => {
 				});
 			const registry = new RunnerRegistry();
 			registry.register(runner);
-
-			const result = await dispatchForFile(
+			return await dispatchForFile(
 				createDispatchContext(
 					filePath,
 					env.tmpDir,
@@ -2338,12 +2390,26 @@ describe("per-edit blocker scope (#4481)", () => {
 				[{ mode: "all", runnerIds: ["rubocop"] }],
 				registry,
 			);
-
-			expect(result.blockers).toEqual([
-				expect.objectContaining({ tool: "rubocop", line: 1 }),
-			]);
 		} finally {
 			env.cleanup();
 		}
+	}
+
+	it("withholds a linter blocker on an unchanged line, still observed", async () => {
+		const result = await dispatchRubocop(1);
+
+		expect(result.blockers).toEqual([]);
+		expect(result.warnings).toEqual([]);
+		expect(result.stillObserved).toEqual([
+			expect.objectContaining({ tool: "rubocop", line: 1 }),
+		]);
+	});
+
+	it("keeps a linter blocker on a changed line", async () => {
+		const result = await dispatchRubocop(2);
+
+		expect(result.blockers).toEqual([
+			expect.objectContaining({ tool: "rubocop", line: 2 }),
+		]);
 	});
 });

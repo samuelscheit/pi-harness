@@ -755,3 +755,89 @@ describe("resolveToolCwd (#2777)", () => {
 		expect(lines[0]).toContain("reason=file-dir-fallback");
 	});
 });
+
+describe("ruff runs at its config root, else the repository root", () => {
+	// Recurrence (2026-11-13, law-formalization): with no ruff config, I001
+	// flagged a test's imports for each of three orders. The language markers
+	// rooted ruff at `tools/kernel` (a `requirements.txt`), and with the bundled
+	// `--config` ruff takes its cwd as the project root for first-party
+	// detection, so the verdict depended on where it ran.
+	function repo(): { root: string; pkg: string; file: string } {
+		const root = path.join(home, "repo");
+		const pkg = path.join(root, "tools", "kernel");
+		const file = path.join(pkg, "tests", "test_root.py");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.mkdirSync(path.join(root, ".git"));
+		fs.writeFileSync(path.join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+		fs.writeFileSync(path.join(pkg, "requirements.txt"), "pyyaml\n");
+		fs.writeFileSync(file, "import os\n");
+		return { root, pkg, file };
+	}
+
+	it("runs at the repository root when the project has no ruff config, from any dispatch cwd", () => {
+		const { root, pkg, file } = repo();
+		for (const cwd of [root, pkg, path.dirname(file)]) {
+			expect(
+				toolCwd.resolveToolCwd("runner", "ruff", file, { cwd, homeDir: home }),
+			).toEqual({ cwd: root, marker: ".git" });
+		}
+		// The autofix (formatter kind) agrees, so a fix cannot undo the lint.
+		expect(
+			toolCwd.resolveToolCwd("formatter", "ruff", file, {
+				cwd: pkg,
+				homeDir: home,
+			}).cwd,
+		).toBe(root);
+	});
+
+	it("leaves a tool that is not config-rooted on the language markers", () => {
+		const { pkg, file } = repo();
+		expect(
+			toolCwd.resolveToolCwd("runner", "mypy", file, {
+				cwd: pkg,
+				homeDir: home,
+			}).cwd,
+		).toBe(pkg);
+	});
+
+	it("ignores a pyproject.toml that carries no [tool.ruff] table", () => {
+		const { root, pkg, file } = repo();
+		fs.writeFileSync(
+			path.join(pkg, "pyproject.toml"),
+			"[project]\nname = 'k'\n",
+		);
+		expect(
+			toolCwd.resolveToolCwd("runner", "ruff", file, {
+				cwd: pkg,
+				homeDir: home,
+			}).cwd,
+		).toBe(root);
+	});
+
+	it("runs where the nearest ruff config lives", () => {
+		const { pkg, file } = repo();
+		fs.writeFileSync(
+			path.join(pkg, "pyproject.toml"),
+			"[tool.ruff]\nline-length = 120\n",
+		);
+		expect(
+			toolCwd.resolveToolCwd("runner", "ruff", file, {
+				cwd: path.dirname(file),
+				homeDir: home,
+			}),
+		).toEqual({ cwd: pkg, marker: "pyproject.toml" });
+	});
+
+	it("falls back to the marker walk outside a repository with no config", () => {
+		const pkg = path.join(home, "loose");
+		const file = path.join(pkg, "src", "main.py");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(pkg, "requirements.txt"), "\n");
+		expect(
+			toolCwd.resolveToolCwd("runner", "ruff", file, {
+				cwd: pkg,
+				homeDir: home,
+			}).cwd,
+		).toBe(pkg);
+	});
+});

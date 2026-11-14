@@ -85,7 +85,7 @@ import {
 	disabledRunnerIdsFor,
 } from "./disabled-runners.js";
 import { getToolProfile } from "./tool-profile.js";
-import { classifyPreExisting, preEditSeedFactKey } from "./pre-edit-seed.js";
+import { applyLinterBlockerPolicy } from "./blocker-policy.js";
 import {
 	checkedVerdict,
 	emptyDispatchResult,
@@ -98,6 +98,7 @@ import {
 	noPrimaryCheckerReason,
 	reachedNoVerdict,
 	SKIP_REASON_PHRASE,
+	spanOverlapsModifiedRanges,
 	TOOL_UNUSABLE_SKIP_REASONS,
 	unchecked,
 } from "./types.js";
@@ -365,8 +366,7 @@ export function createDispatchContext(
 
 /**
  * The session fact holding a file's delta baseline (absolute, normalized
- * path; the #2489 note in `dispatchForFile`). The #4483 pre-edit capture reads
- * it to tell a file's first dispatch from a later one.
+ * path; the #2489 note in `dispatchForFile`).
  */
 export function deltaBaselineFactKey(filePath: string): string {
 	return `session.baseline.${filePath}`;
@@ -467,19 +467,16 @@ function blocksAsClassMember(d: Diagnostic): boolean {
 
 /**
  * #5416: one verdict and one copy per cross-tool finding class at a place.
- * It runs on what the per-copy filters, the delta and the pre-edit seed left,
- * so each of them read every tool's copy apart. A class the seed held a copy
- * of keeps its other copies as their tools rated them: the finding is listed
- * as pre-existing, and the seed's scope stays linters only. Every other
- * member is raised to the class tier, then the copy the overlap dedupe would
- * prefer stands. It only raises or collapses survivors, so it never lowers a
- * verdict.
+ * It runs on what the per-copy filters and the delta left, so each of them
+ * read every tool's copy apart. Every member on an edited line is raised to
+ * the class tier (a finding on a line the edit did not change never blocks,
+ * blocker-policy.ts), then the copy the overlap dedupe would prefer stands.
+ * It only raises or collapses survivors, so it never lowers a verdict.
  */
 function mergeFindingClasses(
 	visible: Diagnostic[],
-	held: readonly Diagnostic[],
+	ctx: Pick<DispatchContext, "modifiedRanges">,
 ): Diagnostic[] {
-	const heldKeys = new Set(held.map(findingClassKey));
 	const score = (d: Diagnostic) =>
 		semanticRank(d.semantic) * 100 +
 		toolPriority(d.tool, d.defectClass ?? classifyDiagnostic(d));
@@ -487,11 +484,14 @@ function mergeFindingClasses(
 	const merged: Diagnostic[] = [];
 	for (const d of visible) {
 		const key = findingClassKey(d);
-		if (key === undefined || heldKeys.has(key)) {
+		if (key === undefined) {
 			merged.push(d);
 			continue;
 		}
-		const raised = withClassSeverity(d);
+		const edited =
+			d.line === undefined ||
+			spanOverlapsModifiedRanges(d.line, d.line, ctx.modifiedRanges);
+		const raised = edited ? withClassSeverity(d) : d;
 		const slot = slotByKey.get(key);
 		if (slot === undefined) {
 			slotByKey.set(key, merged.push(raised) - 1);
@@ -1511,17 +1511,14 @@ async function runGroup(
 					? { skipReason, ...(claimSource !== undefined && { claimSource }) }
 					: undefined),
 		});
-		// #4483: a pre-edit capture reads bytes the host is about to replace,
-		// so its counts never reach the widget's runner state.
-		if (!ctx.preEditCapture)
-			recordRunner(
-				ctx.filePath,
-				runnerId,
-				result.status,
-				result.diagnostics.length,
-				duration,
-				ctx.writeIndex,
-			);
+		recordRunner(
+			ctx.filePath,
+			runnerId,
+			result.status,
+			result.diagnostics.length,
+			duration,
+			ctx.writeIndex,
+		);
 
 		// #4484 r2: every finding names the runner that observed it, so a
 		// recorded blocker is retired only by a conclusive run of its own source.
@@ -1686,7 +1683,6 @@ export async function dispatchForFile(
 			groupCount: groups.length,
 			kind: ctx.kind,
 			runners: allRunnerIds.join(","),
-			...(ctx.preEditCapture && { preEditCapture: true }),
 		},
 	});
 
@@ -1942,46 +1938,7 @@ export async function dispatchForFile(
 		resolvedCount = filtered.fixed.length;
 	}
 
-	// #4483: a blocking linter finding the file held before its first edit
-	// this session (the seed `tool_call` captured) is pre-existing: not a
-	// blocker, not held back, reported on its own. Matched by identity and
-	// line text, so it stays pre-existing when lines move; the seed shrinks to
-	// what this run still observes, or keeps entries of runners with no verdict.
-	const seedKey = preEditSeedFactKey(ctx.filePath);
-	const preEditSeed =
-		ctx.deltaMode && baselinePathSafe
-			? ctx.facts.getBoundedSessionFact<Diagnostic[]>(seedKey)
-			: undefined;
-	const seedContent = ctx.facts.getFileFact<string>(
-		ctx.filePath,
-		"file.content",
-	);
-	let preExisting: Diagnostic[] = [];
-	if (preEditSeed && seedContent !== undefined) {
-		const classified = classifyPreExisting(
-			preEditSeed,
-			[
-				// #5416: and a class member the merge below would raise, so the
-				// seed holds it before the raise can block on it.
-				...visibleDiagnostics.filter(
-					(d) => d.semantic === "blocking" || blocksAsClassMember(d),
-				),
-				...heldBackBlockers,
-			],
-			seedContent,
-			new Set(
-				[...answeredRunnerIds].filter((id) => !inconclusiveRunnerIds.has(id)),
-			),
-		);
-		if (classified.preExisting.length > 0) {
-			const held = new Set(classified.preExisting);
-			visibleDiagnostics = visibleDiagnostics.filter((d) => !held.has(d));
-			heldBackBlockers = heldBackBlockers.filter((d) => !held.has(d));
-			preExisting = classified.preExisting;
-		}
-		ctx.facts.setBoundedSessionFact(seedKey, classified.nextSeed);
-	}
-	visibleDiagnostics = mergeFindingClasses(visibleDiagnostics, preExisting);
+	visibleDiagnostics = mergeFindingClasses(visibleDiagnostics, ctx);
 
 	// Persist full current snapshot for next run (not delta-filtered subset).
 	// Gated on `baselinePathSafe` too: a non-absolute `ctx.filePath` already
@@ -2125,11 +2082,6 @@ export async function dispatchForFile(
 			baselineWarningCount,
 			// #4484: blockers still observed that the delta did not call new.
 			heldBackBlockers: heldBackBlockers.length,
-			// #4483: whether a pre-edit seed was read, and the blocking linter
-			// findings it reported as pre-existing.
-			preEditSeed: preEditSeed !== undefined,
-			preExisting: preExisting.length,
-			...(ctx.preEditCapture && { preEditCapture: true }),
 			// #4484 r2: findings that only keep a recorded blocker pending, and
 			// the sources whose silence is no evidence.
 			stillObserved: stillObserved.length,
@@ -2150,7 +2102,6 @@ export async function dispatchForFile(
 		blockerOutput,
 		hasBlockers: blockers.length > 0,
 		...(heldBackBlockers.length > 0 && { heldBackBlockers }),
-		...(preExisting.length > 0 && { preExisting }),
 		...(stillObserved.length > 0 && { stillObserved }),
 		...(editScopedRunnerIds.some((id) => !voidedCovers.has(id)) && {
 			editScopedRunnerIds: editScopedRunnerIds.flatMap((id) =>
@@ -2325,11 +2276,17 @@ async function runRunner(
 			filePath: normalizeDiagnosticFilePath(ctx, d.filePath),
 		}));
 
-		return {
-			...result,
-			diagnostics,
-			semantic: result.semantic ?? defaultSemantic,
-		};
+		// One verdict on what a linter finding may block, for the inline and the
+		// collect-later lanes alike (blocker-policy.ts).
+		return applyLinterBlockerPolicy(
+			{
+				...result,
+				diagnostics,
+				semantic: result.semantic ?? defaultSemantic,
+			},
+			ctx,
+			runner.id,
+		);
 	} catch (error) {
 		ctx.log(`Runner ${runner.id} failed: ${error}`);
 		const message = error instanceof Error ? error.message : String(error);

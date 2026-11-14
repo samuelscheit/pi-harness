@@ -55,6 +55,11 @@ import {
 	retagAuxiliaryDiagnostics,
 } from "../auxiliary-lsp.js";
 import { readFileContent } from "./utils.js";
+import { recordDegradationOnce } from "../../degradation-ledger.js";
+import {
+	isToolchainEnvironmentFailure,
+	toolchainFailureCause,
+} from "../../lsp/toolchain-failure.js";
 import {
 	tryWarmAttachedCodeActions,
 	tryWarmAttachedDiagnostics,
@@ -422,6 +427,26 @@ const lspRunner: RunnerDefinition = {
 				lspDiags = kept;
 				withheldNotice = describePythonCompileWithheld(dropped, declared);
 			}
+		}
+
+		// A server that could not check the file because its toolchain or the
+		// filesystem failed (Lean's `lake setup-file` hitting EACCES) reached no
+		// verdict: its row is not a code diagnostic (lsp/toolchain-failure.ts).
+		{
+			const codeRows: typeof lspDiags = [];
+			for (const diagnostic of lspDiags) {
+				if (!isToolchainEnvironmentFailure(diagnostic.message)) {
+					codeRows.push(diagnostic);
+					continue;
+				}
+				diagnosticsInconclusive = true;
+				recordDegradationOnce({
+					kind: "lsp-toolchain-environment-failure",
+					subject: diagnostic.serverId ?? diagnostic.source ?? "lsp",
+					reason: `not checked: ${toolchainFailureCause(diagnostic.message)}`,
+				});
+			}
+			lspDiags = codeRows;
 		}
 
 		if (serverFailed) {

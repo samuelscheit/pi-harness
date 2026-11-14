@@ -1,9 +1,15 @@
 id: unchecked-throwing-call-python
 language: Python
-severity: error
+severity: warning
 message: "Call without try/except — throws on invalid input or missing file"
 note: |
-  These Python calls raise exceptions that must be handled.
+  These Python calls raise exceptions on a missing file or malformed input.
+
+  LIMIT (why this rule reports below `error`, as its JS/TS siblings do,
+  #5466): letting the exception propagate is often the right handling (a
+  script's top level, `main()`, a CLI that should fail loudly on a missing
+  file), and a `try` in a caller is invisible to this lexical check. Read a
+  hit as a prompt to decide where the error is handled, not as a defect.
 
   open():       raises FileNotFoundError, PermissionError, IsADirectoryError
   json.loads(): raises json.JSONDecodeError on malformed JSON
@@ -13,7 +19,7 @@ note: |
   `int()`/`float()` are a separate rule, `unchecked-numeric-parse-python`
   (#3211): whether they can raise depends on the argument's runtime type,
   which is often undecidable from syntax alone (a typed parameter, a prior
-  guard), so they ship at `warning` instead of `error` here.
+  guard).
 
   ✅ WRAP IN TRY/EXCEPT:
     try:

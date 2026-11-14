@@ -15,6 +15,11 @@ import {
 	detectPythonEnvironment,
 } from "../../python-environment.js";
 import { hashText } from "../../finding-identity.js";
+import {
+	isImportResolutionFinding,
+	modifiesSysPath,
+	RUNTIME_PATH_NOTICE,
+} from "../../python-runtime-path.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
@@ -30,6 +35,7 @@ import {
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
 import { finishParsedRun } from "./utils/tool-failure.js";
+import { readFileContent } from "./utils.js";
 
 const pyright = createAvailabilityChecker("pyright", ".exe");
 
@@ -189,8 +195,24 @@ export function normalizePyrightSeverity(
 	}
 }
 
-export function parsePyrightOutput(data: any, _filePath: string): Diagnostic[] {
+export function parsePyrightOutput(
+	data: any,
+	_filePath: string,
+	readContent: (filePath: string) => string | undefined = readFileContent,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	// Per reported file, read only when an import-resolution error asks
+	// (python-runtime-path.ts). Unreadable: unknown, the error keeps its tier.
+	const runtimePath = new Map<string, boolean>();
+	const extendsSysPath = (file: string): boolean => {
+		let known = runtimePath.get(file);
+		if (known === undefined) {
+			const content = readContent(file);
+			known = content !== undefined && modifiesSysPath(content);
+			runtimePath.set(file, known);
+		}
+		return known;
+	};
 
 	// Pyright JSON output has generalDiagnostics array
 	const generalDiags: PyrightDiagnostic[] = data.generalDiagnostics || [];
@@ -205,8 +227,17 @@ export function parsePyrightOutput(data: any, _filePath: string): Diagnostic[] {
 		// convert to (`range.start.line + 1`). `range` itself is omitted when
 		// pyright has nothing to point at, so both fall back to line 1.
 		const start = diag.range?.start;
-		const message = diag.message || "Type error";
-		const severity = normalizePyrightSeverity(diag.severity);
+		const reported = diag.file || _filePath;
+		const pathGap =
+			normalizePyrightSeverity(diag.severity) === "error" &&
+			isImportResolutionFinding(diag.rule, diag.message ?? "") &&
+			extendsSysPath(reported);
+		const message = pathGap
+			? `${diag.message} ${RUNTIME_PATH_NOTICE}`
+			: diag.message || "Type error";
+		const severity = pathGap
+			? "warning"
+			: normalizePyrightSeverity(diag.severity);
 		const line = (start?.line ?? 0) + 1;
 		diagnostics.push({
 			// #5412: a rule-less finding (a syntax error, say) keys its id on its
@@ -218,7 +249,7 @@ export function parsePyrightOutput(data: any, _filePath: string): Diagnostic[] {
 				? `pyright-${diag.rule}`
 				: `pyright-${line}-${hashText(message)}`,
 			message,
-			filePath: diag.file || _filePath,
+			filePath: reported,
 			line,
 			column: (start?.character ?? 0) + 1,
 			severity,

@@ -736,6 +736,10 @@ const DRIVERS: Record<string, Driver> = {
 	"ruff-lint": {
 		file: "src/app.py",
 		content: "x = y\n",
+		// A ruff finding blocks only under a project ruff config
+		// (clients/dispatch/blocker-policy.ts).
+		prepare: (root) =>
+			fs.writeFileSync(path.join(root, "ruff.toml"), "line-length = 88\n"),
 		status: "failed",
 		reply: ({ filePath }) => ({
 			status: 1,

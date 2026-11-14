@@ -1563,14 +1563,11 @@ function publishInlineVerdict(args: {
 		if (getFlag("lens-guard")) {
 			// #4733 r1 F2: a clean verdict over the whole file, applied, with no
 			// blocker left in the observation; anything less observes nothing.
-			// #4733 r5 G3: a blocking finding the seed called pre-existing is still
-			// reported, so it is not a clean verdict for another session's section.
 			const wholeFileClean =
 				inlineVerdictApplied &&
 				!result.isError &&
 				!result.hasBlockers &&
 				result.currentBlockerCount === 0 &&
-				(result.preExistingBlockerCount ?? 0) === 0 &&
 				result.fileVerdictComplete === true;
 			syncGitGuardRecord(
 				runtime,

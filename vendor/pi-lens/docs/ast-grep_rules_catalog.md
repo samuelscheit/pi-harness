@@ -363,7 +363,7 @@ See [`docs/custom-rules.md`](custom-rules.md) to add your own. Rule sources: `ru
 | `python-webrepl-hardcoded-secret-python` | warning | no | CodeRabbit | A secret is hard-coded in the application. Secrets stored in source code, such as credentials, identifiers, and other types of sensitive da… |
 | `reducible-list-comprehension` | warning | yes | pi-lens | A list comprehension is unnecessary here; use a generator expression |
 | `unchecked-numeric-parse-python` | warning | no | pi-lens | int()/float() without try/except — raises ValueError on non-numeric input |
-| `unchecked-throwing-call-python` | error | no | pi-lens | Call without try/except — throws on invalid input or missing file |
+| `unchecked-throwing-call-python` | warning | no | pi-lens | Call without try/except — throws on invalid input or missing file |
 
 ### Ruby (20)
 

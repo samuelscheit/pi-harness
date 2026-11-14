@@ -620,7 +620,9 @@ const MEMBERS: Member[] = [
 		fileContent: "name: a\nname: b\n",
 		output: (reported) => ({
 			status: 1,
-			stdout: `${reported}:4:5: [error] ${MARKER} (key-duplicates)\n`,
+			// A parse error: it blocks with or without a project yamllint config
+			// (clients/dispatch/blocker-policy.ts).
+			stdout: `${reported}:4:5: [error] ${MARKER} (syntax)\n`,
 		}),
 	},
 	{

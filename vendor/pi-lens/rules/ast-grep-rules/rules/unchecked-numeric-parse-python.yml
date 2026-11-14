@@ -6,8 +6,8 @@ note: |
   Split out of `unchecked-throwing-call-python` (#3211): `int()`/`float()`
   raise `ValueError` on non-numeric strings, but whether a given call CAN
   raise depends on the argument's runtime type — often undecidable from
-  syntax alone — so this ships at `warning`, separate from the
-  syntactically-certain `error`-level calls (open/json/os/shutil).
+  syntax alone — so this is a rule of its own beside the calls that raise
+  on any bad input (open/json/os/shutil). Both report at `warning`.
 
   Excluded as already-safe by construction: a numeric literal argument
   (`int(3.7)`), an argument that is itself a call to `int()`/

@@ -1,6 +1,7 @@
 /**
  * Edit-scope census (#4481): every dispatch lane that can STOP the agent on a
- * per-edit pass is classified as span-gated or unscoped by design.
+ * per-edit pass is classified as span-gated, dispatcher-gated or unscoped by
+ * design.
  *
  * Recurrence this prevents: #4481. tree-sitter gated its blocking tier on the
  * edited lines; ast-grep-napi was added beside it without that gate, so the
@@ -10,14 +11,17 @@
  * span-gated lane whose runner source no longer calls
  * `spanOverlapsModifiedRanges` fails too.
  *
- * Scope (the maintainer's 2026-10-15 decision, mirrored on #4480): only the
- * ast-grep lanes and tree-sitter are span-gated. Language-server diagnostics,
- * type checkers, compilers, linters and the other scanners stay unscoped by
- * design: an edit can cause their findings at a line it never touched. A
- * runner source outside the span-gated set that references the predicate or
- * `modifiedRanges` fails, so a gate, shared or private (tree-sitter's was a
- * private function before #4481 r2), cannot drift onto an unscoped runner
- * through the runner module itself.
+ * Scope: the ast-grep lanes and tree-sitter gate their own spans. Linters are
+ * gated once, in the dispatcher (`applyLinterBlockerPolicy`,
+ * clients/dispatch/blocker-policy.ts, over `LINTER_RUNNER_IDS`): a finding on
+ * a line the edit did not change never blocks (2026-11-14, replacing the
+ * 2026-10-15 linters-unscoped decision and its #4483 pre-edit seed).
+ * Language-server diagnostics, type checkers, compilers and the other
+ * scanners stay unscoped by design: an edit can cause a type error at a line
+ * it never touched. A runner source outside the span-gated set that
+ * references the predicate or `modifiedRanges` fails, so a gate, shared or
+ * private (tree-sitter's was a private function before #4481 r2), cannot
+ * drift onto a runner through the runner module itself.
  *
  * Derivation (AGENTS.md shape 69): lanes come from the live registry
  * (`registerDefaultRunners`) plus one lane per auxiliary LSP profile, never a
@@ -51,7 +55,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { AUXILIARY_LSP_PROFILES } from "../../../clients/dispatch/auxiliary-lsp.js";
 import { RunnerRegistry } from "../../../clients/dispatch/dispatcher.js";
-import { PRE_EDIT_SEED_RUNNER_IDS } from "../../../clients/dispatch/pre-edit-seed.js";
+import { LINTER_RUNNER_IDS } from "../../../clients/dispatch/blocker-policy.js";
 import { registerDefaultRunners } from "../../../clients/dispatch/runners/index.js";
 import type { RunnerDefinition } from "../../../clients/dispatch/types.js";
 import {
@@ -70,10 +74,11 @@ const PREDICATE = /^spanOverlapsModifiedRanges$/;
 
 type Classification =
 	| { scope: "span-gated" }
-	| { scope: "unscoped"; kind: "linter" | "semantic" | "scanner" };
+	| { scope: "dispatcher-gated" }
+	| { scope: "unscoped"; kind: "semantic" | "scanner" };
 
 const GATED: Classification = { scope: "span-gated" };
-const LINTER: Classification = { scope: "unscoped", kind: "linter" };
+const LINTER: Classification = { scope: "dispatcher-gated" };
 const SEMANTIC: Classification = { scope: "unscoped", kind: "semantic" };
 const SCANNER: Classification = { scope: "unscoped", kind: "scanner" };
 
@@ -209,7 +214,7 @@ describe("edit-scope census (#4481)", () => {
 		expect(
 			unclassified,
 			"classify each new dispatch lane in CLASSIFICATION: span-gated only " +
-				"under the maintainer's ast-grep/tree-sitter scope, otherwise unscoped",
+				"under the ast-grep/tree-sitter scope, LINTER for a linter, otherwise unscoped",
 		).toEqual([]);
 		expect(
 			stale,
@@ -221,19 +226,18 @@ describe("edit-scope census (#4481)", () => {
 		);
 	});
 
-	it("seeds the pre-edit baseline from exactly the linter lanes (#4483)", () => {
+	it("gates exactly the linter lanes in the dispatcher", () => {
 		// Recurrence: a linter registered (or reclassified) here without joining
-		// PRE_EDIT_SEED_RUNNER_IDS would stop the agent on its old errors at a
-		// file's first write again (#4483); a language server or scanner added
-		// to that set would hide its old errors there, against the maintainer's
-		// linters-only scope (2026-10-15).
+		// LINTER_RUNNER_IDS would stop the agent on findings on lines the edit
+		// never touched again; a language server or type checker added to that
+		// set would hide a type error the edit caused elsewhere.
 		const linters = Object.entries(CLASSIFICATION)
-			.filter(([, c]) => c.scope === "unscoped" && c.kind === "linter")
+			.filter(([, c]) => c.scope === "dispatcher-gated")
 			.map(([id]) => id);
 		assertNonEmptyScan("linter lanes", linters.length, 20);
 		expect(
-			[...PRE_EDIT_SEED_RUNNER_IDS].sort(),
-			"PRE_EDIT_SEED_RUNNER_IDS (clients/dispatch/pre-edit-seed.ts) must equal the lanes classified LINTER here",
+			[...LINTER_RUNNER_IDS].sort(),
+			"LINTER_RUNNER_IDS (clients/dispatch/blocker-policy.ts) must equal the lanes classified LINTER here",
 		).toEqual(linters.sort());
 	});
 
@@ -276,7 +280,7 @@ describe("edit-scope census (#4481)", () => {
 			});
 		expect(
 			driftedGates,
-			"only the ast-grep lanes and tree-sitter are edit-scoped; an unscoped runner must not gate on the edited lines",
+			"only the ast-grep lanes and tree-sitter gate their own spans; linters are gated in the dispatcher, the rest are unscoped",
 		).toEqual([]);
 	});
 });
