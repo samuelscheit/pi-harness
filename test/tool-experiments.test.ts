@@ -87,7 +87,7 @@ async function session(sessionManager: SessionManager): Promise<AgentSession> {
 		extensionFactories: [
 			createCodemodeExtension({ mode: "on" }),
 			(pi: ExtensionAPI) => prompt(pi, experimentsDir, rulesDir),
-			(pi: ExtensionAPI) => workflow(pi, { experimentsDir, workflowDirs: () => [HARNESS_WORKFLOWS, join(repo, ".pi", "workflows")], modelRuntime: async () => runtime }),
+			(pi: ExtensionAPI) => workflow(pi, { experimentsDir, workflowDirs: () => [HARNESS_WORKFLOWS, join(repo, ".pi", "workflows")], modelRuntime: async () => runtime, agentDir: dir }),
 		],
 	});
 	await resourceLoader.reload();
