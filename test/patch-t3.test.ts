@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
 import { withHugePs } from "./fixtures/huge-ps.ts";
@@ -139,6 +139,9 @@ describe("patchBundle", () => {
 		"delegate-fork-runtime",
 		"delegate-fork-schema",
 		"delegate-fork-tool",
+		"delegate-template-schema",
+		"delegate-template-tool",
+		"delegate-template-runtime",
 		"session-questions",
 	];
 
@@ -166,11 +169,18 @@ describe("patchBundle", () => {
 		assert.ok(text.includes("forkSource: optional(Struct({\n\t\t\tthreadId: ThreadId,\n\t\t\trunId: RunId\n\t\t})),"), "the command carries its source");
 		assert.ok(text.includes("const forkSource = fork ? yield* resolveForkSource(parent.thread.id, parentRun, input.forkThreadId) : void 0;"));
 		assert.ok(text.includes("modelSelection: forkSource.run.modelSelection\n\t\t\t};"), "a fork takes its source run's selection");
-		assert.ok(text.includes('status: forkSource === void 0 ? "consumed" : "pending",'), "a fork's spawn waits for its turn start");
 		assert.ok(text.includes('(transfer.type === "fork" || transfer.type === "subagent_spawn") && transfer.targetThreadId'));
 		assert.ok(text.includes("getThreadRecords(nativeForkTransfer.sourcePoint.threadId, ["), "a fork of a delegated thread reads that thread");
 		assert.ok(text.includes('...nativeForkTransfer.type === "subagent_spawn" || sourceProviderTurn === void 0 ? {} : {'), "a delegated fork copies up to now");
-		assert.ok(text.includes("No parent history, unless `fork:true` starts it from a copy of this conversation (Pi only)."));
+		// delegate_task with forkSessionFile: the tool, its command, the source point, the check and the turn start.
+		assert.ok(text.includes("forkSessionFile: optional(TrimmedNonEmptyString.annotate("), "the tool takes forkSessionFile");
+		assert.ok(text.includes("\t\tforkSessionFile: optional(String$2),\n\t\tcreatedAt: optional(DateTimeUtc)"), "the command carries the file");
+		assert.ok(text.includes("\tsessionFile: optional(String$2)\n});\nconst OrchestrationV2ThreadForkSourcePoint"), "a source point can name a file");
+		assert.ok(text.includes("const templateFile = input.forkSessionFile === void 0 ? void 0 : resolveTemplateSessionFile(input.forkSessionFile);"));
+		assert.ok(text.includes("...templateFile === void 0 ? {} : { forkSessionFile: templateFile.file },\n\t\t\t\tcompletionWake:"), "the checked real path is dispatched");
+		assert.ok(text.includes('status: forkSource === void 0 && forkSessionFile === void 0 ? "consumed" : "pending",'), "a fork's or a template's spawn waits for its turn start");
+		assert.ok(text.includes("const templateFile = nativeForkTransfer?.sourcePoint.sessionFile;\n\t\t\tif (templateFile !== void 0) return yield* loadFromProvider(session.forkThread({"));
+		assert.ok(text.includes("No parent history, unless `fork:true` starts it from a copy of this conversation, or `forkSessionFile` from a Pi session template (Pi only)."));
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -233,6 +243,33 @@ describe("patchBundle", () => {
 		assert.equal(taskPrompt({ task: "Spike A" }, link), `Forked from ${link}.\n\nSpike A`);
 		assert.equal(taskPrompt({ task: "Spike A", role: "research" }, link), `Forked from ${link}.\n\nAct as the research sub-agent for this task.\n\nSpike A`);
 		assert.equal(taskPrompt({ task: "Spike A", role: "general" }), "Spike A", "a task without fork is unchanged");
+
+		// The template check, run as bundled with the chunk's own node imports (which the patch requires).
+		assert.ok(server.includes('import * as NodeFS from "node:fs";\nimport * as NodePath from "node:path";\nimport * as NodeOS from "node:os";\n'));
+		const { piTemplatesDir, resolveTemplateSessionFile } = new Function("NodeFS", "NodePath", "NodeOS", "process", `${between(server, "function piTemplatesDir(", "function taskPrompt(")}\nreturn { piTemplatesDir, resolveTemplateSessionFile };`)(
+			{ realpathSync, statSync },
+			{ join, isAbsolute, sep },
+			{ homedir },
+			{ env: {} },
+		);
+		assert.equal(piTemplatesDir({}), join(homedir(), ".pi", "agent", "templates"));
+		assert.equal(piTemplatesDir({ PI_CODING_AGENT_DIR: "~/agent" }), join(homedir(), "agent", "templates"));
+		const agent = realpathSync(mkdtempSync(join(tmpdir(), "t3-templates-")));
+		try {
+			mkdirSync(join(agent, "templates", "review", "repo"), { recursive: true });
+			const session = join(agent, "templates", "review", "repo", "session.jsonl");
+			writeFileSync(session, "{}\n");
+			writeFileSync(join(agent, "elsewhere.jsonl"), "{}\n");
+			symlinkSync(join(agent, "elsewhere.jsonl"), join(agent, "templates", "escape.jsonl"));
+			const templates = join(agent, "templates");
+			assert.deepEqual(resolveTemplateSessionFile(join(templates, "review", "..", "review", "repo", "session.jsonl"), templates), { file: session });
+			for (const outside of [join(agent, "elsewhere.jsonl"), join(templates, "escape.jsonl"), "review/repo/session.jsonl", join(templates, "review")]) {
+				assert.match(resolveTemplateSessionFile(outside, templates).problem, /must be a Pi session template file under/, outside);
+			}
+			assert.match(resolveTemplateSessionFile(join(templates, "gone.jsonl"), templates).problem, /does not exist/);
+		} finally {
+			rmSync(agent, { recursive: true, force: true });
+		}
 
 		// The forked child's Pi process, as the patched adapter launches it: its launch-argument code run
 		// as bundled, composed as `PiAdapter.forkThread` composes it.
@@ -355,7 +392,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, session-questions;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -373,13 +410,13 @@ describe("keeping t3 patched", () => {
 			const app = join(dir, "T3 Test.app");
 			const archive = join(app, "Contents/Resources/app.asar");
 			mkdirSync(dirname(archive), { recursive: true });
-			// An archive patched before the fork patches existed: only the adapter chunk is patched.
-			const fork = (patch: Patch) => patch.name.startsWith("delegate-fork");
+			// An archive patched before the delegate_task patches existed: only the adapter chunk is patched.
+			const fork = (patch: Patch) => patch.name.startsWith("delegate-");
 			const adapterChunk = "apps/server/dist/chunk0.mjs";
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool;/);
+			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 

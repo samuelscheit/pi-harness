@@ -52,6 +52,15 @@
 //   instead of starting without the history. The task message starts "Forked from <source link>".
 //   The patch spans three chunks of t3's server bundle: the contracts, the MCP service, and the
 //   orchestrator with the Pi adapter.
+// - delegate-template-schema, delegate-template-tool, delegate-template-runtime (same branch,
+//   "feat(orchestrator): delegate_task can start a Pi child from a session template"):
+//   `delegate_task({ forkSessionFile, task })` starts the child from a copy of a Pi session file,
+//   only a real `.jsonl` file under Pi's `templates/` directory (`$PI_CODING_AGENT_DIR` or
+//   `~/.pi/agent`, symlinks resolved), on a Pi target, not with `fork` and not in another
+//   environment. The harness's `delegate_task({ template })` passes the template's built session
+//   (extensions/template). The orchestrator records the file on the child's pending `subagent_spawn`
+//   transfer (`sourcePoint.sessionFile`), and the child's first turn start runs the Pi adapter's
+//   existing native fork on it (`pi --fork <file>`, no source thread or turn).
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -365,6 +374,144 @@ export const PATCHES: Patch[] = [
 			[
 				'\t\t\t\t...workspaceStrategy === void 0 ? {} : { workspaceStrategy },\n\t\t\t\tcompletionWake: input.mode === "wait" ? "settled_only" : "always"\n',
 				'\t\t\t\t...workspaceStrategy === void 0 ? {} : { workspaceStrategy },\n\t\t\t\t...forkSource === void 0 ? {} : { forkSource: {\n\t\t\t\t\tthreadId: forkSource.thread.id,\n\t\t\t\t\trunId: forkSource.run.id\n\t\t\t\t} },\n\t\t\t\tcompletionWake: input.mode === "wait" ? "settled_only" : "always"\n',
+			],
+		],
+	},
+	{
+		name: "delegate-template-schema",
+		file: "const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+		marker: "forkSessionFile: optional(",
+		edits: [
+			[
+				'\tforkThreadId: optional(ThreadId.annotate({ description: "With `fork:true`: fork this thread instead of yours. Only a thread you delegated, directly or through your tasks." }))\n});',
+				[
+					'\tforkThreadId: optional(ThreadId.annotate({ description: "With `fork:true`: fork this thread instead of yours. Only a thread you delegated, directly or through your tasks." })),',
+					'\tforkSessionFile: optional(TrimmedNonEmptyString.annotate({ description: "Start the child from a copy of this Pi session file: a session template under the Pi agent directory\'s `templates/` (Pi only; not with `fork`)." }))',
+					"});",
+				].join("\n"),
+			],
+			[
+				"\t\tforkSource: optional(Struct({\n\t\t\tthreadId: ThreadId,\n\t\t\trunId: RunId\n\t\t})),\n\t\tcreatedAt: optional(DateTimeUtc)",
+				"\t\tforkSource: optional(Struct({\n\t\t\tthreadId: ThreadId,\n\t\t\trunId: RunId\n\t\t})),\n\t\tforkSessionFile: optional(String$2),\n\t\tcreatedAt: optional(DateTimeUtc)",
+			],
+			[
+				"\tproviderThreadRef: optional(OrchestrationV2ProviderRef),\n\tproviderTurnRef: optional(OrchestrationV2ProviderRef)\n});\nconst OrchestrationV2ThreadForkSourcePoint",
+				"\tproviderThreadRef: optional(OrchestrationV2ProviderRef),\n\tproviderTurnRef: optional(OrchestrationV2ProviderRef),\n\tsessionFile: optional(String$2)\n});\nconst OrchestrationV2ThreadForkSourcePoint",
+			],
+		],
+	},
+	{
+		name: "delegate-template-tool",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "resolveTemplateSessionFile",
+		edits: [
+			// The check below uses the chunk's own node imports.
+			['import * as NodeFS from "node:fs";\nimport * as NodePath from "node:path";\nimport * as NodeOS from "node:os";\n', 'import * as NodeFS from "node:fs";\nimport * as NodePath from "node:path";\nimport * as NodeOS from "node:os";\n'],
+			[
+				"unless `fork:true` starts it from a copy of this conversation (Pi only).",
+				"unless `fork:true` starts it from a copy of this conversation, or `forkSessionFile` from a Pi session template (Pi only).",
+			],
+			[
+				"function taskPrompt(input, forkedFrom) {",
+				[
+					"function piTemplatesDir(env = process.env) {",
+					"\tconst agentDir = env.PI_CODING_AGENT_DIR?.trim();",
+					'\treturn NodePath.join(agentDir === void 0 || agentDir === "" ? NodePath.join(NodeOS.homedir(), ".pi", "agent") : agentDir.replace(/^~(?=$|\\/)/, NodeOS.homedir()), "templates");',
+					"}",
+					"function resolveTemplateSessionFile(file, templatesDir = piTemplatesDir()) {",
+					"\tconst outside = { problem: `\\`forkSessionFile\\` must be a Pi session template file under ${templatesDir}${NodePath.sep}, not ${file}.` };",
+					'\tif (!NodePath.isAbsolute(file) || !file.endsWith(".jsonl")) return outside;',
+					"\tlet root;",
+					"\tlet real;",
+					"\ttry {",
+					"\t\troot = NodeFS.realpathSync(templatesDir);",
+					"\t\treal = NodeFS.realpathSync(file);",
+					"\t} catch {",
+					"\t\treturn { problem: `The session template ${file} does not exist.` };",
+					"\t}",
+					'\tif (!real.startsWith(`${root}${NodePath.sep}`) || !real.endsWith(".jsonl")) return outside;',
+					"\tif (!NodeFS.statSync(real).isFile()) return { problem: `The session template ${file} is not a file.` };",
+					"\treturn { file: real };",
+					"}",
+					"function taskPrompt(input, forkedFrom) {",
+				].join("\n"),
+			],
+			[
+				"Omit `isolation` or use 'shared'.\");\n\t\t\tconst environmentId = input.target === void 0 ? void 0 : remoteTarget(callerScope, input.target.environmentId);",
+				[
+					"Omit `isolation` or use 'shared'.\");",
+					'\t\t\tif (fork && input.forkSessionFile !== void 0) return yield* failure$2("invalid_request", "`fork` copies a thread\'s conversation and `forkSessionFile` a session template: pass one of them.");',
+					"\t\t\tconst templateFile = input.forkSessionFile === void 0 ? void 0 : resolveTemplateSessionFile(input.forkSessionFile);",
+					'\t\t\tif (templateFile !== void 0 && "problem" in templateFile) return yield* failure$2("invalid_request", templateFile.problem);',
+					"\t\t\tconst environmentId = input.target === void 0 ? void 0 : remoteTarget(callerScope, input.target.environmentId);",
+					'\t\t\tif (templateFile !== void 0 && environmentId !== void 0) return yield* failure$2("invalid_request", "A session template is a file on this machine: a task starting from one runs here. Omit `target.environmentId`.");',
+				].join("\n"),
+			],
+			[
+				"\t\t\tconst target = forkSource === void 0 ? resolved : {\n\t\t\t\t...resolved,\n\t\t\t\tmodelSelection: forkSource.run.modelSelection\n\t\t\t};",
+				[
+					"\t\t\tconst target = forkSource === void 0 ? resolved : {",
+					"\t\t\t\t...resolved,",
+					"\t\t\t\tmodelSelection: forkSource.run.modelSelection",
+					"\t\t\t};",
+					"\t\t\tconst targetDriver = providers.find((provider) => provider.instanceId === target.modelSelection.instanceId)?.driver;",
+					'\t\t\tif (templateFile !== void 0 && targetDriver !== "pi") return yield* failure$2("invalid_request", `A session template is a Pi session: the child must run on Pi, not ${targetDriver ?? target.modelSelection.instanceId}.`);',
+				].join("\n"),
+			],
+			[
+				"\t\t\t\t\trunId: forkSource.run.id\n\t\t\t\t} },\n\t\t\t\tcompletionWake:",
+				"\t\t\t\t\trunId: forkSource.run.id\n\t\t\t\t} },\n\t\t\t\t...templateFile === void 0 ? {} : { forkSessionFile: templateFile.file },\n\t\t\t\tcompletionWake:",
+			],
+		],
+	},
+	{
+		name: "delegate-template-runtime",
+		marker: "nativeForkTransfer?.sourcePoint.sessionFile",
+		edits: [
+			[
+				"\t\t\tcause\n\t\t})));\n\t\tconst now$56 = command.createdAt ?? (yield* now);",
+				[
+					"\t\t\tcause",
+					"\t\t})));",
+					"\t\tconst forkSessionFile = command.forkSessionFile;",
+					"\t\tif (forkSessionFile !== void 0) {",
+					'\t\t\tconst refusal = forkSource !== void 0 ? "A delegated task forks either a thread\'s run or a session template, not both." : targetAdapter.driver !== "pi" ? `A session template is a Pi session; provider ${command.modelSelection.instanceId} runs ${targetAdapter.driver}.` : void 0;',
+					"\t\t\tif (refusal !== void 0) return yield* new OrchestratorDispatchError({",
+					"\t\t\t\tcommandId: command.commandId,",
+					"\t\t\t\tcommandType: command.type,",
+					"\t\t\t\tcause: refusal",
+					"\t\t\t});",
+					"\t\t}",
+					"\t\tconst now$56 = command.createdAt ?? (yield* now);",
+				].join("\n"),
+			],
+			[
+				"\t\t\t\t...contextSourcePointForRun(parentProjection, parentRun),\n\t\t\t\tturnItemId: taskTurnItemId\n\t\t\t},",
+				"\t\t\t\t...contextSourcePointForRun(parentProjection, parentRun),\n\t\t\t\tturnItemId: taskTurnItemId,\n\t\t\t\t...forkSessionFile === void 0 ? {} : { sessionFile: forkSessionFile }\n\t\t\t},",
+			],
+			['\t\t\tstatus: forkSource === void 0 ? "consumed" : "pending",', '\t\t\tstatus: forkSource === void 0 && forkSessionFile === void 0 ? "consumed" : "pending",'],
+			["\t\t\tconsumedAt: forkSource === void 0 ? now$56 : null", "\t\t\tconsumedAt: forkSource === void 0 && forkSessionFile === void 0 ? now$56 : null"],
+			[
+				"\t\tconst loadedProviderThread = yield* gen$1(function* () {\n\t\t\tif (nativeForkTransfer !== void 0) {",
+				[
+					"\t\tconst loadedProviderThread = yield* gen$1(function* () {",
+					"\t\t\tconst templateFile = nativeForkTransfer?.sourcePoint.sessionFile;",
+					"\t\t\tif (templateFile !== void 0) return yield* loadFromProvider(session.forkThread({",
+					"\t\t\t\tsourceProviderThread: {",
+					"\t\t\t\t\t...providerThread,",
+					"\t\t\t\t\tnativeThreadRef: {",
+					"\t\t\t\t\t\tdriver: session.driver,",
+					"\t\t\t\t\t\tnativeId: templateFile,",
+					'\t\t\t\t\t\tstrength: "strong"',
+					"\t\t\t\t\t},",
+					"\t\t\t\t\tforkedFrom: null",
+					"\t\t\t\t},",
+					"\t\t\t\ttargetThreadId: projection.thread.id,",
+					"\t\t\t\tmodelSelection: run.modelSelection,",
+					"\t\t\t\truntimePolicy: resolvedRuntimePolicy",
+					"\t\t\t}));",
+					"\t\t\tif (nativeForkTransfer !== void 0) {",
+				].join("\n"),
 			],
 		],
 	},
