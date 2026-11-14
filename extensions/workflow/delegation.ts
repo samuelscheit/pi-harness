@@ -38,6 +38,21 @@ export interface DelegationSpec {
 	schema?: Record<string, unknown>;
 	/** The session that delegated. */
 	callerSessionId?: string;
+	/** The template the child was forked from, and when it was built. */
+	template?: { name: string; builtAt: string; note?: string };
+}
+
+/** A template resolved for a delegation (template/store.ts `templateUse`): the session file the child forks. */
+export interface TemplateUse {
+	name: string;
+	builtAt: string;
+	/** Its session file, under `<agentDir>/templates/`. */
+	file: string;
+	/** "provider/id": the child runs on it. */
+	model: string;
+	thinking?: string;
+	/** A rebuild or a staleness warning, for the child's first message. */
+	note?: string;
 }
 
 /** What the harness adds to t3's delegate_task, as JSON Schema properties. */
@@ -48,6 +63,11 @@ export const DELEGATE_EXTENSION = {
 	},
 	system: { type: "string", description: "Replaces the child's system prompt." },
 	tools: { type: "array", items: { type: "string" }, minItems: 1, description: "The child's tool names (instead of its default set)." },
+	template: {
+		type: "string",
+		description:
+			"Start the child from this session template: a prepared conversation (role, way of working, files read, examples) that every task of its kind forks, so it is cached once. Use one when a template exists for the kind of task. Runs on the template's model (`target.model` must match or be omitted); `system` and `tools` still apply. Not with `fork`.",
+	},
 } as const;
 
 /** The keys of delegate_task's parameters that the harness, not t3, handles. */
@@ -55,12 +75,14 @@ export const HARNESS_KEYS = Object.keys(DELEGATE_EXTENSION) as (keyof typeof DEL
 
 /** Why delegate_task arguments are invalid for the harness's part, or undefined. */
 export function delegateProblem(input: Record<string, unknown>): string | undefined {
-	const { schema, system, tools, fork, forkThreadId } = input;
+	const { schema, system, tools, fork, forkThreadId, template } = input;
 	if (schema !== undefined && (typeof schema !== "object" || schema === null || (schema as { type?: unknown }).type !== "object")) {
 		return 'schema must be a JSON Schema of an object ({ type: "object", properties: … })';
 	}
 	if (system !== undefined && (typeof system !== "string" || !system.trim())) return "system must be a non-empty string";
 	if (tools !== undefined && (!Array.isArray(tools) || tools.length === 0 || !tools.every((t) => typeof t === "string" && t.trim()))) return "tools must be a non-empty array of tool names";
+	if (template !== undefined && (typeof template !== "string" || !template.trim())) return "template must be a template name";
+	if (template !== undefined && (fork !== undefined || forkThreadId !== undefined)) return "a template is where the child starts, a fork starts from a thread's conversation: use one of template and fork";
 	if (fork !== undefined && typeof fork !== "boolean") return "fork must be a boolean";
 	if (forkThreadId !== undefined && fork !== true) return "forkThreadId needs fork: true";
 	if (fork === true) {
@@ -75,13 +97,14 @@ export function delegateProblem(input: Record<string, unknown>): string | undefi
  * the task gets the marker, summary and brief. Without schema, system or tools, and without fork,
  * the arguments stay t3's alone (no spec). A fork always gets a spec: its own marker must follow the
  * source's. `always` makes a spec in any case (a workflow reads every child's state); `inherit` is
- * the source's spec of a fork, whose system prompt and tools the fork keeps. Throws when the
- * arguments are invalid.
+ * the source's spec of a fork, whose system prompt and tools the fork keeps. `template` is the
+ * resolved `template` argument: t3 forks the child from its session file (`forkSessionFile`) on its
+ * model. Throws when the arguments are invalid.
  */
 export function prepareDelegation(
 	input: Record<string, unknown>,
 	dir: string,
-	options: { id?: string; callerSessionId?: string; always?: boolean; inherit?: DelegationSpec } = {},
+	options: { id?: string; callerSessionId?: string; always?: boolean; inherit?: DelegationSpec; template?: TemplateUse } = {},
 ): { input: Record<string, unknown>; spec?: DelegationSpec } {
 	const problem = delegateProblem(input);
 	if (problem) throw new Error(`delegate_task: ${problem}`);
@@ -89,6 +112,12 @@ export function prepareDelegation(
 	// Prepared already (a workflow's delegate() prepares its calls itself).
 	const prepared = typeof input.task === "string" ? parseMarker(input.task) : undefined;
 	if (!own.length && ((input.fork !== true && !options.always) || (prepared?.run === 1 && readSpec(dir, prepared.id)))) return { input };
+	const template = input.template === undefined ? undefined : options.template;
+	if (input.template !== undefined && template?.name !== input.template) throw new Error(`delegate_task: template ${String(input.template)} was not resolved`);
+	const target = (input.target ?? {}) as { model?: unknown; options?: unknown };
+	if (template && target.model !== undefined && target.model !== template.model) {
+		throw new Error(`delegate_task: template ${template.name} runs on ${template.model} (its turns belong to that model): omit target.model or pass ${template.model}`);
+	}
 	const { system, tools, schema } = options.inherit ?? {};
 	const spec: DelegationSpec = {
 		id: options.id ?? randomUUID(),
@@ -99,10 +128,19 @@ export function prepareDelegation(
 		...(input.tools !== undefined ? { tools: input.tools as string[] } : {}),
 		...(input.schema !== undefined ? { schema: input.schema as Record<string, unknown> } : {}),
 		...(options.callerSessionId ? { callerSessionId: options.callerSessionId } : {}),
+		...(template ? { template: { name: template.name, builtAt: template.builtAt, ...(template.note ? { note: template.note } : {}) } } : {}),
 	};
 	writeSpec(dir, spec);
 	const rest = Object.fromEntries(Object.entries(input).filter(([key]) => !(HARNESS_KEYS as string[]).includes(key)));
-	return { input: { ...rest, task: delegationMessage(spec, 1, String(input.task ?? "")) }, spec };
+	return { input: { ...rest, ...(template ? templateArgs(target, template) : {}), task: delegationMessage(spec, 1, String(input.task ?? "")) }, spec };
+}
+
+/** What t3 gets for a template: its session file to fork, and `target` on its model (and thinking, unless `target.options` says). */
+export function templateArgs(target: { options?: unknown }, template: TemplateUse): { forkSessionFile: string; target: Record<string, unknown> } {
+	return {
+		forkSessionFile: template.file,
+		target: { ...target, model: template.model, ...(target.options === undefined && template.thinking ? { options: { thinking: template.thinking } } : {}) },
+	};
 }
 
 export interface DelegationState {
@@ -211,7 +249,8 @@ export function specSummary(spec: DelegationSpec): string {
 		...(spec.tools ? [`tools: ${spec.tools.join(", ")}`] : []),
 		...(spec.schema ? [`returns its result with ${SUBMIT_TOOL} (a JSON Schema)`] : []),
 	];
-	return `Delegated by the harness${parts.length ? `: ${parts.join("; ")}` : ""}.`;
+	const from = spec.template ? ` from template ${spec.template.name} (built ${spec.template.builtAt}${spec.template.note ? `; ${spec.template.note}` : ""})` : "";
+	return `Delegated by the harness${from}${parts.length ? `: ${parts.join("; ")}` : ""}.`;
 }
 
 /** What every delegated child is told on its first run. */

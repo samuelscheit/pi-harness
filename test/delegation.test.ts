@@ -293,6 +293,11 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 					const source = fx.threads.get(String(args.forkThreadId))?.session.sessionFile;
 					if (!source) throw new Error("fake t3: fork needs the forkThreadId of a known thread");
 					manager = SessionManager.forkFrom(source, fx.repo, fx.sessionsDir);
+				} else if (args.forkSessionFile !== undefined) {
+					// t3 forks a template's session file, only one under <agentDir>/templates/.
+					const file = String(args.forkSessionFile);
+					if (!file.startsWith(`${join(fx.agentDir, "templates")}/`)) throw new Error(`fake t3: forkSessionFile outside the templates: ${file}`);
+					manager = SessionManager.forkFrom(file, fx.repo, fx.sessionsDir);
 				}
 				const { thread, ui } = newThread();
 				const session = await newSession([workflowExtension(childRuntime), askUser, warm], manager, childRuntime, ui);
@@ -541,25 +546,25 @@ describe("delegate() in t3", () => {
 	});
 });
 
+/** A parent in "t3" whose model makes the given calls one after another, then says "parent done"; children answer with `child`. */
+async function parentCalls(calls: { name: string; args: JsonObject }[], child: (context: Context) => AssistantMessage) {
+	const parent = await newSession([workflowExtension(runtime), fakeT3(runtime, { waitMs: 5000 })]);
+	const seen: Context[] = [];
+	let next = 0;
+	const dispatch: FauxResponseStep = (context) => {
+		if (isChild(context)) return child(context);
+		seen.push(context);
+		const step = calls[next++];
+		return step ? call(step.name, step.args) : say("parent done");
+	};
+	faux.setResponses(Array.from({ length: 30 }, () => dispatch));
+	await parent.prompt("go");
+	const results = parent.messages.flatMap((m) => (m.role === "toolResult" ? [{ name: m.toolName, text: textOf(m.content), isError: m.isError }] : []));
+	return { parent, seen, results };
+}
+
 describe("t3's delegate_task as the harness extends it", () => {
 	const schema = { type: "object", properties: { verdict: { type: "string", enum: ["ok", "bad"] } }, required: ["verdict"], additionalProperties: false };
-
-	/** A parent in "t3" whose model makes the given calls one after another, then says "parent done"; children answer with `child`. */
-	async function parentCalls(calls: { name: string; args: JsonObject }[], child: (context: Context) => AssistantMessage) {
-		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime, { waitMs: 5000 })]);
-		const seen: Context[] = [];
-		let next = 0;
-		const dispatch: FauxResponseStep = (context) => {
-			if (isChild(context)) return child(context);
-			seen.push(context);
-			const step = calls[next++];
-			return step ? call(step.name, step.args) : say("parent done");
-		};
-		faux.setResponses(Array.from({ length: 30 }, () => dispatch));
-		await parent.prompt("go");
-		const results = parent.messages.flatMap((m) => (m.role === "toolResult" ? [{ name: m.toolName, text: textOf(m.content), isError: m.isError }] : []));
-		return { parent, seen, results };
-	}
 
 	test("the model passes schema, system and tools: the tool declares them, t3 gets the prepared task, the child applies them, and the result comes back in the task's result", async () => {
 		const childSeen: Context[] = [];
@@ -574,7 +579,7 @@ describe("t3's delegate_task as the harness extends it", () => {
 			},
 		);
 		const declared = seen[0]!.messages.flatMap((m) => (m.role === "system" ? (m.toolsAdded ?? []) : [])).find((t) => t.name === `${T3_PREFIX}delegate_task`)!;
-		assert.deepEqual(Object.keys((declared.parameters as { properties: object }).properties).sort(), ["schema", "system", "tools"], "the model sees the harness's parameters");
+		assert.deepEqual(Object.keys((declared.parameters as { properties: object }).properties).sort(), ["schema", "system", "template", "tools"], "the model sees the harness's parameters");
 		const [delegated] = callsOf("delegate_task");
 		assert.deepEqual(Object.keys(delegated!.args).sort(), ["mode", "task", "title"], "t3 gets its own arguments only");
 		assert.match(String(delegated!.args.task), /^harness-delegation: [\w-]+\nDelegated by the harness: system prompt \(16 chars\); tools: read; returns its result with submit_result \(a JSON Schema\)\. When the plan no longer fits.*\n\nJudge README\.md$/);
@@ -1256,5 +1261,83 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		const marker = /<div class="edit-marker" data-version="2">new code from here · v2 <code>\w{12}<\/code><\/div>/;
 		assert.match(renderWorkflow(journal), marker, "the page");
 		assert.match(livePage(journal, id), marker, "the dashboard's live view");
+	});
+});
+
+describe("templates", () => {
+	/** A project template in the test repository: it reads README.md and has one example. */
+	const writeRecipe = (model = MODEL) => {
+		mkdirSync(join(fx.repo, ".pi", "templates"), { recursive: true });
+		writeFileSync(join(fx.repo, ".pi", "templates", "review.md"), `---\nmodel: ${model}\nthinking: low\nread: README.md\n---\nYou review this repository.\n\n:::user\nReview x.\n:::\n:::assistant\nx is fine.\n:::\n`);
+	};
+	/** The child's context as the model saw it: roles and the first texts, without the prompt. */
+	const conversation = (context: Context) => context.messages.filter((m) => m.role !== "system").map((m) => `${m.role}: ${textOf(m.content).split("\n")[0]}`);
+	const TEMPLATE_HISTORY = ["user: You review this repository.", "assistant: ", "toolResult: hello", "assistant: I have read README.md.", "user: Review x.", "assistant: x is fine.", 'user: This is where the template "review" ends. The task follows.'];
+
+	test("delegate_task with a template: t3 forks the template's session file on its model; the child starts with the template's history and is told which template, built when", async () => {
+		writeRecipe();
+		const childSeen: Context[] = [];
+		const { seen, results } = await parentCalls([{ name: `${T3_PREFIX}delegate_task`, args: { task: "Review README.md", mode: "wait", template: "review", tools: ["read"] } }], (context) => {
+			childSeen.push(context);
+			return say("reviewed");
+		});
+		assert.equal(results[0]!.isError, false, results[0]!.text);
+		const declared = seen[0]!.messages.flatMap((m) => (m.role === "system" ? (m.toolsAdded ?? []) : [])).find((t) => t.name === `${T3_PREFIX}delegate_task`)!;
+		assert.match((declared.parameters as { properties: { template: { description: string } } }).properties.template.description, /Templates here: review\.$/);
+		const [delegated] = callsOf("delegate_task");
+		const file = join(fx.agentDir, "templates", "review");
+		assert.ok(String(delegated!.args.forkSessionFile).startsWith(file), "t3 forks the built session file");
+		assert.deepEqual(delegated!.args.target, { model: MODEL, options: { thinking: "low" } }, "the template's model and thinking");
+		assert.equal(delegated!.args.template, undefined, "the name stays with the harness");
+		assert.match(String(delegated!.args.task), /^harness-delegation: [\w-]+\nDelegated by the harness from template review \(built \d{4}-\d\d-\d\dT[\d:.]+Z; rebuilt now: it was not built yet\): tools: read\. When/);
+		assert.deepEqual(conversation(childSeen[0]!).slice(0, -1), TEMPLATE_HISTORY);
+		assert.match(conversation(childSeen[0]!).at(-1)!, /^user: You are a delegated undefined child\.$/);
+		assert.match(textOf(lastMessage(childSeen[0]!).content), /Review README\.md$/);
+		// The child's prompt leads its context, ahead of the template.
+		assert.equal(childSeen[0]!.messages[0]!.role, "system");
+		assert.deepEqual(toolNames(childSeen[0]!), ["read"]);
+	});
+
+	test("template refusals: with fork, with another target model, an unknown name", async () => {
+		writeRecipe();
+		const { results } = await parentCalls(
+			[
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", template: "review", fork: true } },
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", template: "review", target: { model: "faux/other" } } },
+				{ name: `${T3_PREFIX}delegate_task`, args: { task: "x", template: "nope" } },
+			],
+			() => say("child done"),
+		);
+		const refused = results.map((r) => r.text);
+		assert.match(refused[0]!, /use one of template and fork/);
+		assert.match(refused[1]!, /template review runs on faux\/faux-1 \(its turns belong to that model\): omit target\.model or pass faux\/faux-1/);
+		assert.match(refused[2]!, /no template nope \(templates: review\)/);
+		assert.deepEqual(callsOf("delegate_task"), [], "nothing reached t3");
+	});
+
+	test("delegate({ template }) in a workflow, in t3 and in-process: the same history, then the task", async () => {
+		writeRecipe();
+		const seen: Context[] = [];
+		const { details } = await runInT3("return (await delegate({ template: 'review' }).run('Review a.ts')).text;", (context) => {
+			seen.push(context);
+			return say("t3 child done");
+		});
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(conversation(seen[0]!).slice(0, TEMPLATE_HISTORY.length), TEMPLATE_HISTORY);
+		assert.ok(String(callsOf("delegate_task")[0]!.args.forkSessionFile).endsWith("session.jsonl"));
+
+		const inProcess: Context[] = [];
+		faux.setResponses([
+			(context: Context) => {
+				inProcess.push(context);
+				return say("in-process child done");
+			},
+		]);
+		const run = await runWorkflow({ source: "return (await delegate({ template: 'review' }).run('Review b.ts')).text;", filename: INLINE_FILE, inline: true }, 1, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
+		assert.equal(run.details.status, "completed", run.details.error);
+		assert.deepEqual(conversation(inProcess[0]!).slice(0, TEMPLATE_HISTORY.length), TEMPLATE_HISTORY);
+		assert.match(textOf(lastMessage(inProcess[0]!).content), /^harness-delegation: [\w-]+\nDelegated by the harness from template review \(built [^)]+\)\. When[\s\S]*Review b\.ts$/, "built already: no rebuild note");
+		const bad = await runWorkflow({ source: "await delegate({ template: 'review', target: { model: 'faux/other' } }).run('x');", filename: INLINE_FILE, inline: true }, 1, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
+		assert.match(bad.details.error!, /template review runs on faux\/faux-1/);
 	});
 });

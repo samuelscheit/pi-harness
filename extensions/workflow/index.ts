@@ -163,6 +163,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
 			'A run that was interrupted or stopped continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
 			'Stop a running run with workflow { stop: "<id>" }: its agents keep running and their results are recorded; stopChildren: true cancels them. To change a run\'s script without losing its paid work, resume it with workflow { resume: "<id>", code: "<new code>" }: calls the new code makes as before come from the journal, from its first other call it runs live. Effects of the old code (commits, files) stay; the new code must cope with them.',
+			"When a session template exists for the kind of task a child gets (`template` of delegate() and delegate_task names those here), start the child from it: its prepared context is cached once for every task.",
 			"When you are about to run the same kind of long shell command again with different arguments, save it as a workflow with the arguments as parameters (built with sh`…`) and call that tool from then on.",
 		],
 		parameters: Type.Object({
@@ -258,7 +259,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	// Registered after the switches above: a delegated child's tools replace them.
 	const child = delegatedChild(pi, delegationsDir(agentDir));
 	// t3's delegate_task with the harness's schema, system and tools, for the model as for delegate().
-	extendDelegateTool(pi, delegationsDir(agentDir), (ctx) => child.spec(ctx));
+	extendDelegateTool(pi, agentDir, (ctx) => child.spec(ctx));
 	// A workflow saved during a turn is callable from the next turn (not in a delegated child, whose tools are fixed).
 	pi.on("turn_end", (_event, ctx) => {
 		if (child.active(ctx)) return;

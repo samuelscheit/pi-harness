@@ -53,6 +53,9 @@ declare function llm(prompt: string, options?: { model?: string; system?: string
  * (its final message), `changed` (files the working tree changed meanwhile, other agents' too) and
  * `cost`. `compact` is Pi's /compact, `warm` the harness's /warm ("2h", "until 18:00", "off": hold
  * the child's prompt cache warm until its next run); `fork` starts a new child from this one's conversation.
+ * `template` (a name from .pi/templates/ or `/template list`) starts the child from that prepared
+ * session (role, files read, examples) on its model, cached once for every task: use one when a
+ * template exists for the kind of task.
  * `onAsk` gets the child's ask_user questions: return answers (in order, or by question id), which
  * the child receives as its tool result, or undefined to pass them up to whoever runs you; throw to
  * stop the run. Answers are journaled and replayed on resume.
@@ -65,6 +68,7 @@ declare function delegate(params?: {
 	system?: string;
 	tools?: string[];
 	schema?: object;
+	template?: string;
 	fork?: boolean;
 	forkThreadId?: string;
 	onAsk?: (questions: { id: string; title: string; options?: string[] }[]) => Promise<string[] | Record<string, string> | undefined>;

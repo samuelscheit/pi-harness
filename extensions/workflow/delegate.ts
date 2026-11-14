@@ -9,6 +9,9 @@
 // - steer(text): steers the running turn; stop(): stops the child's work;
 // - fork(message): a new child forked from this one's conversation, running `message`;
 // - cost, threadId.
+// With `template`, the child starts from the template's session (extensions/template), built or
+// rebuilt at its first run, on the template's model: in t3 a fork of its file (`forkSessionFile`),
+// in-process Pi's session fork of it.
 //
 // In t3 (the session has t3's tools) each child is a t3 delegated task with a thread of its own
 // under the calling thread (t3.ts), where the user can watch, steer and stop it. Elsewhere it is an
@@ -35,10 +38,12 @@ import { relative } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { canonical, changedPaths, type Snapshot, snapshot } from "../lib/workspace.ts";
 import askUser from "../ask-user/index.ts";
+import { modelFinder } from "../template/index.ts";
+import { templateUse } from "../template/store.ts";
 import warm from "../warm/index.ts";
 import { type Ask, answerPending, answersInOrder, type Question, questionsUi } from "./ask.ts";
 import { delegatedChild, RUN_STOPPED } from "./child.ts";
-import { type DelegationSpec, type DelegationState, delegateProblem, delegationMessage, delegationsDir, HARNESS_KEYS, prepareDelegation, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
+import { type DelegationSpec, type DelegationState, delegateProblem, type TemplateUse, delegationMessage, delegationsDir, HARNESS_KEYS, templateArgs, prepareDelegation, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
 import { type CallContext, type Durable, isInterruption } from "./durable.ts";
 import { CACHE_RETENTION, resolveModel, THINKING, type Thinking } from "./models.ts";
 import { type T3, T3Child, type T3ChildIds } from "./t3.ts";
@@ -71,6 +76,8 @@ export interface DelegateOptions {
 	schema?: Record<string, unknown>;
 	system?: string;
 	tools?: string[];
+	/** The template the child starts from (its name). */
+	template?: string;
 	/** Answers the child's questions; undefined passes them up. Not journaled with the options (a function). */
 	onAsk?: (questions: Question[]) => unknown;
 }
@@ -171,14 +178,15 @@ export function delegateOptions(raw: unknown): DelegateOptions {
 		...(params.schema !== undefined ? { schema: params.schema as Record<string, unknown> } : {}),
 		...(params.system !== undefined ? { system: (params.system as string).trim() } : {}),
 		...(params.tools !== undefined ? { tools: params.tools as string[] } : {}),
+		...(params.template !== undefined ? { template: (params.template as string).trim() } : {}),
 	};
 }
 
-/** An in-process child's model and thinking: `target.model` and `target.options.thinking`, else the caller's model. */
-function inProcessModel(options: DelegateOptions, env: DelegateEnv): { model: string; thinking: Thinking } {
+/** An in-process child's model and thinking: the template's, else `target.model` and `target.options.thinking`, else the caller's model. */
+function inProcessModel(options: DelegateOptions, env: DelegateEnv, template?: TemplateUse): { model: string; thinking: Thinking } {
 	const target = (options.t3.target ?? {}) as { model?: unknown; options?: { thinking?: unknown } };
-	const model = typeof target.model === "string" ? target.model : (env.model ?? DEFAULT_MODEL);
-	const thinking = target.options?.thinking;
+	const model = template?.model ?? (typeof target.model === "string" ? target.model : (env.model ?? DEFAULT_MODEL));
+	const thinking = target.options?.thinking ?? template?.thinking;
 	return { model, thinking: typeof thinking === "string" && (THINKING as readonly string[]).includes(thinking) ? (thinking as Thinking) : "medium" };
 }
 
@@ -220,8 +228,7 @@ interface Transport {
 	describe(): string;
 }
 
-function inProcess(options: DelegateOptions, dir: string, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask): Transport {
-	const { model, thinking } = inProcessModel(options, env);
+function inProcess(options: DelegateOptions, dir: string, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask, template: () => TemplateUse | undefined): Transport {
 	let child: Promise<AgentSession> | undefined;
 	let sessionFile: string | undefined;
 	const create = async (manager: SessionManager) => {
@@ -244,6 +251,7 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			],
 		});
 		await resourceLoader.reload();
+		const { model, thinking } = inProcessModel(options, env, template());
 		const tools = options.tools ?? fork?.spec.tools;
 		const { session } = await createAgentSession({
 			cwd: env.cwd,
@@ -263,6 +271,8 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 		return session;
 	};
 	const fresh = () => {
+		const from = template();
+		if (from) return SessionManager.forkFrom(from.file, env.cwd, env.sessionDir);
 		if (fork) {
 			if (!fork.sessionFile || !existsSync(fork.sessionFile)) throw new Error(`${label}: the source of the fork has no session file (in-process children need a session directory to fork)`);
 			return SessionManager.forkFrom(fork.sessionFile, env.cwd, env.sessionDir);
@@ -309,14 +319,15 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 	};
 }
 
-function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask): Transport {
+function inT3(t3: T3, options: DelegateOptions, label: string, env: DelegateEnv, fork: ForkSource | undefined, ask: Ask, template: () => TemplateUse | undefined): Transport {
 	let task: T3Child | undefined;
 	let restored: T3ChildIds = {};
 	/** Pending requests answered or passed up: each is handled once. */
 	const handled = new Set<string>();
 	const child = (title: string) => {
 		if (task) return task;
-		const params = { title, ...options.t3, ...(fork ? { fork: true, forkThreadId: fork.threadId } : {}) };
+		const from = template();
+		const params = { title, ...options.t3, ...(from ? templateArgs((options.t3.target ?? {}) as { options?: unknown }, from) : {}), ...(fork ? { fork: true, forkThreadId: fork.threadId } : {}) };
 		// Without onAsk every question goes up, as t3 reports it: nothing to read.
 		task = new T3Child(t3, params, options.onAsk ? (current, signal) => answerPending(t3.call, current.threadId!, handled, ask, signal) : undefined);
 		task.restore(restored);
@@ -366,7 +377,8 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	const options = delegateOptions(raw ?? {});
 	let fork = source;
 	if (!env.t3) {
-		resolveModel(env.runtime, inProcessModel(options, env).model);
+		// A template's model is checked when it is resolved.
+		if (!options.template) resolveModel(env.runtime, inProcessModel(options, env).model);
 		// fork: true forks the calling session, here with Pi's session fork as well.
 		if (options.t3.fork === true && !fork) {
 			if (options.t3.forkThreadId !== undefined) throw new TypeError("delegate(): forkThreadId names a t3 thread; outside t3 fork a delegate with its fork()");
@@ -388,7 +400,9 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		})) as { answers: (string | null)[] | null };
 		return value.answers?.map((answer) => answer ?? undefined);
 	};
-	const transport = env.t3 ? inT3(env.t3, options, label, env, fork, ask) : inProcess(options, dir, label, env, fork, ask);
+	/** The template, resolved (built when stale) at the first run. */
+	let template: TemplateUse | undefined;
+	const transport = env.t3 ? inT3(env.t3, options, label, env, fork, ask, () => template) : inProcess(options, dir, label, env, fork, ask, () => template);
 	let spec: DelegationSpec | undefined;
 	let runs = 0;
 	let cost = 0;
@@ -455,13 +469,15 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	};
 
 	/** The first run's message for t3 or the in-process child, and the spec it wrote. */
-	const firstMessage = (message: string) => {
+	const resolveTemplate = () => templateUse(options.template!, env.cwd, env.agentDir, modelFinder((provider, id) => env.runtime.getModel(provider, id)));
+	const firstMessage = async (message: string) => {
+		if (options.template) template = await resolveTemplate();
 		// A fork's target only chose the in-process model; t3 forks take their source's.
 		const t3Args = fork ? Object.fromEntries(Object.entries(options.t3).filter(([key]) => key !== "target")) : options.t3;
 		const prepared = prepareDelegation(
-			{ ...t3Args, ...(fork ? { fork: true } : {}), task: message, ...(options.schema ? { schema: options.schema } : {}), ...(options.system !== undefined ? { system: options.system } : {}), ...(options.tools ? { tools: options.tools } : {}) },
+			{ ...t3Args, ...(fork ? { fork: true } : {}), task: message, ...(options.schema ? { schema: options.schema } : {}), ...(options.system !== undefined ? { system: options.system } : {}), ...(options.tools ? { tools: options.tools } : {}), ...(options.template ? { template: options.template } : {}) },
 			dir,
-			{ always: true, ...(env.callerSessionId ? { callerSessionId: env.callerSessionId } : {}), ...(fork ? { inherit: { ...fork.spec, ...(options.schema ? { schema: options.schema } : {}) } } : {}) },
+			{ always: true, ...(env.callerSessionId ? { callerSessionId: env.callerSessionId } : {}), ...(fork ? { inherit: { ...fork.spec, ...(options.schema ? { schema: options.schema } : {}) } } : {}), ...(template ? { template } : {}) },
 		);
 		return { message: String(prepared.input.task), spec: prepared.spec! };
 	};
@@ -476,12 +492,14 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		let runMessage: string;
 		if (reattach && recorded.spec) {
 			spec = recorded.spec;
+			// A child that had not started yet starts from the template again.
+			if (options.template) template = await resolveTemplate();
 			runMessage = delegationMessage(spec, n, message);
 			transport.restore({ ...(recorded.sessionFile ? { sessionFile: recorded.sessionFile } : {}), ...(recorded.threadId ? { t3: { taskId: recorded.taskId, threadId: recorded.threadId, link: recorded.link } } : {}) });
 			if (env.t3 && recorded.threadId && !recorded.runId) env.warn(`${label}: run ${n} had no run id recorded; repeating its call with the same request id`);
 			env.warn(`${label}: run ${n} reattached after the workflow stopped; its changed files are those since the resume`);
 		} else if (n === 1) {
-			({ message: runMessage, spec } = firstMessage(message));
+			({ message: runMessage, spec } = await firstMessage(message));
 			call.meta({ spec });
 		} else runMessage = delegationMessage(spec!, n, message);
 		const current = spec!;
@@ -567,7 +585,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		const n = runs + 1;
 		const args = n === 1 ? { options, message, ...(fork ? { fork: fork.key } : {}) } : { delegate: firstKey, run: n, message };
 		const value = (await env.durable.call(
-			{ kind: "delegate", args, label: `${tag}${n > 1 ? ` run ${n}` : ""}: ${headline(message).slice(0, 100)}`, ...(env.t3 ? {} : { model: inProcessModel(options, env).model }) },
+			{ kind: "delegate", args, label: `${tag}${n > 1 ? ` run ${n}` : ""}: ${headline(message).slice(0, 100)}`, ...(env.t3 || options.template ? {} : { model: inProcessModel(options, env).model }) },
 			(call) => execute(n, message, head, call, false),
 			(call) => execute(n, message, head, call, true),
 		)) as { run: DelegateRun; handle: HandleState };

@@ -10,21 +10,28 @@
 // - the call: a `tool_call` handler (it runs for the model's calls and for calls a tool makes, such
 //   as a workflow's) turns the harness's keys into a delegation spec (delegation.ts) and the task
 //   into its first message, and leaves t3 the rest; invalid arguments block the call with the
-//   reason. `fork` and `forkThreadId` pass through to t3 untouched (a t3 that does not know them
+//   reason. A `template` is resolved (built or rebuilt when stale, extensions/template) into the
+//   session file t3 forks the child from (`forkSessionFile`) and the template's model; `fork` and `forkThreadId` pass through to t3 untouched (a t3 that does not know them
 //   refuses them), checked first: a fork takes its source's provider, model, options, system
 //   prompt and tools, so it goes with none of target, system and tools;
 // - the result: the child (child.ts) ends its run's final message with the submitted object, so it
 //   is part of the task's result wherever t3 reports it.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DELEGATE_EXTENSION, type DelegationSpec, prepareDelegation } from "./delegation.ts";
+import { modelFinder } from "../template/index.ts";
+import { templateNames, templateUse } from "../template/store.ts";
+import { DELEGATE_EXTENSION, type DelegationSpec, delegationsDir, prepareDelegation } from "./delegation.ts";
 import { T3_DELEGATE } from "./t3.ts";
 
 /** The bridge also registers each tool under a hidden canonical name. */
 export const DELEGATE_TOOLS = new Set([T3_DELEGATE, T3_DELEGATE.replace("mcp__t3-code__", "mcp__t3_code__")]);
 
-/** Add the harness's properties to t3's delegate_task schemas; returns how many schemas changed. */
-export function extendDelegateSchemas(pi: Pick<ExtensionAPI, "getAllTools">): number {
+/** `template`'s description with the templates usable here. */
+export const templateDescription = (names: readonly string[]) =>
+	`${DELEGATE_EXTENSION.template.description} ${names.length ? `Templates here: ${names.join(", ")}.` : "No templates exist here (.pi/templates/<name>.md)."}`;
+
+/** Add the harness's properties to t3's delegate_task schemas, `template` naming `templates`; returns how many schemas changed. */
+export function extendDelegateSchemas(pi: Pick<ExtensionAPI, "getAllTools">, templates: readonly string[] = []): number {
 	let changed = 0;
 	for (const tool of pi.getAllTools()) {
 		if (!DELEGATE_TOOLS.has(tool.name)) continue;
@@ -32,25 +39,29 @@ export function extendDelegateSchemas(pi: Pick<ExtensionAPI, "getAllTools">): nu
 		if (!properties || typeof properties !== "object") continue;
 		const missing = Object.keys(DELEGATE_EXTENSION).filter((key) => !(key in properties));
 		for (const key of missing) properties[key] = structuredClone(DELEGATE_EXTENSION[key as keyof typeof DELEGATE_EXTENSION]);
-		if (missing.length) changed++;
+		const template = properties.template as { description?: string };
+		const description = templateDescription(templates);
+		if (missing.length || template.description !== description) changed++;
+		template.description = description;
 	}
 	return changed;
 }
 
 /** `specOf`: the calling session's own delegation spec: a fork of it keeps its system prompt and tools. */
-export function extendDelegateTool(pi: ExtensionAPI, delegationsDir: string, specOf: (ctx: ExtensionContext) => DelegationSpec | undefined): void {
-	const extend = () => void extendDelegateSchemas(pi);
+export function extendDelegateTool(pi: ExtensionAPI, agentDir: string, specOf: (ctx: ExtensionContext) => DelegationSpec | undefined): void {
+	const extend = (_event: unknown, ctx: ExtensionContext) => void extendDelegateSchemas(pi, templateNames(ctx.cwd, agentDir));
 	pi.on("session_start", extend);
 	pi.on("before_agent_start", extend);
 	pi.on("turn_start", extend);
 
-	pi.on("tool_call", (event, ctx) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!DELEGATE_TOOLS.has(event.toolName)) return;
 		const input = event.input as Record<string, unknown>;
 		let prepared: Record<string, unknown>;
 		try {
 			const own = input.fork === true && input.forkThreadId === undefined ? specOf(ctx) : undefined;
-			prepared = prepareDelegation(input, delegationsDir, { callerSessionId: ctx.sessionManager.getSessionId(), ...(own ? { inherit: own } : {}) }).input;
+			const template = typeof input.template === "string" ? await templateUse(input.template, ctx.cwd, agentDir, modelFinder((provider, id) => ctx.modelRegistry.find(provider, id))) : undefined;
+			prepared = prepareDelegation(input, delegationsDir(agentDir), { callerSessionId: ctx.sessionManager.getSessionId(), ...(own ? { inherit: own } : {}), ...(template ? { template } : {}) }).input;
 		} catch (error) {
 			return { block: true, reason: error instanceof Error ? error.message : String(error) };
 		}

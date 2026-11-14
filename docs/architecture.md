@@ -55,6 +55,7 @@ flowchart TB
 | [`extensions/web`](../extensions/web/index.ts) | `web_search` and `web_fetch` through Anthropic server tools. |
 | [`extensions/improvements`](../extensions/improvements/index.ts) | `note_improvement`, the agent's friction log. |
 | [`extensions/goal`](../extensions/goal/index.ts) | `/goal` and the `goal` tool: a session goal that holds the run at its end until it is achieved, blocked or out of budget ([goal.md](goal.md)). |
+| [`extensions/template`](../extensions/template/index.ts) | Session templates: recipes in `.pi/templates/`, deterministic builds, staleness and rebuilds, `/template` ([templates.md](templates.md)). |
 | [`extensions/warm`](../extensions/warm/index.ts) | `/warm` and the `keep_warm` tool: hold the prompt cache warm until a time, with a budget ([tools.md](tools.md#warm-and-keep_warm)). |
 | [`extensions/lens`](../extensions/lens/index.ts) | Layered global and per-project configuration for pi-lens. |
 | [`dashboard/`](../dashboard) | `node:http` JSON API over the query layer, plus a React frontend. |
@@ -80,6 +81,8 @@ flowchart TB
 | Pi configuration written by the installer | `~/.pi/agent/{settings,models,auth}.json` | no |
 | Sessions | `~/.pi/agent/sessions/` (Pi) | no; the source of truth for metrics |
 | Metrics index | `~/.pi/agent/metrics.db` | no; rebuilt from sessions |
+| Template recipes | `<repo>/.pi/templates/`, `templates/` here | yes |
+| Built and captured templates | `~/.pi/agent/templates/<name>/<scope>/` | no; rebuilt from recipes |
 | Workflow journals, start snapshots and pages | `~/.pi/agent/workflows/<id>/` | no; a day after the run ended, a week when interrupted or stopped |
 | Improvement notes, changelog, dream ledger and reports | `.agents/` in this repository (git-ignored in the public repository) | locally |
 | Project rules and settings | `<repo>/AGENTS.md`, `<repo>/.pi/`, `<repo>/.agents/` | in that project |
