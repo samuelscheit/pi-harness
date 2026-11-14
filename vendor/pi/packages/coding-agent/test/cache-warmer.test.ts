@@ -671,6 +671,7 @@ describe("ExtensionRunner.emitCacheWarmingDecision", () => {
 			warmCost: 0.05,
 			missCost: 0.5,
 			continuationProbability: 0.15,
+			held: false,
 			action: "warm",
 		};
 
