@@ -32,7 +32,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync,
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { currentLink, deploy } from "../extensions/lib/release.ts";
+import { currentLink, deploy, recordPiBuild } from "../extensions/lib/release.ts";
 import { LAUNCH_AGENT, launchAgent } from "./patch-t3.ts";
 
 const KEYCHAIN_SERVICE = "pi-harness-gateway";
@@ -128,6 +128,8 @@ chmodSync(authFile, 0o600);
 // The first release: the committed state of the current branch (uncommitted edits are not deployed).
 const branch = execFileSync("git", ["-C", root, "branch", "--show-current"], { encoding: "utf8" }).trim();
 if (!branch) throw new Error(`${root} is not on a branch; check out the branch to deploy`);
+// The Pi built above is the branch's (also with uncommitted vendor/pi edits: installing builds them on purpose).
+await recordPiBuild(agentDir, root, branch);
 const deployed = await deploy({ source: root, branch, agentDir });
 if (deployed.status === "failed") throw new Error(`harness commit ${deployed.commit} does not load:\n${deployed.error}`);
 

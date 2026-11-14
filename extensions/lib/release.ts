@@ -15,9 +15,14 @@
 //                        every load): pruning never removes a release a live process holds, so a
 //                        process that has not reloaded (or cannot: an older Pi) keeps its files
 //
+//   pi-build             the `vendor/pi` tree id the global Pi (a link to vendor/pi) was built from
+//
 // A release is deployed only if every extension entry point imports in a fresh Node process: a
 // commit with a broken import or a syntax error stays undeployed and the previous release keeps
-// running.
+// running. Its extensions may use Pi APIs of its own `vendor/pi`, so before that check the global Pi
+// is rebuilt when it was built from another tree: a Pi process started later loads the release on
+// the matching Pi. A running process keeps the Pi it started with; extensions/release reloads it
+// only into releases built for that Pi.
 
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -39,6 +44,51 @@ export const currentLink = (agentDir: string) => join(harnessDir(agentDir), "cur
 const releasesDir = (agentDir: string) => join(harnessDir(agentDir), "releases");
 const failedFile = (agentDir: string, commit: string) => join(harnessDir(agentDir), "failed", `${commit}.txt`);
 const inUseDir = (agentDir: string) => join(harnessDir(agentDir), "in-use");
+const piBuildFile = (agentDir: string) => join(harnessDir(agentDir), "pi-build");
+
+/** The `vendor/pi` tree id the global Pi was built from, or undefined if unknown. */
+export const builtPi = (agentDir: string): string | undefined => (existsSync(piBuildFile(agentDir)) ? readFileSync(piBuildFile(agentDir), "utf8").trim() : undefined);
+
+/** Record the `vendor/pi` tree id of `commit` as the global Pi's build. */
+export async function recordPiBuild(agentDir: string, source: string, commit: string): Promise<void> {
+	mkdirSync(harnessDir(agentDir), { recursive: true });
+	writeFileSync(piBuildFile(agentDir), `${(await piTree(source, commit)) ?? ""}\n`);
+}
+
+/** The id of `vendor/pi` in `commit` of the source (the working tree plays no part), undefined if absent. */
+export async function piTree(source: string, commit: string): Promise<string | undefined> {
+	try {
+		return (await git(source, "rev-parse", "--verify", "-q", `${commit}:vendor/pi`)).toString("utf8").trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Build the global Pi from the source's `vendor/pi` working tree (what scripts/install.mjs builds). */
+export async function buildPi(source: string): Promise<void> {
+	try {
+		await exec("npm", ["run", "build:offline"], { cwd: join(source, "vendor", "pi"), timeout: 15 * 60_000, maxBuffer: 64 * 1024 * 1024 });
+	} catch (error) {
+		const e = error as { stdout?: string; stderr?: string; message: string };
+		throw new Error(`building Pi (vendor/pi) failed:\n${`${e.stdout ?? ""}\n${e.stderr ?? e.message}`.trim().split("\n").slice(-20).join("\n")}`);
+	}
+}
+
+/**
+ * Make the global Pi the build of `commit`'s `vendor/pi`: rebuild it unless it is that build already.
+ * The build reads the working tree, so it must hold exactly that `vendor/pi`.
+ */
+async function ensurePi(source: string, commit: string, agentDir: string, build: (source: string) => Promise<void>): Promise<void> {
+	const tree = await piTree(source, commit);
+	if (!tree || builtPi(agentDir) === tree) return;
+	try {
+		await git(source, "diff", "--quiet", commit, "--", "vendor/pi");
+	} catch {
+		throw new Error(`vendor/pi in ${source} has changes not in ${shortCommit(commit)}; commit them, or run scripts/install.mjs to build Pi from the working tree`);
+	}
+	await build(source);
+	await recordPiBuild(agentDir, source, commit);
+}
 
 /** Record that process `pid` runs release `commit`, so pruning keeps that release while the process lives. */
 export function holdRelease(agentDir: string, commit: string, pid = process.pid): void {
@@ -136,10 +186,12 @@ export interface DeployOptions {
 	branch: string;
 	agentDir: string;
 	validate?: (root: string) => Promise<void>;
+	/** Build the global Pi from the source's vendor/pi. */
+	buildPi?: (source: string) => Promise<void>;
 }
 
 /** Deploy the branch's latest commit unless it is deployed already or failed before. */
-export async function deploy({ source, branch, agentDir, validate = importCheck }: DeployOptions): Promise<DeployResult> {
+export async function deploy({ source, branch, agentDir, validate = importCheck, buildPi: build = buildPi }: DeployOptions): Promise<DeployResult> {
 	const commit = await branchCommit(source, branch);
 	const previous = currentRelease(agentDir)?.commit;
 	if (previous === commit) return { status: "current", commit };
@@ -157,7 +209,8 @@ export async function deploy({ source, branch, agentDir, validate = importCheck 
 			rmSync(temporary, { recursive: true, force: true });
 			mkdirSync(temporary, { recursive: true });
 			try {
-				await build(source, branch, commit, temporary);
+				await extract(source, branch, commit, temporary);
+				await ensurePi(source, commit, agentDir, build);
 				await validate(temporary);
 			} catch (error) {
 				rmSync(temporary, { recursive: true, force: true });
@@ -184,7 +237,7 @@ export async function deploy({ source, branch, agentDir, validate = importCheck 
 }
 
 /** Extract `commit` (without vendor/) into `dir`, link the unversioned parts and write the marker. */
-async function build(source: string, branch: string, commit: string, dir: string): Promise<void> {
+async function extract(source: string, branch: string, commit: string, dir: string): Promise<void> {
 	const archive = await git(source, "archive", "--format=tar", commit, "--", ".", ":(exclude)vendor");
 	await new Promise<void>((resolve, reject) => {
 		const tar = execFile("tar", ["-x", "-C", dir], (error) => (error ? reject(error) : resolve()));
@@ -201,21 +254,6 @@ async function build(source: string, branch: string, commit: string, dir: string
 	writeFileSync(join(dir, RELEASE_MARKER), `${JSON.stringify(marker, null, "\t")}\n`);
 }
 
-/**
- * Whether `path` (a file or directory) differs between two commits of the source: its tree or blob
- * ids are compared, so the working tree plays no part (a symlinked or missing path there does not
- * matter). A path absent from both commits is unchanged.
- */
-export async function changedBetween(source: string, from: string, to: string, path: string): Promise<boolean> {
-	const id = async (commit: string) => {
-		try {
-			return (await git(source, "rev-parse", "--verify", "-q", `${commit}:${path}`)).toString("utf8").trim();
-		} catch {
-			return undefined;
-		}
-	};
-	return (await id(from)) !== (await id(to));
-}
 
 export const shortCommit = (commit: string) => commit.slice(0, 9);
 
