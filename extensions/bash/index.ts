@@ -4,8 +4,11 @@
 // 22 sessions over 10 days) is an agent ending its turn "waiting" on a background job: nothing
 // wakes it when the job finishes, so the result reaches no one. Instructions alone did not stop it.
 //
-// Pi runs every bash command as the leader of its own process group (detached spawn), and the
-// shell's background jobs (`cmd &`, `nohup cmd &`) stay in that group after the shell exits. So
+// A command that detaches a job itself (`cmd &`, `nohup cmd &`, setsid) is refused before it runs
+// (detach.ts). Processes can still outlive their command: a script or program the command runs
+// starts them (`bash start.sh`, a dev server that forks). Pi runs every bash command as the leader
+// of its own process group (detached spawn), and such processes stay in that group after the
+// shell exits. So
 // before each bash call this extension prefixes the command with a line that writes the shell's
 // `$$` (its pid, the group id) to a file; the transcript keeps the original command (Pi hands
 // tool_call handlers a copy). When the run is about to settle, it lists the live processes in the

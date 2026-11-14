@@ -13,7 +13,8 @@
 // built-in call keeps running (its own `timeout` still applies) and, when it ends, its normal
 // result reaches the session as a message that starts a run if the session is idle: the agent is
 // woken, also after its turn ended. While jobs run, the session reports background work
-// (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated child's run open.
+// (`pi.setBackgroundWork`), so t3 keeps it loaded and keeps a delegated child's run open. A
+// command that detaches a job itself would lose that report: it is refused (detach.ts).
 //
 // Jobs live in process state, not in the extension instance: a harness release reloads the
 // extensions while jobs run, and the job's end must reach the reloaded instance's API.
@@ -23,6 +24,7 @@ import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/p
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { type BashToolDetails, createBashToolDefinition, type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { TOOL_GUIDELINE, withToolBridge } from "./bridge.ts";
+import { detaches, refusal, systemGuideline } from "./detach.ts";
 
 type BashResult = AgentToolResult<BashToolDetails | undefined>;
 
@@ -178,11 +180,13 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 		reportWork(jobs);
 	});
 
-	// Registered before the guard's handler, so the command is still the one the model wrote.
+	// Registered before the guard's handler, so the command is still the one the model wrote. A
+	// command that detaches a job is refused here (detach.ts); Pi then runs no later handler.
 	pi.on("tool_call", (event, ctx) => {
-		if (isToolCallEventType("bash", event) && event.parentToolCallId === undefined) {
-			sessionJobs(ctx.sessionManager.getSessionId()).topLevel.set(event.toolCallId, event.input.command);
-		}
+		if (!isToolCallEventType("bash", event)) return;
+		const detached = detaches(event.input.command);
+		if (detached.length > 0) return { block: true, reason: refusal(detached, detachAfterMs) };
+		if (event.parentToolCallId === undefined) sessionJobs(ctx.sessionManager.getSessionId()).topLevel.set(event.toolCallId, event.input.command);
 	});
 
 	// A reload: this instance goes stale, so jobs report through the reloaded one (its
@@ -207,8 +211,9 @@ export function detachableBash(pi: ExtensionAPI, options: DetachOptions): void {
 		...builtin,
 		promptGuidelines: [
 			...(builtin.promptGuidelines ?? []),
+			systemGuideline(),
 			TOOL_GUIDELINE,
-			`A command still running after ${detachAfterMs / 60_000} minutes, or when the user sends a message, moves to the background and keeps running; its result reaches you as a new message when it ends, also after your turn. So run long builds and tests in the foreground: no \`&\`, no sleep or poll loops waiting for them.`,
+			`A command still running after ${detachAfterMs / 60_000} minutes, or when the user sends a message, moves to the background and keeps running; its result reaches you as a new message when it ends, also after your turn. So run long builds, tests and servers in the foreground, with no sleep or poll loops waiting for them: a command that detaches a job (\`&\` without \`wait\`, nohup, setsid, disown) is refused.`,
 		],
 		async execute(callId, params, signal, onUpdate, ctx): Promise<BashResult> {
 			const sessionId = ctx.sessionManager.getSessionId();

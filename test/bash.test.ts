@@ -191,6 +191,12 @@ const bash = (command: string, timeout?: number) => fauxAssistantMessage([fauxTo
 const respond = (...steps: FauxResponseStep[]) => faux.setResponses(steps);
 const guardMessages = (s: AgentSession) => s.messages.filter((m) => m.role === "custom" && m.customType === MESSAGE_TYPE);
 const marker = () => join(dir, `marker-${Math.random().toString(36).slice(2)}`);
+/** A script that leaves `body` running in the background: a command may not detach a job itself, a program it runs can. */
+const script = (body: string) => {
+	const file = `${marker()}.sh`;
+	writeFileSync(file, `${body} > /dev/null 2>&1 &\n`);
+	return `bash '${file}'`;
+};
 
 describe("in a Pi session", () => {
 	test("a run ending with a background job gets one more turn naming it; the agent's wait ends it", async () => {
@@ -198,7 +204,7 @@ describe("in a Pi session", () => {
 		const done = marker();
 		let seen = "";
 		respond(
-			bash(`(sleep 0.3; touch '${done}') > /dev/null 2>&1 &\necho started`),
+			bash(`${script(`(sleep 0.3; touch '${done}')`)}\necho started`),
 			fauxAssistantMessage("Started it; I'll report when it finishes."),
 			(context) => {
 				seen = JSON.stringify(context.messages.at(-1));
@@ -209,7 +215,7 @@ describe("in a Pi session", () => {
 		await s.prompt("run it");
 		assert.equal(guardMessages(s).length, 1);
 		assert.match(seen, /still running in the background/);
-		assert.match(seen, /from your bash command `\(sleep 0\.3; touch/, "names the command as the agent wrote it");
+		assert.match(seen, /from your bash command `bash '.*\.sh' echo started`/, "names the command as the agent wrote it");
 		assert.ok(existsSync(done));
 		const call = s.messages.find((m) => m.role === "assistant" && m.content.some((c) => c.type === "toolCall"));
 		assert.doesNotMatch(JSON.stringify(call), /printf/, "the transcript keeps the original command");
@@ -218,7 +224,7 @@ describe("in a Pi session", () => {
 
 	test("the same processes are reported once: the agent may end its turn on purpose", async () => {
 		const s = await newSession();
-		respond(bash("sleep 30 > /dev/null 2>&1 &"), fauxAssistantMessage("Started."), fauxAssistantMessage("The server keeps running, as you asked."));
+		respond(bash(script("sleep 30")), fauxAssistantMessage("Started."), fauxAssistantMessage("The server keeps running, as you asked."));
 		await s.prompt("start the server");
 		assert.equal(guardMessages(s).length, 1);
 		respond(fauxAssistantMessage("Still running."));
@@ -232,6 +238,39 @@ describe("in a Pi session", () => {
 		await s.prompt("go");
 		assert.equal(guardMessages(s).length, 0);
 		assert.deepEqual(readdirSync(readdirSync(join(dir, "groups")).map((d) => join(dir, "groups", d))[0]!), [], "finished groups are forgotten");
+	});
+
+	test("a command that detaches a job is refused before it runs, also from a script; the refusal says to run it in the foreground", async () => {
+		const s = await newSession();
+		const ran = marker();
+		const nested = marker();
+		respond(
+			bash(`touch '${ran}'; setsid nohup bash -c 'sleep 30' > /dev/null 2>&1 &`),
+			fauxAssistantMessage([fauxToolCall("script", { command: `touch '${nested}'; sleep 30 &` })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("embed everything");
+		assert.ok(!existsSync(ran), "the refused command did not run");
+		assert.ok(!existsSync(nested), "the refused nested command did not run");
+		const results = s.messages.filter((m) => m.role === "toolResult");
+		assert.equal(results.length, 2);
+		assert.ok(results[0]?.isError, "the refusal is an error result");
+		const [top, fromScript] = results.map((m) => m.content.map((c) => (c.type === "text" ? c.text : "")).join(""));
+		assert.match(top!, /Not run: this command detaches a job/);
+		assert.match(top!, /`setsid nohup bash -c 'sleep 30' > \/dev\/null 2>&1`: `setsid` (does not exist on macOS|moves it out)/);
+		assert.match(top!, /Run the command in the foreground instead/);
+		assert.match(fromScript!, /`sleep 30 &`: runs in the background/);
+		assert.equal(guardMessages(s).length, 0, "nothing was left running");
+		assert.equal(sessionJobs(s.sessionManager.getSessionId()).topLevel.size, 0, "a refused call leaves no state");
+	});
+
+	test("background jobs the command waits for or stops run", async () => {
+		const s = await newSession();
+		respond(bash("sleep 0.2 & sleep 0.1 & wait; echo waited; sleep 30 & pid=$!; kill $pid; echo stopped"), fauxAssistantMessage("Done."));
+		await s.prompt("go");
+		const result = s.messages.find((m) => m.role === "toolResult");
+		assert.match(JSON.stringify(result), /waited\\nstopped/);
+		assert.equal(guardMessages(s).length, 0);
 	});
 });
 
