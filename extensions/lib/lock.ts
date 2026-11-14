@@ -4,7 +4,7 @@
 // or a reused pid) too. Taking over moves the abandoned lock aside with a rename first, so only one
 // waiter wins it.
 
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const LOCK_HEARTBEAT_MS = 2_000;
@@ -37,6 +37,11 @@ function abandoned(path: string): boolean {
 		// Just created, the pid not written yet.
 		return false;
 	}
+}
+
+/** Whether no live process holds the lock at `path` (looking only: it neither takes nor clears it). */
+export function lockFree(path: string): boolean {
+	return !existsSync(path) || abandoned(path);
 }
 
 /** Take the lock at `path`; returns its release, or undefined while another live process holds it. */

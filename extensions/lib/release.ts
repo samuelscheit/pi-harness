@@ -51,12 +51,18 @@ const inUseDir = (agentDir: string) => join(harnessDir(agentDir), "in-use");
 /** The `vendor/pi` tree id the global Pi was built from, or undefined before the first build. */
 export const builtPi = (agentDir: string): string | undefined => builtPiIn(harnessDir(agentDir));
 
-/** The id of `vendor/pi` in `commit` of the source (the working tree plays no part), undefined if absent. */
+/**
+ * The id of `vendor/pi` in `commit` of the source (the working tree plays no part), undefined if
+ * absent. Other failures throw: git that could not run (a spawn failure under memory pressure on
+ * 2026-11-14) must not make a commit read as one without Pi, which deploy() records for good.
+ */
 export async function piTree(source: string, commit: string): Promise<string | undefined> {
 	try {
 		return (await git(source, "rev-parse", "--verify", "-q", `${commit}:vendor/pi`)).toString("utf8").trim() || undefined;
-	} catch {
-		return undefined;
+	} catch (error) {
+		// `--verify -q` exits 1 without output when the object does not exist.
+		if ((error as { code?: unknown }).code === 1) return undefined;
+		throw error;
 	}
 }
 
@@ -160,12 +166,13 @@ function prune(agentDir: string): void {
 /**
  * Why `commit` was not deployed, if it was tried. Releases from before Pi builds moved out of the
  * working tree refused commits whose vendor/pi the working tree did not match; that no longer
- * applies, so such a commit is tried again (their processes still deploy until restarted).
+ * applies, so such a commit is tried again (their processes still deploy until restarted). Neither
+ * does "has no vendor/pi" recorded before piTree told a missing tree from git failing to run.
  */
 function failure(agentDir: string, commit: string): string | undefined {
 	if (!existsSync(failedFile(agentDir, commit))) return undefined;
 	const text = readFileSync(failedFile(agentDir, commit), "utf8");
-	return /^vendor\/pi in .* has changes not in [0-9a-f]+;/.test(text) ? undefined : text;
+	return /^vendor\/pi in .* has changes not in [0-9a-f]+;|^[0-9a-f]+ has no vendor\/pi$/.test(text) ? undefined : text;
 }
 
 export type DeployResult =

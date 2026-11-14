@@ -38,6 +38,14 @@ export interface CallView {
 	version: number;
 	/** The id of the phase it was made in. */
 	phase?: string;
+	/** A replayed call's outcome and the attempt that recorded it (its time and cost are that attempt's). */
+	replayed?: { outcome: "done" | "failed"; attempt: number };
+}
+
+/** What the journal alone does not say. */
+export interface ViewOptions {
+	/** No process runs the run any more (its lock is free): a run without an end was interrupted. */
+	processEnded?: boolean;
 }
 
 export type PhaseStatus = "running" | "done" | "failed" | "over budget" | "interrupted" | "stopped" | "expected";
@@ -89,7 +97,7 @@ export interface RunView {
 export const linkUrl = (link: string) => /\]\(([^)\s]+)\)\s*$/.exec(link)?.[1] ?? link;
 
 /** What the journal says about a run. Throws when the journal has no run header. */
-export function viewOf(entries: readonly JournalEntry[]): RunView {
+export function viewOf(entries: readonly JournalEntry[], options: ViewOptions = {}): RunView {
 	const header = entries[0];
 	if (header?.t !== "run") throw new Error("not a workflow journal: the first entry is no run header");
 	// Calls by view id: the key, until edited code leaves the call unused and may make a call with the same key again.
@@ -113,7 +121,12 @@ export function viewOf(entries: readonly JournalEntry[]): RunView {
 				// Calls still open were in flight when the last attempt's process ended.
 				for (const call of calls.values()) if (call.status === "running" && !lingering.has(call.key)) call.status = "interrupted";
 				// Calls the earlier attempts finished are answered from the journal from now on.
-				if (entry.n > 1) for (const call of calls.values()) if (call.status === "done" || call.status === "failed") call.status = "replayed";
+				if (entry.n > 1)
+					for (const call of calls.values())
+						if (call.status === "done" || call.status === "failed") {
+							call.replayed = { outcome: call.status, attempt: entry.n - 1 };
+							call.status = "replayed";
+						}
 				break;
 			case "edit":
 				versions.push({ n: versions.length + 1, hash: entry.hash, at: entry.at, source: entry.source, attempt: entry.n });
@@ -187,13 +200,19 @@ export function viewOf(entries: readonly JournalEntry[]): RunView {
 				break;
 		}
 	}
+	// The process died without writing an end (killed, crashed): what was running was interrupted.
+	const died = !end && options.processEnded === true && attempts > 0;
+	if (died) {
+		for (const phase of phases.values()) if (phase.status === "running") phase.status = "interrupted";
+		for (const call of calls.values()) if (call.status === "running") call.status = "interrupted";
+	}
 	const list = order.map((key) => calls.get(key)!);
 	const tree = phaseTree(phases, plans, list, entries);
 	const open = list.filter((c) => c.status === "running" || c.status === "interrupted" || c.status === "stopped").length;
 	const unused = list.filter((c) => c.status === "unused").length;
 	return {
 		header,
-		status: end?.status ?? (attempts > 0 ? "running" : "starting"),
+		status: end?.status ?? (died ? "interrupted" : attempts > 0 ? "running" : "starting"),
 		attempts,
 		calls: list,
 		versions,
@@ -337,7 +356,10 @@ const STYLE = `
 
 function node(call: CallView, lastAt: number): string {
 	const took = duration((call.endAt ?? lastAt) - call.startAt);
-	const meta = [`<span class="st">${STATUS_TEXT[call.status]}</span>`, `<span>${call.endAt === undefined ? "for " : ""}${took}</span>`];
+	// A replayed call took no time now: its time is the attempt's that recorded it.
+	const meta = call.replayed
+		? [`<span class="st">${STATUS_TEXT.replayed} · ${call.replayed.outcome}</span>`, `<span>took ${took} in attempt ${call.replayed.attempt}</span>`]
+		: [`<span class="st">${STATUS_TEXT[call.status]}</span>`, `<span>${call.endAt === undefined ? "for " : ""}${took}</span>`];
 	if (call.cost > 0) meta.push(`<span>${usd(call.cost)}</span>`);
 	if (call.model) meta.push(`<span>${escape(call.model)}</span>`);
 	if (call.link) meta.push(call.link.includes("://") ? `<a href="${escape(call.link)}">thread</a>` : `<span>thread ${escape(clip(call.link, 40))}</span>`);
@@ -361,8 +383,8 @@ function phaseRow(phase: PhaseView, lastAt: number): string {
 }
 
 /** The body of the page: the header and the groups (no document around it). */
-export function renderWorkflowBody(entries: readonly JournalEntry[]): string {
-	const view = viewOf(entries);
+export function renderWorkflowBody(entries: readonly JournalEntry[], options: ViewOptions = {}): string {
+	const view = viewOf(entries, options);
 	const name = view.header.entry.name ?? "inline workflow";
 	const stats = [
 		`<span class="run-status">${escape(view.status)}</span>`,
@@ -408,8 +430,8 @@ function versionsSection(versions: readonly CodeVersion[]): string {
 }
 
 /** The self-contained page of a run. Pure: the same journal gives the same bytes. */
-export function renderWorkflow(entries: readonly JournalEntry[]): string {
-	return `<!doctype html><html><head><meta charset="utf-8"><title>workflow ${escape((entries[0] as RunHeader | undefined)?.id ?? "")}</title><style>${STYLE}</style></head><body>${renderWorkflowBody(entries)}</body></html>`;
+export function renderWorkflow(entries: readonly JournalEntry[], options: ViewOptions = {}): string {
+	return `<!doctype html><html><head><meta charset="utf-8"><title>workflow ${escape((entries[0] as RunHeader | undefined)?.id ?? "")}</title><style>${STYLE}</style></head><body>${renderWorkflowBody(entries, options)}</body></html>`;
 }
 
 /** A frame height for html_render that fits the page (t3 refits it to the content). */

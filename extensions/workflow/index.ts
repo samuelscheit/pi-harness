@@ -67,6 +67,8 @@ export interface WorkflowExtensionOptions {
 	agentDir?: string;
 	/** The dashboard's base URL for live views; default http://127.0.0.1:4317. */
 	dashboardUrl?: string;
+	/** How t3 calls that fail in transport are repeated; default t3.ts's. */
+	t3Retry?: RunEnv["t3Retry"];
 }
 
 let sharedRuntime: Promise<ModelRuntime> | undefined;
@@ -125,6 +127,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			llmCache,
 			executeTool: execute,
 			toolNames,
+			...(options.t3Retry ? { t3Retry: options.t3Retry } : {}),
 			...(ctx.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 			sessionId,
 			library: () => library,

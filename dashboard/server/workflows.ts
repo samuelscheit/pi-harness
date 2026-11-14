@@ -5,7 +5,8 @@
 import { existsSync, type FSWatcher, readFileSync, watch } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { journalPath, listRuns, parseJournal, RUN_ID, runDir } from "../../extensions/workflow/journal.ts";
-import { duration, renderWorkflow, renderWorkflowBody, viewOf } from "../../extensions/workflow/render.ts";
+import { duration, renderWorkflow, renderWorkflowBody, type ViewOptions, viewOf } from "../../extensions/workflow/render.ts";
+import { lockHeld } from "../../extensions/workflow/stop.ts";
 
 /** t3's theme variables (dark), so the page looks as in the thread. */
 const THEME = `:root{color-scheme:dark;--background:#0b0b0d;--foreground:#ececef;--muted:#1c1c21;--muted-foreground:#9a9aa3;--card:#141418;--card-foreground:#ececef;--border:#2a2a31;--primary:#8ab4ff;--info:#6aa7ff;--success:#4fc28a;--warning:#e5b04d;--destructive:#f06a6a;--radius:8px;--font-sans:ui-sans-serif,system-ui,-apple-system,sans-serif;--font-mono:ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -24,9 +25,12 @@ const events = new EventSource(${JSON.stringify(`/workflows/${id}/events`)});
 events.onmessage = (event) => { const current = document.querySelector(".wf"); if (current) current.outerHTML = JSON.parse(event.data).body; };
 </script>`;
 
+/** What the journal does not say: whether a process still runs the run (a run whose process died has no end). */
+const viewOptions = (agentDir: string, id: string): ViewOptions => ({ processEnded: !lockHeld(agentDir, id) });
+
 /** The run's page with the theme and the live updates around the renderer's output. */
-export function livePage(entries: Parameters<typeof renderWorkflow>[0], id: string): string {
-	return renderWorkflow(entries).replace("</head>", `<style>${THEME}</style></head>`).replace("</body>", `${liveScript(id)}</body>`);
+export function livePage(entries: Parameters<typeof renderWorkflow>[0], id: string, options: ViewOptions = {}): string {
+	return renderWorkflow(entries, options).replace("</head>", `<style>${THEME}</style></head>`).replace("</body>", `${liveScript(id)}</body>`);
 }
 
 function listPage(agentDir: string): string {
@@ -35,14 +39,15 @@ function listPage(agentDir: string): string {
 		.map((run) => {
 			let cost = "";
 			let took = "";
+			let status = run.end?.status ?? "running";
 			try {
-				const view = viewOf(parseJournal(readFileSync(journalPath(agentDir, run.id), "utf8")));
+				const view = viewOf(parseJournal(readFileSync(journalPath(agentDir, run.id), "utf8")), viewOptions(agentDir, run.id));
 				cost = `$${view.cost.toFixed(4)} of $${view.header.budget.toFixed(2)}`;
 				took = duration(view.lastAt - view.startAt);
+				status = view.status;
 			} catch {
 				// Removed meanwhile.
 			}
-			const status = run.end?.status ?? "running or interrupted";
 			return `<tr><td><a href="/workflows/${run.id}">${run.id}</a></td><td>${escape(run.header.entry.name ?? "inline")}</td><td>${escape(status)}</td><td>${took}</td><td>${cost}</td><td>${escape(run.header.cwd)}</td></tr>`;
 		});
 	return `<!doctype html><html><head><meta charset="utf-8"><title>Workflow runs</title><style>${THEME}</style></head><body><h1 style="font-size:16px">Workflow runs</h1><table><tr><th>Run</th><th>Workflow</th><th>Status</th><th>Time</th><th>Cost</th><th>Directory</th></tr>${rows.join("") || '<tr><td colspan="6">No runs yet.</td></tr>'}</table></body></html>`;
@@ -60,7 +65,7 @@ function events(req: IncomingMessage, res: ServerResponse, agentDir: string, id:
 	let sent = "";
 	const push = () => {
 		try {
-			const body = renderWorkflowBody(parseJournal(readFileSync(path, "utf8")));
+			const body = renderWorkflowBody(parseJournal(readFileSync(path, "utf8")), viewOptions(agentDir, id));
 			if (body === sent) return;
 			sent = body;
 			res.write(`data: ${JSON.stringify({ body })}\n\n`);
@@ -79,7 +84,11 @@ function events(req: IncomingMessage, res: ServerResponse, agentDir: string, id:
 	} catch {
 		// Gone.
 	}
-	const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), HEARTBEAT_MS);
+	// Also looks again: a process that died writes nothing, and its run shows as interrupted from then on.
+	const heartbeat = setInterval(() => {
+		res.write(": keep-alive\n\n");
+		push();
+	}, HEARTBEAT_MS);
 	push();
 	req.on("close", () => {
 		watcher?.close();
@@ -102,6 +111,6 @@ export function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathn
 		return true;
 	}
 	if (stream) events(req, res, agentDir, id);
-	else send(res, 200, livePage(parseJournal(readFileSync(journalPath(agentDir, id), "utf8")), id));
+	else send(res, 200, livePage(parseJournal(readFileSync(journalPath(agentDir, id), "utf8")), id, viewOptions(agentDir, id)));
 	return true;
 }

@@ -31,6 +31,8 @@ function durable(entries: readonly JournalEntry[] = [], inFlight: InFlightPolicy
 	const journal = new Journal(join(dir, `j${++journals}.jsonl`));
 	const diverged: DivergenceError[] = [];
 	const replayed: string[] = [];
+	/** The recorded cost of each replayed call, in order. */
+	const costs: number[] = [];
 	const dropped: { key: string; meta: Record<string, unknown> }[] = [];
 	const signal = new AbortController().signal;
 	const d = new Durable({
@@ -41,11 +43,14 @@ function durable(entries: readonly JournalEntry[] = [], inFlight: InFlightPolicy
 		signal,
 		signalFor: () => signal,
 		...(extra.inherited ? { inherited: extra.inherited } : {}),
-		replayed: (kind) => replayed.push(kind),
+		replayed: (kind, cost) => {
+			replayed.push(kind);
+			costs.push(cost);
+		},
 		diverged: (e) => diverged.push(e),
 		dropped: (calls) => dropped.push(...calls.map((c) => ({ key: c.start.key, meta: c.meta }))),
 	});
-	return { d, journal, diverged, replayed, dropped, entries: () => readJournal(journal.path) };
+	return { d, journal, diverged, replayed, costs, dropped, entries: () => readJournal(journal.path) };
 }
 const spec = (kind: CallSpec["kind"], args: unknown, extra: Partial<CallSpec> = {}): CallSpec => ({ kind, args, label: `${kind} ${JSON.stringify(args)}`, ...extra });
 const value = (v: unknown) => async () => ({ value: v });
@@ -109,7 +114,7 @@ describe("replay", () => {
 	test("parallel calls finish in any order; a replay answers each call by its key", async () => {
 		const first = durable();
 		const delays: Record<string, number> = { a: 150, b: 5, c: 60 };
-		const results = await Promise.all(["a", "b", "c"].map((n) => first.d.call(spec("llm", { prompt: n }), async () => (await sleep(delays[n]!), { value: `answer ${n}`, cost: 0.01 }))));
+		const results = await Promise.all(["a", "b", "c"].map((n) => first.d.call(spec("llm", { prompt: n }), async (call) => (await sleep(delays[n]!), call.spend(0.01), { value: `answer ${n}` }))));
 		assert.deepEqual(results, ["answer a", "answer b", "answer c"]);
 		assert.deepEqual(first.entries().filter((e) => e.t === "done").map((e) => e.t === "done" && e.value), ["answer b", "answer c", "answer a"], "finished out of order");
 
@@ -119,7 +124,47 @@ describe("replay", () => {
 		assert.deepEqual(again, ["answer c", "answer a", "answer b"]);
 		assert.equal(replay.d.replayedCalls, 3);
 		assert.deepEqual(replay.replayed, ["llm", "llm", "llm"]);
+		assert.deepEqual(replay.costs, [0.01, 0.01, 0.01]);
 		assert.deepEqual(replay.entries(), [], "a replay writes nothing");
+	});
+
+	test("what a call spent is recorded with its outcome, also a failure, and counted again by a replay; nothing spent records no cost", async () => {
+		const first = durable();
+		await assert.rejects(
+			first.d.call(spec("delegate", { n: 1 }), async (call) => {
+				call.spend(0.25);
+				call.spend(0.5);
+				call.spend(-1);
+				throw new Error("the child reported no end");
+			}),
+			/no end/,
+		);
+		assert.equal(await first.d.call(spec("llm", { n: 2 }), async (call) => (call.spend(0.1), { value: "ok" })), "ok");
+		assert.equal(await first.d.call(spec("shell", { n: 3 }), value(0)), 0);
+		const outcomes = first.entries().flatMap((e) => (e.t === "done" || e.t === "failed" ? [[e.t, "cost" in e ? e.cost : undefined]] : []));
+		assert.deepEqual(outcomes, [["failed", 0.75], ["done", 0.1], ["done", undefined]]);
+
+		const replay = durable(first.entries());
+		await assert.rejects(replay.d.call(spec("delegate", { n: 1 }), never), /no end/);
+		await replay.d.call(spec("llm", { n: 2 }), never);
+		await replay.d.call(spec("shell", { n: 3 }), never);
+		assert.deepEqual(replay.costs, [0.75, 0.1, 0]);
+	});
+
+	test("a replayed nested workflow skips its calls and counts what they spent", async () => {
+		const first = durable();
+		const nested = (d: Durable) =>
+			d.call(spec("workflow", { name: "w" }), async () => {
+				await d.call(spec("llm", { p: 1 }), async (call) => (call.spend(0.5), { value: "x" }));
+				await d.call(spec("delegate", { p: 2 }), async (call) => (call.spend(2), { value: "y" }));
+				return { value: "w" };
+			});
+		assert.equal(await nested(first.d), "w");
+		const replay = durable(first.entries());
+		assert.equal(await replay.d.call(spec("workflow", { name: "w" }), never), "w");
+		assert.deepEqual(replay.replayed, ["llm", "delegate", "workflow"]);
+		assert.deepEqual(replay.costs, [0.5, 2, 0]);
+		assert.equal(replay.d.replayedCalls, 1);
 	});
 
 	test("occurrence numbers: the nth equal call gets the nth recorded result; the next one runs live", async () => {
@@ -618,6 +663,24 @@ describe("the page", () => {
 		const resumed = viewOf([...JOURNAL, { t: "attempt", n: 2, at: 2_000_000, pid: 2 }]);
 		assert.deepEqual(resumed.calls.map((c) => c.status), ["replayed", "replayed", "replayed", "interrupted", "interrupted"]);
 		assert.deepEqual([resumed.attempts, resumed.status], [2, "running"]);
+		assert.deepEqual(resumed.calls.map((c) => c.replayed), [{ outcome: "done", attempt: 1 }, { outcome: "failed", attempt: 1 }, { outcome: "done", attempt: 1 }, undefined, undefined]);
+		// A replayed call took no time in this attempt: the page says whose time it shows.
+		const page = renderWorkflow([...JOURNAL, { t: "attempt", n: 2, at: 2_000_000, pid: 2 }]);
+		assert.match(page, /<span class="st">replayed · failed<\/span><span>took 2\.0 s in attempt 1<\/span>/);
+		assert.match(page, /<span class="st">replayed · done<\/span><span>took 4\.0 s in attempt 1<\/span>/);
+
+		const third = viewOf([...JOURNAL, { t: "attempt", n: 2, at: 2_000_000, pid: 2 }, { t: "start", key: "delegate:ddd#1", kind: "delegate", label: "#1: Review the diff", at: 2_000_100 }, { t: "done", key: "delegate:ddd#1", at: 2_000_900 }, { t: "attempt", n: 3, at: 3_000_000, pid: 3 }]);
+		assert.deepEqual(third.calls.map((c) => c.replayed?.attempt), [1, 1, 1, 2, undefined], "each call names the attempt that recorded it");
+	});
+
+	test("a run whose process died without an end (the lock is free): interrupted, its open calls and phases too; an end wins", () => {
+		const dead = viewOf(JOURNAL, { processEnded: true });
+		assert.equal(dead.status, "interrupted");
+		assert.deepEqual(dead.calls.map((c) => c.status), ["done", "failed", "done", "interrupted", "interrupted"]);
+		assert.match(renderWorkflow(JOURNAL, { processEnded: true }), /run-status">interrupted</);
+		const ended = viewOf([...JOURNAL, { t: "end", at: 1_010_000, status: "completed", ok: true, cost: 0.0031, text: "" }], { processEnded: true });
+		assert.equal(ended.status, "completed");
+		assert.equal(viewOf([H], { processEnded: true }).status, "starting", "not started yet: no attempt");
 	});
 
 	test("calls overlapping in time are lanes side by side; groups follow each other", () => {

@@ -9,7 +9,7 @@
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { acquireLock } from "../lib/lock.ts";
+import { lockFree } from "../lib/lock.ts";
 import type { Work } from "./durable.ts";
 import { runDir, runState } from "./journal.ts";
 
@@ -27,9 +27,7 @@ export const lockPath = (dir: string) => join(dir, "lock");
 
 /** Whether a process holds the run's lock (it runs now, or waits for agents a stop left running). */
 export function lockHeld(agentDir: string, id: string): boolean {
-	const unlock = acquireLock(lockPath(runDir(agentDir, id)));
-	unlock?.();
-	return unlock === undefined;
+	return !lockFree(lockPath(runDir(agentDir, id)));
 }
 
 /** A request no one took (the run ended first) must not stop a later execution. */

@@ -260,7 +260,7 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			thinkingLevel: thinking,
 			modelRuntime: env.runtime,
 			resourceLoader,
-			...(tools ? { tools: [...tools, ...(options.schema || fork?.spec.schema ? [SUBMIT_TOOL] : [])] } : {}),
+			...(tools ? { tools: [...new Set([...tools, ...(options.schema || fork?.spec.schema ? [SUBMIT_TOOL] : [])])] } : {}),
 			sessionManager: manager,
 			settingsManager,
 		});
@@ -412,6 +412,8 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	let firstKey: string | undefined;
 	/** The cost of each child session counted so far. */
 	let counted = new Map<string, number>();
+	/** Notes the child's spending with the run (durable.ts records it with the run's outcome, also a failure). */
+	let charge: ((usd: number) => void) | undefined;
 	env.onDispose((interrupted) => {
 		disposed = true;
 		transport.dispose();
@@ -434,6 +436,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			counted.set(state.sessionId, state.cost);
 			cost += delta;
 			env.spend(delta);
+			charge?.(delta);
 		}
 		return state;
 	};
@@ -482,8 +485,17 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		return { message: String(prepared.input.task), spec: prepared.spec! };
 	};
 
-	/** Run `n` live, or reattach to it when it was in flight when the run stopped. */
+	/** Run `n` live, or reattach to it when it was in flight when the run stopped; what the child spent meanwhile goes with the run. */
 	const execute = async (n: number, raw: string, head: string | undefined, call: CallContext, reattach: boolean) => {
+		charge = (usd) => call.spend(usd);
+		try {
+			return await executeRun(n, raw, head, call, reattach);
+		} finally {
+			sync();
+			charge = undefined;
+		}
+	};
+	const executeRun = async (n: number, raw: string, head: string | undefined, call: CallContext, reattach: boolean) => {
 		// The phase header goes before the script's message (not into the call's key).
 		const message = head ? `${head}\n\n${raw}` : raw;
 		const { signal } = call;
@@ -541,7 +553,8 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			}
 		} catch (error) {
 			// The parent's side failed (t3, or onAsk threw): the child would wait for an answer or a reader forever.
-			if (!signal.aborted) transport.cancel();
+			// Not when the run is interrupted (t3 unreachable): the child runs on and a resume reattaches.
+			if (!signal.aborted && !isInterruption(error)) transport.cancel();
 			throw error;
 		} finally {
 			running = false;
@@ -562,7 +575,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			sessionId: state.sessionId,
 			...(transport.threadId ? { threadId: transport.threadId } : {}),
 		};
-		return { value: { run, handle: handleState() }, cost: run.cost };
+		return { value: { run, handle: handleState() } };
 	};
 
 	// Runs and compactions of one child are one conversation: they go one after the other.

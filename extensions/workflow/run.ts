@@ -22,7 +22,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { type ToolCall, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
-import { type ModelRuntime, truncateHead } from "@earendil-works/pi-coding-agent";
+import { type ModelRuntime, SettingsManager, truncateHead } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
 import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
@@ -36,7 +36,7 @@ import type { SavedWorkflow } from "./library.ts";
 import { DEFAULT_LLM_MODEL, llm } from "./llm.ts";
 import { sh } from "./sh.ts";
 import { clearStopRequest, linger, lockPath, takeLingering, watchStop } from "./stop.ts";
-import { cancelTask, T3, T3_DELEGATE, T3_PREFIX, t3Data } from "./t3.ts";
+import { cancelTask, T3, T3_DELEGATE, T3_PREFIX, type T3Options, t3Data, waitSliceMs } from "./t3.ts";
 
 const DEFAULT_CONCURRENCY = 4;
 const MAX_LLM_IN_FLIGHT = 8;
@@ -70,6 +70,8 @@ export interface RunEnv {
 	executeTool?: (name: string, args: unknown, signal: AbortSignal) => Promise<ToolOutcome>;
 	/** The tools executeTool can call; with t3's, delegate() children become t3 tasks. */
 	toolNames?: readonly string[];
+	/** How t3 calls that fail in transport are repeated; default t3.ts's. */
+	t3Retry?: Pick<T3Options, "retryDeadlineMs" | "backoffMs">;
 	/** The calling session's model ("provider/id"): in-process children's default. */
 	model?: string;
 	/** The calling session's id and file. */
@@ -427,27 +429,33 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	const live = () => {
 		if (signal.aborted) throw signal.reason;
 	};
+	/** Stop the run as interrupted (resumable); t3 children run on (an interruption does not cancel them). */
+	const interrupt = (error: unknown) => {
+		controller.abort(error);
+		children.abort(error);
+	};
 	// A tool call that fails because the run is interrupted stops the whole run as interrupted.
 	const executeTool = env.executeTool
 		? async (name: string, args: unknown, callSignal: AbortSignal) => {
 				try {
 					return await env.executeTool!(name, args, callSignal);
 				} catch (error) {
-					if (isInterruption(error)) {
-						controller.abort(error);
-						children.abort(error);
-					}
+					if (isInterruption(error)) interrupt(error);
 					throw error;
 				}
 			}
 		: undefined;
 	t3 =
 		executeTool && env.toolNames?.includes(T3_DELEGATE)
-			? new T3(async (name, args, callSignal) => {
-					const outcome = await executeTool(`${T3_PREFIX}${name}`, args, callSignal);
-					if (outcome.isError) throw new Error(`t3 ${name}: ${outcome.text || "failed"}`);
-					return t3Data(name, outcome.value, outcome.text);
-				})
+			? new T3(
+					async (name, args, callSignal) => {
+						const outcome = await executeTool(`${T3_PREFIX}${name}`, args, callSignal);
+						if (outcome.isError) throw new Error(`t3 ${name}: ${outcome.text || "failed"}`);
+						return t3Data(name, outcome.value, outcome.text);
+					},
+					// t3's bridge fetches with Pi's dispatcher, whose idle timeout would cut a longer wait.
+					{ waitMs: waitSliceMs(SettingsManager.create(env.cwd, env.agentDir).getHttpIdleTimeoutMs()), ...env.t3Retry, unreachable: interrupt },
+				)
 			: undefined;
 	let delegates = 0;
 	/** Ask whoever runs the workflow with its session's ask_user; resolves to the answers in order. */
@@ -505,14 +513,13 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 			return durable.call({ kind: "llm", args: { prompt, options: options ?? null }, label: typeof prompt === "string" ? firstLine(prompt, 100) : "llm()", model: typeof model === "string" ? model : DEFAULT_LLM_MODEL }, (call) =>
 				llmSlot(async () => {
 					live();
-					let cost = 0;
 					const value = await llm(prompt, options, {
 						runtime: env.runtime,
 						cache: env.llmCache,
 						signal: call.signal,
 						spend: (u) => {
 							usage = addUsage(usage, u);
-							cost += u.cost.total;
+							call.spend(u.cost.total);
 							spend(u.cost.total);
 						},
 						counted: (cached) => {
@@ -521,7 +528,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 							publish();
 						},
 					});
-					return { value, cost };
+					return { value };
 				}),
 			);
 		},

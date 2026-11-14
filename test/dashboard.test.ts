@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { request } from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -241,15 +241,28 @@ describe("workflow runs", () => {
 	});
 
 	test("/workflows lists recent runs; /workflows/<id> serves the renderer's page with the theme and live updates", async () => {
+		// A process holds the run's lock: it runs.
+		const lock = join(dir, "agent", "workflows", ID, "lock");
+		mkdirSync(lock);
+		writeFileSync(join(lock, "pid"), String(process.pid));
 		const list = await get("/workflows");
 		assert.equal(list.status, 200);
-		assert.match(list.text, new RegExp(`<a href="/workflows/${ID}">${ID}</a></td><td>fix_loop</td><td>running or interrupted</td>`));
+		assert.match(list.text, new RegExp(`<a href="/workflows/${ID}">${ID}</a></td><td>fix_loop</td><td>running</td>`));
 		const page = await get(`/workflows/${ID}`);
 		assert.equal(page.status, 200);
 		assert.match(page.headers.get("content-type")!, /text\/html/);
 		const { renderWorkflowBody } = await import("../extensions/workflow/render.ts");
 		const { readJournal } = await import("../extensions/workflow/journal.ts");
 		assert.ok(page.text.includes(renderWorkflowBody(readJournal(journal()))), "the same renderer's body");
+		assert.match(page.text, /run-status">running</);
+		// Its process died (killed: no end written, the lock left behind with a dead pid): interrupted, its open call too.
+		writeFileSync(join(lock, "pid"), "999999");
+		assert.match((await get("/workflows")).text, new RegExp(`<td>fix_loop</td><td>interrupted</td>`));
+		const dead = await get(`/workflows/${ID}`);
+		assert.match(dead.text, /run-status">interrupted</);
+		assert.match(dead.text, /class="node k-shell s-interrupted"/);
+		assert.ok(existsSync(join(lock, "pid")), "looking does not take or clear the lock");
+		rmSync(lock, { recursive: true });
 		assert.match(page.text, /--success:/, "t3's theme variables are defined");
 		assert.match(page.text, new RegExp(`new EventSource\\("/workflows/${ID}/events"\\)`));
 		assert.equal((await get("/workflows/20261114-120000-ffffff")).status, 404);

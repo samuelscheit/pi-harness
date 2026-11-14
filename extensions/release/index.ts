@@ -59,11 +59,21 @@ export default function release(pi: ExtensionAPI, options: ReleaseOptions = {}) 
 	const follow = async (ctx: ExtensionContext) => {
 		const deployed = currentRelease(agentDir);
 		if (deployed === undefined || deployed.commit === loaded.commit) return;
-		if (!needsPi.has(deployed.commit)) needsPi.set(deployed.commit, piTree(loaded.source, deployed.commit));
 		// Unknown build (no record): it may lack APIs the release uses.
-		if (state.pi !== undefined && (await needsPi.get(deployed.commit)) === state.pi) {
-			pi.requestReload();
-			return;
+		if (state.pi !== undefined) {
+			if (!needsPi.has(deployed.commit)) needsPi.set(deployed.commit, piTree(loaded.source, deployed.commit));
+			let tree: string | undefined;
+			try {
+				tree = await needsPi.get(deployed.commit);
+			} catch (error) {
+				// Git failed to run: ask again next time instead of keeping the failure.
+				needsPi.delete(deployed.commit);
+				throw error;
+			}
+			if (tree === state.pi) {
+				pi.requestReload();
+				return;
+			}
 		}
 		if (state.piNoticeShown) return;
 		state.piNoticeShown = true;

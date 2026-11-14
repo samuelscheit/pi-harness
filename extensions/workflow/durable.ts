@@ -57,12 +57,12 @@ export interface CallSpec {
 export interface LiveResult {
 	/** Journaled, and returned to the script as JSON would bring it back. */
 	value: unknown;
-	/** USD the call spent (already counted by the call itself). */
-	cost?: number;
 }
 
 export interface CallContext {
 	key: string;
+	/** Note USD the call spent (counted against the budget by the call itself): recorded with its outcome, also a failure, so a resume counts it again. */
+	spend(usd: number): void;
 	/** Record what the call learned (an agent's thread), durably: a resume reattaches with it. */
 	meta(data: Record<string, unknown>): void;
 	/** Whatever meta the journal had for this call (a reattach). */
@@ -71,8 +71,8 @@ export interface CallContext {
 	signal: AbortSignal;
 }
 
-/** Names of errors that interrupt a run rather than end it (its session ended, its context went stale): it can be resumed. */
-const INTERRUPTIONS = new Set(["SessionEnded", "ContextStale"]);
+/** Names of errors that interrupt a run rather than end it (its session ended, its context went stale, t3 stayed unreachable): it can be resumed. */
+const INTERRUPTIONS = new Set(["SessionEnded", "ContextStale", "T3Unreachable"]);
 export const isInterruption = (reason: unknown) => INTERRUPTIONS.has((reason as { name?: unknown } | null)?.name as string);
 
 /** The reason of a run stopped on request (`workflow { stop }`); `children`: its agents are cancelled too. */
@@ -333,8 +333,13 @@ export class Durable {
 	private async answer(key: string, spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>, reattach?: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
 		this.consume(key);
 		const outcome = this.folded.outcomes.get(key);
-		// A nested workflow answered from the journal makes none of its calls again.
-		if (outcome && spec.kind === "workflow") for (const nested of this.pending.filter((k) => k.startsWith(`${key}/`))) this.consume(nested);
+		// A nested workflow answered from the journal makes none of its calls again; what they spent counts.
+		if (outcome && spec.kind === "workflow")
+			for (const nested of this.pending.filter((k) => k.startsWith(`${key}/`))) {
+				this.consume(nested);
+				const recorded = this.folded.outcomes.get(nested);
+				if (recorded) this.onReplayed(this.folded.starts.get(nested)!.kind, recorded.cost ?? 0);
+			}
 		this.notify();
 		if (outcome) {
 			this.replayedCalls++;
@@ -401,8 +406,12 @@ export class Durable {
 		this.journal.append({ t: "start", key, kind: spec.kind, label: spec.label, at: Date.now(), ...(spec.idempotent ? { idempotent: true as const } : {}), ...(spec.model ? { model: spec.model } : {}), ...(phase ? { phase } : {}) }, true);
 		const own = new AbortController();
 		const signal = AbortSignal.any([this.signalFor(spec.kind), own.signal]);
+		let spent = 0;
 		const context: CallContext = {
 			key,
+			spend: (usd) => {
+				if (usd > 0) spent += usd;
+			},
 			recorded: { ...this.folded.metas.get(key) },
 			meta: (data) => {
 				this.folded.metas.set(key, { ...this.folded.metas.get(key), ...data });
@@ -419,8 +428,8 @@ export class Durable {
 			// Cancelled after it finished (unused by edited code): its outcome is not recorded.
 			if (own.signal.aborted) throw own.signal.reason;
 			const value = roundTrip(result.value);
-			this.journal.append({ t: "done", key, at: Date.now(), ...(value === undefined ? {} : { value }), ...(result.cost ? { cost: result.cost } : {}) }, true);
-			settle({ outcome: "done", value, cost: result.cost ?? 0 });
+			this.journal.append({ t: "done", key, at: Date.now(), ...(value === undefined ? {} : { value }), ...(spent ? { cost: spent } : {}) }, true);
+			settle({ outcome: "done", value, cost: spent });
 			return value;
 		} catch (error) {
 			// Stopped by the run (a stop, an interruption): no outcome, a resume decides. A phase over its budget is the call's failure.
@@ -429,10 +438,9 @@ export class Durable {
 				settle({ outcome: "none" });
 				throw error;
 			}
-			const cost = (error as { cost?: unknown } | null)?.cost;
 			const failed = serializeError(signal.aborted ? reason : error);
-			this.journal.append({ t: "failed", key, at: Date.now(), error: failed, ...(typeof cost === "number" && cost > 0 ? { cost } : {}) }, true);
-			settle({ outcome: "failed", error: failed, cost: typeof cost === "number" ? cost : 0 });
+			this.journal.append({ t: "failed", key, at: Date.now(), error: failed, ...(spent ? { cost: spent } : {}) }, true);
+			settle({ outcome: "failed", error: failed, cost: spent });
 			throw signal.aborted ? reason : error;
 		} finally {
 			if (this.works.get(key) === work) this.works.delete(key);

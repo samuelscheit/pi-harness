@@ -417,6 +417,22 @@ describe("the global Pi build", () => {
 		git("rm", "-rq", "--cached", "vendor");
 		const without = commit("no vendor");
 		assert.equal(await piTree(source, without), undefined, "absent");
+		// git that fails to run (a spawn failure under memory pressure, a missing repository) is no answer.
+		await assert.rejects(piTree(join(dir, "no-such-repository"), first), /Command failed: git/);
+	});
+
+	test("'has no vendor/pi' recorded when git could not run is tried again; a commit really without vendor/pi is refused anew", async () => {
+		await deployMain();
+		const second = newPi("pi 2\n");
+		mkdirSync(join(harnessDir(agentDir), "failed"), { recursive: true });
+		writeFileSync(join(harnessDir(agentDir), "failed", `${second}.txt`), `${second.slice(0, 9)} has no vendor/pi`);
+		assert.equal((await deployMain()).status, "deployed", "the spurious record is no refusal");
+		rmSync(join(source, "vendor"), { recursive: true });
+		git("rm", "-rq", "--cached", "vendor");
+		const without = commit("no vendor");
+		const refused = await deployMain();
+		assert.deepEqual(refused, { status: "failed", commit: without, error: `${without.slice(0, 9)} has no vendor/pi`, fresh: true });
+		assert.equal(currentRelease(agentDir)?.commit, second, "the running release stays");
 	});
 });
 

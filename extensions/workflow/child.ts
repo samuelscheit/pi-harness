@@ -149,7 +149,9 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 
 		const options = event.systemPromptOptions;
 		const available = new Set(pi.getAllTools().map((tool) => tool.name));
-		const unknown = (child.spec.tools ?? []).filter((name) => !available.has(name));
+		// submit_result is this extension's own (registered next, with the schema): listing it is no error.
+		const listed = (child.spec.tools ?? []).filter((name) => name !== SUBMIT_TOOL);
+		const unknown = listed.filter((name) => !available.has(name));
 		if (unknown.length) {
 			child.state = { ...child.state, done: true, error: `unknown tool${unknown.length === 1 ? "" : "s"} ${unknown.join(", ")}; this session has ${[...available].sort().join(", ")}` };
 			save(child);
@@ -157,7 +159,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			return;
 		}
 		registerSubmit(child);
-		const tools = [...(child.spec.tools ?? options.selectedTools.filter((name) => name !== SUBMIT_TOOL)), ...(child.spec.schema ? [SUBMIT_TOOL] : [])];
+		const tools = [...(child.spec.tools ? listed : options.selectedTools.filter((name) => name !== SUBMIT_TOOL)), ...(child.spec.schema ? [SUBMIT_TOOL] : [])];
 		if (child.spec.system !== undefined) options.customPrompt = child.spec.system;
 		options.selectedTools = tools;
 		pi.setActiveTools(tools);

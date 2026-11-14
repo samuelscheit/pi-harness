@@ -228,8 +228,10 @@ afterEach(async () => {
 	assert.deepEqual(fx.errors, [], "no extension errors");
 });
 
+/** How t3 calls are repeated in these tests: quickly, and given up on after 300 ms. */
+const T3_RETRY = { retryDeadlineMs: 300, backoffMs: 20 };
 const workflowExtension = (childRuntime: ModelRuntime) => (pi: ExtensionAPI) =>
-	workflow(pi, { experimentsDir: join(dir, "experiments"), workflowDirs: () => [], modelRuntime: async () => childRuntime, agentDir: fx.agentDir });
+	workflow(pi, { experimentsDir: join(dir, "experiments"), workflowDirs: () => [], modelRuntime: async () => childRuntime, agentDir: fx.agentDir, t3Retry: T3_RETRY });
 
 async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionManager = SessionManager.create(fx.repo, fx.sessionsDir), sessionRuntime = runtime, uiContext?: ExtensionUIContext): Promise<AgentSession> {
 	const settingsManager = SettingsManager.inMemory({});
@@ -241,8 +243,11 @@ async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionMan
 	return session;
 }
 
-/** The t3 tools as the t3 MCP bridge registers them; each child is a real Pi session with the workflow extension. */
-function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
+/**
+ * The t3 tools as the t3 MCP bridge registers them; each child is a real Pi session with the workflow extension.
+ * `failWait`: while it says so, t3_thread_wait fails as the bridge's fetch does when its HTTP request is cut or refused.
+ */
+function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait?: () => boolean } = {}) {
 	const waitMs = options.waitMs ?? 80;
 	let ids = 0;
 	const finishedWithin = async (run: Promise<void>, ms: number) => Promise.race([run.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), ms))]);
@@ -322,6 +327,7 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
 			return { threadId: known.threadId, runId: known.runId, taskId: `task-${known.threadId}-${ids}`, status: "running", delivery: "started" };
 		});
 		tool("t3_thread_wait", async (args) => {
+			if (options.failWait?.()) throw new TypeError("fetch failed");
 			const thread = fx.threads.get(String(args.threadId))!;
 			// As in t3: only the run's end or the timeout ends a wait, not a pending question.
 			const done = await finishedWithin(thread.runs.get(String(args.runId))!, Math.min(waitMs, Number(args.timeoutMs ?? waitMs)));
@@ -353,9 +359,9 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number } = {}) {
  * Run `code` as a workflow from a parent session in "t3": the parent's model calls the workflow tool
  * once, then answers; children answer with `child(context)`. Returns the tool result's details and text.
  */
-async function runInT3(code: string, child: FauxResponseStep, opts: { childRuntime?: ModelRuntime; budget?: number; signal?: AbortSignal } = {}) {
+async function runInT3(code: string, child: FauxResponseStep, opts: { childRuntime?: ModelRuntime; budget?: number; signal?: AbortSignal; failWait?: () => boolean } = {}) {
 	const childRuntime = opts.childRuntime ?? runtime;
-	const parent = await newSession([workflowExtension(runtime), fakeT3(childRuntime)]);
+	const parent = await newSession([workflowExtension(runtime), fakeT3(childRuntime, opts.failWait ? { failWait: opts.failWait } : {})]);
 	parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
 	const dispatch: FauxResponseStep = (...args) => {
 		const [context] = args;
@@ -426,6 +432,105 @@ describe("delegate() in t3", () => {
 		assert.equal(text.split("\n\n").at(-1), "finally");
 		assert.ok(callsOf("t3_thread_wait").length >= 2, "waited more than once");
 		assert.equal(callsOf("t3_thread_wait")[0]!.args.untilDelegatedWorkSettled, true);
+		assert.equal(callsOf("t3_thread_wait")[0]!.args.timeoutMs, 240_000, "below Pi's default HTTP idle timeout of 300 s, which would cut it");
+	});
+
+	test("a wait slice follows Pi's httpIdleTimeoutMs setting, which t3's bridge fetches under", async () => {
+		mkdirSync(fx.agentDir, { recursive: true });
+		writeFileSync(join(fx.agentDir, "settings.json"), JSON.stringify({ httpIdleTimeoutMs: 60_000 }));
+		try {
+			const { details } = await runInT3("return (await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('slow')).text;", async () => {
+				await new Promise((r) => setTimeout(r, 200));
+				return say("finally");
+			});
+			assert.equal(details.status, "completed", details.error);
+			assert.deepEqual([...new Set(callsOf("t3_thread_wait").map((c) => c.args.timeoutMs))], [45_000]);
+		} finally {
+			rmSync(join(fx.agentDir, "settings.json"), { force: true });
+		}
+	});
+
+	test("t3 cuts waits (fetch failed, as at 300 s on 2026-11-14): they are repeated, the run completes, the child is not cancelled", async () => {
+		let failures = 3;
+		const { details, text } = await runInT3(
+			"return (await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('slow')).text;",
+			async () => {
+				await new Promise((r) => setTimeout(r, 300));
+				return say("finally");
+			},
+			{ failWait: () => failures-- > 0 },
+		);
+		assert.equal(details.status, "completed", details.error);
+		assert.equal(text.split("\n\n").at(-1), "finally");
+		assert.ok(callsOf("t3_thread_wait").length >= 4, "the failed waits and the ones after");
+		assert.equal(callsOf("task_cancel").length, 0, "the child was not cancelled");
+	});
+
+	test("t3 unreachable past the deadline: the run is interrupted, its children run on; a resume reattaches to them and the result arrives once", async () => {
+		let down = false;
+		let childRuns = 0;
+		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime, { failWait: () => down })]);
+		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
+		const code = "const out = await map(['a', 'b'], (n) => delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], system: `You are agent ${n}.` }).run('review'), { concurrency: 2 });\nreturn out.map((r) => r.text).join(' + ');";
+		let release!: () => void;
+		const released = new Promise<void>((r) => (release = r));
+		let resumeId = "";
+		const dispatch: FauxResponseStep = async (context) => {
+			if (isChild(context)) {
+				childRuns++;
+				// The children keep working while t3 is unreachable, and finish only after the run gave up.
+				down = true;
+				await released;
+				return say(`${/You are agent (\w)/.exec(systemOf(context))![1]} reviewed`);
+			}
+			const last = lastMessage(context);
+			if (last.role === "toolResult") return say("parent done");
+			return textOf(last.content).includes("resume") ? call("workflow", { resume: resumeId }) : call("workflow", { code, budget: 5 });
+		};
+		faux.setResponses(Array.from({ length: 20 }, () => dispatch));
+		await parent.prompt("go");
+		const results = () => parent.messages.flatMap((m) => (m.role === "toolResult" && m.toolName === "workflow" ? [m] : []));
+		const first = results()[0]!;
+		const details = first.details as unknown as WorkflowDetails;
+		assert.equal(details?.status, "interrupted", details?.error);
+		assert.match(details!.error!, /interrupted: t3 did not answer t3_thread_wait for 0 s \(\d+ attempts; last: t3 t3_thread_wait: fetch failed\)\. Its child threads keep running; resume the workflow to reattach to them\./);
+		assert.match(textOf(first.content), new RegExp(`call workflow with resume: "${details!.id}"`));
+		assert.equal(callsOf("task_cancel").length, 0, "no child was cancelled");
+		const journal = join(runDir(fx.agentDir, details!.id), "journal.jsonl");
+		assert.equal(readJournal(journal).filter((e) => e.t === "failed").length, 0, "no delegate failed: both are in flight");
+		assert.deepEqual(viewOf(readJournal(journal)).calls.map((c) => c.status), ["interrupted", "interrupted"]);
+
+		// t3 is back and the children finish; the resume waits for their recorded runs.
+		down = false;
+		release();
+		resumeId = details!.id;
+		const waitsBefore = callsOf("t3_thread_wait").length;
+		await parent.prompt("resume it");
+		const second = results().at(-1)!;
+		const resumed = second.details as unknown as WorkflowDetails;
+		assert.equal(resumed?.status, "completed", resumed?.error);
+		assert.equal(textOf(second.content).split("\n\n").at(-1), "a reviewed + b reviewed");
+		assert.equal(childRuns, 2, "each child ran once");
+		assert.equal(fx.threads.size, 2, "no new task");
+		assert.equal(callsOf("delegate_task").length, 2);
+		assert.equal(callsOf("t3_thread_send").length, 0);
+		const recordedRuns = new Set(readJournal(journal).flatMap((e) => (e.t === "meta" && typeof e.data.runId === "string" ? [e.data.runId] : [])));
+		assert.ok(callsOf("t3_thread_wait").slice(waitsBefore).every((c) => recordedRuns.has(String(c.args.runId))), "the resume waited for the recorded runs");
+		assert.equal(callsOf("task_cancel").length, 0);
+	});
+
+	test("submit_result listed in tools with a schema is the child's own tool, not an unknown one", async () => {
+		const seen: Context[] = [];
+		const { details, text } = await runInT3(
+			"return JSON.stringify((await delegate({ target: { model: 'faux/faux-1' }, tools: ['read', 'submit_result'], schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } }).run('count')).result);",
+			(context) => {
+				seen.push(context);
+				return seen.length === 1 ? call("submit_result", { n: 3 }) : say("Submitted.");
+			},
+		);
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(value(text), { n: 3 });
+		assert.deepEqual(toolNames(seen[0]!), ["read", "submit_result"], "once");
 	});
 
 	test("an unknown tool fails the run before any request of the child", async () => {
@@ -543,6 +648,23 @@ describe("delegate() in t3", () => {
 		assert.equal(over.details.status, "over budget");
 		assert.ok(callsOf("task_cancel").length >= 1, "the t3 task was cancelled");
 		assert.ok(over.details.cost > 1 && over.details.cost < 2.5, `stopped soon after: ${over.details.cost}`);
+	});
+
+	test("cost: a delegate run that fails keeps what its child spent, in the journal, the page and a resume's total", async () => {
+		const code = "await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }).run('x');";
+		const { details } = await runInT3(code, () => say("no result"), { childRuntime: priced(runtime, 0.25) });
+		assert.equal(details.status, "failed");
+		const spent = 0.25 * (1 + MAX_REMINDERS);
+		assert.equal(details.cost, spent);
+		const journal = readJournal(join(runDir(fx.agentDir, details.id), "journal.jsonl"));
+		const failed = journal.find((e) => e.t === "failed");
+		assert.equal(failed?.t === "failed" && failed.cost, spent, "recorded with the failure");
+		assert.equal(viewOf(journal).cost, spent, "the page counts it");
+		// Continued with the same code: the failure is replayed, with its cost (attempt 2 of the run on 2026-11-14 showed $1.82 of $12.81).
+		const resumed = await resumeWorkflow({ id: details.id, code }, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
+		assert.equal(resumed.details.status, "failed");
+		assert.equal(resumed.details.replayedCalls, 1);
+		assert.equal(resumed.details.cost, spent);
 	});
 });
 
