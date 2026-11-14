@@ -97,7 +97,7 @@ export function refusal(found: readonly Detach[], detachAfterMs: number, platfor
 	return [
 		"Not run: this command detaches a job, so its result would reach no one.",
 		...lines,
-		`The bash tool backgrounds long commands itself: a command still running after ${detachAfterMs / 60_000} minutes, or when the user sends a message, moves to the background, keeps running, and its end reaches you as a new message with its output, also after your turn. Run the command in the foreground instead, without \`&\`, nohup, setsid or disown; redirect its output to a log only if you want one. To run jobs in parallel within one command, end it with \`wait\`.`,
+		`Run it in the foreground instead: the same command without setsid, nohup, disown and the trailing \`&\` (a redirect to a log and \`< /dev/null\` may stay). The bash tool backgrounds long commands itself: if the command still runs after ${detachAfterMs / 60_000} minutes, or when the user sends a message, the tool returns at once with the output so far, the process group and a log of the latest output, and the command keeps running, its shell included. It keeps running after your turn ends; when it ends, its exit code and output arrive as a new message, which starts a new turn if you are idle. It is stopped (SIGTERM to its process group) only when the session ends (quit, new session, resume, fork), not when the harness reloads; a \`timeout\` you give the call still applies. To run several jobs in parallel in one command, end it with \`wait\`.`,
 		...(platform === "darwin" && !found.some((d) => d.kind === "setsid") ? ["On macOS `setsid` does not exist."] : []),
 	].join("\n");
 }

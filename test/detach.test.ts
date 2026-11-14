@@ -89,8 +89,10 @@ describe("messages", () => {
 		assert.match(text, /^Not run: this command detaches a job/);
 		assert.match(text, /- `setsid nohup bash -c 'job' > embed\.log`: `setsid` does not exist on macOS \(command not found\), so the job would never start/);
 		assert.match(text, /- `setsid nohup bash -c 'job' > embed\.log &`: runs in the background \(`&`\)/);
-		assert.match(text, /still running after 2 minutes, .* moves to the background, keeps running, and its end reaches you as a new message/);
-		assert.match(text, /Run the command in the foreground instead/);
+		assert.match(text, /Run it in the foreground instead: the same command without setsid, nohup, disown and the trailing `&`/);
+		assert.match(text, /still runs after 2 minutes, or when the user sends a message, the tool returns at once with the output so far, the process group and a log/);
+		assert.match(text, /keeps running after your turn ends; when it ends, its exit code and output arrive as a new message, which starts a new turn if you are idle/);
+		assert.match(text, /stopped \(SIGTERM to its process group\) only when the session ends \(quit, new session, resume, fork\), not when the harness reloads/);
 		assert.doesNotMatch(text, /On macOS `setsid` does not exist\./, "said once, in the setsid line");
 	});
 

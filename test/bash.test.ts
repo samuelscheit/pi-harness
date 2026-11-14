@@ -258,7 +258,7 @@ describe("in a Pi session", () => {
 		const [top, fromScript] = results.map((m) => m.content.map((c) => (c.type === "text" ? c.text : "")).join(""));
 		assert.match(top!, /Not run: this command detaches a job/);
 		assert.match(top!, /`setsid nohup bash -c 'sleep 30' > \/dev\/null 2>&1`: `setsid` (does not exist on macOS|moves it out)/);
-		assert.match(top!, /Run the command in the foreground instead/);
+		assert.match(top!, /Run it in the foreground instead/);
 		assert.match(fromScript!, /`sleep 30 &`: runs in the background/);
 		assert.equal(guardMessages(s).length, 0, "nothing was left running");
 		assert.equal(sessionJobs(s.sessionManager.getSessionId()).topLevel.size, 0, "a refused call leaves no state");
