@@ -64,7 +64,7 @@
 // updater just started it, nothing is in flight), and otherwise asked to restart by a notification.
 // A t3 update that breaks a patch is reported by a notification too.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { packedFiles, readFile, readHeader, replaceFiles } from "./lib/asar.ts";
@@ -468,16 +468,22 @@ export function elapsedSeconds(etime: string): number {
 /** The app's main executable (bundle name without `.app`). */
 const executable = (app: string) => join(app, "Contents/MacOS", basename(app, ".app"));
 
+/** An extended regular expression matching `text` literally. */
+const literal = (text: string) => text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+
 /**
  * Seconds since a process started from `main` without arguments did (an app's main process; its
- * helpers carry arguments), or undefined when none runs.
+ * helpers carry arguments), or undefined when none runs. `pgrep` compares the command lines, and `ps`
+ * reports only the matches: listing every command line exceeds child_process's output limit when many
+ * processes run (ENOBUFS).
  */
 export function startedAgoS(main: string): number | undefined {
-	const line = execFileSync("ps", ["-axo", "etime=,args="], { encoding: "utf8" })
-		.split("\n")
-		.map((l) => l.trim())
-		.find((l) => l.slice(l.indexOf(" ") + 1) === main);
-	return line === undefined ? undefined : elapsedSeconds(line.slice(0, line.indexOf(" ")));
+	// Exit 1: no match.
+	const pids = spawnSync("pgrep", ["-x", "-f", literal(main)], { encoding: "utf8" }).stdout.trim().split(/\s+/).filter(Boolean);
+	if (pids.length === 0) return undefined;
+	// Exit 1 when the match exited meanwhile.
+	const etime = spawnSync("ps", ["-o", "etime=", "-p", pids.join(",")], { encoding: "utf8" }).stdout.trim().split("\n")[0]?.trim();
+	return etime ? elapsedSeconds(etime) : undefined;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

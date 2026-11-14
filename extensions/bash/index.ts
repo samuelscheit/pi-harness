@@ -26,7 +26,7 @@ import { BACKGROUND_GUIDELINE, DETACH_AFTER_MS } from "../background/index.ts";
 import { sessionJobs, setStopHint } from "../background/jobs.ts";
 import { openBridge, TOOL_GUIDELINE, toolBinDir, withImages } from "./bridge.ts";
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
-import { adoptLeftovers, defaultPs, leftText } from "./leftovers.ts";
+import { adoptLeftovers, defaultPs, leftText, type Ps } from "./leftovers.ts";
 
 /** The line put before a bash command: the shell's pid (its process group) into `file`. */
 export const recordLine = (file: string) => `printf '%s' "$$" > '${file.replaceAll("'", "'\\''")}' 2>/dev/null\n`;
@@ -51,8 +51,8 @@ export interface BashOptions {
 	detachAfterMs?: number;
 	/** How often processes calls left running are checked. */
 	pollMs?: number;
-	/** `ps` with leftovers.ts's PS_ARGS. */
-	ps?: () => Promise<string>;
+	/** `ps` (leftovers.ts). */
+	ps?: Ps;
 }
 
 export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {

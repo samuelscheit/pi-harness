@@ -4,7 +4,7 @@
 // the session.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -390,11 +390,12 @@ describe("long commands move to the background", () => {
 		await until("the first command in the background", () => jobsOf(s).size === 1);
 		const [job] = [...jobsOf(s).values()];
 		await new Promise((r) => setTimeout(r, 200));
-		const ps = () => execFileSync("ps", ["-A", "-o", "command="], { encoding: "utf8" });
-		assert.match(ps(), /^sleep 31$/m, "the second command runs in the foreground");
+		// pgrep, not every command line from ps: those exceed spawnSync's output limit when many processes run.
+		const sleeping = () => spawnSync("pgrep", ["-x", "-f", "sleep 31"]).status === 0;
+		assert.ok(sleeping(), "the second command runs in the foreground");
 		await s.abort();
 		await run;
-		await until("the foreground command stopped", () => !/^sleep 31$/m.test(ps()), 3000);
+		await until("the foreground command stopped", () => !sleeping(), 3000);
 		assert.ok(alive(pgidOf(job)), "the background job survives the abort");
 		assert.equal(jobsOf(s).size, 1);
 	});

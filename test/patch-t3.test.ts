@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
+import { withHugePs } from "./fixtures/huge-ps.ts";
 import {
 	afterPatch,
 	elapsedSeconds,
@@ -295,29 +296,32 @@ describe("keeping t3 patched", () => {
 		assert.equal(elapsedSeconds("3-00:00:01"), 3 * 86_400 + 1);
 	});
 
-	test("finds the app's main process by its executable, not a helper started with arguments", async () => {
+	test("finds the app's main process by its executable, not a helper started with arguments, also with more than 1 MB of ps output", async () => {
 		// A symlink to a signed system binary, outside any `.app` bundle: a copy is killed at launch, and
 		// a bundle makes Gatekeeper ask about a damaged app. `ps` shows the path it was started by.
 		const dir = mkdtempSync(join(tmpdir(), "t3-running-"));
-		const main = join(dir, "Fake T3");
+		// Characters a regular expression would read as syntax, as in "T3 Code (Nightly).app".
+		const main = join(dir, "Fake T3 (Nightly) [x]+.*");
 		symlinkSync("/usr/bin/yes", main);
 		const helper = spawn(main, ["--type=helper"], { stdio: "ignore" });
-		try {
-			await new Promise((resolve) => setTimeout(resolve, 200));
-			assert.equal(startedAgoS(main), undefined, "only a helper with arguments runs");
-			const running = spawn(main, [], { stdio: "ignore" });
+		await withHugePs(async () => {
 			try {
 				await new Promise((resolve) => setTimeout(resolve, 200));
-				const ago = startedAgoS(main);
-				assert.ok(ago !== undefined && ago >= 0 && ago < 5, `started ${ago}s ago`);
+				assert.equal(startedAgoS(main), undefined, "only a helper with arguments runs");
+				const running = spawn(main, [], { stdio: "ignore" });
+				try {
+					await new Promise((resolve) => setTimeout(resolve, 200));
+					const ago = startedAgoS(main);
+					assert.ok(ago !== undefined && ago >= 0 && ago < 5, `started ${ago}s ago`);
+				} finally {
+					running.kill();
+				}
 			} finally {
-				running.kill();
+				helper.kill();
+				rmSync(dir, { recursive: true, force: true });
 			}
-		} finally {
-			helper.kill();
-			rmSync(dir, { recursive: true, force: true });
-		}
-		assert.equal(startedAgoS("/Applications/Not Installed.app/Contents/MacOS/Not Installed"), undefined);
+			assert.equal(startedAgoS("/Applications/Not Installed.app/Contents/MacOS/Not Installed"), undefined);
+		});
 	});
 
 	test("the LaunchAgent is a valid plist that watches the app's folder and runs at load", () => {
