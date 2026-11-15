@@ -96,19 +96,20 @@ describe("resolveToolCwd (#2777)", () => {
 
 	it("picks the nearest directory, not the first-listed marker (#2922)", () => {
 		// Recurrence: a marker-major walk would return the workspace root because
-		// `biome.json` sorts before `package.json` in the marker list. The walk is
-		// level-major, so the nearer directory wins even though its marker is
+		// `.prettierrc` sorts before `package.json` in the marker list. The walk
+		// is level-major, so the nearer directory wins even though its marker is
 		// later in the list. Every other case in this file places the SAME marker
-		// at both levels, which cannot tell the two orderings apart.
+		// at both levels, which cannot tell the two orderings apart. (Biome, the
+		// original subject, now runs at its root config by design.)
 		const workspace = path.join(home, "ws");
 		const pkg = path.join(workspace, "packages", "app");
 		const file = path.join(pkg, "src", "index.ts");
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(path.join(workspace, "biome.json"), "{}\n");
+		fs.writeFileSync(path.join(workspace, ".prettierrc"), "{}\n");
 		fs.writeFileSync(path.join(pkg, "package.json"), "{}\n");
 
 		expect(
-			toolCwd.resolveToolCwd("formatter", "biome", file, { cwd: workspace })
+			toolCwd.resolveToolCwd("formatter", "prettier", file, { cwd: workspace })
 				.cwd,
 		).toBe(pkg);
 	});
@@ -839,5 +840,69 @@ describe("ruff runs at its config root, else the repository root", () => {
 				homeDir: home,
 			}).cwd,
 		).toBe(pkg);
+	});
+});
+
+describe("biome runs at the root config that owns the file", () => {
+	// Recurrence (2026-11-14): biome discovered its config from its cwd, and a
+	// checkout's root biome.json above a project disabled every rule the
+	// project's own config enabled. The cwd and `biomeConfigArgs` both come
+	// from `findBiomeRootConfig`, so they name one project.
+	function repo(): { root: string; pkg: string; file: string } {
+		const root = path.join(home, "repo");
+		const pkg = path.join(root, "packages", "web");
+		const file = path.join(pkg, "src", "deep", "page.ts");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.mkdirSync(path.join(root, ".git"));
+		fs.writeFileSync(path.join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+		fs.writeFileSync(path.join(pkg, "package.json"), "{}\n");
+		fs.writeFileSync(path.join(pkg, "tsconfig.json"), "{}\n");
+		fs.writeFileSync(file, "export {};\n");
+		return { root, pkg, file };
+	}
+	const resolve = (kind: "runner" | "formatter", file: string, cwd: string) =>
+		toolCwd.resolveToolCwd(kind, "biome", file, { cwd, homeDir: home });
+
+	it("runs in the package that carries its own biome.json, from any dispatch cwd", () => {
+		const { root, pkg, file } = repo();
+		fs.writeFileSync(path.join(pkg, "biome.json"), "{}\n");
+		fs.writeFileSync(path.join(root, "biome.json"), '{ "root": true }\n');
+		for (const cwd of [root, pkg, path.dirname(file)]) {
+			expect(resolve("runner", file, cwd)).toEqual({
+				cwd: pkg,
+				marker: "biome.json",
+			});
+		}
+		// The formatter agrees, so a format cannot read another project's config.
+		expect(resolve("formatter", file, root).cwd).toBe(pkg);
+	});
+
+	it("climbs past a nested root: false config to the root config", () => {
+		const { root, pkg, file } = repo();
+		fs.writeFileSync(
+			path.join(pkg, "biome.jsonc"),
+			'// nested\n{ "root": false, "extends": "//" }\n',
+		);
+		fs.writeFileSync(path.join(root, "biome.json"), "{}\n");
+		expect(resolve("runner", file, pkg)).toEqual({
+			cwd: root,
+			marker: "biome.json",
+		});
+	});
+
+	it("finds the dot-named config biome also loads", () => {
+		const { pkg, file } = repo();
+		fs.writeFileSync(path.join(pkg, ".biome.jsonc"), "{}\n");
+		expect(resolve("runner", file, path.dirname(file))).toEqual({
+			cwd: pkg,
+			marker: ".biome.jsonc",
+		});
+	});
+
+	it("keeps the language markers when the project has no biome config", () => {
+		// Not the repository root, unlike ruff: the bundled config is named
+		// explicitly, so the cwd cannot change biome's answer.
+		const { pkg, file } = repo();
+		expect(resolve("runner", file, pkg).cwd).toBe(pkg);
 	});
 });

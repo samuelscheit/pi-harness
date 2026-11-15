@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { isFileKind } from "./file-kinds.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { realpathOrResolve } from "./path-utils.js";
 import {
 	findGlobalBinary,
 	findLocalBinAt,
@@ -364,8 +365,9 @@ export class BiomeClient {
 
 	/**
 	 * Async auto-fix variant for pipeline use (non-blocking spawn).
-	 * `cwd` is the dispatch language root (used for config discovery); when
-	 * omitted it defaults to the file's directory.
+	 * `cwd` is the dispatch language root; biome runs in the directory of the
+	 * root config that owns the file when there is one, and that config is
+	 * named by `--config-path` either way (`biomeConfigArgs`).
 	 */
 	async fixFileAsync(
 		filePath: string,
@@ -385,7 +387,11 @@ export class BiomeClient {
 			};
 		}
 
-		const absolutePath = path.resolve(filePath);
+		// The path identity: `biomeConfigArgs` names the config directory by its
+		// identity, and biome matches nested configs to a file by path prefix,
+		// so a file spelled through a link (`/var` on macOS for `/private/var`)
+		// got only the root config.
+		const absolutePath = realpathOrResolve(filePath);
 		if (!fs.existsSync(absolutePath)) {
 			return {
 				success: false,

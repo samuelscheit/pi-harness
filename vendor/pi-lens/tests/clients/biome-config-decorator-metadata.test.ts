@@ -113,10 +113,35 @@ const USER_BIOME_JSON = JSON.stringify({
 	},
 });
 
+/**
+ * The harness checkout's root `biome.json`: biome off for everything under it.
+ * A project below such a tree is still governed by its own config.
+ */
+const ANCESTOR_ROOT_BIOME_JSON = JSON.stringify({
+	root: true,
+	formatter: { enabled: false },
+	linter: { enabled: false },
+	assist: { enabled: false },
+});
+
 const createdDirs: string[] = [];
 
-async function makeFixture(withUserBiomeConfig: boolean): Promise<string> {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-biome-2385-"));
+/**
+ * `userConfig`: the fixture's own `biome.json`. `ancestorConfig`: a
+ * `biome.json` in a directory the fixture sits in, the monorepo or checkout
+ * root above the project.
+ */
+async function makeFixture(
+	withUserBiomeConfig: boolean,
+	options: { userConfig?: string; ancestorConfig?: string } = {},
+): Promise<string> {
+	let base = os.tmpdir();
+	if (options.ancestorConfig !== undefined) {
+		base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-biome-2385-tree-"));
+		createdDirs.push(base);
+		fs.writeFileSync(path.join(base, "biome.json"), options.ancestorConfig);
+	}
+	const dir = fs.mkdtempSync(path.join(base, "pi-lens-biome-2385-"));
 	createdDirs.push(dir);
 	fs.writeFileSync(path.join(dir, "tsconfig.json"), TSCONFIG_JSON);
 	fs.mkdirSync(path.join(dir, "src"));
@@ -139,9 +164,22 @@ async function makeFixture(withUserBiomeConfig: boolean): Promise<string> {
 		fs.chmodSync(shim, 0o755);
 	}
 	if (withUserBiomeConfig) {
-		fs.writeFileSync(path.join(dir, "biome.json"), USER_BIOME_JSON);
+		fs.writeFileSync(
+			path.join(dir, "biome.json"),
+			options.userConfig ?? USER_BIOME_JSON,
+		);
 	}
 	return dir;
+}
+
+/** Run the production autofix and report whether useImportType converted. */
+async function convertsImportType(dir: string): Promise<boolean> {
+	const widget = path.join(dir, "src", "widget.ts");
+	const result = await new BiomeClient().fixFileAsync(widget, dir);
+	expect(result.success).toBe(true);
+	return fs
+		.readFileSync(widget, "utf-8")
+		.includes('import type { CounterModel } from "./model";');
 }
 
 /** Compile the fixture with the real tsc, run it, report the design:type name. */
@@ -212,11 +250,19 @@ describe.skipIf(!BINARIES_PRESENT)(
 				);
 
 				const client = new BiomeClient();
+				// Positive control first: the bundled config's safe `useConst` fix
+				// lands, so biome processed files of this fixture under that config.
+				// A run that ignored the file (a foreign config above biome's cwd)
+				// also reports success with nothing changed.
+				const fixable = path.join(dir, "src", "fixable.ts");
+				fs.writeFileSync(fixable, "let n = 1;\nexport { n };\n");
+				expect((await client.fixFileAsync(fixable, dir)).changed).toBe(true);
+				expect(fs.readFileSync(fixable, "utf-8")).toContain("const n = 1;");
+
 				const result = await client.fixFileAsync(file, dir);
 
-				// Positive control: the config parsed, biome ran, and no other
-				// safe fix fired — so an unchanged import is evidence about THIS
-				// rule, not a silently failed run.
+				// The config parsed, biome ran, and no other safe fix fired, so an
+				// unchanged import is evidence about THIS rule.
 				expect(result.success).toBe(true);
 				expect(result.changed).toBe(false);
 				const after = fs.readFileSync(file, "utf-8");
@@ -231,8 +277,10 @@ describe.skipIf(!BINARIES_PRESENT)(
 			{ timeout: 120_000 },
 			async () => {
 				const dir = await makeFixture(true);
-				// No --config-path flag: biomeConfigArgs yields to the user config.
-				expect(biomeConfigArgs(dir)).toEqual([]);
+				// The project's own config directory is named, never the bundled one.
+				expect(biomeConfigArgs(dir)).toEqual([
+					`--config-path=${fs.realpathSync(dir)}`,
+				]);
 
 				const client = new BiomeClient();
 				const result = await client.fixFileAsync(
@@ -246,6 +294,61 @@ describe.skipIf(!BINARIES_PRESENT)(
 				).toContain('import type { CounterModel } from "./model";');
 				// The consequence the user opted into: metadata identity changes.
 				expect(await observedDesignType(dir)).toBe("Function");
+			},
+		);
+
+		it(
+			"a project under a tree whose root biome.json disables biome uses its own config",
+			{ timeout: 120_000 },
+			async () => {
+				// The harness checkout's shape: a root config turns biome off, and
+				// the fixture below it carries its own. Its config is the answer.
+				const dir = await makeFixture(true, {
+					ancestorConfig: ANCESTOR_ROOT_BIOME_JSON,
+				});
+				expect(await convertsImportType(dir)).toBe(true);
+			},
+		);
+
+		it(
+			"a nested config with root: false applies through the root config above it",
+			{ timeout: 120_000 },
+			async () => {
+				// The root config leaves useImportType off; only the nested
+				// package config turns it on. Biome is named the ROOT config's
+				// directory (naming the nested one fails in biome 2.6.5), and still
+				// merges the nested config in.
+				const dir = await makeFixture(true, {
+					ancestorConfig: JSON.stringify({
+						root: true,
+						linter: {
+							rules: { recommended: false, style: { useImportType: "off" } },
+						},
+					}),
+					userConfig: JSON.stringify({
+						root: false,
+						extends: "//",
+						linter: { rules: { style: { useImportType: "error" } } },
+					}),
+				});
+				expect(biomeConfigArgs(dir)).toEqual([
+					`--config-path=${fs.realpathSync(path.dirname(dir))}`,
+				]);
+				expect(await convertsImportType(dir)).toBe(true);
+			},
+		);
+
+		it(
+			"a project with no config of its own gets the bundled config, not an ancestor's",
+			{ timeout: 120_000 },
+			async () => {
+				// No biome.json in the project and none above it: the documented
+				// default is the bundled core.jsonc, which keeps useImportType off.
+				const dir = await makeFixture(false);
+				expect(biomeConfigArgs(dir)[0]).toMatch(
+					/^--config-path=.*config[\\/]biome[\\/]core\.jsonc$/,
+				);
+				expect(await convertsImportType(dir)).toBe(false);
 			},
 		);
 

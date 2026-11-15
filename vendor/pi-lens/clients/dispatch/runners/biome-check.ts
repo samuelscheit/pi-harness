@@ -9,7 +9,7 @@
 import { toolAbsentSkip } from "./utils/runner-helpers.js";
 import * as path from "node:path";
 import { incrementDegradationCount } from "../../degradation-ledger.js";
-import { pathsEqual } from "../../path-utils.js";
+import { pathsEqual, realpathOrResolve } from "../../path-utils.js";
 import { mapWithConcurrency } from "../../dependency-checker.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
@@ -107,7 +107,9 @@ export function parseBiomeJson(
 		const result = JSON.parse(raw);
 		const diagnostics: BiomeDiagnostic[] = result.diagnostics || [];
 		const autofix = getAutofixCapability("biome");
-		const absTarget = path.resolve(cwd, filePath);
+		// Biome is handed the file's path identity (`run` below), so it reports
+		// that spelling; compare on the identity axis.
+		const absTarget = realpathOrResolve(path.resolve(cwd, filePath));
 
 		return {
 			diagnostics: diagnostics.flatMap((d) => {
@@ -116,7 +118,10 @@ export function parseBiomeJson(
 				// run past the argv.
 				if (
 					d.location?.path &&
-					!pathsEqual(path.resolve(cwd, d.location.path), absTarget)
+					!pathsEqual(
+						realpathOrResolve(path.resolve(cwd, d.location.path)),
+						absTarget,
+					)
 				)
 					return [];
 				{
@@ -302,6 +307,10 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 		// the same builder, so the user's config / package fallback applies on
 		// `lint --write` too.
 		const configArg = biomeConfigArgs(cwd);
+		// The config directory is a path identity, and biome matches nested
+		// configs to a file by path prefix: a file spelled through a link
+		// (`/var` on macOS for `/private/var`) gets only the root config.
+		const target = realpathOrResolve(ctx.filePath);
 
 		// Run biome lint (diagnostics only - format is handled separately)
 		const checkResult = await safeSpawnAsync(
@@ -311,7 +320,7 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 				"--reporter=json",
 				"--no-errors-on-unmatched",
 				...configArg,
-				ctx.filePath,
+				target,
 			],
 			{ timeout: 30000, cwd },
 		);

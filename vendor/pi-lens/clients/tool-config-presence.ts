@@ -42,6 +42,7 @@ import * as path from "node:path";
 import { hasTomlTable, normalizeToml } from "./cargo-manifest.js";
 import { readFileContent } from "./dispatch/runners/utils.js";
 import { readJsonCache } from "./json-cache-read.js";
+import { parseJsonc } from "./review-graph/tsconfig-paths.js";
 import { pathsEqual, realpathOrResolve, walkUpDirs } from "./path-utils.js";
 
 export type ToolConfigId =
@@ -209,9 +210,11 @@ const TOOL_CONFIG_SPECS: Readonly<Record<ToolConfigId, ToolConfigSpec>> = {
 			jsonFields: [{ file: "package.json", field: "eslintConfig" }],
 		},
 	},
-	// `biome.jsonc` is probed first, so it wins where both names sit in one
-	// directory. No caller reads the biome match's file; presence is the answer.
-	biome: { files: ["biome.jsonc", "biome.json"] },
+	// Every name biome 2 loads (probed against biome 2.6.5 `rage`). Callers read
+	// only the hit's directory: biome picks the file within it by its own order.
+	biome: {
+		files: ["biome.jsonc", "biome.json", ".biome.jsonc", ".biome.json"],
+	},
 	stylelint: {
 		files: [
 			".stylelintrc",
@@ -584,6 +587,42 @@ export function findToolConfig(
 		if (fs.existsSync(path.join(dir, "package.json"))) pastPackage = true;
 	}
 	return undefined;
+}
+
+/**
+ * The root biome config governing files under `startDir`: the nearest one,
+ * climbing past every config that declares `"root": false` (a nested monorepo
+ * config biome merges under the root one). Its directory is what biome must
+ * be given: run there, or named by `--config-path` from any cwd, biome applies
+ * the root config and every nested one; named at a nested directory it fails
+ * (biome 2.6.5). A nested config with no root above it is returned as is, so
+ * biome reports that error itself. An unreadable config counts as a root.
+ */
+export function findBiomeRootConfig(
+	startDir: string,
+	options: ToolConfigOptions = {},
+): ToolConfigHit | undefined {
+	let hit = findToolConfig("biome", startDir, options);
+	while (hit && declaresNestedBiomeConfig(hit.file)) {
+		const parent = path.dirname(hit.dir);
+		const above =
+			parent === hit.dir ? undefined : findToolConfig("biome", parent, options);
+		if (!above) break;
+		hit = above;
+	}
+	return hit;
+}
+
+function declaresNestedBiomeConfig(file: string): boolean {
+	const content = readFileContent(file);
+	if (content === undefined) return false;
+	try {
+		return (parseJsonc<{ root?: unknown }>(content) ?? {}).root === false;
+	} catch {
+		// none: an unparseable config ends the climb and is handed to biome,
+		// which reports the broken file to the user itself.
+		return false;
+	}
 }
 
 /** Whether `tool` is configured for `startDir`: {@link findToolConfig} as a boolean. */

@@ -141,6 +141,14 @@ import {
 export type RootFunction = ((file: string) => Promise<string | undefined>) & {
 	/** Marker table projected into the shared tool-cwd resolver. */
 	rootMarkers?: readonly string[];
+	/**
+	 * Asked only after the function answered no root for `file`. A reason means
+	 * the file must get no server at all: `resolveLspServerCwd` then skips the
+	 * file-directory fallback every other marker-less file gets. Without it a
+	 * deliberate "no" (Deno outside a `deno.json` project, TypeScript inside
+	 * one) became a root at each file's folder, one process per folder.
+	 */
+	unrootedDecline?: (file: string) => Promise<string | undefined>;
 };
 
 function withRootMarkers(
@@ -230,9 +238,12 @@ export async function resolveLspServerCwd(
 	}
 	const rootMarkers = server.rootMarkers ?? server.root.rootMarkers;
 	let serverRoot: string | undefined;
+	let declineReason: string | undefined;
 	let rootFailed = false;
 	try {
 		serverRoot = await server.root(filePath);
+		if (!serverRoot)
+			declineReason = await server.root.unrootedDecline?.(filePath);
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
 		rootFailed = true;
@@ -259,18 +270,29 @@ export async function resolveLspServerCwd(
 			probedMarker !== undefined && rootMarkers?.includes(probedMarker)
 				? probedMarker
 				: undefined;
-		const fallbackCwd = rootMarkers?.length
-			? resolveToolCwd("lsp", server.id, filePath, {
-					cwd: path.dirname(path.resolve(filePath)),
-					rootMarkers,
-				})
-			: undefined;
+		const fallbackCwd =
+			rootMarkers?.length && declineReason === undefined
+				? resolveToolCwd("lsp", server.id, filePath, {
+						cwd: path.dirname(path.resolve(filePath)),
+						rootMarkers,
+					})
+				: undefined;
 		if (!serverRoot) {
-			recordDegradationOnce({
-				kind: "tool-cwd-resolution",
-				subject: server.id,
-				reason: `lsp:server-root-${rootFailed ? "failed" : "fallback"}:${filePath}`,
-			});
+			if (declineReason !== undefined) {
+				// One row per server and session (the first reason): the decline is
+				// a policy for every such file, not a per-file degradation.
+				recordDegradationOnce({
+					kind: "lsp-root-declined",
+					subject: server.id,
+					reason: `LSP root declined for ${server.id}: ${declineReason}`,
+				});
+			} else {
+				recordDegradationOnce({
+					kind: "tool-cwd-resolution",
+					subject: server.id,
+					reason: `lsp:server-root-${rootFailed ? "failed" : "fallback"}:${filePath}`,
+				});
+			}
 			// Not gated by the once-only record above: every caller that asks
 			// learns the verdict, not only the first one per file.
 			onRootFallback?.({
@@ -2807,18 +2829,43 @@ export async function tryGemInstall(gem: string): Promise<boolean> {
 	return ok;
 }
 
+const DENO_CONFIG_MARKERS = ["deno.json", "deno.jsonc"] as const;
+
 /**
- * Wraps a root function so it returns undefined for files inside a Deno project.
+ * A root that exists only where its markers are: a file with none above it
+ * gets no server, never the file-directory fallback. Deno: a `deno.json(c)` is
+ * what makes a TypeScript file a Deno file; with the fallback, a Node project
+ * whose TypeScript server was unavailable started `deno lsp` once per folder
+ * (85 in one session, Myrodex 2026-11-14).
+ */
+function MarkerRequiredRoot(markers: readonly string[]): RootFunction {
+	const root = createRootDetector([...markers]);
+	root.unrootedDecline = async () =>
+		`no ${markers.join(" / ")} above the file, and the server starts only inside its own project`;
+	return root;
+}
+
+/**
+ * Wraps a root function so it returns undefined for files inside a Deno project,
+ * and declines them outright (`unrootedDecline`), so the file-directory
+ * fallback cannot start TypeScript there after all.
  * Prevents TypeScript LSP from being spawned alongside Deno LSP for the same file,
  * which would produce false diagnostics for Deno-specific APIs.
  */
 export function DenoExcludeRoot(primary: RootFunction): RootFunction {
-	const denoDetector = createRootDetector(["deno.json", "deno.jsonc"]);
-	return async (file: string): Promise<string | undefined> => {
+	const denoDetector = createRootDetector([...DENO_CONFIG_MARKERS]);
+	const root: RootFunction = async (file) => {
 		const denoRoot = await denoDetector(file);
 		if (denoRoot) return undefined;
 		return primary(file);
 	};
+	root.unrootedDecline = async (file) => {
+		const denoRoot = await denoDetector(file);
+		if (denoRoot)
+			return `the file belongs to the Deno project at ${denoRoot}, which the Deno server owns`;
+		return primary.unrootedDecline?.(file);
+	};
+	return root;
 }
 
 // --- Server Definitions ---
@@ -3188,7 +3235,7 @@ export const DenoServer: LSPServerInfo = {
 	fallbackFor: "typescript",
 	extensions: JS_TS_LSP_EXTENSIONS,
 	autoPropagateDiagnostics: true,
-	root: createRootDetector(["deno.json", "deno.jsonc"]),
+	root: MarkerRequiredRoot(DENO_CONFIG_MARKERS),
 	async spawn(root, options) {
 		return resolveAndLaunch(
 			{

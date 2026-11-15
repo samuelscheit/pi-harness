@@ -21,7 +21,11 @@ import {
 	createGenerationSource,
 } from "./generation-guard.js";
 import { rootMarkersForFile } from "./language-profile.js";
-import { findToolConfig, type ToolConfigId } from "./tool-config-presence.js";
+import {
+	findBiomeRootConfig,
+	findToolConfig,
+	type ToolConfigHit,
+} from "./tool-config-presence.js";
 
 export type ToolCwdKind = "runner" | "formatter" | "lsp";
 
@@ -250,10 +254,30 @@ export function logRunnerAdvisoryOnce(
  * from the repository root another. Such a tool runs where its own config
  * lives, or at the repository root when there is none, whatever language
  * markers sit in between.
+ *
+ * Biome runs in the directory of the root config that owns the file
+ * (`findBiomeRootConfig`), the one `biomeConfigArgs` names, so the cwd and the
+ * config can never point at two projects. With no config it keeps the
+ * language markers: the bundled config is named explicitly, so the cwd does
+ * not change its answer.
  */
-const CONFIG_ROOTED_TOOLS: Readonly<Partial<Record<string, ToolConfigId>>> = {
-	ruff: "ruff",
-};
+interface ConfigRootedTool {
+	find(fileDir: string, homeDir: string): ToolConfigHit | undefined;
+	/** With no config: run at the repository root instead of the markers. */
+	repositoryRootFallback: boolean;
+}
+
+const CONFIG_ROOTED_TOOLS: Readonly<Partial<Record<string, ConfigRootedTool>>> =
+	{
+		ruff: {
+			find: (fileDir, homeDir) => findToolConfig("ruff", fileDir, { homeDir }),
+			repositoryRootFallback: true,
+		},
+		biome: {
+			find: (fileDir, homeDir) => findBiomeRootConfig(fileDir, { homeDir }),
+			repositoryRootFallback: false,
+		},
+	};
 
 function configRootFor(
 	kind: ToolCwdKind,
@@ -262,10 +286,11 @@ function configRootFor(
 	homeDir: string,
 	gitRoot: () => string | null,
 ): ToolCwdResolution | undefined {
-	const configId = CONFIG_ROOTED_TOOLS[tool];
-	if (configId === undefined || kind === "lsp") return undefined;
-	const hit = findToolConfig(configId, fileDir, { homeDir });
+	const rooted = CONFIG_ROOTED_TOOLS[tool];
+	if (rooted === undefined || kind === "lsp") return undefined;
+	const hit = rooted.find(fileDir, homeDir);
 	if (hit) return { cwd: hit.dir, marker: path.basename(hit.file) };
+	if (!rooted.repositoryRootFallback) return undefined;
 	const root = gitRoot();
 	return root === null ? undefined : { cwd: root, marker: ".git" };
 }

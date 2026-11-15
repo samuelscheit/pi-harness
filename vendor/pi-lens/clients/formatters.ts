@@ -1873,6 +1873,8 @@ const FORMATTER_CONFIG_FILES = [
 	"package.json",
 	"biome.json",
 	"biome.jsonc",
+	".biome.json",
+	".biome.jsonc",
 	".prettierrc",
 	".prettierrc.json",
 	".prettierrc.yml",

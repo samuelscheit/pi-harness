@@ -5,7 +5,7 @@ import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logLatency } from "./latency-logger.js";
 import { resolvePackagePath } from "./package-root.js";
 import { findNearestContaining, walkUpDirs } from "./path-utils.js";
-import { hasToolConfig } from "./tool-config-presence.js";
+import { findBiomeRootConfig, hasToolConfig } from "./tool-config-presence.js";
 import type { ProjectConventions } from "./project-conventions.js";
 import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
 
@@ -2107,19 +2107,22 @@ export function ruffConfigArgs(cwd: string): string[] {
  * The lint runner (`biome-check.ts`) and `biomeClient.fixFileAsync` MUST both
  * consume this builder so the user's `biome.json(c)` — or the package-owned
  * `config/biome/core.jsonc` fallback — applies on `lint --write` too.
+ *
+ * `startDir` is the analysed file's directory. The config is always named:
+ * the project's root config directory when it has one, else the package
+ * fallback. Biome's own discovery starts at its cwd, and an `npx` run gets a
+ * neutral cwd (`getIsolatedNpxSpawnOptions`), from which biome found whatever
+ * config sat above pi-lens's tools directory, not the project's (a checkout
+ * with a root `biome.json` disabling the linter ignored every file). Naming
+ * the root config's directory keeps nested `"root": false` configs applying
+ * (#1731), verified against biome 2.6.5.
  */
-export function biomeConfigArgs(cwd: string): string[] {
-	// A project config wins outright (#1731, discipline A): passing
-	// `--config-path` even when the project ships `biome.json(c)` pinned
-	// biome's config resolution to that ONE file, so a monorepo package
-	// underneath `cwd` with its own `biome.json` never got to extend/override
-	// the root config the way biome's own nested-config resolution allows. No
-	// flag at all lets biome discover it unaided, exactly like the ruff/
-	// markdownlint fallbacks above skip `--config` under the same condition.
-	if (hasToolConfig("biome", cwd)) return [];
+export function biomeConfigArgs(startDir: string): string[] {
+	const projectConfig = findBiomeRootConfig(startDir);
 	return [
 		"--config-path=" +
-			resolvePackagePath(import.meta.url, "config/biome/core.jsonc"),
+			(projectConfig?.dir ??
+				resolvePackagePath(import.meta.url, "config/biome/core.jsonc")),
 	];
 }
 
