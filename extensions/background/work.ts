@@ -16,6 +16,10 @@
 //
 // Processes programs left (named, not tracked: a daemon such as git's fsmonitor) are no items:
 // nothing waits for them. /jobs lists them apart.
+//
+// A delegated child that submitted its run's result releases its jobs (`releaseWork`): every item
+// says `awaited: false`, so t3 delivers the result to the parent at once instead of after the last
+// job ends (a 3-hour Miri run held one for hours, 2026-11-15). The jobs still wake the child.
 
 import type { BackgroundWorkItem } from "@earendil-works/pi-coding-agent";
 import type { Leftover, Named } from "../bash/leftovers.ts";
@@ -109,7 +113,7 @@ export function workItems(jobs: SessionJobs, ps: Ps = defaultPs): WorkItem[] {
 export function reportWork(jobs: SessionJobs): void {
 	const api = jobs.api;
 	if (!api) return;
-	const items = workItems(jobs).map(({ stop: _, ...item }) => item);
+	const items = workItems(jobs).map(({ stop: _, ...item }) => (jobs.released ? { ...item, awaited: false } : item));
 	try {
 		api.setBackgroundWork(BACKGROUND_WORK_KEY, items);
 	} catch (error) {
@@ -123,6 +127,17 @@ export function reportWork(jobs: SessionJobs): void {
 			console.error("[background] cannot report background work:", fallback);
 		}
 	}
+}
+
+/**
+ * Whether the session's result waits for its jobs (`released`: it does not), reported at once when
+ * it changes: every item then says `awaited: false`, and t3 no longer holds a delegated child's
+ * result for them.
+ */
+export function releaseWork(jobs: SessionJobs, released: boolean): void {
+	if (jobs.released === released) return;
+	jobs.released = released;
+	reportWork(jobs);
 }
 
 /** The named processes still running (the others are forgotten); `ps` lists the live ones. */

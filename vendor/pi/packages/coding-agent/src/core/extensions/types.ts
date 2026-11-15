@@ -2322,6 +2322,12 @@ export interface BackgroundWorkItem {
 	url?: string;
 	/** The tool call that started it. */
 	toolCallId?: string;
+	/**
+	 * Whether the session's result waits for it. `false`: the result is already final (a delegated
+	 * agent submitted it) though the work still runs and wakes the session when it ends. Unset: the
+	 * host decides (t3 waits).
+	 */
+	awaited?: boolean;
 }
 
 export type SetBackgroundWorkHandler = (key: string, items: readonly BackgroundWorkItem[]) => void;

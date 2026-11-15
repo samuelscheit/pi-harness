@@ -14,6 +14,7 @@ import {
 	keepPatched,
 	LAUNCH_AGENT,
 	launchAgent,
+	notPatchedMessage,
 	type Patch,
 	PATCHES,
 	patchApp,
@@ -151,6 +152,8 @@ describe("patchBundle", () => {
 		"handoff-ends-turn",
 		"thread-identity-search",
 		"connection-failure-resumable",
+		"background-released",
+		"background-released-contract",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -205,6 +208,10 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('source: Literals([\n\t\t\t"id",\n\t\t\t"title",'));
 		assert.ok(!text.includes("Skips subagent threads."), "the tool no longer says it skips delegated children");
 		// A lost provider connection interrupts the turn instead of failing it.
+		// Work an item releases holds no result.
+		assert.ok(text.includes('awaited: piRecordField(item, "awaited") !== false /* releasedByItem */'));
+		assert.ok(text.includes("\tawaited: optional(Boolean$2),\n\t/** The shell command the work runs, when it is one. */"), "the contract takes false");
+		assert.ok(text.includes("task.awaited ?? backgroundWorkKindHoldsCompletion(task.kind)"));
 		assert.ok(text.includes("const failure = connectionFailure === null ? reportedFailure : null;"));
 		assert.ok(text.includes("}\n\t\t\t\tif (failure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tyield* emit({\n\t\t\t\t\t\ttype: \"turn.terminal\","), "only a real failure fails the turn");
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
@@ -219,11 +226,12 @@ describe("patchBundle", () => {
 	});
 
 	test("a bundle patched before background-items (the fixed task) gets only those, and loses the fixed task", () => {
-		const items = (patch: Patch) => patch.name.startsWith("background-items");
+		// background-released edits background-items' output: it comes with them.
+		const items = (patch: Patch) => patch.name.startsWith("background-items") || patch.name.startsWith("background-released");
 		const before = patchBundle(bundle, PATCHES.filter((patch) => !items(patch)));
 		assert.ok(before.text.includes("PI_BACKGROUND_WORK_TASK"));
 		const { text, applied } = patchBundle(before.text);
-		assert.deepEqual(applied, ["background-items", "background-items-contract", "background-items-caller"]);
+		assert.deepEqual(applied, ["background-items", "background-items-contract", "background-items-caller", "background-released", "background-released-contract"]);
 		assert.equal(text, patchBundle(bundle).text);
 		assert.ok(!text.includes("PI_BACKGROUND_WORK_TASK") && !text.includes("pi-background-work"));
 		assert.deepEqual(patchBundle(text).applied, [], "the earlier patches' markers survive it");
@@ -290,6 +298,7 @@ describe("patchBundle", () => {
 				{ id: "toolu_1", kind: "call", label: "bash: pytest -x", command: "pytest -x", startedAt, processGroup: 42, logPath: "/tmp/j/toolu_1.log", toolCallId: "toolu_1" },
 				{ id: "process-7", kind: "process", label: "process: npm run dev", command: "npm run dev", startedAt, pid: 7, processGroup: 5, toolCallId: "toolu_2" },
 				{ id: "toolu_3", kind: "call", label: "workflow: inline run r1", startedAt, logPath: "/tmp/j/toolu_3.log", url: "http://127.0.0.1:4317/workflows/r1", toolCallId: "toolu_3" },
+				{ id: "toolu_4", kind: "call", label: "bash: cargo miri test", command: "cargo miri test", startedAt, toolCallId: "toolu_4", awaited: false },
 				{ id: "", label: "no id" },
 				null,
 			],
@@ -299,10 +308,12 @@ describe("patchBundle", () => {
 			{ taskId: "toolu_1", kind: "command", description: `bash: pytest -x · started ${clock} · process group 42 · log /tmp/j/toolu_1.log`, command: "pytest -x", itemId: "item:toolu_1", awaited: true },
 			{ taskId: "process-7", kind: "command", description: `process: npm run dev · started ${clock} · pid 7 (group 5)`, command: "npm run dev", itemId: "item:toolu_2", awaited: true },
 			{ taskId: "toolu_3", kind: "background_task", description: `workflow: inline run r1 · started ${clock} · log /tmp/j/toolu_3.log · http://127.0.0.1:4317/workflows/r1`, itemId: "item:toolu_3", awaited: true },
+			{ taskId: "toolu_4", kind: "command", description: `bash: cargo miri test · started ${clock}`, command: "cargo miri test", itemId: "item:toolu_4", awaited: false },
 		]);
 		assert.deepEqual(piBackgroundTasks(undefined, String), []);
 		assert.equal(piSameFlatRecords(tasks, tasks.map((task: object) => ({ ...task }))), true);
 		assert.equal(piSameFlatRecords(tasks, tasks.slice(1)), false);
+		assert.equal(piSameFlatRecords(tasks, tasks.map((task: { awaited: boolean }) => ({ ...task, awaited: true }))), false, "a release is a change");
 		assert.equal(piSameFlatRecords([{ a: 1 }], [{ a: 1, b: 2 }]), false);
 
 		// The forked task's first message, as the patched MCP service writes it.
@@ -574,6 +585,16 @@ describe("patchBundle", () => {
 });
 
 describe("keeping t3 patched", () => {
+	test("a failed run's notification names the App Management fix when macOS refused the write, else the error", () => {
+		const refused = Object.assign(new Error("EPERM: operation not permitted, open '/Applications/T3.app/Contents/Resources/app.asar.rewrite'"), { code: "EPERM" });
+		assert.equal(
+			notPatchedMessage(refused, "/usr/local/bin/node"),
+			"t3 is not patched for the harness: macOS blocked /usr/local/bin/node (App Management). Allow it in System Settings › Privacy & Security › App Management, or run `npm run patch-t3` in a terminal.",
+		);
+		assert.equal(notPatchedMessage(new Error(`t3 changed: ${"x".repeat(300)}`), "node"), `t3 is not patched for the harness: t3 changed: ${"x".repeat(148)}`);
+		assert.equal(notPatchedMessage("odd", "node"), "t3 is not patched for the harness: odd");
+	});
+
 	test("restarts a t3 its update just started, asks one running longer, leaves others alone", () => {
 		assert.equal(afterPatch(["questions"], undefined), "none", "not running: it loads the patches when it starts");
 		assert.equal(afterPatch([], 5), "none", "nothing applied: the running t3 has the patches");
@@ -649,7 +670,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -668,12 +689,12 @@ describe("keeping t3 patched", () => {
 			const archive = join(app, "Contents/Resources/app.asar");
 			mkdirSync(dirname(archive), { recursive: true });
 			// An archive patched before the delegate_task and background-items patches existed: only the adapter chunk is patched.
-			const fork = (patch: Patch) => patch.name.startsWith("delegate-") || patch.name.startsWith("background-items");
+			const fork = (patch: Patch) => patch.name.startsWith("delegate-") || patch.name.startsWith("background-items") || patch.name.startsWith("background-released");
 			const adapterChunk = "apps/server/dist/chunk0.mjs";
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search;/);
+			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 

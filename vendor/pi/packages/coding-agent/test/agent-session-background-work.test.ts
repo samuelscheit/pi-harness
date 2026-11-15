@@ -72,6 +72,7 @@ describe("setBackgroundWork", () => {
 			logPath: "/tmp/dev.log",
 			url: "http://127.0.0.1:4317/workflows/x",
 			toolCallId: "toolu_1",
+			awaited: false,
 		});
 		api!.setBackgroundWork("jobs", [{ ...full, extra: "dropped" } as BackgroundWorkItem]);
 		expect(events(h)[0]).toEqual({ type: "background_work", pending: 1, items: [full] });
@@ -93,6 +94,7 @@ describe("setBackgroundWork", () => {
 		expect(bad([item("a", { pid: 1.5 })])).toThrow(/invalid pid: 1.5/);
 		expect(bad([item("a", { processGroup: 0 })])).toThrow(/invalid processGroup: 0/);
 		expect(bad([item("a", { logPath: "" })])).toThrow(/empty or non-string logPath/);
+		expect(bad([item("a", { awaited: "no" as unknown as boolean })])).toThrow(/non-boolean awaited: "no"/);
 		expect(events(h)).toEqual([]);
 		api!.setBackgroundWork("other", [item("a")]);
 		expect(bad([item("a")])).toThrow(/id "a" is another key's/);

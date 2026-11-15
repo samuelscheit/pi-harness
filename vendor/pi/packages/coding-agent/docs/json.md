@@ -123,7 +123,7 @@ Use `toolCallId` to correlate the lifecycle. `partialResult` is the latest parti
 | `session_info_changed` | `name` | The session display name changed. An absent `name` means it was cleared. |
 | `thinking_level_changed` | `level` | The active thinking level changed. |
 | `cache_warming` | `state`, `nextWarmAt?`, `reason?`, `holdUntil?` | Prompt cache warming changed state. A host keeping sessions loaded can keep this one while a refresh is `scheduled` or `refreshing`. `holdUntil` is set while an extension holds the cache warm (`pi.setCacheWarmingHold`). |
-| `background_work` | `pending`, `items` | The work extensions keep running outside any run changed (`pi.setBackgroundWork`): every item (`id`, `kind`, `label`, `startedAt`, and when known `command`, `pid`, `processGroup`, `logPath`, `url`, `toolCallId`) and their number. A host keeping sessions loaded keeps this one while `pending > 0`. |
+| `background_work` | `pending`, `items` | The work extensions keep running outside any run changed (`pi.setBackgroundWork`): every item (`id`, `kind`, `label`, `startedAt`, and when known `command`, `pid`, `processGroup`, `logPath`, `url`, `toolCallId`, `awaited`) and their number. A host keeping sessions loaded keeps this one while `pending > 0`. |
 
 The `entry` value uses a persisted [session entry type](session-format.md#entry-types).
 

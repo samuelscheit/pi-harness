@@ -1985,6 +1985,7 @@ Report the work your extension keeps running for the session outside any agent r
 | `logPath` | optional | A file with its latest output. |
 | `url` | optional | A page showing it live. |
 | `toolCallId` | optional | The tool call that started it. |
+| `awaited` | optional | Whether the session's result waits for it. `false` when the result is final already (the harness sets it once a delegated agent submitted its result) while the work still runs and wakes the session when it ends; unset, the host decides (t3 waits). |
 
 Malformed items throw `Invalid background work: …`; unknown fields are dropped.
 

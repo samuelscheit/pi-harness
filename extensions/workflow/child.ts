@@ -9,7 +9,9 @@
 //   settle without a submitted result: `agent_before_settle` sends a reminder and continues, at most
 //   MAX_REMINDERS times, then the run fails. Each run needs its own result. The run's final message
 //   ends with the result as JSON (RESULT_HEADING), so it reaches whoever reads the task's result
-//   (t3's summary, the parent's wake message);
+//   (t3's summary, the parent's wake message); a submitted result releases the session's background
+//   jobs (../background/work.ts `releaseWork`), so t3 delivers it without waiting for them, and the
+//   next run (by the parent or the user) holds them again until it submits;
 // - reports its state (session, cost, the run's text, result or error, compactions) to the parent.
 //
 // The workflow extension wires this into every harness session (a t3 delegated child is one), and
@@ -18,6 +20,8 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
+import { sessionJobs } from "../background/jobs.ts";
+import { releaseWork } from "../background/work.ts";
 import { TOOL_GUIDELINES_SECTION, toolGuidelinesSection } from "../prompt/index.ts";
 import { type DelegationSpec, type DelegationState, parseMarker, readSpec, readState, SUBMIT_TOOL, writeState } from "./delegation.ts";
 
@@ -118,6 +122,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 				if (!current) throw new Error("this session is not a delegated agent");
 				current.state = { ...current.state, submitted: true, result: params };
 				save(current);
+				releaseWork(sessionJobs(ctx.sessionManager.getSessionId()), true);
 				return { content: [{ type: "text", text: "Result recorded. Finish with a brief summary." }], details: undefined };
 			},
 		});
@@ -142,6 +147,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			const run = marker?.id === child.spec.id ? marker.run : child.state.run;
 			const { sessionId, cost, compactions, compactionError } = child.state;
 			child.state = { sessionId, cost, run, done: false, ...(compactions ? { compactions } : {}), ...(compactionError ? { compactionError } : {}) };
+			releaseWork(sessionJobs(ctx.sessionManager.getSessionId()), false);
 		} else if (!event.reloaded) {
 			// The session continues on its own (a background job ended): the run is not done yet.
 			child.state = { ...child.state, done: false };

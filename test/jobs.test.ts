@@ -25,6 +25,7 @@ import background from "../extensions/background/index.ts";
 import { JOB_MESSAGE_TYPE, sessionJobs } from "../extensions/background/jobs.ts";
 import { BACKGROUND_WORK_KEY, jobsText, reportWork } from "../extensions/background/work.ts";
 import bashExtension from "../extensions/bash/index.ts";
+import { delegationMessage, delegationsDir, writeSpec } from "../extensions/workflow/delegation.ts";
 import workflow from "../extensions/workflow/index.ts";
 
 const item = (extra: Partial<BackgroundWorkItem>): BackgroundWorkItem => ({ id: "c1", kind: "call", label: "bash: make", startedAt: 0, ...extra });
@@ -272,6 +273,38 @@ describe("every job is an item", () => {
 		);
 		await until("its end", () => latest(x).length === 0 && jobMessages(x.s).length === 1);
 		assert.ok(x.events.every((items) => items.length <= 1), "never the run and its call as two items");
+	});
+});
+
+describe("a delegated child's submitted result releases its jobs", () => {
+	test("its items say awaited: false once it submits; the next run holds them again until it submits; their end still wakes it", async () => {
+		const x = await newSession();
+		const spec = { id: "release-1", schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } };
+		writeSpec(delegationsDir(join(dir, "agent")), spec);
+		faux.setResponses([
+			bash("sleep 2; echo done"),
+			call("submit_result", { n: 1 }),
+			fauxAssistantMessage("Submitted while the job runs."),
+			call("submit_result", { n: 2 }),
+			...Array.from({ length: 20 }, () => fauxAssistantMessage("ok")),
+		]);
+		const awaited = () => x.events.map((items) => items.map((i) => i.awaited));
+		await x.s.prompt(delegationMessage(spec, 1, "Run the checks."));
+		assert.deepEqual(awaited(), [[undefined], [false]], "held while it ran, released by the result");
+		assert.equal(latest(x)[0]!.command, "sleep 2; echo done", "the same job, released");
+		await x.s.prompt(delegationMessage(spec, 2, "Again."));
+		assert.deepEqual(awaited(), [[undefined], [false], [undefined], [false]], "the next run holds it until its own result");
+		await until("the job's end wakes the child", () => jobMessages(x.s).length === 1 && latest(x).length === 0 && !x.s.isStreaming);
+		assert.deepEqual(awaited().at(-1), []);
+		assert.equal(sessionJobs(x.s.sessionManager.getSessionId()).released, true, "a wake run keeps the run's result");
+	});
+
+	test("a session that is no delegated child never releases its jobs", async () => {
+		const x = await newSession();
+		model(bash("sleep 0.8; echo done"));
+		await x.s.prompt("go");
+		await until("its end", () => jobMessages(x.s).length === 1 && latest(x).length === 0);
+		assert.ok(x.events.flat().every((i) => i.awaited === undefined));
 	});
 });
 

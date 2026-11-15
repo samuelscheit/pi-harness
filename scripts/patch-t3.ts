@@ -98,6 +98,14 @@
 //   second agent in the same worktree (2026-11-12). A turn ending on a transport failure (timeouts,
 //   connection and socket errors, gateway 502/504/52x; not a client, auth, quota or context error) is
 //   now interrupted with the cause as its reason, its error shown as a retryable `transport_error`.
+// - background-released, background-released-contract (mirror t3code's branch pi-dialogs-outlive-turns,
+//   "feat(orchestrator): background work marked `awaited: false` holds no result"): every Pi job held a
+//   delegated child's result until it ended, so a child that submitted its result and left a 3-hour
+//   Miri run going never reached its parent (2026-11-15). The harness marks a child's jobs
+//   `awaited: false` once it submitted its run's result; the adapter takes the flag (default still
+//   awaited), the contract's `awaited` is a boolean, and `backgroundWorkHoldsCompletion` lets an
+//   explicit `false` hold nothing, whatever the kind. The jobs still wake the child; a delivered
+//   result is not delivered again.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -878,6 +886,36 @@ export const PATCHES: Patch[] = [
 			],
 		],
 	},
+	{
+		name: "background-released",
+		// Within background-items' output.
+		marker: "releasedByItem",
+		edits: [["\t\t\tawaited: true\n\t\t}];", '\t\t\tawaited: piRecordField(item, "awaited") !== false /* releasedByItem */\n\t\t}];']],
+	},
+	{
+		name: "background-released-contract",
+		file: "const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+		marker: "releasedWorkHoldsNothing",
+		edits: [
+			[
+				// Within background-items-contract's output.
+				"\t/**\n\t* The agent declared it resumes when this work ends, so the thread holds like it does for a\n\t* subagent. Only the agent knows whether a command is a wait or a dev server it left running.\n\t*/\n\tawaited: optional(Literal(true)),\n\t/** The shell command the work runs, when it is one. */",
+				[
+					"\t/**",
+					"\t* Whether the agent's result waits for this work: `true` holds the thread like a subagent,",
+					"\t* `false` holds nothing whatever the kind (a child submitted its result while its jobs run),",
+					"\t* absent lets the kind decide. Only the agent knows whether a command is a wait.",
+					"\t*/",
+					"\tawaited: optional(Boolean$2),",
+					"\t/** The shell command the work runs, when it is one. */",
+				].join("\n"),
+			],
+			[
+				"return tasks.some((task) => task.awaited === true || backgroundWorkKindHoldsCompletion(task.kind));",
+				"return tasks.some((task) => task.awaited ?? backgroundWorkKindHoldsCompletion(task.kind)) /* releasedWorkHoldsNothing */;",
+			],
+		],
+	},
 ];
 
 /** Identifies the bundled Pi adapter, patched or not. */
@@ -1017,8 +1055,7 @@ export async function keepPatched(app: string): Promise<string> {
 	try {
 		result = patchApp(app);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		notify(`t3 is not patched for the harness: ${message.slice(0, 160)}`);
+		notify(notPatchedMessage(error, process.execPath));
 		throw error;
 	}
 	switch (afterPatch(result.applied, startedAgoS(executable(app)))) {
@@ -1032,6 +1069,19 @@ export async function keepPatched(app: string): Promise<string> {
 	}
 	notify(`t3 was patched for the harness (${result.applied.join(", ")}). Restart t3 to apply.`);
 	return `${result.message}; asked to restart t3`;
+}
+
+/**
+ * The notification for a failed patch run. macOS's App Management permission refuses writes into
+ * another app's bundle with EPERM to a process launchd started (2026-11-15: the LaunchAgent never
+ * wrote a patch; runs inside t3 or a terminal inherit their app's permission), so that one names the fix.
+ */
+export function notPatchedMessage(error: unknown, node: string): string {
+	if ((error as NodeJS.ErrnoException | undefined)?.code === "EPERM") {
+		return `t3 is not patched for the harness: macOS blocked ${node} (App Management). Allow it in System Settings › Privacy & Security › App Management, or run \`npm run patch-t3\` in a terminal.`;
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return `t3 is not patched for the harness: ${message.slice(0, 160)}`;
 }
 
 export const LAUNCH_AGENT = "com.pi-harness.patch-t3";

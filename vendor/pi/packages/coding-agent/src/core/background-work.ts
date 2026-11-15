@@ -34,6 +34,11 @@ export function validBackgroundWork(items: readonly BackgroundWorkItem[]): Backg
 			if (!Number.isInteger(value) || value <= 0) throw problem(`has an invalid ${key}: ${value}`);
 			copy[key] = value;
 		}
+		if (item.awaited !== undefined) {
+			if (typeof item.awaited !== "boolean")
+				throw problem(`has a non-boolean awaited: ${JSON.stringify(item.awaited)}`);
+			copy.awaited = item.awaited;
+		}
 		return copy;
 	});
 }

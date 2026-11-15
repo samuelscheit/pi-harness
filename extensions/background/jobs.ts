@@ -61,6 +61,11 @@ export interface SessionJobs {
 	poll: NodeJS.Timeout | undefined;
 	/** The API of the extension instance loaded last: the one a job's end reports through (none during a reload). */
 	api: ExtensionAPI | undefined;
+	/**
+	 * The session's result does not wait for its jobs: a delegated child submitted its run's result
+	 * (../workflow/child.ts), so t3 delivers it while they run on. Their ends still wake the session.
+	 */
+	released: boolean;
 }
 
 /** The process group a call of one tool runs in, if any. */
@@ -74,7 +79,7 @@ const state = globalThis as { __harnessJobs?: Map<string, SessionJobs>; __harnes
  */
 export function sessionJobs(sessionId: string): SessionJobs {
 	const all = (state.__harnessJobs ??= new Map());
-	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), named: new Map(), runs: new Map(), poll: undefined, api: undefined };
+	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), named: new Map(), runs: new Map(), poll: undefined, api: undefined, released: false };
 	const jobs = all.get(sessionId);
 	if (!jobs) {
 		all.set(sessionId, fresh);
