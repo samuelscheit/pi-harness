@@ -1,5 +1,5 @@
 // The commands a bash command line runs, for the refusals before it runs (detach.ts, git.ts,
-// commit.ts).
+// commit.ts, gate.ts).
 //
 // The command is parsed with unbash (a Bash 5.3 parser; pi-lens installs it), so a command name in
 // quoted text, a comment or a heredoc body does not count, while one behind wrappers (`nohup`,
@@ -27,7 +27,7 @@ const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 
 /** The commands a simple command runs: its name, then the command each wrapper runs, with their arguments. */
-function unwrap(command: Command, text: string): RunCommand[] {
+export function unwrap(command: Command, text: string): RunCommand[] {
 	const words = [command.name, ...command.args].flatMap((word) => (word?.type === "Word" ? [word.value] : []));
 	const env: Record<string, string> = {};
 	for (const part of command.prefix) if (part.type === "Assignment") env[part.name] = part.value?.type === "Word" ? part.value.value : "";
@@ -48,7 +48,7 @@ function unwrap(command: Command, text: string): RunCommand[] {
 }
 
 /** The script a command runs as shell code, when it is literal text: `bash -c '…'` (also `-lc`, `-ec`), `eval …`. */
-function scriptOf({ name, args }: RunCommand): string | undefined {
+export function scriptOf({ name, args }: RunCommand): string | undefined {
 	if (name === "eval") return args.join(" ");
 	if (!SHELLS.has(name)) return undefined;
 	const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg));

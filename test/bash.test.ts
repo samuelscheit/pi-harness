@@ -375,6 +375,23 @@ describe("setsid", () => {
 	});
 });
 
+describe("a publish gated on a filtered pipeline", () => {
+	test("is refused before anything of the command runs; with pipefail it runs and the failure holds the push", async () => {
+		const s = await newSession();
+		const ran = marker();
+		respond(
+			bash(`touch '${ran}'; sh -c 'echo "1 fail"; exit 1' | grep -E " pass$| fail$" && git push`),
+			bash(`set -o pipefail; sh -c 'echo "1 fail"; exit 1' | grep -E " fail$" && git push || echo held`),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("test and push");
+		const texts = toolTexts(s);
+		assert.ok(!existsSync(ran), "nothing of the refused command ran");
+		assert.match(texts[0]!, /^Not run: this command runs `git push` only if a pipeline ending in a filter succeeds:\n- `sh -c 'echo "1 fail"; exit 1' \| grep -E " pass\$\| fail\$"`\nGated: `git push`\./);
+		assert.equal(texts[1], "1 fail\nheld\n");
+	});
+});
+
 describe("shared checkouts", () => {
 	const repoGit = (...args: string[]) =>
 		execFileSync("git", ["-C", join(dir, "repo"), ...args], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
