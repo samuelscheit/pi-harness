@@ -12,10 +12,11 @@
 //   failed/<commit>.txt  why a commit was not deployed, so it is tried once
 //   .lock/               held while deploying (several Pi processes watch the same repository); holds
 //                        the holder's pid, and the holder touches it every few seconds
-//   in-use/<pid>         the release a running Pi process loaded and the Pi build it runs, one per line
-//                        (extensions/release writes it on every load): pruning never removes a release
-//                        or a Pi build a live process holds, so a process that has not reloaded (or
-//                        cannot: another Pi) keeps its files
+//   in-use/<pid>         what a running Pi process holds, one per line: the release it loaded last, the
+//                        Pi build it runs, then the other releases its sessions still run
+//                        (extensions/release writes it on every load and session end): pruning never
+//                        removes a release or a Pi build a live process holds, so a process that has
+//                        not reloaded (or cannot: another Pi) keeps its files
 //   pi-builds/<tree>/, pi, pi-build   the global Pi, built per `vendor/pi` tree (pi-build.ts)
 //
 // A release is deployed only if every extension entry point imports in a fresh Node process: a
@@ -24,7 +25,8 @@
 // built first (unless built already), and the check resolves Pi's packages from that build. Once it
 // passes, the global Pi and `current` switch: a Pi process started later loads the release on the
 // matching Pi. A running process keeps the Pi it started with; extensions/release reloads it only
-// into releases built for that Pi.
+// into releases built for that Pi, and deploys (so prunes) only while it runs the deployed release:
+// older code may misread the holds newer releases write.
 
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -67,12 +69,18 @@ export async function piTree(source: string, commit: string): Promise<string | u
 }
 
 /**
- * Record that process `pid` runs release `commit` on the Pi build `pi` (undefined: not a build, e.g.
- * a checkout), so pruning keeps both while the process lives.
+ * Record that process `pid` runs `releases` (the one it loaded last first) on the Pi build `pi`
+ * (undefined: not a build, e.g. a checkout), so pruning keeps them while the process lives. The
+ * last loaded release and the Pi come first because processes that cannot reload run releases
+ * whose pruning reads only those two lines. Written whole (a rename): a reader never sees a part.
  */
-export function holdRelease(agentDir: string, commit: string, pi: string | undefined, pid = process.pid): void {
+export function holdRelease(agentDir: string, releases: readonly [string, ...string[]], pi: string | undefined, pid = process.pid): void {
+	const [last, ...others] = releases;
 	mkdirSync(inUseDir(agentDir), { recursive: true });
-	writeFileSync(join(inUseDir(agentDir), String(pid)), `${commit}\n${pi ?? ""}\n`);
+	// Outside in-use/: pruning removes names there that are no pid.
+	const temporary = join(harnessDir(agentDir), `.in-use.${pid}.${process.hrtime.bigint()}`);
+	writeFileSync(temporary, [last, pi ?? "", ...others.filter((commit) => commit !== last)].map((line) => `${line}\n`).join(""));
+	renameSync(temporary, join(inUseDir(agentDir), String(pid)));
 }
 
 /** The releases and Pi builds live processes hold; the holds of processes that exited are removed. */
@@ -86,8 +94,8 @@ export function holds(agentDir: string): { releases: Set<string>; pis: Set<strin
 			rmSync(file, { force: true });
 			continue;
 		}
-		const [release, pi] = readFileSync(file, "utf8").split("\n").map((line) => line.trim());
-		if (release) held.releases.add(release);
+		const [last, pi, ...others] = readFileSync(file, "utf8").split("\n").map((line) => line.trim());
+		for (const release of [last, ...others]) if (release) held.releases.add(release);
 		if (pi) held.pis.add(pi);
 	}
 	return held;

@@ -2,6 +2,12 @@
 // Real bash calls using it are in bash.test.ts.
 
 import assert from "node:assert/strict";
+import { execFile, execFileSync } from "node:child_process";
+import { copyFileSync, cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, test } from "node:test";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -177,12 +183,52 @@ describe("tool commands left running", () => {
 	});
 
 	test("a client is recognised in ps output before and after the wrapper's exec; other processes are not", () => {
-		const client = new URL("../extensions/bash/cli.mjs", import.meta.url).pathname;
-		assert.equal(clientCommand(`${process.execPath} ${client} slow --ms 5`), "tool slow --ms 5");
-		assert.equal(clientCommand(`${process.execPath} ${client}`), "tool");
+		assert.equal(clientCommand(`${process.execPath} /tmp/bin/tool.mjs slow --ms 5`, "/tmp/bin"), "tool slow --ms 5");
+		assert.equal(clientCommand(`${process.execPath} /tmp/bin/tool.mjs`, "/tmp/bin"), "tool");
 		assert.equal(clientCommand("/bin/sh /tmp/bin/tool read x", "/tmp/bin"), "tool read x");
-		assert.equal(clientCommand(`${process.execPath} ${client}x`), undefined);
+		assert.equal(clientCommand(`${process.execPath} /tmp/bin/tool.mjsx`, "/tmp/bin"), undefined);
+		assert.equal(clientCommand(`${process.execPath} /tmp/other/tool.mjs read x`, "/tmp/bin"), undefined, "another process's client");
 		assert.equal(clientCommand("sleep 30", "/tmp/bin"), undefined);
+		assert.equal(clientCommand("/bin/sh /tmp/bin/tool read x", undefined), undefined, "no bridge in this process");
+	});
+
+	test("the tool command outlives the release that wrote it: pruning it during a call and before the next breaks nothing", async () => {
+		// A release: a copy of the extensions, as deploy() extracts them, with the repository's packages.
+		const repo = new URL("..", import.meta.url).pathname;
+		const release = mkdtempSync(join(tmpdir(), "bridge-release-"));
+		cpSync(join(repo, "extensions"), join(release, "extensions"), { recursive: true });
+		copyFileSync(join(repo, "package.json"), join(release, "package.json"));
+		symlinkSync(join(repo, "node_modules"), join(release, "node_modules"));
+		// A Pi process loads it: its bash extension writes the process's `tool` command.
+		const loader = `import { toolBinDir } from ${JSON.stringify(join(release, "extensions", "bash", "bridge.ts"))}; process.stdout.write(toolBinDir());`;
+		const binDir = execFileSync(process.execPath, ["--input-type=module", "-e", loader], { encoding: "utf8" });
+		const socket = join(binDir, "test.sock");
+		const requests: string[][] = [];
+		const server = createServer((connection) => {
+			let line = "";
+			connection.on("data", (chunk) => {
+				line += chunk.toString("utf8");
+				if (!line.includes("\n")) return;
+				requests.push((JSON.parse(line) as { argv: string[] }).argv);
+				// A deploy prunes the release while the call runs.
+				rmSync(release, { recursive: true, force: true });
+				connection.end(JSON.stringify({ stdout: `ran ${requests.length}\n`, stderr: "", code: 0 }));
+			});
+		});
+		await new Promise<void>((listening) => server.listen(socket, listening));
+		const run = (...argv: string[]) => promisify(execFile)(join(binDir, "tool"), argv, { env: { PATH: process.env.PATH, PI_TOOL_SOCKET: socket } });
+		try {
+			assert.equal((await run("edit", "--path", "a.txt")).stdout, "ran 1\n", "the call that was running when its release went away");
+			assert.equal(existsSync(release), false);
+			assert.equal((await run("read", "x")).stdout, "ran 2\n", "a call after the release went away");
+			assert.deepEqual(requests, [["edit", "--path", "a.txt"], ["read", "x"]]);
+			assert.equal(readFileSync(join(binDir, "tool.mjs"), "utf8"), readFileSync(join(repo, "extensions", "bash", "cli.mjs"), "utf8"), "the client is a copy");
+			assert.doesNotMatch(readFileSync(join(binDir, "tool"), "utf8"), new RegExp(release), "the wrapper names no release file");
+		} finally {
+			server.close();
+			rmSync(release, { recursive: true, force: true });
+			rmSync(binDir, { recursive: true, force: true });
+		}
 	});
 
 	test("the end message names the command, its pid and the bash command, then the exit code and output; or that it was killed", () => {

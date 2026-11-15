@@ -23,11 +23,10 @@
 // report it again. Calls that end while the leftovers are being adopted wait for that, so each
 // call is either answered within the bash call or reported as a job, never lost between the two.
 
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
@@ -301,18 +300,26 @@ export async function runToolCommand(
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 
 const state = globalThis as { __harnessToolBin?: string; __harnessToolSockets?: number };
-const CLIENT = fileURLToPath(new URL("./cli.mjs", import.meta.url));
+/** The client's file in a `tool` directory. */
+const clientIn = (binDir: string) => join(binDir, `${TOOL_COMMAND}.mjs`);
 
 /**
- * The directory holding the `tool` command, per process. Rewritten on each load, so it runs the
- * client of the release loaded last (an atomic rename: a script calling it meanwhile sees a whole file).
+ * The directory holding the `tool` command, per process: a wrapper and a copy of the client, so
+ * the command never depends on a release's files, which pruning removes once no session runs it
+ * (the process, its scripts and its background `tool` clients outlive the release they started on).
+ * Rewritten on each load with the client of the release loaded last; each file by an atomic rename,
+ * so a script calling it meanwhile sees whole files.
  */
 export function toolBinDir(): string {
 	const dir = (state.__harnessToolBin ??= join(tmpdir(), "pi-harness-tool", String(process.pid)));
 	mkdirSync(dir, { recursive: true });
-	const temp = join(dir, `.${TOOL_COMMAND}.${process.hrtime.bigint()}`);
-	writeFileSync(temp, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(CLIENT)} "$@"\n`, { mode: 0o755 });
-	renameSync(temp, join(dir, TOOL_COMMAND));
+	const install = (path: string, content: string | Buffer, mode: number) => {
+		const temp = join(dir, `.${TOOL_COMMAND}.${process.hrtime.bigint()}`);
+		writeFileSync(temp, content, { mode });
+		renameSync(temp, path);
+	};
+	install(clientIn(dir), readFileSync(new URL("./cli.mjs", import.meta.url)), 0o644);
+	install(join(dir, TOOL_COMMAND), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(clientIn(dir))} "$@"\n`, 0o755);
 	return dir;
 }
 
@@ -326,7 +333,8 @@ export const toolLabel = (argv: readonly string[]) => [TOOL_COMMAND, ...argv.map
 
 /** `tool …` for the `ps` command line of a `tool` client (before or after the wrapper's `exec`); undefined for another process. */
 export function clientCommand(command: string, binDir = state.__harnessToolBin): string | undefined {
-	const prefixes = [`${process.execPath} ${CLIENT}`, ...(binDir === undefined ? [] : [`/bin/sh ${join(binDir, TOOL_COMMAND)}`])];
+	if (binDir === undefined) return undefined;
+	const prefixes = [`${process.execPath} ${clientIn(binDir)}`, `/bin/sh ${join(binDir, TOOL_COMMAND)}`];
 	for (const prefix of prefixes) if (command === prefix || command.startsWith(`${prefix} `)) return TOOL_COMMAND + command.slice(prefix.length);
 	return undefined;
 }

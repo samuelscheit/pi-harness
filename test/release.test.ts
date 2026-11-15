@@ -212,11 +212,11 @@ describe("deploy", () => {
 	test("a release a live process holds is never pruned; holds of exited processes are dropped", async () => {
 		const validate = async () => {};
 		const first = (await deployMain(validate)).commit;
-		holdRelease(agentDir, first, undefined, process.ppid);
+		holdRelease(agentDir, [first], undefined, process.ppid);
 		writeFileSync(join(source, "lib", "value.ts"), "export const value = 'second';\n");
 		const second = commit("second");
 		await deployMain(validate);
-		holdRelease(agentDir, second, undefined, deadPid());
+		holdRelease(agentDir, [second], undefined, deadPid());
 		for (let i = 0; i < 7; i++) {
 			writeFileSync(join(source, "lib", "value.ts"), `export const value = ${i};\n`);
 			commit(`c${i}`);
@@ -229,11 +229,90 @@ describe("deploy", () => {
 		assert.deepEqual([...holds(agentDir).releases], [first]);
 		assert.deepEqual(readdirSync(join(harnessDir(agentDir), "in-use")), [String(process.ppid)], "the dead holder's file is gone");
 		// The holder reloads into the current release: the old one becomes prunable.
-		holdRelease(agentDir, currentRelease(agentDir)!.commit, undefined, process.ppid);
+		holdRelease(agentDir, [currentRelease(agentDir)!.commit], undefined, process.ppid);
 		writeFileSync(join(source, "lib", "value.ts"), "export const value = 'last';\n");
 		commit("last");
 		await deployMain(validate);
 		assert.ok(!readdirSync(join(harnessDir(agentDir), "releases")).includes(first));
+	});
+
+	test("a hold names the release loaded last, the Pi, then the others; every release in it is held, also in a one-line hold", () => {
+		const [a, b, c, d] = ["a", "b", "c", "d"].map((x) => x.repeat(40));
+		holdRelease(agentDir, [a!, b!, a!, c!], "pi-tree", process.ppid);
+		const file = join(harnessDir(agentDir), "in-use", String(process.ppid));
+		assert.equal(readFileSync(file, "utf8"), `${a}\npi-tree\n${b}\n${c}\n`, "releases before Pi holds read the first two lines as release and Pi");
+		// A process on a release from before holds named their Pi: one line.
+		writeFileSync(join(harnessDir(agentDir), "in-use", String(process.pid)), d!);
+		assert.deepEqual(holds(agentDir), { releases: new Set([a, b, c, d]), pis: new Set(["pi-tree"]) });
+		holdRelease(agentDir, [b!], undefined, process.ppid);
+		assert.equal(readFileSync(file, "utf8"), `${b}\n\n`, "rewritten whole");
+		assert.deepEqual(readdirSync(harnessDir(agentDir)).filter((name) => name.startsWith(".in-use")), [], "no temporary file left");
+		assert.deepEqual(readdirSync(join(harnessDir(agentDir), "in-use")).sort(), [String(process.pid), String(process.ppid)].sort());
+	});
+});
+
+describe("holds of running sessions", () => {
+	type Handler = (event: unknown, ctx: unknown) => unknown;
+	const validate = async () => {};
+	const released = () => readdirSync(join(harnessDir(agentDir), "releases"));
+	const held = () => readFileSync(join(harnessDir(agentDir), "in-use", String(process.pid)), "utf8").split("\n").filter(Boolean);
+	/** A new commit, deployed. */
+	const next = async (label: string) => {
+		writeFileSync(join(source, "lib", "value.ts"), `export const value = ${JSON.stringify(label)};\n`);
+		commit(label);
+		return (await deployMain(validate)).commit;
+	};
+	/** A session of this process loading the release extension on `loaded` (not started: no polling). */
+	function load(loaded: string) {
+		const handlers = new Map<string, Handler>();
+		release({ on: (name: string, handler: Handler) => handlers.set(name, handler), requestReload: () => {} } as never, {
+			agentDir,
+			release: { commit: loaded, source, branch: "main", subject: "s", deployedAt: "" },
+			pi: builtPi(agentDir),
+		});
+		return { end: () => handlers.get("session_shutdown")!({ reason: "reload" }, {}) };
+	}
+	afterEach(() => {
+		delete (globalThis as { __harnessRelease?: unknown }).__harnessRelease;
+	});
+
+	test("a reload into a new release holds it and frees the old one, but not before the new one loaded", async () => {
+		const first = (await deployMain(validate)).commit;
+		const old = load(first);
+		const second = await next("second");
+		old.end();
+		assert.deepEqual(held(), [first, builtPi(agentDir)], "between the session's end and its reload, the release it ran stays held");
+		load(second);
+		assert.deepEqual(held(), [second, builtPi(agentDir)]);
+		for (let i = 0; i < 6; i++) await next(`c${i}`);
+		assert.ok(!released().includes(first), "the old release is pruned like any other");
+		assert.ok(released().includes(second), "the reloaded one is held although older than the five newest");
+	});
+
+	test("two sessions of one process on different releases hold both until each ends", async () => {
+		const first = (await deployMain(validate)).commit;
+		const parent = load(first);
+		const second = await next("second");
+		const child = load(second);
+		assert.deepEqual(held(), [second, builtPi(agentDir), first]);
+		for (let i = 0; i < 6; i++) await next(`c${i}`);
+		assert.ok(released().includes(first) && released().includes(second), "both kept while their sessions run");
+		parent.end();
+		assert.deepEqual(held(), [second, builtPi(agentDir)]);
+		await next("after parent");
+		assert.ok(!released().includes(first), "the parent's release goes once it ended");
+		child.end();
+		await next("after child");
+		assert.ok(released().includes(second), "the release loaded last stays held while the process lives: its `tool` command's bridge");
+	});
+
+	test("a dead process's hold holds nothing, however many releases it names", async () => {
+		const first = (await deployMain(validate)).commit;
+		const second = await next("second");
+		holdRelease(agentDir, [second, first], builtPi(agentDir), deadPid());
+		for (let i = 0; i < 6; i++) await next(`c${i}`);
+		assert.ok(!released().includes(first) && !released().includes(second));
+		assert.deepEqual(readdirSync(join(harnessDir(agentDir), "in-use")), [], "its file is gone");
 	});
 });
 
@@ -337,9 +416,9 @@ describe("the global Pi build", () => {
 			const { commit: deployed } = await deployMain(validate);
 			trees.push((await piTree(source, deployed))!);
 			// A process started on pi 1 runs it still; one started on pi 2 exited; one runs pi 3 under a release pruned meanwhile.
-			if (i === 1) holdRelease(agentDir, deployed, trees[0], process.ppid);
-			if (i === 2) holdRelease(agentDir, deployed, trees[1], deadPid());
-			if (i === 3) holdRelease(agentDir, "f".repeat(40), trees[2], process.pid);
+			if (i === 1) holdRelease(agentDir, [deployed], trees[0], process.ppid);
+			if (i === 2) holdRelease(agentDir, [deployed], trees[1], deadPid());
+			if (i === 3) holdRelease(agentDir, ["f".repeat(40)], trees[2], process.pid);
 		}
 		const kept = new Set(readdirSync(builds()));
 		// Releases kept: current (9), the five newest others (4-8) and the held one (1).
@@ -555,16 +634,42 @@ describe("release extension", () => {
 		writeFileSync(join(source, "vendor", "pi", "core.txt"), "pi 2\n");
 		const newPi = commit("new pi");
 		await until(() => session.notes.length > 0);
-		// Later releases need the new Pi too: still no reload, and no repeated notice.
+		assert.equal(currentRelease(agentDir)!.commit, newPi);
+		// Later releases need the new Pi too: still no reload, and no repeated notice. Nor does this
+		// process deploy them: it runs older code than the deployed release, whose pruning may misread holds.
 		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "three";\n');
 		const later = commit("harness on new pi");
-		await until(() => currentRelease(agentDir)!.commit === later);
+		await new Promise((wait) => setTimeout(wait, 300));
+		assert.equal(currentRelease(agentDir)!.commit, newPi, "left to a process on the deployed release");
+		assert.equal((await deployMain()).status, "deployed");
+		assert.equal(currentRelease(agentDir)!.commit, later);
+		for (let i = 0; i < 6; i++) {
+			writeFileSync(join(source, "lib", "value.ts"), `export const value = ${i};\n`);
+			commit(`c${i}`);
+			await deployMain();
+		}
 		await new Promise((wait) => setTimeout(wait, 100));
 		session.stop();
 		assert.equal(session.reloads.requested, 0);
+		assert.ok(readdirSync(join(harnessDir(agentDir), "releases")).includes(first), "the release it cannot leave stays held");
 		assert.deepEqual(session.notes, [
 			[`Harness ${newPi.slice(0, 9)} needs another Pi build than this process runs (vendor/pi changed); this session keeps ${first.slice(0, 9)}. Restart Pi to run it.`, "warning"],
 		]);
+	});
+
+	test("a session on an older release only follows: it reloads but deploys nothing", async () => {
+		const first = (await deployMain()).commit;
+		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "two";\n');
+		const second = commit("second");
+		await deployMain();
+		const session = load(first);
+		writeFileSync(join(source, "lib", "value.ts"), 'export const value = "three";\n');
+		commit("third");
+		await session.start();
+		await until(() => session.reloads.requested > 0);
+		await new Promise((wait) => setTimeout(wait, 200));
+		session.stop();
+		assert.equal(currentRelease(agentDir)!.commit, second, "the new commit waits for a session on the deployed release");
 	});
 
 	test("a process started on the rebuilt Pi reloads into later releases on that Pi", async () => {
