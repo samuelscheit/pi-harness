@@ -91,6 +91,8 @@ Use `inputLimits.images.resize` to control how Pi encodes new image attachments,
       "resize": {
         "maxWidth": 1568,
         "maxHeight": 1568,
+        "patchSize": 28,
+        "maxPatches": 1568,
         "maxBytes": 524288,
         "jpegQuality": 75
       }
@@ -99,7 +101,7 @@ Use `inputLimits.images.resize` to control how Pi encodes new image attachments,
 }
 ```
 
-`maxBytes` limits the base64-encoded payload. Omitted resize fields use conservative defaults of 2000 by 2000 pixels, 4.5 MiB encoded, and JPEG quality 80. Images are encoded once; changing models does not rewrite historical images. The catalog can also describe hard request limits with `inputLimits.maxRequestBytes`, `images.maxPerMessage`, and `images.maxPerRequest`, but Pi does not yet rewrite or reject history based on them. The `read` tool's `tiles: true` uses them: it sends at most 16 tiles per read (fewer when `maxPerMessage` or `maxPerRequest` is lower), each at most `maxWidth` by `maxHeight`, and keeps all tiles of one read within half of `maxRequestBytes` (32 MiB when unset).
+Images are sent at the largest size with their aspect ratio that the model reads without downscaling it again: within `maxWidth` by `maxHeight` and, when `patchSize` and `maxPatches` are set, with at most `maxPatches` patches of `patchSize` pixels (`ceil(width / patchSize) * ceil(height / patchSize)`), the visual-token cap of models such as Claude. The built-in catalog sets these from each Claude model's resolution tier (2576 px and 4784 patches of 28 px for Claude 4.7 and later, 1568 px and 1568 patches for older models). `maxBytes` limits the base64-encoded payload. A lossless source (PNG, GIF, WebP, converted formats) is sent as PNG whenever that fits `maxBytes`; otherwise as JPEG at `jpegQuality` (then lower), at the same size, with a note telling the model; a JPEG source stays JPEG. Omitted resize fields use conservative defaults of 2000 by 2000 pixels, no patch cap, 4.5 MiB encoded, and JPEG quality 80. Images are encoded once; changing models does not rewrite historical images. The catalog can also describe hard request limits with `inputLimits.maxRequestBytes`, `images.maxPerMessage`, and `images.maxPerRequest`, but Pi does not yet rewrite or reject history based on them. The `read` tool's `tiles: true` uses them: it sends at most 16 tiles per read (fewer when `maxPerMessage` or `maxPerRequest` is lower), each at most `maxWidth` by `maxHeight` and within the patch cap so it is read at native resolution, and keeps all tiles of one read within half of `maxRequestBytes` (32 MiB when unset).
 
 <a id="prompt-cache-lifetimes"></a>
 

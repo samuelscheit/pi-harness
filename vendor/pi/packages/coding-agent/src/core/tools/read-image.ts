@@ -87,9 +87,10 @@ export async function readImageContent(
 		];
 		images.forEach((image, index) => {
 			const downscaled = image.wasResized ? ` (downscaled to ${image.width}x${image.height})` : "";
+			const jpeg = image.jpegFallbackQuality !== undefined ? ` (JPEG quality ${image.jpegFallbackQuality})` : "";
 			content.push({
 				type: "text",
-				text: `Tile ${index + 1}/${images.length}: ${formatBox(image.box)}${downscaled}`,
+				text: `Tile ${index + 1}/${images.length}: ${formatBox(image.box)}${downscaled}${jpeg}`,
 			});
 			content.push(imageBlock(image));
 		});

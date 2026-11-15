@@ -475,6 +475,16 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 100
+                },
+                "patchSize": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Edge of the square pixel patch the provider bills as one visual token; used with maxPatches."
+                },
+                "maxPatches": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Most patches per image: ceil(width / patchSize) * ceil(height / patchSize) must not exceed it, or the provider downscales the image."
                 }
               },
               "description": "Cache-safe resize profile applied before a new image enters conversation history."

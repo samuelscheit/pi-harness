@@ -51,6 +51,20 @@ const DEFAULT_IMAGE_RESIZE = {
 	maxBytes: 4.5 * 1024 * 1024,
 	jpegQuality: 80,
 };
+const CLAUDE_STANDARD_RESIZE = {
+	...DEFAULT_IMAGE_RESIZE,
+	maxWidth: 1568,
+	maxHeight: 1568,
+	patchSize: 28,
+	maxPatches: 1568,
+};
+const CLAUDE_HIGH_RES_RESIZE = {
+	...DEFAULT_IMAGE_RESIZE,
+	maxWidth: 2576,
+	maxHeight: 2576,
+	patchSize: 28,
+	maxPatches: 4784,
+};
 
 describe("builtin providers", () => {
 	it("builtinModels registers every builtin provider with models", async () => {
@@ -102,14 +116,47 @@ describe("builtin providers", () => {
 		expect(getBuiltinModel("anthropic", "claude-haiku-4-5").compat?.supportsStrictTools).toBe(true);
 	});
 
-	it("keeps the conservative resize profile on every vision model", () => {
+	it("gives Claude vision models their API resolution tier and every other vision model the conservative profile", () => {
 		const visionModels = getBuiltinProviders()
 			.flatMap((provider) => getBuiltinModels(provider))
 			.filter((model) => model.input.includes("image"));
 		expect(visionModels.length).toBeGreaterThan(0);
 		for (const model of visionModels) {
-			expect(model.inputLimits?.images?.resize).toEqual(DEFAULT_IMAGE_RESIZE);
+			const resize = model.inputLimits?.images?.resize;
+			if (!/claude-/i.test(model.id)) {
+				expect(resize, model.id).toEqual(DEFAULT_IMAGE_RESIZE);
+				continue;
+			}
+			expect([CLAUDE_STANDARD_RESIZE, CLAUDE_HIGH_RES_RESIZE], `${model.provider}:${model.id}`).toContainEqual(
+				resize,
+			);
 		}
+	});
+
+	it("uses Claude's high-resolution image tier for Claude 4.7 and later on every host", () => {
+		// https://platform.claude.com/docs/en/build-with-claude/vision#resolution-and-token-cost
+		for (const id of [
+			"claude-opus-4-7",
+			"claude-opus-5-5",
+			"claude-sonnet-5",
+			"claude-haiku-5-5",
+			"claude-fable-5",
+		]) {
+			expect(getBuiltinModel("anthropic", id as never).inputLimits?.images?.resize, id).toEqual(
+				CLAUDE_HIGH_RES_RESIZE,
+			);
+		}
+		for (const id of ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-sonnet-4-5-20250929"]) {
+			expect(getBuiltinModel("anthropic", id as never).inputLimits?.images?.resize, id).toEqual(
+				CLAUDE_STANDARD_RESIZE,
+			);
+		}
+		expect(
+			getBuiltinModel("amazon-bedrock", "anthropic.claude-haiku-4-5-20251001-v1:0").inputLimits?.images?.resize,
+		).toEqual(CLAUDE_STANDARD_RESIZE);
+		expect(
+			getBuiltinModel("amazon-bedrock", "anthropic.claude-opus-4-7" as never).inputLimits?.images?.resize,
+		).toEqual(CLAUDE_HIGH_RES_RESIZE);
 	});
 
 	it("records known direct-provider image request limits", () => {
@@ -132,8 +179,12 @@ describe("builtin providers", () => {
 	});
 
 	it("does not infer image limits from gateway API compatibility", () => {
-		const openRouterModel = getBuiltinModels("openrouter").find((model) => model.input.includes("image"));
-		expect(openRouterModel?.inputLimits).toEqual({ images: { resize: DEFAULT_IMAGE_RESIZE } });
+		const visionModels = getBuiltinModels("openrouter").filter((model) => model.input.includes("image"));
+		const otherModel = visionModels.find((model) => !model.id.includes("claude-"));
+		expect(otherModel?.inputLimits).toEqual({ images: { resize: DEFAULT_IMAGE_RESIZE } });
+		// A Claude model gets Claude's image resolution, a fact of the model, but no Anthropic request limits.
+		const claudeModel = visionModels.find((model) => model.id.includes("claude-opus-4.7"));
+		expect(claudeModel?.inputLimits).toEqual({ images: { resize: CLAUDE_HIGH_RES_RESIZE } });
 	});
 
 	it("uses models.dev effort levels for Google thinking models", () => {

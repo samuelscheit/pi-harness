@@ -1,5 +1,7 @@
 // Plans which pixel boxes of an image to send: the whole image, one region, or a grid of tiles.
 
+import { type ImageSizeLimits, tileSize } from "./image-limits.ts";
+
 /** A rectangle in original image pixels. */
 export interface ImageBox {
 	x: number;
@@ -42,15 +44,14 @@ export const TILE_OVERLAP = 64;
 
 /**
  * Plan the boxes to render for a view of an image of the given size. Regions are clamped to the
- * image; regions that start outside it or have no area are rejected. Tiles are at most
- * `maxTileWidth` x `maxTileHeight`, overlap by about TILE_OVERLAP pixels and cover the area.
+ * image; regions that start outside it or have no area are rejected. Tiles are the largest size
+ * the limits let the model read natively, overlap by about TILE_OVERLAP pixels and cover the area.
  */
 export function planImageView(
 	view: ImageView,
 	imageWidth: number,
 	imageHeight: number,
-	maxTileWidth: number,
-	maxTileHeight: number,
+	limits: ImageSizeLimits,
 ): ImageViewPlan {
 	const full: ImageBox = { x: 0, y: 0, width: imageWidth, height: imageHeight };
 	if (view.kind === "whole") return { ok: true, area: full, clamped: false, boxes: [full] };
@@ -59,6 +60,7 @@ export function planImageView(
 	const clamped = view.region !== undefined && !sameBox(area.box, view.region);
 	if (view.kind === "region") return { ok: true, area: area.box, clamped, boxes: [area.box] };
 
+	const { width: maxTileWidth, height: maxTileHeight } = tileSize(area.box.width, area.box.height, limits);
 	const columns = splitAxis(area.box.x, area.box.width, maxTileWidth);
 	const rows = splitAxis(area.box.y, area.box.height, maxTileHeight);
 	const all = rows.flatMap((row) => columns.map((column) => boxOf(column, row)));

@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed Claude vision models carrying a flat 2000x2000 image resize profile: every Claude model, on every host, now gets its API resolution tier as `inputLimits.images.resize` (2576 px and 4784 visual tokens of 28x28 px for Claude 4.7 and later, 1568 px and 1568 tokens for older models), with the new `patchSize` and `maxPatches` fields for the token cap
 - Fixed tools with `strict: "prefer"` constrained sampling being sent in strict mode when their schema contains a node without a `type` (such as `items: {}`, `Type.Unknown()`, or a bare `const`), which OpenAI rejects with a 400 error; these tools now fall back to non-strict mode, and `strict: "require"` fails locally. Nodes with only an `enum` stay strict ([#12049](https://github.com/earendil-works/pi/issues/12049))
 - Fixed provider errors reading "Connection closed." not being retried ([#12064](https://github.com/earendil-works/pi/issues/12064))
 - Fixed `retryAssistantCall` giving up on network and server errors after the fast retries: `scheduleRetry` adds a slow tier (30 s, 1 min, 2 min, 5 min, 5 min) for them, `onRetryScheduled` now receives a `ScheduledRetry` with `tier` and the transport `errorClass`, client errors other than 408 and 429 are never retried (also not by `retryProviderRequest`, which retried 409 and `x-should-retry: true`), and messages naming a transport error code such as `ECONNRESET` are retryable

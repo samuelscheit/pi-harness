@@ -1,7 +1,14 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, ImageContent, Model, ModelInputLimits, TextContent } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	ImageContent,
+	Model,
+	ModelImageResizeOptions,
+	ModelInputLimits,
+	TextContent,
+} from "@earendil-works/pi-ai";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ExtensionToolContext, ToolDefinition } from "../src/core/extensions/types.ts";
 import {
@@ -55,6 +62,39 @@ function writePng(name: string, width: number, height: number): string {
 	return path;
 }
 
+/** Mid-grey with seeded per-channel noise: PNG compresses it poorly, JPEG well (about 12x smaller). */
+function noisyPixels(width: number, height: number): Uint8Array {
+	const pixels = new Uint8Array(width * height * 4);
+	let seed = 1;
+	for (let i = 0; i < width * height; i++) {
+		for (let channel = 0; channel < 3; channel++) {
+			seed = (seed * 1103515245 + 12345) >>> 0;
+			pixels[i * 4 + channel] = 112 + ((seed >>> 16) % 32);
+		}
+		pixels[i * 4 + 3] = 255;
+	}
+	return pixels;
+}
+
+function writeNoisy(name: string, width: number, height: number, format: "png" | "jpeg"): string {
+	const image = new photon.PhotonImage(noisyPixels(width, height), width, height);
+	const path = join(dir, name);
+	try {
+		writeFileSync(path, format === "png" ? image.get_bytes() : image.get_bytes_jpeg(90));
+	} finally {
+		image.free();
+	}
+	return path;
+}
+
+// Claude's tiers: https://platform.claude.com/docs/en/build-with-claude/vision#resolution-and-token-cost
+const CLAUDE_HIGH_RES = { maxWidth: 2576, maxHeight: 2576, patchSize: 28, maxPatches: 4784 };
+const CLAUDE_STANDARD = { maxWidth: 1568, maxHeight: 1568, patchSize: 28, maxPatches: 1568 };
+
+function patches(width: number, height: number): number {
+	return Math.ceil(width / 28) * Math.ceil(height / 28);
+}
+
 /** Width, height and top-left pixel of an image block. */
 function decode(block: ImageContent): { width: number; height: number; red: number; green: number } {
 	const image = photon.PhotonImage.new_from_byteslice(Buffer.from(block.data, "base64"));
@@ -84,7 +124,7 @@ function model(inputLimits: ModelInputLimits): Model<Api> {
 
 async function read(
 	args: ReadToolInput,
-	resize?: { maxWidth: number; maxHeight: number },
+	resize?: ModelImageResizeOptions,
 	inputLimits: ModelInputLimits = {},
 ): Promise<ReadResult> {
 	const ctx = { cwd: dir, model: model({ ...inputLimits, images: { ...inputLimits.images, resize } }) };
@@ -162,7 +202,147 @@ describe("read image downscale notice", () => {
 	}, 30_000);
 });
 
+describe("read image model resolution", () => {
+	it("sends the incident's 3439x2583 scan to a high-res Claude model at its patch-capped size, losslessly", async () => {
+		const result = await read({ path: writePng("highres.png", 3439, 2583) }, CLAUDE_HIGH_RES);
+		// The 2576 px edge cap alone would give 2576x1935 = 6440 patches; the 4784-patch cap binds first.
+		expect(texts(result)[0]).toMatch(/^\[Image downscaled 1\.55x: original 3439x2583, sent at 2212x1661\./);
+		const [image] = images(result);
+		expect(image.mimeType).toBe("image/png");
+		expect(decode(image)).toMatchObject({ width: 2212, height: 1661 });
+		expect(patches(2212, 1661)).toBeLessThanOrEqual(4784);
+	}, 30_000);
+
+	it("sends the same scan to a standard-resolution Claude model at its smaller limit", async () => {
+		const result = await read({ path: writePng("standard.png", 3439, 2583) }, CLAUDE_STANDARD);
+		expect(texts(result)[0]).toMatch(/^\[Image downscaled 2\.71x: original 3439x2583, sent at 1268x952\./);
+		expect(decode(images(result)[0])).toMatchObject({ width: 1268, height: 952 });
+		expect(patches(1268, 952)).toBeLessThanOrEqual(1568);
+	}, 30_000);
+
+	it("downscales an image within the edge cap whose patch count exceeds the cap", async () => {
+		// 1075x1520 (an A4 scan at 130 DPI) is 2145 patches: within 1568 px, over 1568 patches.
+		const result = await read({ path: writePng("a4.png", 1075, 1520) }, CLAUDE_STANDARD);
+		expect(decode(images(result)[0])).toMatchObject({ width: 924, height: 1307 });
+		// The high-res tier reads it as it is.
+		const highRes = await read({ path: writePng("a4-highres.png", 1075, 1520) }, CLAUDE_HIGH_RES);
+		expect(texts(highRes)).toEqual(["Read image file [image/png]"]);
+		expect(decode(images(highRes)[0])).toMatchObject({ width: 1075, height: 1520 });
+	});
+
+	it("uses the built-in 2000x2000 profile for a model without input limits", async () => {
+		const path = writePng("nolimits.png", 3439, 2583);
+		const { inputLimits: _, ...bare } = model({});
+		const ctx = { cwd: dir, model: bare };
+		const result = (await createReadToolDefinition(dir).execute(
+			"read",
+			{ path },
+			undefined,
+			undefined,
+			ctx as unknown as ExtensionToolContext,
+		)) as ReadResult;
+		expect(texts(result)[0]).toMatch(/^\[Image downscaled 1\.72x: original 3439x2583, sent at 2000x1502\./);
+	}, 30_000);
+});
+
+describe("read image encoding", () => {
+	it("keeps a PNG lossless when it fits the byte limit, even where JPEG would be smaller", async () => {
+		const result = await read(
+			{ path: writeNoisy("fits.png", 600, 400, "png") },
+			{ maxWidth: 500, maxHeight: 500, maxBytes: 2_000_000 },
+		);
+		const [image] = images(result);
+		expect(image.mimeType).toBe("image/png");
+		expect(decode(image)).toMatchObject({ width: 500, height: 333 });
+		expect(texts(result)[0]).not.toContain("JPEG");
+		expect(texts(result)[0]).toContain("Read image file [image/png]");
+	});
+
+	it("falls back to JPEG at full size when the PNG does not fit, and says so", async () => {
+		// The 500x333 PNG is about 640 KB of base64; the JPEG about 55 KB.
+		const result = await read(
+			{ path: writeNoisy("toolarge.png", 600, 400, "png") },
+			{ maxWidth: 500, maxHeight: 500, maxBytes: 300_000, jpegQuality: 80 },
+		);
+		const [image] = images(result);
+		expect(image.mimeType).toBe("image/jpeg");
+		// JPEG before any further shrinking: the size is the fitted one, not a byte-driven downscale.
+		expect(decode(image)).toMatchObject({ width: 500, height: 333 });
+		expect(texts(result)[0]).toContain("Read image file [image/jpeg]");
+		expect(texts(result)[0]).toContain(
+			"[Image sent as JPEG (quality 80) because the lossless PNG exceeded the per-image size limit: thin lines and small text may show compression artifacts.]",
+		);
+	});
+
+	it("falls back to JPEG for a PNG at native size that only exceeds the byte limit", async () => {
+		const result = await read(
+			{ path: writeNoisy("native.png", 600, 400, "png") },
+			{ maxWidth: 2000, maxHeight: 2000, maxBytes: 300_000 },
+		);
+		expect(images(result)[0].mimeType).toBe("image/jpeg");
+		expect(decode(images(result)[0])).toMatchObject({ width: 600, height: 400 });
+		expect(texts(result)[0]).toContain("[Image sent as JPEG (quality 80)");
+		// Not a resolution loss, so no downscale notice.
+		expect(result.details).toBeUndefined();
+	});
+
+	it("keeps a JPEG source as JPEG without a fallback note", async () => {
+		const result = await read(
+			{ path: writeNoisy("photo.jpg", 600, 400, "jpeg") },
+			{ maxWidth: 500, maxHeight: 500, maxBytes: 2_000_000 },
+		);
+		expect(images(result)[0].mimeType).toBe("image/jpeg");
+		expect(decode(images(result)[0])).toMatchObject({ width: 500, height: 333 });
+		expect(texts(result)[0]).not.toContain("sent as JPEG");
+	});
+
+	it("marks tiles that fell back to JPEG", async () => {
+		// 6000 bytes of request budget halved over 3 tiles: 1000 bytes each, too small for a noisy PNG tile
+		// (about 1.6 KB) and for its JPEG at quality 80, so quality 70 is used.
+		const result = await read(
+			{ path: writeNoisy("tilesjpeg.png", 40, 20, "png"), tiles: true },
+			{ maxWidth: 20, maxHeight: 20 },
+			{ maxRequestBytes: 6000 },
+		);
+		expect(texts(result)[0]).toContain(
+			"[3 of 3 images sent as JPEG (quality 70) because their lossless PNG exceeded",
+		);
+		expect(texts(result).slice(1)).toEqual([
+			"Tile 1/3: x=0 y=0 w=17 h=20 (JPEG quality 70)",
+			"Tile 2/3: x=11 y=0 w=17 h=20 (JPEG quality 70)",
+			"Tile 3/3: x=23 y=0 w=17 h=20 (JPEG quality 70)",
+		]);
+	});
+});
+
 describe("read image tiles", () => {
+	it("sizes tiles by the model's patch cap so each tile is read natively", async () => {
+		// 10 px patches, at most 49: tiles of at most 70x70 (overlapping by 17 px) although the edge cap allows 1000.
+		const result = await read(
+			{ path: writePng("patchtiles.png", 200, 130), tiles: true },
+			{ maxWidth: 1000, maxHeight: 1000, patchSize: 10, maxPatches: 49 },
+		);
+		const labels = texts(result).slice(1);
+		expect(texts(result)[0]).toContain("grid 4x3 over x=0 y=0 w=200 h=130");
+		expect(labels).toHaveLength(12);
+		for (const [index, block] of images(result).entries()) {
+			const { width, height } = decode(block);
+			expect(Math.ceil(width / 10) * Math.ceil(height / 10)).toBeLessThanOrEqual(49);
+			expect(labels[index]).toMatch(new RegExp(` w=${width} h=${height}$`));
+		}
+	});
+
+	it("tiles the incident scan for a high-res Claude model into four native tiles within its patch cap", async () => {
+		const result = await read({ path: writePng("highrestiles.png", 3439, 2583), tiles: true }, CLAUDE_HIGH_RES);
+		expect(texts(result)[0]).toContain("4 tiles at native resolution: grid 2x2");
+		for (const block of images(result)) {
+			expect(block.mimeType).toBe("image/png");
+			const { width, height } = decode(block);
+			expect(patches(width, height)).toBeLessThanOrEqual(4784);
+		}
+		expect(result.details).toBeUndefined();
+	}, 60_000);
+
 	it("returns native tiles labeled with their boxes that cover the whole image", async () => {
 		const result = await read(
 			{ path: writePng("grid.png", 450, 330), tiles: true },

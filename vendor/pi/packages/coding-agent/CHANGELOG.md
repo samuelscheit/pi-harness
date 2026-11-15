@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Fixed images being sized to a flat 2000x2000 box instead of the model's real limit: images and `read` regions and tiles now fit the model's edge and visual-token (patch) cap, so high-resolution Claude models get up to 2576 px and older ones are no longer sent pixels the API discards
+- Fixed lossless images (such as a PNG of a line drawing) being sent as JPEG whenever JPEG was smaller: they now stay PNG when the PNG fits the byte limit, and a JPEG fallback is announced to the model
 - Fixed `read` downscaling large images with only a trailing note to the model: the result now starts with an `[Image downscaled ...]` line giving the factor, both sizes and how to read at native resolution, and the collapsed tool row shows the same line to the user
 - Fixed MCP tools loaded by `tool_search` being dropped on resume and `/reload` when an extension deactivates only its own tool at `session_start`, as pi-web-access and pi-subagents do in `toolActivation: "auto"` mode ([#11996](https://github.com/earendil-works/pi/issues/11996))
 - Fixed the standalone binary failing to resolve extension npm dependencies whose entry point is declared in `package.json` `main` or `exports` (for example `shiki`, `yaml`, `graceful-fs`), including imports made from inside other dependencies ([#12012](https://github.com/earendil-works/pi/issues/12012))

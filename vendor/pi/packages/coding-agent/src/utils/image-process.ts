@@ -3,6 +3,7 @@ import {
 	formatDimensionNote,
 	type ImageResizeOptions,
 	type ImageViewResult,
+	type ResizedImage,
 	renderImageView,
 	resizeImage,
 } from "./image-resize.ts";
@@ -82,6 +83,21 @@ function conversionHint(from: string | undefined, to: string): string | undefine
 }
 
 /**
+ * The note for images of a lossless source sent as JPEG because their PNG exceeded the size limit,
+ * so the model knows edges and small glyphs may be compression artifacts, not image content.
+ */
+function jpegFallbackHint(images: ResizedImage[]): string | undefined {
+	const fallbacks = images.filter((image) => image.jpegFallbackQuality !== undefined);
+	if (fallbacks.length === 0) return undefined;
+	const qualities = [...new Set(fallbacks.map((image) => image.jpegFallbackQuality))].join("/");
+	const subject =
+		images.length === 1
+			? `Image sent as JPEG (quality ${qualities}) because the lossless PNG exceeded`
+			: `${fallbacks.length} of ${images.length} images sent as JPEG (quality ${qualities}) because their lossless PNG exceeded`;
+	return `[${subject} the per-image size limit: thin lines and small text may show compression artifacts.]`;
+}
+
+/**
  * Convert an image to an inline format and render a view of it (whole, region, or tiles) within
  * the resize limits. Unlike processImage, always decodes: a region or tile needs the pixels.
  */
@@ -95,8 +111,11 @@ export async function processImageView(
 	if (!normalized) return { ok: false, message: "Image could not be converted to a supported inline image format." };
 	const rendered = await renderImageView(normalized.bytes, normalized.mimeType, view, resizeOptions);
 	if (!rendered.ok) return rendered;
-	const convertedHint = conversionHint(normalized.convertedFrom, rendered.images[0].mimeType);
-	return { ...rendered, hints: convertedHint ? [convertedHint] : [] };
+	const hints = [
+		conversionHint(normalized.convertedFrom, rendered.images[0].mimeType),
+		jpegFallbackHint(rendered.images),
+	].filter((hint) => hint !== undefined);
+	return { ...rendered, hints };
 }
 
 export async function processImage(
@@ -122,11 +141,11 @@ export async function processImage(
 			};
 		}
 
-		const hints: string[] = [];
-		const convertedHint = conversionHint(normalized.convertedFrom, resized.mimeType);
-		if (convertedHint) hints.push(convertedHint);
-		const dimensionNote = formatDimensionNote(resized);
-		if (dimensionNote) hints.push(dimensionNote);
+		const hints = [
+			conversionHint(normalized.convertedFrom, resized.mimeType),
+			jpegFallbackHint([resized]),
+			formatDimensionNote(resized),
+		].filter((hint) => hint !== undefined);
 
 		return {
 			ok: true,

@@ -99,6 +99,8 @@ See [Describe model input and caching](models.md#describe-model-input-and-cachin
 | `images.resize.maxHeight` | integer |  |  |
 | `images.resize.maxBytes` | integer |  | Maximum base64-encoded payload size in bytes. |
 | `images.resize.jpegQuality` | integer |  |  |
+| `images.resize.patchSize` | integer |  | Edge of the square pixel patch the provider bills as one visual token; used with maxPatches. |
+| `images.resize.maxPatches` | integer |  | Most patches per image: ceil(width / patchSize) * ceil(height / patchSize) must not exceed it, or the provider downscales the image. |
 | `images.maxPerMessage` | integer |  | Maximum images accepted in one provider message. |
 | `images.maxPerRequest` | integer |  | Maximum images accepted across one provider request. |
 

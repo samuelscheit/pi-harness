@@ -2,8 +2,8 @@
 // Ids appear dashed (claude-opus-4-8), dotted (claude-opus-4.8), prefixed
 // (anthropic/claude-opus-4.8), and dated (claude-opus-5-20260723).
 
-import type { Model, ThinkingLevelMap } from "../../src/types.ts";
-import { type ChatModel, mergeCompat, mergeThinking } from "../define.ts";
+import type { Model, ModelImageResizeOptions, ThinkingLevelMap } from "../../src/types.ts";
+import { type ChatModel, mergeCompat, mergeThinking, withInputLimits } from "../define.ts";
 
 function stripPrefix(modelId: string): string {
 	return modelId.toLowerCase().replace(/^~?anthropic\//, "");
@@ -97,6 +97,45 @@ const XHIGH_AND_MAX_EFFORT = [
 	"haiku.5",
 ];
 
+// Claude downscales an image to the largest size that keeps its aspect ratio, fits the long-edge
+// limit and costs at most the visual-token limit, ceil(w/28) * ceil(h/28). Sending images at that
+// size keeps every pixel the model sees and makes coordinates in the image map 1:1.
+// https://platform.claude.com/docs/en/build-with-claude/vision#resolution-and-token-cost
+// https://platform.claude.com/docs/en/build-with-claude/vision-coordinates
+const CLAUDE_STANDARD_IMAGES = {
+	maxWidth: 1568,
+	maxHeight: 1568,
+	patchSize: 28,
+	maxPatches: 1568,
+} as const satisfies ModelImageResizeOptions;
+const CLAUDE_HIGH_RES_IMAGES = {
+	maxWidth: 2576,
+	maxHeight: 2576,
+	patchSize: 28,
+	maxPatches: 4784,
+} as const satisfies ModelImageResizeOptions;
+
+// Family and version: claude-opus-4-7, claude-opus-4.7, anthropic.claude-sonnet-5-v1, claude-opus-4-20250514
+// (major 4, the date is no minor version). Claude 3 ids (claude-3-5-sonnet) put the version first.
+const CLAUDE_VERSION = /claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d)(?!\d))?/;
+
+/** Claude 4.7 and later read images at high resolution; all other Claude models at the standard one. */
+export function supportsClaudeHighResImages(modelId: string): boolean {
+	const id = modelId.toLowerCase();
+	if (isClaudeLatestAlias(id)) return true;
+	const match = CLAUDE_VERSION.exec(id);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2] ?? 0);
+	return major > 4 || (major === 4 && minor >= 7);
+}
+
+/** The resize profile that matches how Claude downscales images, for any Claude model id. */
+export function claudeImageResize(modelId: string): ModelImageResizeOptions | undefined {
+	if (!/claude-/i.test(modelId)) return undefined;
+	return supportsClaudeHighResImages(modelId) ? CLAUDE_HIGH_RES_IMAGES : CLAUDE_STANDARD_IMAGES;
+}
+
 /**
  * Adaptive thinking effort levels (per Anthropic adaptive thinking docs):
  * "max" is available on all adaptive-thinking Claude models; "xhigh" only on
@@ -106,6 +145,8 @@ export function applyClaudeFamilyRules(model: ChatModel): void {
 	if (idIncludesAny(model.id, MAX_EFFORT_ONLY)) mergeThinking(model, { max: "max" });
 	if (idIncludesAny(model.id, XHIGH_AND_MAX_EFFORT)) mergeThinking(model, { xhigh: "xhigh", max: "max" });
 	if (model.id.includes("fable-5")) mergeThinking(model, { off: null, xhigh: "xhigh", max: "max" });
+	const imageResize = claudeImageResize(model.id);
+	if (imageResize) withInputLimits(model, { images: { resize: { ...imageResize } } });
 	if (model.api !== "anthropic-messages") return;
 	const messagesModel = model as Model<"anthropic-messages">;
 	if (isClaudeLatestAlias(model.id) || idIncludesAny(model.id, ADAPTIVE_THINKING)) {

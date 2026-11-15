@@ -78,6 +78,19 @@ const ModelImageResizeProperties = {
 	maxHeight: opt(int({ minimum: 1 })),
 	maxBytes: opt(int({ minimum: 1, description: "Maximum base64-encoded payload size in bytes." })),
 	jpegQuality: opt(int({ minimum: 1, maximum: 100 })),
+	patchSize: opt(
+		int({
+			minimum: 1,
+			description: "Edge of the square pixel patch the provider bills as one visual token; used with maxPatches.",
+		}),
+	),
+	maxPatches: opt(
+		int({
+			minimum: 1,
+			description:
+				"Most patches per image: ceil(width / patchSize) * ceil(height / patchSize) must not exceed it, or the provider downscales the image.",
+		}),
+	),
 };
 
 function modelImageResizeOptions(options?: Annotations<StaticObject<typeof ModelImageResizeProperties>>) {
