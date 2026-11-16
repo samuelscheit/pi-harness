@@ -165,6 +165,7 @@ describe("patchBundle", () => {
 		"effect-slot-wait",
 		"effect-slot-handback",
 		"keyed-lock-contended",
+		"background-tasks-from-pi",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -182,7 +183,10 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('"dismiss",\n\t\t\t\t\t"questions"\n\t\t\t\t].includes'), "a questions dialog waits for a turn owner");
 		assert.ok(text.includes('questions: method === "questions" ? piQuestions(nativeRequestId, event)'));
 		assert.ok(text.includes('\t\t\t...environment,\n\t\t\tPI_RPC_DIALOGS: "questions",\n'), "Pi learns that t3 renders questions dialogs");
-		assert.ok(text.includes('backgroundWork = piBackgroundTasks(event["items"], turnItemOfToolCall);\n\t\t\t\t\tyield* publishBackgroundWork(previous);\n\t\t\t\t\treturn;'), "each item is published on the thread");
+		assert.ok(text.includes('backgroundWork = piBackgroundTasks(event["items"], turnItemOfToolCall);\n\t\t\t\t\tyield* publishBackgroundWork();\n\t\t\t\t\treturn;'), "each item is published on the thread");
+		assert.ok(text.includes("...patch,\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork /* piTasksFromReport */,"), "every thread update carries Pi's last report");
+		assert.ok(!text.includes("const others = (threadState.providerThread.pendingBackgroundTasks"), "a report replaces the list, it is not merged into an older one");
+		assert.ok(text.includes("pendingWake = null;\n\t\t\t\tbackgroundWork = [];\n\t\t\t\tif (threadState !== null && (threadState.providerThread.pendingBackgroundTasks ?? []).length > 0) yield* updateProviderThread(threadState, {}).pipe(ignore);"), "closing the session clears the list");
 		assert.ok(text.includes("forkedFrom: null,\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork,"), "a thread attached during background work lists its items");
 		assert.ok(text.includes('status: "idle",\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork,'), "an existing thread lists this process's items, not an earlier one's");
 		assert.ok(!text.includes("PI_BACKGROUND_WORK_TASK") && !text.includes("backgroundWorkPending"), "no fixed task, no count flag");
@@ -240,12 +244,12 @@ describe("patchBundle", () => {
 	});
 
 	test("a bundle patched before background-items (the fixed task) gets only those, and loses the fixed task", () => {
-		// background-released edits background-items' output: it comes with them.
-		const items = (patch: Patch) => patch.name.startsWith("background-items") || patch.name.startsWith("background-released");
+		// background-released and background-tasks-from-pi edit background-items' output: they come with them.
+		const items = (patch: Patch) => patch.name.startsWith("background-items") || patch.name.startsWith("background-released") || patch.name === "background-tasks-from-pi";
 		const before = patchBundle(bundle, PATCHES.filter((patch) => !items(patch)));
 		assert.ok(before.text.includes("PI_BACKGROUND_WORK_TASK"));
 		const { text, applied } = patchBundle(before.text);
-		assert.deepEqual(applied, ["background-items", "background-items-contract", "background-items-caller", "background-released", "background-released-contract"]);
+		assert.deepEqual(applied, ["background-items", "background-items-contract", "background-items-caller", "background-released", "background-released-contract", "background-tasks-from-pi"]);
 		assert.equal(text, patchBundle(bundle).text);
 		assert.ok(!text.includes("PI_BACKGROUND_WORK_TASK") && !text.includes("pi-background-work"));
 		assert.deepEqual(patchBundle(text).applied, [], "the earlier patches' markers survive it");
@@ -703,7 +707,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -723,12 +727,12 @@ describe("keeping t3 patched", () => {
 			const archive = join(app, "Contents/Resources/app.asar");
 			mkdirSync(dirname(archive), { recursive: true });
 			// An archive patched before the delegate_task and background-items patches existed: only the adapter chunk is patched.
-			const fork = (patch: Patch) => patch.name.startsWith("delegate-") || patch.name.startsWith("background-items") || patch.name.startsWith("background-released");
+			const fork = (patch: Patch) => patch.name.startsWith("delegate-") || patch.name.startsWith("background-items") || patch.name.startsWith("background-released") || patch.name === "background-tasks-from-pi";
 			const adapterChunk = "apps/server/dist/chunk0.mjs";
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended;/);
+			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 

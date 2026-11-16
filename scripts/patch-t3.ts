@@ -123,6 +123,12 @@
 //   repo's checkpoint lock, so a turn start in another repo waited 6 minutes for a slot: the user's
 //   messages reached Pi minutes late (2026-11-16, thread c07fa621). A slot now moves on after 30 s, and
 //   at once when its effect is about to wait on a contended workspace lock (the effect finishes later).
+// - background-tasks-from-pi (mirrors t3code's branch pi-dialogs-outlive-turns, 8a12369c "a thread's
+//   pending tasks are always Pi's last report"): idle Pi threads listed jobs that had ended an hour
+//   before (2026-11-16). A turn start installs the orchestrator's copy of the thread, whose task list
+//   can be older; every later thread update re-published it, and background-items' merge kept every
+//   task it had not published itself. Now every update carries Pi's last report, a report replaces
+//   the list, and closing the session clears it (the harness stops a session's jobs with it).
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -984,6 +990,29 @@ export const PATCHES: Patch[] = [
 			[
 				"withLock: (key, effect) => acquireUseRelease(acquire(key), (semaphore) => semaphore.withPermit(effect), () => release(key)),",
 				"withLock: (key, effect, options) => acquireUseRelease(acquire(key), ({ semaphore, contended }) => contended && options?.onContended !== void 0 ? andThen(options.onContended, semaphore.withPermit(effect)) : semaphore.withPermit(effect), () => release(key)),",
+			],
+		],
+	},
+	{
+		name: "background-tasks-from-pi",
+		// The last two anchors are background-items' output.
+		marker: "piTasksFromReport",
+		edits: [
+			[
+				'\t\t\t\t\t...patch,\n\t\t\t\t\tupdatedAt\n\t\t\t\t};\n\t\t\t\tyield* emit({\n\t\t\t\t\ttype: "provider_thread.updated",\n\t\t\t\t\tdriver: PI_PROVIDER,',
+				'\t\t\t\t\t...patch,\n\t\t\t\t\tpendingBackgroundTasks: backgroundWork /* piTasksFromReport */,\n\t\t\t\t\tupdatedAt\n\t\t\t\t};\n\t\t\t\tyield* emit({\n\t\t\t\t\ttype: "provider_thread.updated",\n\t\t\t\t\tdriver: PI_PROVIDER,',
+			],
+			[
+				"const publishBackgroundWork = fnUntraced(function* (previous) {\n\t\t\t\tif (threadState === null || piSameFlatRecords(previous, backgroundWork)) return;\n\t\t\t\tconst replaced = new Set(previous.map((task) => task.taskId));\n\t\t\t\tconst others = (threadState.providerThread.pendingBackgroundTasks ?? []).filter((task) => !replaced.has(task.taskId));\n\t\t\t\tyield* updateProviderThread(threadState, { pendingBackgroundTasks: [...others, ...backgroundWork] });\n\t\t\t});",
+				"const publishBackgroundWork = fnUntraced(function* () {\n\t\t\t\tif (threadState === null || piSameFlatRecords(threadState.providerThread.pendingBackgroundTasks ?? [], backgroundWork)) return;\n\t\t\t\tyield* updateProviderThread(threadState, {});\n\t\t\t});",
+			],
+			[
+				'const previous = backgroundWork;\n\t\t\t\t\tbackgroundWork = piBackgroundTasks(event["items"], turnItemOfToolCall);\n\t\t\t\t\tyield* publishBackgroundWork(previous);',
+				'backgroundWork = piBackgroundTasks(event["items"], turnItemOfToolCall);\n\t\t\t\t\tyield* publishBackgroundWork();',
+			],
+			[
+				"pendingWake = null;\n\t\t\t\tif (extensionStatusReset !== null)",
+				"pendingWake = null;\n\t\t\t\tbackgroundWork = [];\n\t\t\t\tif (threadState !== null && (threadState.providerThread.pendingBackgroundTasks ?? []).length > 0) yield* updateProviderThread(threadState, {}).pipe(ignore);\n\t\t\t\tif (extensionStatusReset !== null)",
 			],
 		],
 	},
