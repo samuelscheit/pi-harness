@@ -119,8 +119,13 @@ export const clip = (text: string, max: number) => {
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 };
 
-/** A call's arguments in a line: a lone string argument as is (e.g. bash's command), else JSON. */
+/**
+ * A call's arguments in a line: a `command` argument as is (bash's, also with its `timeout`), a lone
+ * string argument as is, else JSON. A bash call with a timeout read `bash: {"command":"cd …` in t3's
+ * list of background work and in its end message (2026-11-16).
+ */
 export function argsText(input: Record<string, unknown>): string {
+	if (typeof input.command === "string") return input.command;
 	const values = Object.values(input);
 	return values.length === 1 && typeof values[0] === "string" ? values[0] : JSON.stringify(input);
 }

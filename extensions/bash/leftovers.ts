@@ -24,6 +24,15 @@
 // A process outside the group (`setsid`, a daemon that forks into its own session) is not seen:
 // `setsid` is refused (detach.ts).
 //
+// A known helper daemon (HELPER_DAEMON) is never adopted, also not as the orphan of a job that
+// ended: a script the agent ran with `&` ran git, whose fsmonitor outlived it in the group, and the
+// sweep adopted it, so idle threads listed git's fsmonitor as awaited work for hours (2026-11-16).
+// The sweep names such orphans instead (/jobs lists them).
+//
+// A subshell (`( … ) &`) keeps its parent's command line, which is the bash tool's own wrapper
+// (`bash -c export PI_TOOL_SOCKET=…`, bridge.ts); such a leftover is recorded as the subshell of
+// the command the agent wrote, which is what every list and message shows.
+//
 // `ps` lists every process with numbers only, and command lines only for the processes adopted
 // (../lib/ps.ts).
 //
@@ -39,6 +48,17 @@
 import { clip, minutes, type SessionJobs, wake } from "../background/jobs.ts";
 import { reportWork } from "../background/work.ts";
 import { commandsOf, type Ps, type PsRow, parseTable, TABLE_ARGS } from "../lib/ps.ts";
+import { SOCKET_ENV } from "./socket.ts";
+
+/** Helper daemons programs start on their own and that never end: named, never tracked. */
+export const HELPER_DAEMON = /\bgit(?:-core\/git)?\s+fsmonitor--daemon\b|(?:^|\/)git-fsmonitor--daemon\b|(?:^|\/)(?:gpg-agent|dirmngr|keyboxd|ssh-agent)(?:\s|$)|^ssh:\s.*\[mux\]|(?:^|\/)ssh\s(?:.*\s)?-o\s*ControlMaster=|(?:^|\/)ssh\s(?:.*\s)?-M(?:\s|$)/;
+export const isHelperDaemon = (command: string) => HELPER_DAEMON.test(command);
+
+/** The bash tool's own command line (a subshell of the agent's command keeps it). */
+const WRAPPER = new RegExp(`^\\S*bash -c export ${SOCKET_ENV}=`);
+
+/** A process's command line as lists and messages show it: a subshell of the bash tool's wrapper as the agent's command's. */
+export const shownCommand = (command: string, startedBy: string) => (WRAPPER.test(command) ? `( … ) & in: ${clip(startedBy, 200)}` : command);
 
 /** The processes of group `pgid` whose parent is not a live process of the group: the jobs left in it. */
 export function rootsOf(rows: readonly PsRow[], pgid: number): PsRow[] {
@@ -126,8 +146,8 @@ export function adopt(leftovers: Leftovers, rows: readonly PsRow[], pgid: number
 	const adopted: Leftover[] = [];
 	for (const row of rootsOf(rows, pgid)) {
 		const command = commands.get(row.pid);
-		if (leftovers.has(row.pid) || command === undefined || skipped.has(key(row))) continue;
-		const leftover: Leftover = { pid: row.pid, pgid, command, startedBy: by.startedBy, ...(by.callId === undefined ? {} : { callId: by.callId }), adoptedAt: now };
+		if (leftovers.has(row.pid) || command === undefined || skipped.has(key(row)) || isHelperDaemon(command)) continue;
+		const leftover: Leftover = { pid: row.pid, pgid, command: shownCommand(command, by.startedBy), startedBy: by.startedBy, ...(by.callId === undefined ? {} : { callId: by.callId }), adoptedAt: now };
 		leftovers.set(row.pid, leftover);
 		adopted.push(leftover);
 	}
@@ -183,8 +203,17 @@ export function release(jobs: SessionJobs, pid: number, pgid: number): boolean {
 
 /** One check of the session's leftovers: each one that ended wakes the session with its own message. */
 async function checkLeftovers(jobs: SessionJobs, ps: Ps): Promise<void> {
-	const { rows, commands } = await snapshot(ps, jobs.leftovers, (rows) => endedOf(jobs.leftovers, rows).map((l) => l.pgid));
+	const endedNow = (rows: readonly PsRow[]) => endedOf(jobs.leftovers, rows);
+	const { rows, commands } = await snapshot(ps, jobs.leftovers, (rows) => endedNow(rows).map((l) => l.pgid));
 	forgetExited(jobs.named, rows);
+	// The helper daemons the ended ones left: named, as a call's are.
+	for (const ended of endedNow(rows)) {
+		for (const row of rootsOf(rows, ended.pgid)) {
+			const command = commands.get(row.pid);
+			if (command !== undefined && isHelperDaemon(command) && !jobs.named.has(key(row)))
+				jobs.named.set(key(row), { pid: row.pid, pgid: ended.pgid, command, startedBy: ended.startedBy, ...(ended.callId === undefined ? {} : { callId: ended.callId }), namedAt: Date.now() });
+		}
+	}
 	const ended = sweep(jobs.leftovers, rows, Date.now(), commands, jobs.named);
 	if (ended.length === 0) return;
 	stopPollWhenEmpty(jobs);
@@ -210,7 +239,7 @@ export async function adoptLeftovers(
 	const now = Date.now();
 	const untracked = rootsOf(rows, pgid).flatMap((row) => {
 		const command = commands.get(row.pid);
-		return command === undefined || jobs.leftovers.has(row.pid) || jobs.named.has(key(row)) || isJob(row.pid, command) ? [] : [{ pid: row.pid, command }];
+		return command === undefined || jobs.leftovers.has(row.pid) || jobs.named.has(key(row)) || (isJob(row.pid, command) && !isHelperDaemon(command)) ? [] : [{ pid: row.pid, command }];
 	});
 	for (const left of untracked) jobs.named.set(key({ pid: left.pid, pgid }), { ...left, pgid, startedBy: by.startedBy, ...(by.callId === undefined ? {} : { callId: by.callId }), namedAt: now });
 	const adopted = adopt(jobs.leftovers, rows, pgid, by, now, commands, jobs.named);

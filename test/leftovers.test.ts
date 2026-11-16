@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { describe, test } from "node:test";
 import { sessionJobs } from "../extensions/background/jobs.ts";
-import { adopt, adoptLeftovers, endedText, type Leftovers, leftText, rootsOf, sweep, untrackedRoots, untrackedText } from "../extensions/bash/leftovers.ts";
+import { adopt, adoptLeftovers, endedText, isHelperDaemon, type Leftovers, leftText, rootsOf, shownCommand, sweep, untrackedRoots, untrackedText } from "../extensions/bash/leftovers.ts";
 import { commandArgs, commandsOf, defaultPs, parseCommands, parseTable, type Ps, TABLE_ARGS, treeOf } from "../extensions/lib/ps.ts";
 import { withHugePs } from "./fixtures/huge-ps.ts";
 
@@ -121,6 +121,34 @@ describe("adopting and sweeping", () => {
 		assert.deepEqual(sleep, { pid: 101, pgid: 100, command: "sleep 30", startedBy: "cmd", callId: "toolu_1", adoptedAt: 0 });
 		const [ended] = sweep(leftovers, parseTable(["  101     1   100 S", "  103     1   100 R"].join("\n")), 5, COMMANDS);
 		assert.deepEqual(ended!.orphans.map((o) => [o.pid, o.callId]), [[103, "toolu_1"]]);
+	});
+
+	test("a helper daemon is never adopted, also not as the orphan of an ended job (2026-11-16: git's fsmonitor listed for hours)", () => {
+		const leftovers: Leftovers = new Map();
+		const commands = new Map([
+			[101, "/bin/bash scratch/runH.sh"],
+			[103, "/Applications/Xcode.app/Contents/Developer/usr/libexec/git-core/git fsmonitor--daemon run --detach --ipc-threads=8"],
+			[104, "make"],
+		]);
+		adopt(leftovers, parseTable("  101     1   100 S"), 100, { startedBy: "./runH.sh &" }, 0, commands);
+		// runH.sh ends; it left git's fsmonitor and a make in the group.
+		const [ended] = sweep(leftovers, parseTable(["  103     1   100 S", "  104     1   100 R"].join("\n")), 5, commands);
+		assert.deepEqual(ended!.orphans.map((o) => o.command), ["make"]);
+		assert.deepEqual([...leftovers.keys()], [104]);
+		for (const daemon of ["git fsmonitor--daemon run", "/usr/local/bin/gpg-agent --daemon", "ssh: /Users/u/.ssh/cm-host [mux]", "ssh -o ControlMaster=auto -N host", "ssh -M -S sock host", "/opt/homebrew/bin/dirmngr --daemon"]) {
+			assert.equal(isHelperDaemon(daemon), true, daemon);
+		}
+		for (const job of ["make", "git fetch origin", "ssh host ./run.sh", "node server.js --daemon-port 3", "pytest tests/test_gpg-agent.py"]) {
+			assert.equal(isHelperDaemon(job), false, job);
+		}
+	});
+
+	test("a subshell of the bash tool's wrapper is shown as the agent's command's", () => {
+		const leftovers: Leftovers = new Map();
+		const wrapper = "/bin/bash -c export PI_TOOL_SOCKET='/tmp/pi-tool-1.sock' PATH='/tmp/bin':\"$PATH\"\nprintf '%s' \"$$\" > /tmp/g";
+		const [sub] = adopt(leftovers, parseTable("  101     1   100 S"), 100, { startedBy: "(for t in a b; do pytest $t; done) > log 2>&1 &" }, 0, new Map([[101, wrapper]]));
+		assert.equal(sub!.command, "( … ) & in: (for t in a b; do pytest $t; done) > log 2>&1 &");
+		assert.equal(shownCommand("sleep 30", "x"), "sleep 30");
 	});
 
 	test("a root without a command line exited after the listing: not adopted", () => {

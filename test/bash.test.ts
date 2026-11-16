@@ -602,7 +602,8 @@ describe("long commands move to the background", () => {
 		respond(bash("echo started; sleep 10", 1.5), fauxAssistantMessage("In the background."), fauxAssistantMessage("It timed out."));
 		await s.prompt("go");
 		await until("the wake run", settled(s, "It timed out."));
-		assert.match(jobMessages(s)[0]!, /^Your background `bash` call `\{"command":"echo started; sleep 10","timeout":1\.5\}` \(call [^)]+\) failed after \d s:\n\nstarted\n+Command timed out after 1\.5 seconds$/);
+		// The command itself, not the call's JSON with its timeout.
+		assert.match(jobMessages(s)[0]!, /^Your background `bash` call `echo started; sleep 10` \(call [^)]+\) failed after \d s:\n\nstarted\n+Command timed out after 1\.5 seconds$/);
 	});
 
 	test("a command a script runs through ctx.executeTool stays in the foreground of the script: only the script moves", async () => {
