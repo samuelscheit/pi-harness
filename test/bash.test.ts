@@ -453,6 +453,24 @@ describe("shared checkouts", () => {
 		assert.equal(repoGit("diff", "--cached", "--name-only"), "", "the refused command's git add did not run");
 		assert.match(texts[5]!, /^\s*3\n$/, `the checked commit ran: ${texts[5]}`);
 	});
+
+	test("a commit message from a file is refused before anything runs; from a heredoc on stdin it commits with its `#` headings", async () => {
+		initRepo();
+		const msg = join(dir, "msg.txt");
+		writeFileSync(msg, "another agent's message\n");
+		const s = await newSession(FOREGROUND_MS);
+		respond(
+			write("a.ts", "mine\n"),
+			bash(`git add a.ts && ${commitEnv} git commit -qF '${msg}' a.ts`),
+			bash(`${commitEnv} git commit -q --only a.ts -F - <<'EOF'\nfeat: mine\n\n## Why\nbody\nEOF\ngit log -1 --format=%B`),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("commit");
+		const texts = toolTexts(s);
+		assert.match(texts[1]!, /^Not run: this command reads a commit or tag message from a file:\n- `GIT_AUTHOR_NAME=t [^`]* git commit -qF '/);
+		assert.equal(repoGit("diff", "--cached", "--name-only"), "", "the refused command's git add did not run");
+		assert.equal(texts[2], "feat: mine\n\n## Why\nbody\n\n");
+	});
 });
 
 const textOf = (content: string | readonly { type: string; text?: string }[]) => (typeof content === "string" ? content : content.map((c) => c.text ?? "").join(""));

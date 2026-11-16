@@ -17,6 +17,8 @@ export interface RunCommand {
 	text: string;
 	/** Variables set for it: `X=1 cmd`, `env X=1 cmd`. */
 	env: Record<string, string>;
+	/** The file its standard input is redirected from (`< file`, `0< file`), if any; heredocs and here-strings are not files. */
+	stdin?: string;
 }
 
 /** Commands that run their arguments as a command. */
@@ -31,11 +33,14 @@ export function unwrap(command: Command, text: string): RunCommand[] {
 	const words = [command.name, ...command.args].flatMap((word) => (word?.type === "Word" ? [word.value] : []));
 	const env: Record<string, string> = {};
 	for (const part of command.prefix) if (part.type === "Assignment") env[part.name] = part.value?.type === "Word" ? part.value.value : "";
+	const stdin = command.redirects
+		.flatMap((r) => (r.type === "Redirect" && r.operator === "<" && (r.descriptor === undefined || (r.descriptor.type === "FileDescriptor" && r.descriptor.value === 0)) && r.target ? [r.target.value] : []))
+		.at(-1);
 	const found: RunCommand[] = [];
 	let i = 0;
 	while (i < words.length) {
 		const name = words[i]!.replace(/^.*\//, "");
-		found.push({ name, args: words.slice(i + 1), text, env: { ...env } });
+		found.push({ name, args: words.slice(i + 1), text, env: { ...env }, ...(stdin === undefined ? {} : { stdin }) });
 		if (!WRAPPERS.has(name)) break;
 		i += 1;
 		while (i < words.length && WRAPPER_ARGUMENT.test(words[i]!)) {
@@ -94,6 +99,47 @@ export function gitCommand(command: RunCommand): GitCommand | undefined {
 	}
 	const subcommand = args[i];
 	return subcommand === undefined ? undefined : { dirs, subcommand, args: args.slice(i + 1), command };
+}
+
+/** A git subcommand's options: flags (short ones by letter, long ones as written), the values of valued ones, and the pathspecs. */
+export interface GitOptions {
+	flags: Set<string>;
+	/** Each valued option's values in order, keyed like `flags` (`-Fx`, `-F x`, `--file=x` and `--file x` all under their name). */
+	values: Map<string, string[]>;
+	pathspecs: string[];
+}
+
+/** Parses a git subcommand's arguments; `valuedLong` and `valuedShort` name its options that take a value. */
+export function gitOptions(args: readonly string[], valuedLong: ReadonlySet<string>, valuedShort: ReadonlySet<string>): GitOptions {
+	const flags = new Set<string>();
+	const values = new Map<string, string[]>();
+	const pathspecs: string[] = [];
+	const value = (name: string, v: string | undefined) => {
+		if (v !== undefined) values.set(name, [...(values.get(name) ?? []), v]);
+	};
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (arg === "--") {
+			pathspecs.push(...args.slice(i + 1));
+			break;
+		}
+		if (arg.startsWith("--")) {
+			const [name, inline] = arg.includes("=") ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg, undefined];
+			flags.add(name);
+			if (!valuedLong.has(name)) continue;
+			if (inline !== undefined) value(name, inline);
+			else value(name, args[++i]);
+		} else if (arg.startsWith("-") && arg.length > 1) {
+			for (let j = 1; j < arg.length; j++) {
+				const letter = arg[j]!;
+				flags.add(letter);
+				if (!valuedShort.has(letter)) continue;
+				value(letter, j < arg.length - 1 ? arg.slice(j + 1) : args[++i]);
+				break;
+			}
+		} else pathspecs.push(arg);
+	}
+	return { flags, values, pathspecs };
 }
 
 /**

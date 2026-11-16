@@ -16,7 +16,7 @@
 // too (git.ts: `git stash`, `git reset --hard`, `git clean -f`, whole-tree discards), and so is a
 // commit that takes changes the session's edit and write tools did not make (commit.ts), and a
 // commit or push gated on a pipeline whose status is a filter's (`tests | grep … && git commit`,
-// gate.ts).
+// gate.ts), and a commit whose message is read from a file another agent may overwrite (message.ts).
 //
 // Both rely on the process group: Pi runs every bash command as the leader of its own group
 // (detached spawn), and what the command starts stays in it. Before each bash call this extension
@@ -38,6 +38,7 @@ import { changeEnds, changeStarts, commitRefusal, dropSessionFiles, sessionFiles
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
 import { gateRefusal } from "./gate.ts";
 import { gitRefusal } from "./git.ts";
+import { messageFileRefusal } from "./message.ts";
 import { defaultPs, type Ps } from "../lib/ps.ts";
 import { adoptLeftovers, leftText, type Untracked, untrackedText } from "./leftovers.ts";
 
@@ -100,10 +101,10 @@ export function readGroup(file: string): number | undefined {
 const POLL_MS = 1000;
 
 /** What the tool refuses to run, for its description. */
-const REFUSED = "Refused before they run: `setsid`, `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), a `git commit` of changes your edit and write tools did not make, and a commit or push gated (`&&`, `||`, `if`, `set -e`) on a pipeline ending in a filter (`tests | grep … && git commit`) without `set -o pipefail`.";
+const REFUSED = "Refused before they run: `setsid`, `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), a `git commit` of changes your edit and write tools did not make, a commit or tag message read from a file (`-F <file>`; use `-F -` with a heredoc), and a commit or push gated (`&&`, `||`, `if`, `set -e`) on a pipeline ending in a filter (`tests | grep … && git commit`) without `set -o pipefail`.";
 /** How to work beside other agents, for the tool's guidelines. */
 const SHARED_CHECKOUT_GUIDELINE =
-	"Other agents may work in the same checkout or worktrees of the same repository, so `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f` and whole-tree discards (`git checkout -- .`, `git restore .`) are refused: for a clean state use `git worktree add /tmp/<name> HEAD`, and restore or commit only your own paths. A `git commit` that would take changes your edit and write tools did not make is refused with the paths; after `git diff` shows they are yours, run it as `PI_COMMIT_CHECKED=1 git commit …`.";
+	"Other agents may work in the same checkout or worktrees of the same repository, so `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f` and whole-tree discards (`git checkout -- .`, `git restore .`) are refused: for a clean state use `git worktree add /tmp/<name> HEAD`, and restore or commit only your own paths. A `git commit` that would take changes your edit and write tools did not make is refused with the paths; after `git diff` shows they are yours, run it as `PI_COMMIT_CHECKED=1 git commit …`. Pass a commit message on stdin from a quoted heredoc in the same command (`git commit --only <paths> -F - <<'EOF'`), never through a message file: parallel agents overwrite each other's files in /tmp.";
 
 export interface BashOptions {
 	/** Directory for the group files; default a per-process directory in the system temp dir. */
@@ -139,14 +140,15 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 	});
 
 	// A command using `setsid`, discarding uncommitted work (git.ts), committing changes that are
-	// not the session's (commit.ts) or publishing on a filter's status (gate.ts) is refused here;
+	// not the session's (commit.ts), reading its message from a file (message.ts) or publishing on a
+	// filter's status (gate.ts) is refused here;
 	// Pi then runs no later handler.
 	pi.on("tool_call", (event, ctx) => {
 		if (!isToolCallEventType("bash", event)) return;
 		const { command } = event.input;
 		const setsid = setsidCommands(command);
 		const id = ctx.sessionManager.getSessionId();
-		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, gitRefusal(command), gateRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
+		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, gitRefusal(command), messageFileRefusal(command), gateRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
 		if (reasons.length > 0) return { block: true, reason: reasons.join("\n\n") };
 		mkdirSync(sessionDir(id), { recursive: true });
 		event.input.command = recordLine(groupFile(id, event.toolCallId)) + event.input.command;

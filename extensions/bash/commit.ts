@@ -28,7 +28,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { commandsIn, type GitCommand, gitCommand, refusalText } from "./commands.ts";
+import { commandsIn, type GitCommand, gitCommand, gitOptions, refusalText } from "./commands.ts";
 
 /** The variable that runs a refused commit after its changes were checked. */
 export const COMMIT_CHECKED = "PI_COMMIT_CHECKED";
@@ -131,41 +131,9 @@ export function changeEnds(files: SessionFiles, callId: string, failed: boolean)
 	files.files.set(pending.path, { last, foreign, changes: (record?.changes ?? 0) + 1 });
 }
 
-/** Options of `git commit` that take the next word as their value (long ones also as `--opt=value`). */
-const COMMIT_VALUED_LONG = new Set(["--message", "--file", "--reuse-message", "--reedit-message", "--author", "--date", "--fixup", "--squash", "--template", "--cleanup", "--trailer", "--pathspec-from-file"]);
-const COMMIT_VALUED_SHORT = new Set(["m", "F", "C", "c", "t"]);
-
-interface CommitOptions {
-	flags: Set<string>;
-	pathspecs: string[];
-}
-
-/** A `git commit`'s or `git add`'s flags (short ones by letter, long ones as written) and pathspecs. */
-function options(args: readonly string[], valuedLong: ReadonlySet<string>, valuedShort: ReadonlySet<string>): CommitOptions {
-	const flags = new Set<string>();
-	const pathspecs: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i]!;
-		if (arg === "--") {
-			pathspecs.push(...args.slice(i + 1));
-			break;
-		}
-		if (arg.startsWith("--")) {
-			const name = arg.replace(/=.*$/s, "");
-			flags.add(name);
-			if (valuedLong.has(name) && !arg.includes("=")) i += 1;
-		} else if (arg.startsWith("-") && arg.length > 1) {
-			for (let j = 1; j < arg.length; j++) {
-				flags.add(arg[j]!);
-				if (valuedShort.has(arg[j]!)) {
-					if (j === arg.length - 1) i += 1;
-					break;
-				}
-			}
-		} else pathspecs.push(arg);
-	}
-	return { flags, pathspecs };
-}
+/** Options of `git commit` that take a value (the next word, `-Fvalue`, or `--opt=value`). */
+export const COMMIT_VALUED_LONG = new Set(["--message", "--file", "--reuse-message", "--reedit-message", "--author", "--date", "--fixup", "--squash", "--template", "--cleanup", "--trailer", "--pathspec-from-file"]);
+export const COMMIT_VALUED_SHORT = new Set(["m", "F", "C", "c", "t"]);
 
 /** A `git add` before the commit in the same command: its pathspecs, and whether it adds untracked files (not `-u`). */
 interface Added {
@@ -192,7 +160,7 @@ function changedPaths(dir: string, pathspecs: readonly string[], untracked: bool
 
 /** What one `git commit` would take: each path, relative to the repository's top, and its content's source. */
 function committed(dir: string, commit: GitCommand, added: readonly Added[]): Map<string, Source> {
-	const { flags, pathspecs } = options(commit.args, COMMIT_VALUED_LONG, COMMIT_VALUED_SHORT);
+	const { flags, pathspecs } = gitOptions(commit.args, COMMIT_VALUED_LONG, COMMIT_VALUED_SHORT);
 	const paths = new Map<string, Source>();
 	const staged = () => {
 		for (const path of nulList(git(dir, ["diff", "--cached", "--name-only", "--no-relative", "-z", "--no-renames"]))) paths.set(path, "index");
@@ -223,7 +191,7 @@ function indexBlobs(top: string, paths: readonly string[]): Map<string, string> 
 /** Why the paths one commit in `dir` would take are not only the session's own; empty when they are. */
 export function commitProblems(files: SessionFiles, dir: string, commit: GitCommand, added: readonly Added[] = []): Problem[] {
 	const top = git(dir, ["rev-parse", "--show-toplevel"])?.trim();
-	if (!top || options(commit.args, COMMIT_VALUED_LONG, COMMIT_VALUED_SHORT).flags.has("--dry-run")) return [];
+	if (!top || gitOptions(commit.args, COMMIT_VALUED_LONG, COMMIT_VALUED_SHORT).flags.has("--dry-run")) return [];
 	const paths = committed(dir, commit, added);
 	const index = indexBlobs(top, [...paths].flatMap(([path, source]) => (source === "index" ? [path] : [])));
 	const problems: Problem[] = [];
@@ -262,7 +230,7 @@ export function commitRefusal(files: SessionFiles, source: string, cwd: string):
 		if (!git) continue;
 		const at = resolve(dir, ...git.dirs.map(expandHome));
 		if (git.subcommand === "add") {
-			const { flags, pathspecs } = options(git.args, new Set(["--pathspec-from-file", "--chmod"]), new Set());
+			const { flags, pathspecs } = gitOptions(git.args, new Set(["--pathspec-from-file", "--chmod"]), new Set());
 			const update = flags.has("u") || flags.has("--update");
 			// Relative to where the commit runs: absolute, except pathspecs with magic (`:/src`).
 			if (pathspecs.length || update || flags.has("A") || flags.has("--all"))
