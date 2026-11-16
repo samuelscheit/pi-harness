@@ -3,8 +3,15 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, test } from "node:test";
-import { checkCommand } from "../workflows/fix_loop.ts";
+import { compile, evaluate } from "../extensions/workflow/compile.ts";
+import { HARNESS_WORKFLOWS } from "../extensions/workflow/library.ts";
+
+// Loaded as the runtime loads a saved workflow: its types need the workflow globals, which this project leaves out.
+const file = join(HARNESS_WORKFLOWS, "fix_loop.ts");
+const checkCommand = evaluate(compile(readFileSync(file, "utf8"), file), file, {}).exports.checkCommand as (check: string) => string;
 
 /** The exit code of a check as fix_loop runs it (shell() runs `bash -c`). */
 const exitOf = (check: string) => spawnSync("bash", ["-c", checkCommand(check)]).status;

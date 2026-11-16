@@ -95,6 +95,8 @@ export interface WorkflowModule {
 	meta: unknown;
 	/** The default export. */
 	run: (input?: unknown) => Promise<unknown>;
+	/** Every export (a workflow's helpers, for its tests). */
+	exports: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -111,7 +113,7 @@ export function evaluate(js: string, filename: string, globals: Record<string, u
 	new vm.Script(js, { filename }).runInContext(context, { timeout: LOAD_TIMEOUT_MS });
 	const run = module.exports.default;
 	if (typeof run !== "function") throw new Error(`${filename} has no default export function (export default async function (input) { … })`);
-	return { meta: module.exports.meta, run: run as WorkflowModule["run"] };
+	return { meta: module.exports.meta, run: run as WorkflowModule["run"], exports: module.exports };
 }
 
 /**
