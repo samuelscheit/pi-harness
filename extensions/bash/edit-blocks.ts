@@ -11,6 +11,12 @@
 // Every file is checked with Pi's own matching (computeEditsDiff) before any is written, so a
 // block that does not match changes nothing. Then each file is one `edit` call through the
 // session's tool pipeline: pi-lens checks it and the metrics count it as an edit.
+//
+// A relative path the shell's directory does not hold is looked up from the repository root:
+// agents `cd` into a subdirectory for the check that follows and still write the path as git
+// shows it (2026-11-16, one thread, twice: `cd repo/tools/kernel && tool edit -` with
+// `tools/kernel/dead_refs.py`; each refusal cost a turn over the whole context, and the check
+// after it ran on the old code).
 
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -46,7 +52,7 @@ export const EDIT_BLOCKS_HELP = `Several files from stdin: \`tool edit - <<'EOF'
   =======
   new text
   >>>>>>> REPLACE
-Relative paths resolve against the shell's current directory. Every file is checked before any is written: if a block does not match, nothing changes. Quote the delimiter ('EOF') so the shell leaves $ and backticks alone.
+Relative paths resolve against the shell's current directory, or, when it holds no such file, the git repository's root. Every file is checked before any is written: if a block does not match, nothing changes. Quote the delimiter ('EOF') so the shell leaves $ and backticks alone.
 Inside a block no other line may be \`=======\` or start with \`<<<<<<<\`/\`>>>>>>>\`: such text (git conflict hunks, a 7-character === underline) is ambiguous and refused; change it with --path and --edits instead. A file that still holds a git conflict (\`<<<<<<<\` … \`=======\` … \`>>>>>>>\`) after the edit, when the edit added it or git lists the file as unmerged, exits 1.`;
 
 /**
@@ -151,6 +157,34 @@ async function conflictWarning(path: string, before: string): Promise<string | u
 	return `${path}: changed, but it still holds git conflict markers (conflicts starting at line ${after.join(", ")}); resolve them before staging it`;
 }
 
+/** The root of the git repository holding `cwd`; undefined outside one. */
+async function repositoryRoot(cwd: string): Promise<string | undefined> {
+	try {
+		const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd });
+		return stdout.trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Where each relative path points: against `cwd`, or, when `cwd` holds no such file but the
+ * repository root does, against the root. A path that exists under neither stays against `cwd`.
+ */
+export async function resolvePaths(paths: readonly string[], cwd: string): Promise<string[]> {
+	let root: Promise<string | undefined> | undefined;
+	return Promise.all(
+		paths.map(async (path) => {
+			if (isAbsolute(path)) return path;
+			const local = resolve(cwd, path);
+			if (existsSync(local)) return local;
+			const top = await (root ??= repositoryRoot(cwd));
+			const fromRoot = top === undefined ? undefined : resolve(top, path);
+			return fromRoot !== undefined && existsSync(fromRoot) ? fromRoot : local;
+		}),
+	);
+}
+
 /** Check every file's blocks, then apply them file by file as `edit` calls. */
 export async function runEditBlocks(
 	ctx: Pick<ExtensionToolContext, "executeTool">,
@@ -160,16 +194,21 @@ export async function runEditBlocks(
 ): Promise<ToolResponse> {
 	let files: FileEdits[];
 	try {
-		files = parseEditBlocks(stdin).map((file) => ({ ...file, path: isAbsolute(file.path) ? file.path : resolve(cwd, file.path) }));
+		files = parseEditBlocks(stdin);
 	} catch (error) {
 		if (!(error instanceof EditBlocksError)) throw error;
 		return { stdout: "", stderr: `tool edit: ${error.message}\n`, code: 2 };
 	}
+	const paths = await resolvePaths(
+		files.map((file) => file.path),
+		cwd,
+	);
+	files = files.map((file, index) => ({ ...file, path: paths[index]! }));
 	const checks = await Promise.all(files.map((file) => computeEditsDiff(file.path, file.edits, cwd)));
 	const failures = checks.flatMap((check, index) => {
 		if (!("error" in check)) return [];
 		const path = files[index]!.path;
-		const missing = !existsSync(path) ? " (no such file: a path line holds only the file's path, relative to the shell's current directory)" : "";
+		const missing = !existsSync(path) ? " (no such file: a path line holds only the file's path, relative to the shell's current directory or the repository root)" : "";
 		return [`${path}: ${check.error}${missing}`];
 	});
 	if (failures.length > 0) {

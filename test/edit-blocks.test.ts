@@ -2,7 +2,7 @@
 // through Pi's real edit tool with the check of every file before any is written.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, test } from "node:test";
@@ -137,12 +137,47 @@ describe("runEditBlocks", () => {
 		assert.deepEqual(calls, [`edit ${file("a.ts")}`, `edit ${file("b.ts")}`]);
 	});
 
+	test("a repo-relative path from a subdirectory edits the repository's file; the shell's directory wins when it holds the path", async () => {
+		const sub = join(dir, "tools", "kernel");
+		mkdirSync(join(sub, "tools", "kernel"), { recursive: true });
+		writeFileSync(join(sub, "dead_refs.py"), "import paths\n");
+		writeFileSync(join(dir, "top.py"), "x = 1\n");
+		execFileSync("git", ["init", "-q"], { cwd: dir });
+		// The incident: `cd repo/tools/kernel && tool edit -` with the path as git shows it.
+		const fromSub = await runEditBlocks(ctx(), ["tools/kernel/dead_refs.py", block("import paths", "import paths  # noqa")].join("\n"), sub, signal);
+		assert.equal(fromSub.code, 0, fromSub.stderr);
+		assert.equal(readFileSync(join(sub, "dead_refs.py"), "utf8"), "import paths  # noqa\n");
+		// A file of the root, named from the subdirectory.
+		const top = await runEditBlocks(ctx(), ["top.py", block("x = 1", "x = 2")].join("\n"), sub, signal);
+		assert.equal(top.code, 0, top.stderr);
+		assert.equal(readFileSync(join(dir, "top.py"), "utf8"), "x = 2\n");
+		// Both exist: the shell's directory wins.
+		writeFileSync(join(sub, "tools", "kernel", "dead_refs.py"), "import paths\n");
+		const both = await runEditBlocks(ctx(), ["tools/kernel/dead_refs.py", block("import paths", "import nested")].join("\n"), sub, signal);
+		assert.equal(both.code, 0, both.stderr);
+		assert.equal(readFileSync(join(sub, "tools", "kernel", "dead_refs.py"), "utf8"), "import nested\n");
+		assert.equal(readFileSync(join(sub, "dead_refs.py"), "utf8"), "import paths  # noqa\n");
+		// Under neither: refused, named against the shell's directory, nothing written.
+		const none = await runEditBlocks(ctx(), ["nope/x.py", block("a", "b")].join("\n"), sub, signal);
+		assert.equal(none.code, 1);
+		assert.match(none.stderr, new RegExp(`${join(sub, "nope", "x.py").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: .*no such file.*repository root`));
+	});
+
+	test("outside a repository a missing relative path is refused against the shell's directory", async () => {
+		const sub = join(dir, "sub");
+		mkdirSync(sub);
+		const response = await runEditBlocks(ctx(), ["a.ts", block("const a = 1;", "const a = 2;")].join("\n"), sub, signal);
+		assert.equal(response.code, 1);
+		assert.match(response.stderr, /sub\/a\.ts: .*no such file/);
+		assert.equal(readFileSync(file("a.ts"), "utf8"), "const a = 1;\nconst b = 2;\n");
+	});
+
 	test("one block not matching changes no file and names every failing one", async () => {
 		const stdin = ["a.ts", block("const a = 1;", "const a = 10;"), "b.ts", block("nope", "y"), "missing.ts", block("a", "b")].join("\n");
 		const response = await runEditBlocks(ctx(), stdin, dir, signal);
 		assert.equal(response.code, 1);
 		assert.match(response.stderr, /^tool edit: nothing changed, 2 of 3 files do not match:\n.*b\.ts: .*\n.*missing\.ts: Could not edit file/);
-		assert.match(response.stderr, /missing\.ts: .*\(no such file: a path line holds only the file's path, relative to the shell's current directory\)\n$/);
+		assert.match(response.stderr, /missing\.ts: .*\(no such file: a path line holds only the file's path, relative to the shell's current directory or the repository root\)\n$/);
 		assert.doesNotMatch(response.stderr, /b\.ts: [^\n]*no such file/, "an existing file that does not match gets no path hint");
 		assert.equal(readFileSync(file("a.ts"), "utf8"), "const a = 1;\nconst b = 2;\n");
 		assert.deepEqual(calls, []);
