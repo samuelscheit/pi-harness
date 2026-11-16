@@ -154,6 +154,7 @@ describe("patchBundle", () => {
 		"connection-failure-resumable",
 		"background-released",
 		"background-released-contract",
+		"between-turns-ordinal",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -212,6 +213,9 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('awaited: piRecordField(item, "awaited") !== false /* releasedByItem */'));
 		assert.ok(text.includes("\tawaited: optional(Boolean$2),\n\t/** The shell command the work runs, when it is one. */"), "the contract takes false");
 		assert.ok(text.includes("task.awaited ?? backgroundWorkKindHoldsCompletion(task.kind)"));
+		// A dialog shown between turns follows the last turn's items instead of ordinal 0.
+		assert.ok(text.includes("state.activeTurn = activeTurn;\n\t\t\t\t\t\tstate.lastTurn = activeTurn;"));
+		assert.ok(text.includes("ordinal: (turn ?? state?.lastTurn ?? null) === null ? 0 : itemOrdinal(turn ?? state.lastTurn, nativeRequestId)"));
 		assert.ok(text.includes("const failure = connectionFailure === null ? reportedFailure : null;"));
 		assert.ok(text.includes("}\n\t\t\t\tif (failure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tyield* emit({\n\t\t\t\t\t\ttype: \"turn.terminal\","), "only a real failure fails the turn");
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
@@ -639,6 +643,25 @@ describe("keeping t3 patched", () => {
 		});
 	});
 
+	test("finds the app's main process when the check runs inside it (a t3 session applying a patch)", async () => {
+		// The main process is a shell started without arguments; the check runs in its child.
+		const dir = mkdtempSync(join(tmpdir(), "t3-ancestor-"));
+		const main = join(dir, "Fake T3 (Nightly)");
+		symlinkSync("/bin/sh", main);
+		try {
+			const shell = spawn(main, [], { stdio: ["pipe", "pipe", "inherit"] });
+			let out = "";
+			shell.stdout.on("data", (chunk) => (out += chunk));
+			const check = `import(${JSON.stringify(new URL("../scripts/patch-t3.ts", import.meta.url).href)}).then((m) => console.log(String(m.startedAgoS(${JSON.stringify(main)}))))`;
+			shell.stdin.end(`${JSON.stringify(process.execPath)} -e '${check}'\n`);
+			await new Promise((resolve) => shell.on("exit", resolve));
+			const ago = Number(out.trim());
+			assert.ok(Number.isFinite(ago) && ago >= 0 && ago < 30, `started ${out.trim()}s ago`);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("the LaunchAgent is a valid plist that watches the app's folder and runs at load", () => {
 		const dir = mkdtempSync(join(tmpdir(), "launch-agent-"));
 		try {
@@ -670,7 +693,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);

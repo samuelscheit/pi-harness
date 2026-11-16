@@ -106,6 +106,15 @@
 //   awaited), the contract's `awaited` is a boolean, and `backgroundWorkHoldsCompletion` lets an
 //   explicit `false` hold nothing, whatever the kind. The jobs still wake the child; a delivered
 //   result is not delivered again.
+// - between-turns-ordinal (mirrors t3code's branch pi-dialogs-outlive-turns, "fix(client-runtime,
+//   provider-pi): a question asked between turns shows at once in a long thread"): a dialog Pi shows
+//   while no turn runs (an `ask_user` from a workflow or after its turn returned) got ordinal 0,
+//   before the whole thread. A long thread's renderer holds a bounded window and drops a streamed
+//   run-less item at or below its newest ordinal as unloaded history, so the desktop showed the card
+//   only after its next snapshot, minutes later, while the phone that had just connected showed it
+//   (2026-11-16). The adapter now remembers its newest turn and orders such a dialog after its
+//   items. t3code also keeps an open question's row in the renderer whatever its ordinal; that half
+//   is in the minified client, which this script does not patch.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -916,6 +925,17 @@ export const PATCHES: Patch[] = [
 			],
 		],
 	},
+	{
+		name: "between-turns-ordinal",
+		marker: "betweenTurnsOrdinal",
+		edits: [
+			["state.activeTurn = activeTurn;", "state.activeTurn = activeTurn;\n\t\t\t\t\t\tstate.lastTurn = activeTurn;"],
+			[
+				"ordinal: turn === null ? 0 : itemOrdinal(turn, nativeRequestId),",
+				"ordinal: (turn ?? state?.lastTurn ?? null) === null ? 0 : itemOrdinal(turn ?? state.lastTurn, nativeRequestId) /* betweenTurnsOrdinal */,",
+			],
+		],
+	},
 ];
 
 /** Identifies the bundled Pi adapter, patched or not. */
@@ -1013,11 +1033,13 @@ const literal = (text: string) => text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
  * Seconds since a process started from `main` without arguments did (an app's main process; its
  * helpers carry arguments), or undefined when none runs. `pgrep` compares the command lines, and `ps`
  * reports only the matches: listing every command line exceeds child_process's output limit when many
- * processes run (ENOBUFS).
+ * processes run (ENOBUFS). `-a`: macOS's pgrep skips its own ancestors otherwise, and a run from a t3
+ * session (an agent applying a new patch) descends from t3's main process, which then looked stopped:
+ * no restart notification, and a restart that did not wait for the old process to exit.
  */
 export function startedAgoS(main: string): number | undefined {
 	// Exit 1: no match.
-	const pids = spawnSync("pgrep", ["-x", "-f", literal(main)], { encoding: "utf8" }).stdout.trim().split(/\s+/).filter(Boolean);
+	const pids = spawnSync("pgrep", ["-a", "-x", "-f", literal(main)], { encoding: "utf8" }).stdout.trim().split(/\s+/).filter(Boolean);
 	if (pids.length === 0) return undefined;
 	// Exit 1 when the match exited meanwhile.
 	const etime = spawnSync("ps", ["-o", "etime=", "-p", pids.join(",")], { encoding: "utf8" }).stdout.trim().split("\n")[0]?.trim();
