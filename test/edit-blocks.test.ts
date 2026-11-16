@@ -7,9 +7,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, test } from "node:test";
 import { createEditTool } from "@earendil-works/pi-coding-agent";
-import { EditBlocksError, parseEditBlocks, pathOf, runEditBlocks } from "../extensions/bash/edit-blocks.ts";
+import { execFileSync } from "node:child_process";
+import { conflictLines, EditBlocksError, parseEditBlocks, pathOf, runEditBlocks } from "../extensions/bash/edit-blocks.ts";
 
 const block = (search: string, replace: string) => `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
+const hunk = (ours: string, theirs: string, sha = "1a2b3c4 (fix land)") => `<<<<<<< HEAD\n${ours}\n=======\n${theirs}\n>>>>>>> ${sha}`;
 
 describe("parseEditBlocks", () => {
 	test("several files, several blocks per file, blank lines and fences between them", () => {
@@ -28,11 +30,36 @@ describe("parseEditBlocks", () => {
 		]);
 	});
 
-	test("a divider inside the REPLACE part is text; an empty REPLACE deletes", () => {
-		assert.deepEqual(parseEditBlocks(["md.md", block("Title", "Title\n=======\nbody"), "x.ts", "<<<<<<< SEARCH\ngone\n=======\n>>>>>>> REPLACE"].join("\n")), [
-			{ path: "md.md", edits: [{ oldText: "Title", newText: "Title\n=======\nbody" }] },
+	test("an empty REPLACE deletes; marker-like lines that are not exactly markers are text", () => {
+		const text = ["md.md", block("Title\n========\n  =======\n<<<<<<<<x\n>>>>>>>>y", "Title\n-------\n= ======"), "x.ts", "<<<<<<< SEARCH\ngone\n=======\n>>>>>>> REPLACE"].join("\n");
+		assert.deepEqual(parseEditBlocks(text), [
+			{ path: "md.md", edits: [{ oldText: "Title\n========\n  =======\n<<<<<<<<x\n>>>>>>>>y", newText: "Title\n-------\n= ======" }] },
 			{ path: "x.ts", edits: [{ oldText: "gone", newText: "" }] },
 		]);
+	});
+
+	test("a conflict marker inside a block is ambiguous and refuses the whole input", () => {
+		const ambiguous = (text: string, line: number, marker: string) =>
+			fails(text, new RegExp(`line ${line} \`${marker.replace(/[()]/g, "\\$&")}\` inside the block at line \\d+ looks like a conflict marker.*nothing changed.*--edits`));
+		// The reported case: SEARCH holds a whole conflict hunk; its `=======` used to end SEARCH early.
+		ambiguous(["land.py", block(hunk("ours", "theirs"), "resolved")].join("\n"), 3, "<<<<<<< HEAD");
+		// SEARCH starting inside the hunk: git's `=======` is taken as the divider, its end marker then refuses.
+		ambiguous(["land.py", "<<<<<<< SEARCH\nours\n=======\ntheirs\n>>>>>>> 1a2b3c4 (fix land)\n=======\nresolved\n>>>>>>> REPLACE"].join("\n"), 6, ">>>>>>> 1a2b3c4 (fix land)");
+		ambiguous(["land.py", block(`x\n${hunk("ours", "theirs")}`, "x\nresolved")].join("\n"), 4, "<<<<<<< HEAD");
+		// REPLACE that would write markers back.
+		ambiguous(["a.ts", block("one", hunk("1", "2"))].join("\n"), 5, "<<<<<<< HEAD");
+		ambiguous(["a.ts", block("one", "1\n>>>>>>> 1a2b3c4")].join("\n"), 6, ">>>>>>> 1a2b3c4");
+		ambiguous(["a.ts", block("one", "1\n<<<<<<<")].join("\n"), 6, "<<<<<<<");
+		// A Markdown setext underline of exactly seven `=` is indistinguishable from the divider.
+		ambiguous(["README.md", block("Title", "New title\n=======")].join("\n"), 6, "=======");
+		// A forgotten `>>>>>>> REPLACE`: the next block's start is not taken as text.
+		ambiguous(["a.ts", "<<<<<<< SEARCH\none\n=======\n1", block("two", "2")].join("\n"), 6, "<<<<<<< SEARCH");
+		ambiguous(["a.ts", "<<<<<<< SEARCH\none\n>>>>>>> REPLACE\n=======\n1\n>>>>>>> REPLACE"].join("\n"), 4, ">>>>>>> REPLACE");
+	});
+
+	test("conflict markers outside a block are refused, not taken as paths", () => {
+		fails(["a.ts", block("a", "b"), "<<<<<<< HEAD", block("c", "d")].join("\n"), /line 7: `<<<<<<< HEAD` outside a block/);
+		fails([">>>>>>> 1a2b3c4", "a.ts", block("a", "b")].join("\n"), /line 1: `>>>>>>> 1a2b3c4` outside a block/);
 	});
 
 	test("path lines written as in diffs or Markdown name the file", () => {
@@ -133,6 +160,62 @@ describe("runEditBlocks", () => {
 		assert.equal(response.code, 1);
 		assert.match(response.stderr, /a\.ts: .*(unique|occurrences)/i);
 		assert.equal(readFileSync(file("a.ts"), "utf8"), "x\nx\n");
+	});
+
+	test("one ambiguous block among several files changes no file", async () => {
+		const stdin = ["a.ts", block("const a = 1;", "const a = 10;"), "b.ts", block("'x'", hunk("'y'", "'z'"))].join("\n");
+		const response = await runEditBlocks(ctx(), stdin, dir, signal);
+		assert.equal(response.code, 2);
+		assert.match(response.stderr, /^tool edit: b\.ts: line 11 `<<<<<<< HEAD` inside the block at line 8 looks like a conflict marker/);
+		assert.equal(readFileSync(file("a.ts"), "utf8"), "const a = 1;\nconst b = 2;\n");
+		assert.equal(readFileSync(file("b.ts"), "utf8"), "export const x = 'x';\r\n");
+		assert.deepEqual(calls, []);
+	});
+
+	test("a conflict hunk is resolved through JSON edits; markers left behind in an unmerged file exit 1", async () => {
+		const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: dir, stdio: "pipe" });
+		git("init", "-q", "-b", "main");
+		writeFileSync(file("land.py"), "a = 0\nb = 0\n");
+		git("add", "land.py");
+		git("commit", "-qm", "base");
+		git("checkout", "-qb", "other");
+		writeFileSync(file("land.py"), "a = 2\nb = 2\n");
+		git("commit", "-qam", "other");
+		git("checkout", "-q", "main");
+		writeFileSync(file("land.py"), "a = 1\nb = 1\n");
+		git("commit", "-qam", "main");
+		assert.throws(() => git("merge", "-q", "other"));
+		const conflicted = readFileSync(file("land.py"), "utf8");
+		assert.equal(conflictLines(conflicted).length, 1, conflicted);
+		// Resolving only a line inside the hunk leaves the markers: the edit is made, the exit says so.
+		const response = await runEditBlocks(ctx(), ["land.py", block("a = 2", "a = 3")].join("\n"), dir, signal);
+		assert.equal(response.code, 1);
+		assert.match(response.stdout, /Successfully replaced 1 block/);
+		assert.match(response.stderr, /^tool edit: .*land\.py: changed, but it still holds git conflict markers \(conflicts starting at line 1\); resolve them/);
+		// The same edit after `git add` (merged, the markers were there before): no warning.
+		git("add", "land.py");
+		const again = await runEditBlocks(ctx(), ["land.py", block("a = 3", "a = 4")].join("\n"), dir, signal);
+		assert.deepEqual([again.code, again.stderr], [0, ""]);
+	});
+
+	test("an edit adding a full conflict warns; a Markdown setext underline or an unchanged count of conflicts does not", async () => {
+		writeFileSync(file("doc.md"), `Title\n=====\n\n\`\`\`\n${hunk("ours", "theirs")}\n\`\`\`\n`);
+		const unchanged = await runEditBlocks(ctx(), ["doc.md", block("Title\n=====", "Heading\n========")].join("\n"), dir, signal);
+		assert.deepEqual([unchanged.code, unchanged.stderr], [0, ""], "a documented conflict that was already there is not warned about");
+		// Blocks cannot hold markers, but a text edit inside a line can complete one: `======X` becomes `=======`.
+		writeFileSync(file("a.ts"), "<<<<<<< HEAD\nconst a = 1;\n======X\nconst a = 2;\n>>>>>>> 1a2b3c4\n");
+		const added = await runEditBlocks(ctx(), ["a.ts", block("X", "=")].join("\n"), dir, signal);
+		assert.equal(added.code, 1);
+		assert.match(added.stderr, /a\.ts: changed, but it still holds git conflict markers \(conflicts starting at line 1\)/);
+		assert.equal(readFileSync(file("a.ts"), "utf8"), "<<<<<<< HEAD\nconst a = 1;\n=======\nconst a = 2;\n>>>>>>> 1a2b3c4\n");
+	});
+
+	test("conflictLines needs the full triple, in order, at line start", () => {
+		assert.deepEqual(conflictLines(`x\n${hunk("a", "b")}\ny\r\n${hunk("c", "d")}\n`), [2, 8]);
+		assert.deepEqual(conflictLines("Title\n=======\nbody\n"), []);
+		assert.deepEqual(conflictLines("<<<<<<< HEAD\na\n>>>>>>> x\n=======\n"), []);
+		assert.deepEqual(conflictLines(" <<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n"), []);
+		assert.deepEqual(conflictLines("<<<<<<< HEAD\n<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n"), [2]);
 	});
 
 	test("a format error exits 2 without touching files", async () => {

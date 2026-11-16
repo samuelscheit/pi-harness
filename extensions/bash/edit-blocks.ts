@@ -12,8 +12,10 @@
 // block that does not match changes nothing. Then each file is one `edit` call through the
 // session's tool pipeline: pi-lens checks it and the metrics count it as an edit.
 
-import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { promisify } from "node:util";
 import { computeEditsDiff, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { ToolResponse } from "./bridge.ts";
 
@@ -27,6 +29,15 @@ export class EditBlocksError extends Error {}
 const SEARCH = /^<{7} SEARCH\s*$/;
 const DIVIDER = /^={7}\s*$/;
 const REPLACE = /^>{7} REPLACE\s*$/;
+/**
+ * A line git writes as a conflict marker, which the block delimiters are made of. Inside a block
+ * only its own three delimiters may look like this: git's `=======` ended a SEARCH part early, so a
+ * conflict hunk to resolve was cut in two, its first half matched, and the file kept its markers
+ * (2026-11-15, tools/kernel/land.py, committed by `git rebase --continue`).
+ */
+const CONFLICT_START = /^<{7}(?:\s|$)/;
+const CONFLICT_END = /^>{7}(?:\s|$)/;
+const isMarker = (line: string) => CONFLICT_START.test(line) || DIVIDER.test(line) || CONFLICT_END.test(line);
 
 export const EDIT_BLOCKS_HELP = `Several files from stdin: \`tool edit - <<'EOF'\`, then for each file its path on a line of its own and one or more blocks:
   path/to/file.ts
@@ -35,7 +46,8 @@ export const EDIT_BLOCKS_HELP = `Several files from stdin: \`tool edit - <<'EOF'
   =======
   new text
   >>>>>>> REPLACE
-Relative paths resolve against the shell's current directory. Every file is checked before any is written: if a block does not match, nothing changes. Quote the delimiter ('EOF') so the shell leaves $ and backticks alone.`;
+Relative paths resolve against the shell's current directory. Every file is checked before any is written: if a block does not match, nothing changes. Quote the delimiter ('EOF') so the shell leaves $ and backticks alone.
+Inside a block no other line may be \`=======\` or start with \`<<<<<<<\`/\`>>>>>>>\`: such text (git conflict hunks, a 7-character === underline) is ambiguous and refused; change it with --path and --edits instead. A file that still holds a git conflict (\`<<<<<<<\` … \`=======\` … \`>>>>>>>\`) after the edit, when the edit added it or git lists the file as unmerged, exits 1.`;
 
 /**
  * The path a path line names. Models often write it the way diffs and Markdown do: `--- a/x.py`,
@@ -73,7 +85,11 @@ export function parseEditBlocks(text: string): FileEdits[] {
 				const inner = lines[i]!;
 				if (part === search && DIVIDER.test(inner)) part = replace;
 				else if (part === replace && REPLACE.test(inner)) break;
-				else part.push(inner);
+				else if (isMarker(inner)) {
+					throw new EditBlocksError(
+						`${path}: line ${i + 1} \`${inner.trim()}\` inside the block at line ${start} looks like a conflict marker, so where the block's parts end is ambiguous; nothing changed. Change text with such lines through \`tool edit --path … --edits '[{"oldText": …, "newText": …}]'\` (JSON)`,
+					);
+				} else part.push(inner);
 			}
 			if (search.length === 0 || search.join("").trim() === "") {
 				throw new EditBlocksError(`${path}: the block at line ${start} has an empty SEARCH part; create files with \`tool write\``);
@@ -81,7 +97,7 @@ export function parseEditBlocks(text: string): FileEdits[] {
 			const file = files.get(path) ?? files.set(path, { path, edits: [] }).get(path)!;
 			file.edits.push({ oldText: search.join("\n"), newText: replace.join("\n") });
 			blocksOfPath += 1;
-		} else if (DIVIDER.test(line) || REPLACE.test(line)) {
+		} else if (isMarker(line)) {
 			throw new EditBlocksError(`line ${i + 1}: \`${line.trim()}\` outside a block`);
 		} else if (line.trim() !== "" && !line.startsWith("```")) {
 			endPath();
@@ -98,6 +114,42 @@ const textOf = (content: readonly { type: string; text?: string }[] | undefined)
 	(content ?? []).flatMap((block) => (block.type === "text" && block.text ? [block.text] : [])).join("\n");
 
 const withNewline = (text: string) => (text === "" || text.endsWith("\n") ? text : `${text}\n`);
+
+/** The 1-based lines starting a complete git conflict: `<<<<<<<`, then `=======`, then `>>>>>>>`, each at line start. */
+export function conflictLines(text: string): number[] {
+	const starts: number[] = [];
+	let start: number | undefined;
+	let divided = false;
+	for (const [index, line] of text.split(/\r?\n/).entries()) {
+		if (CONFLICT_START.test(line)) [start, divided] = [index + 1, false];
+		else if (start !== undefined && DIVIDER.test(line)) divided = true;
+		else if (start !== undefined && divided && CONFLICT_END.test(line)) {
+			starts.push(start);
+			start = undefined;
+		}
+	}
+	return starts;
+}
+
+const execFileAsync = promisify(execFile);
+
+/** Whether git lists the file as unmerged; false outside a repository. */
+async function unmerged(path: string): Promise<boolean> {
+	try {
+		const { stdout } = await execFileAsync("git", ["ls-files", "--unmerged", "--", path], { cwd: dirname(path) });
+		return stdout.trim() !== "";
+	} catch {
+		return false;
+	}
+}
+
+/** A warning when an edited file still holds a conflict the edit added, or one of a file git has not merged. */
+async function conflictWarning(path: string, before: string): Promise<string | undefined> {
+	const after = conflictLines(readFileSync(path, "utf8"));
+	if (after.length === 0) return undefined;
+	if (after.length <= conflictLines(before).length && !(await unmerged(path))) return undefined;
+	return `${path}: changed, but it still holds git conflict markers (conflicts starting at line ${after.join(", ")}); resolve them before staging it`;
+}
 
 /** Check every file's blocks, then apply them file by file as `edit` calls. */
 export async function runEditBlocks(
@@ -123,7 +175,9 @@ export async function runEditBlocks(
 	if (failures.length > 0) {
 		return { stdout: "", stderr: `tool edit: nothing changed, ${failures.length} of ${files.length} files do not match:\n${failures.join("\n")}\n`, code: 1 };
 	}
+	const before = files.map((file) => readFileSync(file.path, "utf8"));
 	const out: string[] = [];
+	const warnings: string[] = [];
 	for (const [index, file] of files.entries()) {
 		const outcome = await ctx.executeTool("edit", { path: file.path, edits: file.edits }, { signal });
 		const text = textOf(outcome.result.content as { type: string; text?: string }[]);
@@ -138,6 +192,9 @@ export async function runEditBlocks(
 			};
 		}
 		out.push(text);
+		const warning = await conflictWarning(file.path, before[index]!);
+		if (warning) warnings.push(warning);
 	}
+	if (warnings.length > 0) return { stdout: withNewline(out.join("\n")), stderr: `tool edit: ${warnings.join("\n")}\n`, code: 1 };
 	return { stdout: withNewline(out.join("\n")), stderr: "", code: 0 };
 }
