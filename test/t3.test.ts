@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, test } from "node:test";
 import { Agent } from "undici";
 import { isInterruption } from "../extensions/workflow/durable.ts";
+import { isParentInactive, ParentTurn, type ParentTurnOptions } from "../extensions/workflow/parent-turn.ts";
 import { isTransportFailure, MAX_WAIT_MS, T3, type T3Call, T3Child, type T3Options, T3Unreachable, waitSliceMs } from "../extensions/workflow/t3.ts";
 
 const HEADERS_TIMEOUT_MS = 400;
@@ -240,3 +241,190 @@ describe("transport failures are repeated; t3 gone for good interrupts", () => {
 		}
 	});
 });
+
+// A start t3 refuses because the parent thread has no active run (the agent ended its turn while
+// the workflow runs; run 20261115-071237-996ba4 lost 17 of 30 delegates so): it waits for a turn,
+// waking the session once, and the woken turn's end is held until the starts are in.
+describe("a delegate start waits for the parent's turn (parent_not_active)", () => {
+	const REFUSED = "t3 delegate_task: OrchestratorMcpFailure(parent_not_active): Delegated tasks require an active run owned by this MCP provider session.";
+	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+	/**
+	 * A parent session as t3 sees it: a wake starts a turn after `startMs`, t3 adopts it as a run
+	 * `adoptMs` later; the turn's model is done after `turnMs`, then Pi settles (held by `settling`).
+	 * delegate_task succeeds only while t3 has the run.
+	 */
+	function parentSession(options: { startMs?: number; adoptMs?: number; turnMs?: number; wakeStarts?: boolean; turn?: ParentTurnOptions; active?: boolean } = {}) {
+		const s = { wakes: 0, run: false, starts: 0, refusals: 0, settledAt: [] as number[], startedAt: [] as number[], other: 0 };
+		const turn: ParentTurn = new ParentTurn(
+			() => {
+				s.wakes++;
+				if (options.wakeStarts === false) return;
+				void (async () => {
+					await sleep(options.startMs ?? 10);
+					turn.started();
+					setTimeout(() => (s.run = true), options.adoptMs ?? 30).unref();
+					await sleep(options.turnMs ?? 5);
+					await turn.settling();
+					s.run = false;
+					s.settledAt.push(Date.now());
+				})();
+			},
+			{ pollMs: 10, deadlineMs: 2_000, holdMs: 1_000, ...options.turn },
+			options.active ?? false,
+		);
+		const call: T3Call = async (name, args) => {
+			if (name === "delegate_task") {
+				if (!s.run) {
+					s.refusals++;
+					throw new Error(REFUSED);
+				}
+				s.starts++;
+				s.startedAt.push(Date.now());
+				return { taskId: `task-${String(args.clientRequestId)}`, childThreadId: `thread-${String(args.clientRequestId)}`, childRunId: "run-1", status: "completed", waitTimedOut: false };
+			}
+			s.other++;
+			return name === "task_status" ? { summary: "done" } : { status: "completed" };
+		};
+		return { s, turn, t3: new T3(call, { ...fast, parent: turn }) };
+	}
+	const start = (t3: T3, id: string, signal = new AbortController().signal) => new T3Child(t3, {}).run("task", id, signal, () => undefined);
+
+	test("which errors mean no active run", () => {
+		assert.ok(isParentInactive(new Error(REFUSED)));
+		assert.ok(isParentInactive("parent_not_active"));
+		for (const message of ["t3 delegate_task: Unknown model", "t3 delegate_task: fetch failed", "parent_not_activated", "not_parent_not_active_x"]) assert.ok(!isParentInactive(new Error(message)), message);
+	});
+
+	test("started while the parent is idle: the session is woken, the start repeated in the woken turn, whose end waits for it", async () => {
+		const { s, turn, t3 } = parentSession();
+		await start(t3, "a");
+		assert.equal(s.wakes, 1);
+		assert.equal(s.starts, 1);
+		assert.ok(s.refusals >= 1, "t3 refused it first");
+		assert.equal(turn.pending, 0);
+		await until(() => s.settledAt.length === 1);
+		assert.ok(s.settledAt[0]! >= s.startedAt[0]!, "the woken run ended after the start went through, though its model was done before t3 adopted it");
+	});
+
+	test("17 starts refused at once: one wake, all start in the woken turn", async () => {
+		const { s, t3 } = parentSession({ adoptMs: 80 });
+		await Promise.all(Array.from({ length: 17 }, (_, i) => start(t3, `c${i}`)));
+		assert.equal(s.wakes, 1, "one wake, not 17");
+		assert.equal(s.starts, 17);
+		await until(() => s.settledAt.length === 1);
+		assert.ok(s.settledAt[0]! >= Math.max(...s.startedAt), "held until the last start");
+	});
+
+	test("a turn running (t3 adopting it) is not woken again: the start is repeated until t3 has the run", async () => {
+		const { s, turn, t3 } = parentSession({ active: true });
+		setTimeout(() => (s.run = true), 60);
+		await start(t3, "a");
+		assert.equal(s.wakes, 0);
+		assert.equal(s.starts, 1);
+		assert.ok(s.refusals >= 2);
+		assert.equal(turn.pending, 0);
+	});
+
+	test("bounded: a wake whose turn never comes fails the start after the deadline with t3's error, waking once", async () => {
+		const { s, turn, t3 } = parentSession({ wakeStarts: false, turn: { deadlineMs: 200 } });
+		const started = Date.now();
+		await assert.rejects(start(t3, "a"), (error: Error) => {
+			assert.match(error.message, /^t3 delegate_task: OrchestratorMcpFailure\(parent_not_active\): .*\(the parent session was woken, but t3 had no active run of its thread for 0 s\)$/);
+			assert.ok(isParentInactive(error.cause));
+			return true;
+		});
+		const took = Date.now() - started;
+		assert.ok(took >= 200 && took < 600, `gave up at the deadline (${took} ms)`);
+		assert.equal(s.wakes, 1);
+		assert.ok(s.refusals >= 5 && s.refusals <= 25, `repeated every poll (${s.refusals})`);
+		assert.equal(turn.pending, 0);
+	});
+
+	test("bounded: a held turn end lets go after holdMs; a start still refused then wakes the session again", async () => {
+		// t3 never adopts the woken turns: each is held for holdMs, then the next refusal wakes again.
+		const { s, turn, t3 } = parentSession({ adoptMs: 60_000, turn: { holdMs: 100, deadlineMs: 450 } });
+		await assert.rejects(start(t3, "a"), /parent_not_active/);
+		assert.ok(s.wakes >= 2 && s.wakes <= 5, `a wake per held turn (${s.wakes})`);
+		assert.equal(turn.pending, 0);
+		await turn.settling();
+	});
+
+	test("other errors are not repeated and wake no one", async () => {
+		const turn = new ParentTurn(() => assert.fail("woken"), { pollMs: 10 });
+		let calls = 0;
+		const t3 = new T3(
+			async () => {
+				calls++;
+				throw new Error("t3 delegate_task: Unknown model faux/nope");
+			},
+			{ ...fast, parent: turn },
+		);
+		await assert.rejects(start(t3, "a"), /Unknown model/);
+		assert.equal(calls, 1);
+		assert.equal(turn.pending, 0);
+	});
+
+	test("only starts wait: a wait or read refused for lack of a run fails at once", async () => {
+		const turn = new ParentTurn(() => assert.fail("woken"), { pollMs: 10 });
+		let calls = 0;
+		const t3 = new T3(
+			async () => {
+				calls++;
+				throw new Error(REFUSED);
+			},
+			{ ...fast, parent: turn },
+		);
+		await assert.rejects(child(t3).reattach("ignored", "req-1", "run-1", new AbortController().signal, () => undefined), /parent_not_active/);
+		assert.equal(calls, 1);
+	});
+
+	test("the run's stop ends the waiting at once with its reason; the end of a turn is no longer held for it", async () => {
+		const { s, turn, t3 } = parentSession({ wakeStarts: false });
+		const controller = new AbortController();
+		const pending = start(t3, "a", controller.signal);
+		await until(() => s.refusals >= 2);
+		assert.equal(turn.pending, 1);
+		const held = turn.settling();
+		controller.abort(new Error("stopped"));
+		await assert.rejects(pending, /stopped/);
+		const refusals = s.refusals;
+		await held;
+		await sleep(50);
+		assert.equal(s.refusals, refusals, "not tried again");
+		assert.equal(turn.pending, 0);
+	});
+
+	test("a wake that throws (the session ended) fails the start with that error", async () => {
+		const turn = new ParentTurn(() => {
+			throw new Error("the session ended");
+		});
+		const t3 = new T3(async () => {
+			throw new Error(REFUSED);
+		}, { parent: turn });
+		await assert.rejects(start(t3, "a"), /the session ended/);
+		assert.equal(turn.pending, 0);
+	});
+
+	test("without a parent turn (no session) the refusal fails the start as before", async () => {
+		const t3 = new T3(async () => {
+			throw new Error(REFUSED);
+		});
+		await assert.rejects(start(t3, "a"), /parent_not_active/);
+	});
+
+	test("settling without waiting starts returns at once", async () => {
+		const turn = new ParentTurn(() => undefined, { holdMs: 5_000 });
+		const started = Date.now();
+		await turn.settling();
+		assert.ok(Date.now() - started < 50);
+	});
+});
+
+async function until(ok: () => boolean, ms = 5_000) {
+	const deadline = Date.now() + ms;
+	while (!ok()) {
+		if (Date.now() > deadline) throw new Error("timed out");
+		await new Promise((r) => setTimeout(r, 5));
+	}
+}

@@ -42,6 +42,7 @@ import { INLINE_FILE, resumeWorkflow, runWorkflow, type WorkflowDetails } from "
 import { lockHeld, STOP_FILE } from "../extensions/workflow/stop.ts";
 import { livePage } from "../dashboard/server/workflows.ts";
 import { T3_PREFIX, t3Data } from "../extensions/workflow/t3.ts";
+import { WAKE_MESSAGE } from "../extensions/workflow/parent-turn.ts";
 import { questionsUi } from "../extensions/workflow/ask.ts";
 import { toolsDeclaration, tsType } from "../extensions/workflow/signatures.ts";
 import { parseCompact } from "../extensions/workflow/delegate.ts";
@@ -232,7 +233,7 @@ afterEach(async () => {
 /** How t3 calls are repeated in these tests: quickly, and given up on after 300 ms. */
 const T3_RETRY = { retryDeadlineMs: 300, backoffMs: 20 };
 const workflowExtension = (childRuntime: ModelRuntime) => (pi: ExtensionAPI) =>
-	workflow(pi, { experimentsDir: join(dir, "experiments"), workflowDirs: () => [], modelRuntime: async () => childRuntime, agentDir: fx.agentDir, t3Retry: T3_RETRY });
+	workflow(pi, { experimentsDir: join(dir, "experiments"), workflowDirs: () => [], modelRuntime: async () => childRuntime, agentDir: fx.agentDir, t3Retry: T3_RETRY, parentTurn: { pollMs: 20, deadlineMs: 10_000, holdMs: 10_000 } });
 
 async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionManager = SessionManager.create(fx.repo, fx.sessionsDir), sessionRuntime = runtime, uiContext?: ExtensionUIContext): Promise<AgentSession> {
 	const settingsManager = SettingsManager.inMemory({});
@@ -247,8 +248,9 @@ async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionMan
 /**
  * The t3 tools as the t3 MCP bridge registers them; each child is a real Pi session with the workflow extension.
  * `failWait`: while it says so, t3_thread_wait fails as the bridge's fetch does when its HTTP request is cut or refused.
+ * `parentRun`: whether the calling thread has an active run; without one delegate_task is refused as t3 refuses it.
  */
-function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait?: () => boolean } = {}) {
+function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait?: () => boolean; parentRun?: () => boolean } = {}) {
 	const waitMs = options.waitMs ?? 80;
 	let ids = 0;
 	const finishedWithin = async (run: Promise<void>, ms: number) => Promise.race([run.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), ms))]);
@@ -289,6 +291,7 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait
 				},
 			});
 		tool("delegate_task", async (args) => {
+			if (options.parentRun && !options.parentRun()) throw new Error("OrchestratorMcpFailure(parent_not_active): Delegated tasks require an active run owned by this MCP provider session.");
 			const request = String(args.clientRequestId);
 			let known = fx.requests.get(request);
 			if (!known) {
@@ -1217,8 +1220,16 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 	 * `do <json>` prompt one workflow call and answers everything else with "ok"; a child whose task
 	 * names a gate waits until it is released.
 	 */
-	async function parentInT3() {
+	async function parentInT3(t3Runs?: { adoptMs: number; log: { at: number; what: string }[] }) {
 		const background = (await import("../extensions/background/index.ts")).default;
+		/** As t3 sees the parent: a run from a turn's start (adopted `adoptMs` later) until Pi reports it settled. */
+		let run = false;
+		const parentRun = t3Runs
+			? () => {
+					if (run) t3Runs.log.push({ at: Date.now(), what: "start" });
+					return run;
+				}
+			: undefined;
 		const told: { role: string; text: string }[] = [];
 		const gates = new Map<string, { open: Promise<void>; release: () => void; runs: number }>();
 		const gate = (name: string) => {
@@ -1245,8 +1256,15 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 			return say("ok");
 		};
 		faux.setResponses(Array.from({ length: 200 }, () => dispatch));
-		const parent = await newSession([(pi) => background(pi, { logRoot: join(dir, "logs") }), workflowExtension(runtime), fakeT3(runtime)]);
+		const parent = await newSession([(pi) => background(pi, { logRoot: join(dir, "logs") }), workflowExtension(runtime), fakeT3(runtime, parentRun ? { parentRun } : {})]);
 		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
+		if (t3Runs) {
+			parent.subscribe((event) => {
+				if (event.type === "agent_start") setTimeout(() => (run = true), t3Runs.adoptMs);
+				if (event.type === "agent_settled") run = false;
+				if (event.type === "agent_start" || event.type === "agent_settled") t3Runs.log.push({ at: Date.now(), what: event.type });
+			});
+		}
 		/** One workflow call; resolves to its tool result. */
 		const act = async (args: Record<string, unknown>) => {
 			await until("an idle parent", () => !parent.isStreaming);
@@ -1260,8 +1278,38 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 			await until(`a message ${pattern}`, () => told.some((t) => pattern.test(t.text)));
 			return told.find((t) => pattern.test(t.text))!.text;
 		};
-		return { told, gate, act, start, message };
+		return { told, gate, act, start, message, parent };
 	}
+
+	test("delegates started after the parent's turn ended: t3 refuses them (parent_not_active); one wake, they start in the woken turn, whose end waits for them; the run completes", async () => {
+		const log: { at: number; what: string }[] = [];
+		const { start, message, parent, told } = await parentInT3({ adoptMs: 150, log });
+		const id = await start(
+			[
+				"await shell('sleep 1');",
+				"const out = await Promise.all(Array.from({ length: 6 }, (_, i) => delegate({ target: { model: 'faux/faux-1' } }).run('task ' + i)));",
+				"return out.map((r) => r.text).join(' | ');",
+			].join("\n"),
+		);
+		const completed = await message(/Workflow completed/);
+		assert.equal(completed.split("\n\n").at(-1), Array(6).fill("child done").join(" | "));
+		const wakes = parent.messages.filter((m) => m.role === "custom" && m.customType === WAKE_MESSAGE);
+		assert.equal(wakes.length, 1, "one wake for six refused starts");
+		assert.ok(told.some((t) => t.text.includes("t3 starts a delegated agent only during a turn of this thread")), "the woken agent is told why");
+		const refused = callsOf("delegate_task").length - 6;
+		assert.ok(refused >= 6, `every start was refused first (${refused} refusals)`);
+		assert.equal(fx.threads.size, 6, "each started once");
+		// Turns: the one that started the workflow, the woken one (held until the starts are in), the one the result wakes.
+		const starts = log.filter((e) => e.what === "start");
+		assert.equal(starts.length, 6);
+		const woken = log.findIndex((e) => e.what === "agent_start" && e.at > log.find((s) => s.what === "agent_settled")!.at);
+		const wokenSettled = log.findIndex((e, i) => i > woken && e.what === "agent_settled");
+		assert.ok(woken > 0 && wokenSettled > woken, JSON.stringify(log));
+		assert.ok(starts.every((s) => log.indexOf(s) > woken && log.indexOf(s) < wokenSettled), "all six started in the woken turn, which settled only after them");
+		const view = viewOf(journalOf(id));
+		assert.deepEqual(view.calls.filter((c) => c.kind === "delegate").map((c) => c.status), Array(6).fill("done"));
+		assert.equal(view.status, "completed");
+	});
 
 	test("a stop cuts off shell calls and keeps agents running, whose results are recorded; stopping a stopped or finished run fails clearly", async () => {
 		const { gate, act, start, message } = await parentInT3();

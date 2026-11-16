@@ -23,6 +23,12 @@
 // here is idempotent (reads, waits, cancels; starts and sends carry a clientRequestId t3 dedupes).
 // When t3 stays unreachable past `RETRY_DEADLINE_MS`, the call fails with `T3Unreachable`, an
 // interruption: the run stops resumable, its children keep running, a resume reattaches to them.
+//
+// t3 starts a task only during an active run of the calling thread: a start it refuses with
+// `parent_not_active` (the agent ended its turn while the workflow runs) waits for one, waking the
+// session, and is repeated (parent-turn.ts). The other calls need no active run.
+
+import type { ParentTurn } from "./parent-turn.ts";
 
 export const T3_PREFIX = "mcp__t3-code__";
 export const T3_DELEGATE = `${T3_PREFIX}delegate_task`;
@@ -81,6 +87,8 @@ export interface T3Options {
 	backoffMs?: number;
 	/** Called with `T3Unreachable` before it is thrown: the run interrupts itself (the callers then see an aborted signal). */
 	unreachable?: (error: T3Unreachable) => void;
+	/** The calling session's turn: a start refused for lack of an active run waits for one. */
+	parent?: ParentTurn;
 }
 
 /** t3's data from a tool's outcome: the MCP result's `structuredContent`, else its text as JSON. */
@@ -100,9 +108,11 @@ export function t3Data(name: string, value: unknown, text: string): T3Data {
 export class T3 {
 	readonly call: T3Call;
 	readonly waitMs: number;
+	private readonly parent: ParentTurn | undefined;
 
 	constructor(call: T3Call, options: T3Options = {}) {
 		this.waitMs = options.waitMs ?? MAX_WAIT_MS;
+		this.parent = options.parent;
 		const deadlineMs = options.retryDeadlineMs ?? RETRY_DEADLINE_MS;
 		const firstBackoff = options.backoffMs ?? FIRST_BACKOFF_MS;
 		this.call = async (name, args, signal) => {
@@ -125,6 +135,11 @@ export class T3 {
 				}
 			}
 		};
+	}
+
+	/** Start a task: `attempt` (one delegate_task call), repeated while t3 has no active run of the calling thread. */
+	start(attempt: () => Promise<T3Data>, signal: AbortSignal): Promise<T3Data> {
+		return this.parent ? this.parent.retry(attempt, signal) : attempt();
 	}
 }
 
@@ -218,8 +233,10 @@ export class T3Child {
 	 */
 	async run(message: string, requestId: string, signal: AbortSignal, started: (ids: T3ChildIds) => void): Promise<void> {
 		if (!this.threadId) {
-			// Not aborted with the run: t3 creates the task anyway, and only its id lets a cancel reach it.
-			const task = await this.t3.call("delegate_task", { ...this.params, task: message, mode: "wait", timeoutMs: START_WAIT_MS, clientRequestId: requestId }, AbortSignal.timeout(START_WAIT_MS + 60_000));
+			// A call is not aborted with the run: t3 creates the task anyway, and only its id lets a cancel reach it.
+			// Waiting for an active run of the parent thread is: t3 created nothing then.
+			const args = { ...this.params, task: message, mode: "wait", timeoutMs: START_WAIT_MS, clientRequestId: requestId };
+			const task = await this.t3.start(() => this.t3.call("delegate_task", args, AbortSignal.timeout(START_WAIT_MS + 60_000)), signal);
 			this.taskId = str(task.taskId);
 			this.threadId = str(task.childThreadId);
 			this.link = str(task.link);

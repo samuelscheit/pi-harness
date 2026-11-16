@@ -36,7 +36,8 @@ import { HARNESS_WORKFLOWS, loadWorkflows, projectWorkflowsDir, type SavedWorkfl
 import { INLINE_FILE, type ResumeRequest, type RunEnv, resumeWorkflow, runWorkflow, type ToolOutcome, type WorkflowDetails, type WorkflowResult } from "./run.ts";
 import { sessionJobs } from "../background/jobs.ts";
 import { reportWork } from "../background/work.ts";
-import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, liveUrl, offerInterrupted, recordRun, renderEnd, runHeadline, runName, setLatestApi, showRun, startViews } from "./runs.ts";
+import { ParentTurn, type ParentTurnOptions, parentTurn, WAKE_MESSAGE, WAKE_TEXT } from "./parent-turn.ts";
+import { contextLive, DEFAULT_DASHBOARD, type Executor, flushEndRenders, latestApi, liveUrl, offerInterrupted, recordRun, renderEnd, runHeadline, runName, setLatestApi, showRun, startViews } from "./runs.ts";
 import { type SignatureTool, toolsDeclaration } from "./signatures.ts";
 import { lockHeld, stopRun } from "./stop.ts";
 import { steerRun } from "./steer.ts";
@@ -75,6 +76,8 @@ export interface WorkflowExtensionOptions {
 	dashboardUrl?: string;
 	/** How t3 calls that fail in transport are repeated; default t3.ts's. */
 	t3Retry?: RunEnv["t3Retry"];
+	/** How a delegate start waits for an active run of the parent thread; default parent-turn.ts's. */
+	parentTurn?: ParentTurnOptions;
 }
 
 let sharedRuntime: Promise<ModelRuntime> | undefined;
@@ -101,6 +104,18 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 	let library = new Map<string, SavedWorkflow>();
 	const owned = new Set<string>();
 	let reported = "";
+
+	/** The session's turn as t3 needs it for delegate starts; `active` for one created now. */
+	const turnOf = (sessionId: string, active = false) =>
+		parentTurn(
+			sessionId,
+			() =>
+				new ParentTurn(
+					() => (latestApi(sessionId) ?? pi).sendMessage({ customType: WAKE_MESSAGE, content: WAKE_TEXT, display: true }, { triggerTurn: true, deliverAs: "steer" }),
+					options.parentTurn,
+					active,
+				),
+		);
 
 	/** The session's tools, called as the model calls them; a stale context (a harness reload) interrupts the run. */
 	const executor = (ctx: ExtensionToolContext): Executor => async (name, args, callSignal) => {
@@ -134,6 +149,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			executeTool: execute,
 			toolNames,
 			...(options.t3Retry ? { t3Retry: options.t3Retry } : {}),
+			parent: turnOf(sessionId, !ctx.isIdle()),
 			...(ctx.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 			sessionId,
 			library: () => library,
@@ -280,6 +296,9 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 		refresh(ctx);
 		offerInterrupted(pi, ctx, agentDir);
 	});
+	// t3 has a run of the thread from a turn's start until Pi reports it settled, which a delegate start waiting for one holds.
+	pi.on("agent_start", (_event, ctx) => turnOf(ctx.sessionManager.getSessionId()).started());
+	pi.on("agent_settled", (_event, ctx) => turnOf(ctx.sessionManager.getSessionId()).settling());
 	// The run a finished workflow's message wakes shows its end page (t3 takes a page only while a run is active).
 	pi.on("message_end", (event, ctx) => {
 		if (event.message.role === "assistant") flushEndRenders(ctx.sessionManager.getSessionId());

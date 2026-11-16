@@ -37,6 +37,7 @@ import { DEFAULT_LLM_MODEL, llm } from "./llm.ts";
 import { sh } from "./sh.ts";
 import { watchSteer } from "./steer.ts";
 import { clearStopRequest, linger, lockPath, takeLingering, watchStop } from "./stop.ts";
+import type { ParentTurn } from "./parent-turn.ts";
 import { cancelTask, T3, T3_DELEGATE, T3_PREFIX, type T3Options, t3Data, waitSliceMs } from "./t3.ts";
 
 const DEFAULT_CONCURRENCY = 4;
@@ -73,6 +74,8 @@ export interface RunEnv {
 	toolNames?: readonly string[];
 	/** How t3 calls that fail in transport are repeated; default t3.ts's. */
 	t3Retry?: Pick<T3Options, "retryDeadlineMs" | "backoffMs">;
+	/** The calling session's turn, which t3 needs to start delegated tasks (parent-turn.ts). */
+	parent?: ParentTurn;
 	/** The calling session's model ("provider/id"): in-process children's default. */
 	model?: string;
 	/** The calling session's id and file. */
@@ -457,7 +460,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 						return t3Data(name, outcome.value, outcome.text);
 					},
 					// t3's bridge fetches with Pi's dispatcher, whose idle timeout would cut a longer wait.
-					{ waitMs: waitSliceMs(SettingsManager.create(env.cwd, env.agentDir).getHttpIdleTimeoutMs()), ...env.t3Retry, unreachable: interrupt },
+					{ waitMs: waitSliceMs(SettingsManager.create(env.cwd, env.agentDir).getHttpIdleTimeoutMs()), ...env.t3Retry, unreachable: interrupt, ...(env.parent ? { parent: env.parent } : {}) },
 				)
 			: undefined;
 	let delegates = 0;

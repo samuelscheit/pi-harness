@@ -57,6 +57,9 @@ export function setLatestApi(sessionId: string, pi: ExtensionAPI): void {
 	apis().set(sessionId, pi);
 }
 
+/** The extension API loaded last for a session, if any. */
+export const latestApi = (sessionId: string): ExtensionAPI | undefined => apis().get(sessionId);
+
 /** Record a run's start or end in its session. Never throws: it may run after the session ended. */
 export function recordRun(pi: ExtensionAPI, sessionId: string, data: RunEntryData): void {
 	for (const api of new Set([apis().get(sessionId), pi])) {
