@@ -5,7 +5,8 @@
 // so the child side of the workflow extension runs for real, as in a t3 child.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { sessionJobs } from "../extensions/background/jobs.ts";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,7 @@ import {
 	specPath,
 	specSummary,
 	statePath,
+	SUBMIT_TOOL,
 	sweepDelegations,
 	writeSpec,
 	writeState,
@@ -211,6 +213,8 @@ interface Fixture {
 	threads: Map<string, Thread>;
 	/** What t3 answered per clientRequestId: a repeated call gets the same task and run (t3 dedupes). */
 	requests: Map<string, { threadId: string; runId: string }>;
+	/** A background job's end waking a child: the turn it starts is a new t3 run of its thread, as in t3. */
+	wake?: (threadId: string, content: string) => void;
 }
 
 let fx: Fixture;
@@ -233,7 +237,16 @@ afterEach(async () => {
 /** How t3 calls are repeated in these tests: quickly, and given up on after 300 ms. */
 const T3_RETRY = { retryDeadlineMs: 300, backoffMs: 20 };
 const workflowExtension = (childRuntime: ModelRuntime) => (pi: ExtensionAPI) =>
-	workflow(pi, { experimentsDir: join(dir, "experiments"), workflowDirs: () => [], modelRuntime: async () => childRuntime, agentDir: fx.agentDir, t3Retry: T3_RETRY, parentTurn: { pollMs: 20, deadlineMs: 10_000, holdMs: 10_000 } });
+	workflow(pi, {
+		experimentsDir: join(dir, "experiments"),
+		workflowDirs: () => [],
+		modelRuntime: async () => childRuntime,
+		agentDir: fx.agentDir,
+		t3Retry: T3_RETRY,
+		parentTurn: { pollMs: 20, deadlineMs: 10_000, holdMs: 10_000 },
+		harnessBacklog: join(dir, "harness-backlog.md"),
+		stateWaitMs: 1000,
+	});
 
 async function newSession(extensions: ((pi: ExtensionAPI) => void)[], sessionManager = SessionManager.create(fx.repo, fx.sessionsDir), sessionRuntime = runtime, uiContext?: ExtensionUIContext): Promise<AgentSession> {
 	const settingsManager = SettingsManager.inMemory({});
@@ -262,6 +275,10 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait
 		// A compaction Pi refuses still ends the run, as in t3.
 		thread.runs.set(runId, compact ? thread.session.compact(compact.instructions).then(() => undefined, () => undefined) : thread.session.prompt(message));
 		return runId;
+	};
+	fx.wake = (threadId, content) => {
+		const thread = fx.threads.get(threadId)!;
+		thread.runs.set(`run-${++ids}`, thread.session.sendCustomMessage({ customType: "background-job", content, display: true }, { triggerTurn: true }));
 	};
 	const threadOf = (taskId: unknown) => /^task-(thread-\d+)/.exec(String(taskId))?.[1];
 	/** The child's last assistant text: t3's summary of a run. */
@@ -333,8 +350,9 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait
 		tool("t3_thread_wait", async (args) => {
 			if (options.failWait?.()) throw new TypeError("fetch failed");
 			const thread = fx.threads.get(String(args.threadId))!;
-			// As in t3: only the run's end or the timeout ends a wait, not a pending question.
-			const done = await finishedWithin(thread.runs.get(String(args.runId))!, Math.min(waitMs, Number(args.timeoutMs ?? waitMs)));
+			// As in t3: only the run's end or the timeout ends a wait, not a pending question; without a run id, the latest run.
+			const run = thread.runs.get(args.runId === undefined ? [...thread.runs.keys()].at(-1)! : String(args.runId))!;
+			const done = await finishedWithin(run, Math.min(waitMs, Number(args.timeoutMs ?? waitMs)));
 			return { threadId: args.threadId, runId: args.runId, status: done ? "completed" : "running", timedOut: !done };
 		});
 		tool("t3_pending_request", async (args) => {
@@ -688,6 +706,90 @@ async function parentCalls(calls: { name: string; args: JsonObject }[], child: (
 	const results = parent.messages.flatMap((m) => (m.role === "toolResult" ? [{ name: m.toolName, text: textOf(m.content), isError: m.isError }] : []));
 	return { parent, seen, results };
 }
+
+describe("a child's run that waits for its background jobs (workflow 20261116-072148-b6c213)", () => {
+	const JOB = "job-1";
+	const schema = "{ type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }";
+	const code = `return JSON.stringify(await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], schema: ${schema} }).run('test it'));`;
+	const sessionOf = (threadId: string) => fx.threads.get(threadId)!.session;
+	/** A bash call of the child that moved to the background: pending work its run waits for. */
+	const startJob = (threadId: string) =>
+		sessionJobs(sessionOf(threadId).sessionId).jobs.set(JOB, { callId: JOB, toolName: "bash", input: { command: "pytest tests" }, startedAt: Date.now(), log: join(dir, "job.log"), controller: new AbortController() });
+	/** The job ends after `ms`: it leaves the session's work, and its end wakes the child (a new t3 run). */
+	const endJob = (threadId: string, ms: number) =>
+		setTimeout(() => {
+			sessionJobs(sessionOf(threadId).sessionId).jobs.delete(JOB);
+			fx.wake!(threadId, "The tests passed.");
+		}, ms);
+	/** The child: starts the job and ends its turn waiting for it; woken by its end, submits and finishes. */
+	const child = (onStart: () => void, wokenDelayMs = 0): FauxResponseStep => async (context) => {
+		const last = lastMessage(context);
+		if (last.role === "toolResult") return say("All green.");
+		if (textOf(last.content).includes("The tests passed.")) {
+			await new Promise((r) => setTimeout(r, wokenDelayMs));
+			return call(SUBMIT_TOOL, { a: "green" });
+		}
+		onStart();
+		return say("Waiting for pid 75262 (the tests).");
+	};
+	const backlog = () => join(dir, "harness-backlog.md");
+	afterEach(() => {
+		for (const thread of fx.threads.values()) sessionJobs(thread.session.sessionId).jobs.delete(JOB);
+	});
+
+	test("a turn that ends waiting for a job is no result: the run ends after the turn the job's end wakes, unreminded", async () => {
+		const { details, text } = await runInT3(code, child(() => (startJob("thread-1"), endJob("thread-1", 400))));
+		assert.equal(details.status, "completed", details.error);
+		const run = value(text);
+		assert.equal(run.text, "All green.", "not the waiting turn's text");
+		assert.deepEqual(run.result, { a: "green" });
+		const reminders = sessionOf("thread-1").messages.filter((m) => m.role === "custom" && m.customType === REMINDER_TYPE);
+		assert.deepEqual(reminders, [], "a run waiting for its jobs is not reminded to submit");
+		assert.ok(details.log.some((line) => /delegate 1 · waiting for its background work: bash: .*pytest tests/.test(line)), details.log.join("\n"));
+		assert.equal(existsSync(backlog()), false, "no harness fault");
+	});
+
+	test("without a schema: the result is the woken turn's text, not the waiting turn's (\"Warte auf pid 75262\")", async () => {
+		const plain = "return (await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('test it')).text;";
+		const { details, text } = await runInT3(plain, (context) => {
+			if (textOf(lastMessage(context).content).includes("The tests passed.")) return say("All green.");
+			startJob("thread-1");
+			endJob("thread-1", 400);
+			return say("Waiting for pid 75262 (the tests).");
+		});
+		assert.equal(details.status, "completed", details.error);
+		assert.equal(text.split("\n\n").at(-1), "All green.");
+	});
+
+	test("a woken turn that outlasts the report's lag is followed through t3 (its thread's latest run) until the run ends", async () => {
+		const { details, text } = await runInT3(code, child(() => (startJob("thread-1"), endJob("thread-1", 10)), 2500));
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(value(text).result, { a: "green" });
+		assert.ok(callsOf("t3_thread_wait").some((c) => c.args.runId === undefined), "followed the thread's latest run");
+		assert.equal(existsSync(backlog()), false, "no harness fault");
+	});
+
+	test("a child whose process ended while it waited leaves no end: a harness fault, noted in the harness backlog with the run", async () => {
+		const dead = spawnSync("true").pid!;
+		const { details } = await runInT3(
+			code,
+			child(() => {
+				startJob("thread-1");
+				// Its Pi process ends while the job runs: the state's pid names a process that is gone.
+				setTimeout(() => {
+					const states = readdirSync(delegationsDir(fx.agentDir)).filter((f) => f.endsWith(".result.json"));
+					const id = states[0]!.slice(0, -".result.json".length);
+					writeState(delegationsDir(fx.agentDir), id, { ...readState(delegationsDir(fx.agentDir), id)!, pid: dead });
+				}, 200);
+			}),
+		);
+		assert.equal(details.status, "failed");
+		assert.match(details.error ?? "", new RegExp(`HarnessFault: delegate 1: the child reported no end of run 1 \\(its state: run 1, not done, waiting for bash: .*pytest tests, pid ${dead} ended\\)`));
+		const note = readFileSync(backlog(), "utf8");
+		assert.match(note, /Harness fault, noted automatically by the workflow runtime: delegate 1: the child reported no end of run 1/);
+		assert.match(note, new RegExp(`Workflow run ${details.id}; journal ${details.journal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+	});
+});
 
 describe("t3's delegate_task as the harness extends it", () => {
 	const schema = { type: "object", properties: { verdict: { type: "string", enum: ["ok", "bad"] } }, required: ["verdict"], additionalProperties: false };
@@ -1105,7 +1207,7 @@ describe("the child side", () => {
 		const manager = SessionManager.create(fx.repo, fx.sessionsDir);
 		const first = await newSession([workflowExtension(runtime)], manager);
 		await first.prompt(delegationMessage(spec, 1, "one"));
-		assert.deepEqual(readState(agents, spec.id), { sessionId: first.sessionId, cost: 0, run: 1, done: true, submitted: true, result: { k: "v1" }, text: "ok" });
+		assert.deepEqual(readState(agents, spec.id), { sessionId: first.sessionId, cost: 0, run: 1, done: true, pid: process.pid, submitted: true, result: { k: "v1" }, text: "ok" });
 		const file = first.sessionManager.getSessionFile()!;
 		first.dispose();
 
@@ -1113,7 +1215,7 @@ describe("the child side", () => {
 		await second.prompt(delegationMessage(spec, 2, "two"));
 		assert.match(systemOf(seen[2]!), /^You are restarted\./);
 		assert.deepEqual(toolNames(seen[2]!), ["read", "submit_result"]);
-		assert.deepEqual(readState(agents, spec.id), { sessionId: second.sessionId, cost: 0, run: 2, done: true, submitted: true, result: { k: "v3" }, text: "ok" });
+		assert.deepEqual(readState(agents, spec.id), { sessionId: second.sessionId, cost: 0, run: 2, done: true, pid: process.pid, submitted: true, result: { k: "v3" }, text: "ok" });
 	});
 
 	test("a session without a marker, or whose spec is gone, is left alone", async () => {

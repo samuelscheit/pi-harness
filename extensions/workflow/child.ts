@@ -12,7 +12,12 @@
 //   (t3's summary, the parent's wake message); a submitted result releases the session's background
 //   jobs (../background/work.ts `releaseWork`), so t3 delivers it without waiting for them, and the
 //   next run (by the parent or the user) holds them again until it submits;
-// - reports its state (session, cost, the run's text, result or error, compactions) to the parent.
+// - reports its state (session, cost, the run's text, result or error, compactions) to the parent;
+//   a turn that ends while background work the session waits for runs does not end the run (the
+//   state says `waiting`, with the jobs): the job's end wakes the child into another turn of the same
+//   run, in t3 a new t3 run. Reporting such a turn as the run's end handed the parent "waiting for
+//   pid 75262" as a delegate's result, and failed another with "no end of run 1" when its wake turn
+//   reset the state while the parent read it (2026-11-16, workflow 20261116-072148-b6c213).
 //
 // The workflow extension wires this into every harness session (a t3 delegated child is one), and
 // delegate() into its in-process children. Everything is derived from the session and the state
@@ -21,7 +26,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { sessionJobs } from "../background/jobs.ts";
-import { releaseWork } from "../background/work.ts";
+import { releaseWork, workItems } from "../background/work.ts";
 import { TOOL_GUIDELINES_SECTION, toolGuidelinesSection } from "../prompt/index.ts";
 import { type DelegationSpec, type DelegationState, parseMarker, readSpec, readState, SUBMIT_TOOL, writeState } from "./delegation.ts";
 
@@ -44,6 +49,12 @@ type Content = string | readonly { type: string; text?: string }[];
 
 const textOf = (content: Content): string =>
 	typeof content === "string" ? content : content.flatMap((block) => (block.type === "text" && typeof block.text === "string" ? [block.text] : [])).join("\n");
+
+/** The background work a session's run waits for: none once a submitted result released it. */
+export function awaitedWork(sessionId: string): string[] {
+	const jobs = sessionJobs(sessionId);
+	return jobs.released ? [] : workItems(jobs).map((item) => item.label);
+}
 
 export const reminderText = (attempt: number) =>
 	`This run's result is missing: call ${SUBMIT_TOOL} with an object matching its parameters, then finish with a brief summary. (Reminder ${attempt} of ${MAX_REMINDERS}; without a result the run fails.)`;
@@ -99,7 +110,7 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			if (entry.type === "message" && entry.message.role === "assistant") cost += entry.message.usage.cost.total;
 		}
 		const saved = readState(dir, spec.id);
-		const state: DelegationState = saved?.run === run && saved.sessionId === sessionId ? { ...saved, cost } : { sessionId, cost, run, done: false };
+		const state: DelegationState = saved?.run === run && saved.sessionId === sessionId ? { ...saved, cost, pid: process.pid } : { sessionId, cost, run, done: false, pid: process.pid };
 		const child: Child = { spec, state, submitRegistered: false };
 		children.set(sessionId, child);
 		return child;
@@ -146,11 +157,12 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 			const marker = parseMarker(prompt);
 			const run = marker?.id === child.spec.id ? marker.run : child.state.run;
 			const { sessionId, cost, compactions, compactionError } = child.state;
-			child.state = { sessionId, cost, run, done: false, ...(compactions ? { compactions } : {}), ...(compactionError ? { compactionError } : {}) };
+			child.state = { sessionId, cost, run, done: false, pid: process.pid, ...(compactions ? { compactions } : {}), ...(compactionError ? { compactionError } : {}) };
 			releaseWork(sessionJobs(ctx.sessionManager.getSessionId()), false);
 		} else if (!event.reloaded) {
 			// The session continues on its own (a background job ended): the run is not done yet.
-			child.state = { ...child.state, done: false };
+			const { waiting: _waiting, ...rest } = child.state;
+			child.state = { ...rest, done: false, pid: process.pid };
 		}
 
 		const options = event.systemPromptOptions;
@@ -209,6 +221,8 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 		if (!child?.spec.schema || child.state.submitted || child.state.error) return;
 		// Another extension continues the run already, or it stopped: nothing to remind of now.
 		if (event.continue || event.outcome !== "completed") return;
+		// The run waits for its jobs: their end wakes it, and it submits then.
+		if (awaitedWork(ctx.sessionManager.getSessionId()).length) return;
 		const reminders = sinceLastUser(ctx).filter((entry) => entry.type === "custom_message" && entry.customType === REMINDER_TYPE).length;
 		if (reminders >= MAX_REMINDERS) return;
 		return { entries: [...event.entries, { type: "custom_message", customType: REMINDER_TYPE, content: reminderText(reminders + 1), display: true }], continue: true };
@@ -222,10 +236,12 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 		let error = child.state.error;
 		if (!error && event.aborted) error = RUN_STOPPED;
 		else if (!error && message?.stopReason === "error") error = `the request failed: ${message.errorMessage ?? "unknown error"}`;
-		else if (!error && child.spec.schema && !child.state.submitted) error = `it finished without calling ${SUBMIT_TOOL} (reminded ${MAX_REMINDERS} times)`;
+		const waiting = error ? [] : awaitedWork(ctx.sessionManager.getSessionId());
+		if (!error && !waiting.length && child.spec.schema && !child.state.submitted) error = `it finished without calling ${SUBMIT_TOOL} (reminded ${MAX_REMINDERS} times)`;
 		const text = message ? textOf(message.content) : "";
 		const cut = text.indexOf(RESULT_HEADING.trimStart());
-		child.state = { ...child.state, done: true, text: (cut < 0 ? text : text.slice(0, cut)).trimEnd() };
+		const { waiting: _previous, ...rest } = child.state;
+		child.state = { ...rest, done: waiting.length === 0, pid: process.pid, text: (cut < 0 ? text : text.slice(0, cut)).trimEnd(), ...(waiting.length ? { waiting } : {}) };
 		if (error) child.state.error = error;
 		save(child);
 	});

@@ -28,6 +28,7 @@ import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
 import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { createDelegate, type SteerTarget } from "./delegate.ts";
+import { harnessFault } from "./fault.ts";
 import { Phases } from "./phases.ts";
 import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
 import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, WorkflowStopped } from "./durable.ts";
@@ -88,6 +89,10 @@ export interface RunEnv {
 	onUpdate?: (details: WorkflowDetails) => void;
 	/** The run has its id and journal; called before the script runs. */
 	onStart?: (run: { id: string; journal: string; attempt: number }) => void;
+	/** Where harness faults are noted (fault.ts); default the harness repository's backlog. */
+	harnessBacklog?: string;
+	/** How long a child's report may lag behind the end of its turn; default delegate.ts's. */
+	stateWaitMs?: number;
 }
 
 export type WorkflowStatus = "running" | "completed" | "failed" | "aborted" | "over budget" | "interrupted" | "stopped" | "diverged";
@@ -561,6 +566,9 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				ran: () => details.delegateRuns++,
 				progress,
 				warn: (line) => details.warnings.push(line),
+				...(env.stateWaitMs ? { stateWaitMs: env.stateWaitMs } : {}),
+				fault: (message) =>
+					harnessFault(message, { ...(env.harnessBacklog ? { backlog: env.harnessBacklog } : {}), cwd: env.cwd, ...(env.sessionId ? { sessionId: env.sessionId } : {}), runId: header.id, journal: journal.path }),
 				onDispose: (dispose) => disposers.push(dispose),
 				track: (child) => steerable.push(child),
 			}),

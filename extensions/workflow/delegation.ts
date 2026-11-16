@@ -150,6 +150,13 @@ export interface DelegationState {
 	/** The run the rest describes: 1 for the first message, n for `… run <n>`. */
 	run: number;
 	done: boolean;
+	/**
+	 * The run is not done: its turn ended while background work it waits for runs (the labels), whose
+	 * end wakes the child into another turn of the same run. In t3 that turn is a new t3 run.
+	 */
+	waiting?: string[];
+	/** The child's Pi process: while it lives, a waiting run can still end. */
+	pid?: number;
 	text?: string;
 	/** Whether `submit_result` was called successfully in this run, and its arguments. */
 	submitted?: boolean;

@@ -32,6 +32,11 @@
 // state file says so), and otherwise repeats the call with the same clientRequestId (t3 dedupes it
 // within one Pi process only). In-process it reopens the child's session file. A child whose run
 // was cut off (its process ended too) gets a message to continue.
+//
+// A run ends when the child reports it done, not when its current turn (in t3: its t3 run) ends:
+// a child that waits for its background jobs reports `waiting`, and while its process lives the
+// parent waits on, following the turns the jobs' ends wake (in t3 new t3 runs of the thread).
+// A child that leaves no report is a harness fault (fault.ts): it is noted for the harness's backlog.
 
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -115,6 +120,10 @@ export interface DelegateEnv {
 	ran: () => void;
 	progress: (line: string) => void;
 	warn: (line: string) => void;
+	/** How long a child's report may lag behind the end of its turn; default STATE_WAIT_MS. */
+	stateWaitMs?: number;
+	/** A broken invariant of the harness (fault.ts): noted for the harness's backlog, returned as the error to throw. */
+	fault: (message: string) => Error;
 	/** Register cleanup for the end of the workflow run; `interrupted`: the run will be resumed, children keep their state. */
 	onDispose: (dispose: (interrupted: boolean) => void) => void;
 	/** Each delegate as `workflow { steer }` reaches it. */
@@ -216,6 +225,17 @@ function callLine(tool: string, args: unknown): string {
 
 const headline = (text: string) => (text.split("\n").find((line) => line.trim()) ?? "").trim();
 
+/** Whether a process lives (one of another user counts); without a pid, whether it does is unknown: no. */
+export function alive(pid: number | undefined): boolean {
+	if (pid === undefined) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 /** Where a fork starts: the source's conversation and spec. */
 interface ForkSource {
 	spec: DelegationSpec;
@@ -234,6 +254,8 @@ interface Transport {
 	/** A slash command as a message (`/compact`, `/warm`); resolves when it is done. */
 	command(text: string, requestId: string, signal: AbortSignal): Promise<void>;
 	steer(text: string, requestId: string, signal: AbortSignal): Promise<void>;
+	/** Wait until the child's current turn is over, for a run that goes on after `run` resolved (a turn a job's end woke); false when nothing can go on. */
+	follow(signal: AbortSignal): Promise<boolean>;
 	/** What identifies the child, for the journal. */
 	state(): Pick<HandleState, "t3" | "sessionFile">;
 	restore(state: Pick<HandleState, "t3" | "sessionFile">): void;
@@ -324,6 +346,8 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			else await opened.prompt(text);
 		},
 		steer: async (text) => void (await (await session()).steer(text)),
+		// prompt() resolves when the session settles, after the turns its jobs' ends woke.
+		follow: async () => false,
 		state: () => (sessionFile ? { sessionFile } : {}),
 		restore: (state) => {
 			sessionFile = state.sessionFile ?? sessionFile;
@@ -368,6 +392,11 @@ function inT3(t3: T3, options: DelegateOptions, label: string, title: () => stri
 		reattach: (message, _continuation, requestId, recorded, remember, signal) => child().reattach(message, requestId, recorded.runId, signal, started(child().threadId, remember)),
 		command: (text, requestId, signal) => existing().send(text, "queue", requestId, signal),
 		steer: (text, requestId, signal) => existing().send(text, "steer", requestId, signal),
+		follow: async (signal) => {
+			if (!task?.threadId && !restored.threadId) return false;
+			await child().follow(signal);
+			return true;
+		},
 		state: () => {
 			const ids = task?.ids ?? restored;
 			return Object.keys(ids).length ? { t3: ids } : {};
@@ -457,15 +486,47 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		return state;
 	};
 
-	/** The state of run `n` once it is done; undefined when the child does not report it in time. */
-	const finalState = async (n: number, signal: AbortSignal, waitMs = STATE_WAIT_MS): Promise<DelegationState | undefined> => {
-		const deadline = Date.now() + waitMs;
+	/**
+	 * The state of run `n` once it is done; undefined when the child does not report it in time. A
+	 * child whose run waits for its background jobs gets all the time its process lives.
+	 */
+	const stateWaitMs = env.stateWaitMs ?? STATE_WAIT_MS;
+	const finalState = async (n: number, signal: AbortSignal, waitMs = stateWaitMs): Promise<DelegationState | undefined> => {
+		let deadline = Date.now() + waitMs;
+		let told = "";
 		for (;;) {
 			const state = sync();
 			if (state && (state.run > n || (state.run === n && state.done))) return state;
+			if (state?.run === n && state.waiting?.length && alive(state.pid)) {
+				deadline = Date.now() + waitMs;
+				const line = `${label} · waiting for its background work: ${state.waiting.join("; ")}`;
+				if (line !== told) env.progress((told = line));
+			}
 			if (Date.now() >= deadline || signal.aborted) return undefined;
 			await new Promise((r) => setTimeout(r, 100));
 		}
+	};
+	/**
+	 * The state of run `n` once it is done, also when the run goes on after the transport's run ended:
+	 * a turn a job's end woke is followed until it is over. Undefined when the child leaves no report
+	 * and nothing changes any more.
+	 */
+	const settledState = async (n: number, signal: AbortSignal, waitMs = stateWaitMs): Promise<DelegationState | undefined> => {
+		let seen = "";
+		for (;;) {
+			const state = await finalState(n, signal, waitMs);
+			if (state || signal.aborted) return state;
+			const now = sync();
+			const key = JSON.stringify(now ?? null);
+			if (now?.run !== n || key === seen || !(await transport.follow(signal))) return undefined;
+			seen = key;
+		}
+	};
+	/** What the child last reported, for a fault's message. */
+	const reported = () => {
+		const state = spec && readState(dir, spec.id);
+		if (!state) return "no state file";
+		return `its state: run ${state.run}, ${state.done ? "done" : "not done"}${state.waiting?.length ? `, waiting for ${state.waiting.join("; ")}` : ""}${state.pid !== undefined ? `, pid ${state.pid} ${alive(state.pid) ? "alive" : "ended"}` : ""}`;
 	};
 	/** A run the child ended because it was stopped (cancelled) is no result: a reattach asks it to go on. */
 	const stoppedRun = (state: DelegationState | undefined, n: number) => state?.run === n && state.done && state.error === RUN_STOPPED;
@@ -568,7 +629,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 				} else {
 					await transport.reattach(runMessage, continuation, requestId, recorded, remember, signal);
 					// The child's own run was cut off too (its process ended, or it was stopped): ask it to go on.
-					const after = await finalState(n, signal, 2000);
+					const after = await settledState(n, signal, 2000);
 					if (!after || stoppedRun(after, n)) await transport.run(continuation, `${requestId}-continue`, remember, signal);
 				}
 			}
@@ -584,9 +645,9 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			env.ran();
 		}
 		if (signal.aborted) throw signal.reason;
-		const state = await finalState(n, signal);
+		const state = await settledState(n, signal);
 		const changed = await changedSince(before);
-		if (!state || state.run !== n) throw new Error(`${label}: the child reported no end of run ${n}; ${transport.describe()}`);
+		if (!state || state.run !== n) throw env.fault(`${label}: the child reported no end of run ${n} (${reported()}); ${transport.describe()}`);
 		if (state.error) throw new Error(`${label}: ${state.error}`);
 		const run: DelegateRun = {
 			text: state.text ?? "",
@@ -671,13 +732,13 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 					// The child reports every compaction: a /compact that did not happen (Pi refused it, t3 ignored it) is an error.
 					const before = (spec && readState(dir, spec.id)?.compactions) ?? 0;
 					await transport.command(compactCommand(instructions as string | undefined), requestId, signal);
-					const deadline = Date.now() + STATE_WAIT_MS;
+					const deadline = Date.now() + stateWaitMs;
 					let state = spec && readState(dir, spec.id);
 					while ((state?.compactions ?? 0) <= before && Date.now() < deadline && !signal.aborted) {
 						await new Promise((r) => setTimeout(r, 100));
 						state = spec && readState(dir, spec.id);
 					}
-					if ((state?.compactions ?? 0) <= before) throw new Error(`${label}: the child did not compact; ${transport.describe()}`);
+					if ((state?.compactions ?? 0) <= before) throw env.fault(`${label}: the child did not compact; ${transport.describe()}`);
 					if (state?.compactionError) throw new Error(`${label}: the compaction failed: ${state.compactionError}`);
 				}),
 			);

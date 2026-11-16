@@ -78,6 +78,10 @@ export interface WorkflowExtensionOptions {
 	t3Retry?: RunEnv["t3Retry"];
 	/** How a delegate start waits for an active run of the parent thread; default parent-turn.ts's. */
 	parentTurn?: ParentTurnOptions;
+	/** Where harness faults are noted (fault.ts); default the harness repository's backlog. */
+	harnessBacklog?: string;
+	/** How long a child's report may lag behind the end of its turn; default delegate.ts's. */
+	stateWaitMs?: number;
 }
 
 let sharedRuntime: Promise<ModelRuntime> | undefined;
@@ -149,6 +153,8 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			executeTool: execute,
 			toolNames,
 			...(options.t3Retry ? { t3Retry: options.t3Retry } : {}),
+			...(options.harnessBacklog ? { harnessBacklog: options.harnessBacklog } : {}),
+			...(options.stateWaitMs ? { stateWaitMs: options.stateWaitMs } : {}),
 			parent: turnOf(sessionId, !ctx.isIdle()),
 			...(ctx.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 			sessionId,

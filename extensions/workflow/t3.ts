@@ -264,6 +264,13 @@ export class T3Child {
 		await this.wait(this.runId, signal);
 	}
 
+	/** Wait until the thread's latest run is over: a turn the child started on its own (a background job's end woke it). */
+	async follow(signal: AbortSignal): Promise<void> {
+		if (!this.threadId) return;
+		await this.wait(undefined, signal);
+		await this.deliver(signal);
+	}
+
 	private async wait(runId: string | undefined, signal: AbortSignal): Promise<void> {
 		for (;;) {
 			const started = Date.now();
