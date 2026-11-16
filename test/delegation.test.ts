@@ -682,11 +682,13 @@ describe("delegate() in t3", () => {
 		const failed = journal.find((e) => e.t === "failed");
 		assert.equal(failed?.t === "failed" && failed.cost, spent, "recorded with the failure");
 		assert.equal(viewOf(journal).cost, spent, "the page counts it");
-		// Continued with the same code: the failure is replayed, with its cost (attempt 2 of the run on 2026-11-14 showed $1.82 of $12.81).
-		const resumed = await resumeWorkflow({ id: details.id, code }, { cwd: fx.repo, runtime, agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
+		// Resumed: the failed run runs again (outside t3 here, in-process) and fails the same way; both attempts' cost counts
+		// (attempt 2 of the run on 2026-11-14 showed $1.82 of $12.81 when the failure's cost was not counted).
+		const resumed = await resumeWorkflow({ id: details.id }, { cwd: fx.repo, runtime: priced(runtime, 0.25), agentDir: fx.agentDir, llmCache: new Map(), library: () => new Map() });
 		assert.equal(resumed.details.status, "failed");
-		assert.equal(resumed.details.replayedCalls, 1);
-		assert.equal(resumed.details.cost, spent);
+		assert.equal(resumed.details.retriedCalls, 1);
+		assert.equal(resumed.details.replayedCalls, 0);
+		assert.equal(resumed.details.cost, 2 * spent);
 	});
 });
 

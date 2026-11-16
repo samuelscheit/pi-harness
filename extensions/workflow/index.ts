@@ -205,7 +205,7 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			"Use workflow when a task is a procedure you can write down: the same step over many items (classify, extract, review each with llm()), a loop until a command passes, or several child agents in parallel. Code does what is mechanical; return only what you need, not raw tool output.",
 			'In a longer workflow, name its steps with phase() and what comes next with plan.expect(): the page shows the tree, and workflow { status: "<id>" } returns it as data.',
 			"Rerun an edited workflow freely: unchanged llm() calls come from the cache. Save one that this repository will need again as .pi/workflows/<name>.ts (export meta and a default function); it becomes the tool <name>.",
-			'A run that was interrupted or stopped continues from its journal with workflow { resume: "<id>" }: its recorded calls are not repeated. Do not start it over.',
+			'A run that was interrupted or stopped, or failed in agent or llm calls, continues from its journal with workflow { resume: "<id>" }: finished calls are not repeated, failed agent and llm calls run again. Do not start it over.',
 			'To tell a running run\'s delegates something new (a rule, a correction), steer them with workflow { steer: "<id>", text: "…" }; `delegates` narrows it to some, by title (or a part of it) or thread id as workflow { status: "<id>" } lists them. Do not look for the delegates\' threads with other tools.',
 			'Stop a running run with workflow { stop: "<id>" }: its agents keep running and their results are recorded; stopChildren: true cancels them. To change a run\'s script without losing its paid work, resume it with workflow { resume: "<id>", code: "<new code>" }: calls the new code makes as before come from the journal, from its first other call it runs live. Effects of the old code (commits, files) stay; the new code must cope with them.',
 			"When a session template exists for the kind of task a child gets (`template` of delegate() and delegate_task names those here), start the child from it: its prepared context is cached once for every task.",
@@ -216,7 +216,11 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 			budget: Type.Optional(
 				Type.Number({ exclusiveMinimum: 0, description: "Spending limit of this run in USD for llm() and delegate(); the run stops when it is used up. Small llm() calls cost fractions of a cent, a delegate run cents to dollars. With resume: a new limit for the whole run." }),
 			),
-			resume: Type.Optional(Type.String({ description: "The id of a run that was interrupted or stopped: continue it from its journal; calls it recorded are not repeated. With code, any ended run." })),
+			resume: Type.Optional(
+				Type.String({
+					description: "The id of a run that was interrupted, stopped, or failed in agent or llm calls: continue it from its journal; finished calls are not repeated, failed agent and llm calls run again. With code, any ended run.",
+				}),
+			),
 			inFlight: Type.Optional(
 				Type.Union([Type.Literal("rerun"), Type.Literal("fail")], { description: "With resume: what shell and tools calls that were in flight do: run again, or throw InterruptedCallError. Needed when the resume names such calls." }),
 			),

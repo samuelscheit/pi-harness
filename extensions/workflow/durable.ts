@@ -11,7 +11,15 @@
 //   journaled one by one); shell and tools.* run again only when made with `{ idempotent: true }`
 //   or when the resume says so (`inFlight: "rerun"`); with `inFlight: "fail"` they throw, and
 //   without a decision the resume does not start (`blockingCalls`, checked before the script runs);
-// - the first call without an entry runs live.
+// - the first call without an entry runs live;
+// - a failed agent run, llm() call or nested workflow (`retryable`) runs again: its failure was the
+//   child's work failing (a request failed, a harness fault), and a resume that replayed it would
+//   fail at the same place again. What the failed attempt spent still counts. A failure from a
+//   budget (the run's or a phase's) is replayed: running again would only spend into it again.
+//   Shell and tools.* failures are replayed: running them again could repeat their effects. Once
+//   a call ran again, the script may take another path than the journal (the call now succeeds):
+//   the resume matches leniently from then on, as for edited code, and takes over where the paths
+//   part instead of stopping.
 //
 // The same code (strict): while recorded calls remain that the script has not asked for again, a
 // new call waits, since in parallel code a recorded call may still come. When nothing can bring one
@@ -102,6 +110,23 @@ export class InterruptedCallError extends Error {
 
 type Start = Extract<JournalEntry, { t: "start" }>;
 type Outcome = Extract<JournalEntry, { t: "done" | "failed" }>;
+
+/** Kinds of calls whose recorded failure a resume runs again (see the header). */
+const RETRYABLE: ReadonlySet<CallKind> = new Set<CallKind>(["delegate", "llm", "workflow"]);
+/** Failures a resume replays whatever the call: a budget is used up. */
+const BUDGET_FAILURES = new Set(["BudgetExceeded", "PhaseBudgetExceeded"]);
+/** Whether a resume runs this recorded failure again. */
+export const retryable = (kind: CallKind, outcome: Outcome): boolean => outcome.t === "failed" && RETRYABLE.has(kind) && !BUDGET_FAILURES.has(outcome.error.name ?? "");
+
+/** The recorded failures a resume runs again, in journal order (a nested workflow's own failed calls included). */
+export function retryableFailures(entries: readonly JournalEntry[]): Start[] {
+	const { order, starts, outcomes } = foldJournal(entries);
+	return order.flatMap((key) => {
+		const start = starts.get(key)!;
+		const outcome = outcomes.get(key);
+		return outcome && retryable(start.kind, outcome) ? [start] : [];
+	});
+}
 
 /** What a call's work came to: its outcome, or none (stopped before it had one). */
 export type Settled = { outcome: "done"; value: unknown; cost: number } | { outcome: "failed"; error: SerializedError; cost: number } | { outcome: "none" };
@@ -198,6 +223,8 @@ export interface DurableOptions {
 	inherited?: ReadonlyMap<string, Work>;
 	/** A replayed call's recorded cost and kind, to count. */
 	replayed: (kind: CallKind, cost: number) => void;
+	/** What the recorded attempt of a call that runs again spent, to count. */
+	retried?: (kind: CallKind, cost: number) => void;
 	/** The script took another path: stop the run with this error. */
 	diverged: (error: DivergenceError) => void;
 	/** Edited code took over: recorded agent runs in flight it does not use, whose children are not run here (to cancel). */
@@ -213,12 +240,17 @@ export class Durable {
 	private readonly signal: AbortSignal;
 	private readonly signalFor: DurableOptions["signalFor"];
 	private readonly onReplayed: DurableOptions["replayed"];
+	private readonly onRetried: DurableOptions["retried"];
 	private readonly onDiverged: DurableOptions["diverged"];
 	private readonly onDropped: DurableOptions["dropped"];
 	private readonly phaseOf: DurableOptions["phaseOf"];
 	private readonly folded: Folded;
 	/** Matching leniently: edited code that has not taken over yet. */
 	readonly editing: boolean;
+	/** A recorded failure ran again: the script may part from the journal from there on. */
+	private retried = false;
+	/** Calls whose recorded failure ran again in this execution. */
+	retriedCalls = 0;
 	private tookOver = false;
 	/** The key of the nested workflow a call runs in. */
 	private readonly scope = new AsyncLocalStorage<string>();
@@ -249,6 +281,7 @@ export class Durable {
 		this.signal = options.signal;
 		this.signalFor = options.signalFor;
 		this.onReplayed = options.replayed;
+		this.onRetried = options.retried;
 		this.onDiverged = options.diverged;
 		this.onDropped = options.dropped;
 		this.phaseOf = options.phaseOf;
@@ -303,8 +336,13 @@ export class Durable {
 			if (this.tookOver || this.pending.length === 0) break;
 			await this.wait(key, spec.label);
 		}
-		if (this.editing && !this.tookOver) this.takeover(key, spec.label);
+		if (this.lenient && !this.tookOver) this.takeover(key, spec.label);
 		return this.guard(this.run(key, spec, live));
+	}
+
+	/** Matching as for edited code: edited code, or a recorded failure that ran again. */
+	private get lenient(): boolean {
+		return this.editing || this.retried;
 	}
 
 	/** Work not settled yet: this execution's (and adopted) and inherited work no call asked for. */
@@ -315,13 +353,13 @@ export class Durable {
 	/** The script returned: recorded calls it never asked for are not used (edited code takes over for good). */
 	finish(): void {
 		if (this.pending.length === 0) return;
-		if (this.editing && !this.tookOver) this.takeover();
+		if (this.lenient && !this.tookOver) this.takeover();
 		else this.unused.push(...this.pending.map((key) => this.folded.starts.get(key)!));
 	}
 
 	private matches(key: string): boolean {
 		if (this.tookOver || !this.pending.includes(key)) return false;
-		return !this.editing || this.folded.startAt.get(key)! < (this.pendingOutcomes[0] ?? Number.POSITIVE_INFINITY);
+		return !this.lenient || this.folded.startAt.get(key)! < (this.pendingOutcomes[0] ?? Number.POSITIVE_INFINITY);
 	}
 
 	private consume(key: string): void {
@@ -333,6 +371,14 @@ export class Durable {
 	private async answer(key: string, spec: CallSpec, live: (context: CallContext) => Promise<LiveResult>, reattach?: (context: CallContext) => Promise<LiveResult>): Promise<unknown> {
 		this.consume(key);
 		const outcome = this.folded.outcomes.get(key);
+		if (outcome && retryable(spec.kind, outcome)) {
+			// Its nested calls stay recorded: the workflow asks for them again (its finished ones replay).
+			this.retried = true;
+			this.retriedCalls++;
+			this.onRetried?.(spec.kind, outcome.cost ?? 0);
+			this.notify();
+			return this.guard(this.run(key, spec, live));
+		}
 		// A nested workflow answered from the journal makes none of its calls again; what they spent counts.
 		if (outcome && spec.kind === "workflow")
 			for (const nested of this.pending.filter((k) => k.startsWith(`${key}/`))) {
@@ -488,7 +534,7 @@ export class Durable {
 			this.checkScheduled = false;
 			if (this.active > 0 || this.deferred.length === 0 || this.pending.length === 0) return;
 			const asked = this.deferred[0]!;
-			if (this.editing) {
+			if (this.lenient) {
 				this.takeover(asked.key, asked.label);
 				this.notify();
 				return;

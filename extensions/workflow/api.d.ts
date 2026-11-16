@@ -8,9 +8,10 @@
  * journaled, and a run whose process died is resumed by running the script again, with recorded
  * calls answered from the journal. So keep the script deterministic: act on the outside only
  * through these calls (Date.now(), new Date() and Math.random() are recorded too). A shell or tool
- * call that was running at the crash is not repeated unless marked `idempotent: true`. A resume with
- * edited code answers the calls it makes as before from the journal and runs live from its first
- * other call.
+ * call that was running at the crash is not repeated unless marked `idempotent: true`. A resume
+ * runs failed delegate runs, llm() calls and workflows.* again (a failed run can be resumed);
+ * failed shell and tool calls throw their recorded error again. A resume with edited code answers
+ * the calls it makes as before from the journal and runs live from its first other call.
  */
 
 /**
@@ -108,8 +109,14 @@ declare const plan: { expect(names: string[]): void };
 
 type Thinking = "off" | "minimal" | "low" | "medium" | "high";
 
-/** Map over items with at most `concurrency` (default 4) calls at once. On the first error it starts no more items and rejects once running ones settle. */
-declare function map<T, R>(items: readonly T[], fn: (item: T, index: number) => Promise<R>, options?: { concurrency?: number }): Promise<R[]>;
+/**
+ * Map over items with at most `concurrency` (default 4) calls at once. A failing item does not stop
+ * the others: all run, then a MapError lists the failed ones (`.failed` indexes, `.results`), and a
+ * resume runs only those again. With `settle: true` it never throws for an item and returns each
+ * one's outcome. A budget used up or a stop ends it at once.
+ */
+declare function map<T, R>(items: readonly T[], fn: (item: T, index: number) => Promise<R>, options: { concurrency?: number; settle: true }): Promise<({ ok: true; value: R } | { ok: false; error: Error })[]>;
+declare function map<T, R>(items: readonly T[], fn: (item: T, index: number) => Promise<R>, options?: { concurrency?: number; settle?: false }): Promise<R[]>;
 
 /** A progress line (console.log does the same). The last lines are returned when the script fails. */
 declare function log(...values: unknown[]): void;

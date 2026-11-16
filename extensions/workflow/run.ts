@@ -31,7 +31,7 @@ import { createDelegate, type SteerTarget } from "./delegate.ts";
 import { harnessFault } from "./fault.ts";
 import { Phases } from "./phases.ts";
 import { compile, evaluate, inlineModule, type ScriptHost, scriptStack } from "./compile.ts";
-import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, WorkflowStopped } from "./durable.ts";
+import { blockingCalls, Durable, type InFlightPolicy, isInterruption, isStop, retryableFailures, WorkflowStopped } from "./durable.ts";
 import { codeHash, currentSource, Journal, type JournalEntry, journalPath, newRunId, readJournal, RESUMABLE, type RunHeader, runDir, runState, SNAPSHOT_FILE } from "./journal.ts";
 import type { SavedWorkflow } from "./library.ts";
 import { DEFAULT_LLM_MODEL, llm } from "./llm.ts";
@@ -116,6 +116,8 @@ export interface WorkflowDetails {
 	delegateRuns: number;
 	/** Calls answered from the journal in this execution. */
 	replayedCalls: number;
+	/** Recorded failures of agent runs and llm calls that ran again in this execution. */
+	retriedCalls: number;
 	/** Recorded calls the (edited) script did not use. */
 	unusedCalls: number;
 	/** Agent runs a stop left running; their outcomes are recorded when they end. */
@@ -201,27 +203,72 @@ function limiter(max: number) {
 	};
 }
 
-/** map(): at most `concurrency` calls at once; on the first error no new items start, and it rejects once the running ones settle. */
-async function mapItems(items: unknown, fn: unknown, options: unknown): Promise<unknown[]> {
+/** Errors that end the whole run (or a phase's money), not one item's work: map stops starting items at once. */
+const RUN_ENDING = new Set(["BudgetExceeded", "PhaseBudgetExceeded", "WorkflowStopped", "DivergenceError"]);
+const endsRun = (error: unknown) => RUN_ENDING.has((error as { name?: unknown } | null)?.name as string) || isInterruption(error);
+
+const messageOf = (error: unknown) => (error instanceof Error || (error && typeof error === "object" && "message" in error) ? String((error as { message: unknown }).message) : String(error));
+
+/**
+ * map() without `settle` when items failed: every failed item with its error; the results of the
+ * others in `results` (undefined for the failed ones). A resume runs only the failed calls again.
+ */
+export class MapError extends AggregateError {
+	readonly results: unknown[];
+	/** The indexes of the failed items, ascending. */
+	readonly failed: number[];
+	constructor(failures: Map<number, unknown>, results: unknown[]) {
+		const failed = [...failures.keys()].sort((a, b) => a - b);
+		const lines = failed.map((index) => `- items[${index}]: ${messageOf(failures.get(index)).split("\n")[0]}`);
+		super(
+			failed.map((index) => failures.get(index)),
+			[
+				`map: ${failed.length} of ${results.length} items failed; the other ${results.length - failed.length} finished (their results are recorded).`,
+				...lines,
+				"A resume (workflow { resume: \"<id>\" }) runs only the failed agent and llm calls again; the finished ones come from the journal. To keep going without them, map with { settle: true }.",
+			].join("\n"),
+		);
+		this.name = "MapError";
+		this.results = results;
+		this.failed = failed;
+	}
+}
+
+/**
+ * map(): at most `concurrency` calls at once. An item that fails does not stop the others: every
+ * item runs, then a MapError names every failed one (with `settle`, each item's `{ ok, value }` or
+ * `{ ok: false, error }` comes back instead). An error that ends the run (a budget, a stop, an
+ * interruption: `endsRun`, or the run's signal) stops starting items and is thrown once the running
+ * ones settle. Fan-outs of independent agents were the rule (22 of 22 fan-out scripts used map, 1
+ * handled errors per item), and stopping at the first failure lost the finished work (2026-11-16).
+ */
+async function mapItems(items: unknown, fn: unknown, options: unknown, signal?: AbortSignal): Promise<unknown[]> {
 	if (!Array.isArray(items)) throw new TypeError("map(items, fn, options?): items must be an array");
 	if (typeof fn !== "function") throw new TypeError("map(items, fn, options?): fn must be a function");
-	const concurrency = (options as { concurrency?: unknown } | undefined)?.concurrency ?? DEFAULT_CONCURRENCY;
+	const { concurrency = DEFAULT_CONCURRENCY, settle = false } = (options ?? {}) as { concurrency?: unknown; settle?: unknown };
 	if (typeof concurrency !== "number" || !Number.isInteger(concurrency) || concurrency < 1) throw new TypeError("map(): concurrency must be a positive integer");
+	if (typeof settle !== "boolean") throw new TypeError("map(): settle must be a boolean");
 	const results = new Array<unknown>(items.length);
+	const failures = new Map<number, unknown>();
 	let next = 0;
-	let failure: { error: unknown } | undefined;
+	let ending: { error: unknown } | undefined;
 	const worker = async () => {
-		while (!failure && next < items.length) {
+		while (!ending && !signal?.aborted && next < items.length) {
 			const index = next++;
 			try {
 				results[index] = await fn(items[index], index);
 			} catch (error) {
-				failure ??= { error };
+				if (endsRun(error) || signal?.aborted) ending ??= { error };
+				else failures.set(index, error);
 			}
 		}
 	};
 	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
-	if (failure) throw failure.error;
+	if (ending) throw ending.error;
+	if (signal?.aborted) throw signal.reason;
+	// From the items: `results` has holes where items failed, which Array.map skips.
+	if (settle) return items.map((_, index) => (failures.has(index) ? { ok: false, error: failures.get(index) } : { ok: true, value: results[index] }));
+	if (failures.size) throw new MapError(failures, results);
 	return results;
 }
 
@@ -285,7 +332,7 @@ export async function runWorkflow(entry: WorkflowEntry, budgetLimit: number, env
  */
 export async function resumeWorkflow(request: ResumeRequest, env: RunEnv): Promise<WorkflowResult> {
 	const { entries, header, end } = runState(env.agentDir, request.id);
-	if (end && request.code === undefined && !RESUMABLE.has(end.status)) {
+	if (end && request.code === undefined && !RESUMABLE.has(end.status) && !(end.status === "failed" && retryableFailures(entries).length > 0)) {
 		throw new Error(`workflow run ${request.id} ended (${end.status}); there is nothing to resume (pass code to continue it with changed code). Its result:\n\n${end.text}`);
 	}
 	if (request.code !== undefined) compile(header.entry.inline ? inlineModule(request.code) : request.code, header.entry.filename);
@@ -364,6 +411,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		cachedCalls: 0,
 		delegateRuns: 0,
 		replayedCalls: 0,
+		retriedCalls: 0,
 		unusedCalls: 0,
 		lingeringDelegates: 0,
 		childSessions: [],
@@ -412,6 +460,9 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		replayed: (kind, cost) => {
 			if (kind === "llm") details.llmCalls++;
 			if (kind === "delegate") details.delegateRuns++;
+			if (cost > 0) spend(cost);
+		},
+		retried: (_kind, cost) => {
 			if (cost > 0) spend(cost);
 		},
 		diverged: (error) => controller.abort(error),
@@ -574,7 +625,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 			}),
 		phase: (name: unknown, fn: unknown, options: unknown) => phases.run(name, fn, options),
 		plan: Object.freeze({ expect: (names: unknown) => phases.expect(names) }),
-		map: mapItems,
+		map: (items: unknown, fn: unknown, options: unknown) => mapItems(items, fn, options, controller.signal),
 		sh,
 		log: (...values: unknown[]) => progress(values.map((v) => (typeof v === "string" ? v : show(v))).join(" ")),
 		changes: () =>
@@ -641,6 +692,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	if (root && start) details.changedFiles = await changedPaths(start, await snapshot(root));
 	details.durationMs = performance.now() - started;
 	details.replayedCalls = durable.replayedCalls;
+	details.retriedCalls = durable.retriedCalls;
 	details.unusedCalls = durable.unused.length;
 	details.lingeringDelegates = lingering.length;
 	details.status = overBudget ? "over budget" : diverged ? "diverged" : stopped ? "stopped" : interrupted ? "interrupted" : env.signal?.aborted ? "aborted" : failure !== undefined ? "failed" : "completed";
@@ -649,7 +701,8 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	if (failure !== undefined) details.error = interrupted ? `interrupted: ${(reason as Error).message}` : stopped ? (reason as Error).message : scriptStack(failure, entry.filename);
 	details.log = lines.slice(-PROGRESS_LINES);
 	const cutOff = stopped ? blockingCalls(readJournal(journal.path)).map((call) => `${call.kind} ${call.label}`) : [];
-	const text = report(details, value, failure !== undefined, lines, env.cwd, { unused: durable.unused.map((call) => `${call.kind} ${call.label}`), cutOff });
+	const retry = details.status === "failed" ? retryableFailures(readJournal(journal.path)).length : 0;
+	const text = report(details, value, failure !== undefined, lines, env.cwd, { unused: durable.unused.map((call) => `${call.kind} ${call.label}`), cutOff, retry });
 	journal.append({ t: "end", at: Date.now(), status: details.status, ok: details.ok, cost: details.cost, text, ...(lingering.length ? { lingering } : {}) }, true);
 	// Delegation state stays for a resume (interrupted, stopped): reattaching agents need it.
 	const release = () => {
@@ -666,17 +719,22 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	return { text, details, ...(usage ? { usage } : {}) };
 }
 
-function report(details: WorkflowDetails, value: unknown, failed: boolean, lines: string[], cwd: string, calls: { unused: string[]; cutOff: string[] }): string {
+function report(details: WorkflowDetails, value: unknown, failed: boolean, lines: string[], cwd: string, calls: { unused: string[]; cutOff: string[]; retry: number }): string {
 	const stats = [
 		`${(details.durationMs / 1000).toFixed(1)} s`,
 		`$${details.cost.toFixed(4)} of $${details.budget.toFixed(2)}`,
 		`${details.llmCalls} llm call${details.llmCalls === 1 ? "" : "s"}${details.cachedCalls ? ` (${details.cachedCalls} cached)` : ""}`,
 		`${details.delegateRuns} delegate run${details.delegateRuns === 1 ? "" : "s"}`,
 		...(details.replayedCalls ? [`${details.replayedCalls} replayed from the journal`] : []),
+		...(details.retriedCalls ? [`${details.retriedCalls} failed call${details.retriedCalls === 1 ? "" : "s"} ran again`] : []),
 		`run ${details.id}`,
 	];
 	const out = [`Workflow ${details.workflow ? `${details.workflow} ` : ""}${details.status} · ${stats.join(" · ")}`];
 	if (details.status === "interrupted") out.push(`It can continue from its journal: call workflow with resume: "${details.id}".`);
+	if (calls.retry)
+		out.push(
+			`${calls.retry} agent or llm call${calls.retry === 1 ? "" : "s"} failed. workflow { resume: "${details.id}" } runs ${calls.retry === 1 ? "it" : "them"} again; everything that finished comes from the journal at no cost.`,
+		);
 	if (details.status === "stopped") {
 		if (details.lingeringDelegates) out.push(`${details.lingeringDelegates} delegate run${details.lingeringDelegates === 1 ? " keeps" : "s keep"} running; results are recorded when they end (workflow { stop: "${details.id}", stopChildren: true } cancels them).`);
 		if (calls.cutOff.length) out.push(`Cut off by the stop, may have taken effect partly: ${calls.cutOff.join("; ")}. A resume asks whether to run them again (inFlight).`);

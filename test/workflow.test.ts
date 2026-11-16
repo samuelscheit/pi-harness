@@ -135,17 +135,53 @@ describe("scripts", () => {
 		assert.match(bad.details.error!, /command must be a non-empty string/);
 	});
 
-	test("map: limits concurrency, keeps order, stops starting items after the first error", async () => {
+	test("map: limits concurrency, keeps order; a failing item does not stop the others, then one MapError names every failed item", async () => {
 		const { text } = await run(
 			"let active = 0, peak = 0;\nconst out = await map([1, 2, 3, 4, 5, 6, 7], async (n) => { active++; peak = Math.max(peak, active); await new Promise((r) => setTimeout(r, 20)); active--; return n * 10; }, { concurrency: 3 });\nreturn JSON.stringify({ out, peak });",
 		);
 		assert.deepEqual(JSON.parse(text.split("\n\n")[1]!), { out: [10, 20, 30, 40, 50, 60, 70], peak: 3 });
 		const failing = await run(
-			"const started: number[] = [];\ntry {\n  await map([0, 1, 2, 3, 4, 5], async (n) => { started.push(n); await new Promise((r) => setTimeout(r, n === 1 ? 5 : 30)); if (n === 1) throw new Error('item 1'); return n; }, { concurrency: 2 });\n} catch (e) { return `${(e as Error).message} after ${started.join(',')}`; }",
+			"const started: number[] = [];\ntry {\n  await map([0, 1, 2, 3, 4, 5], async (n) => { started.push(n); await new Promise((r) => setTimeout(r, n === 1 ? 5 : 30)); if (n === 1 || n === 4) throw new Error(`item ${n} broke`); return n; }, { concurrency: 2 });\n} catch (e) { const m = e as Error & { failed: number[]; results: unknown[]; errors: Error[] }; return JSON.stringify({ name: m.name, failed: m.failed, results: m.results, errors: m.errors.map((x) => x.message), started: started.length, message: m.message }); }",
 		);
-		assert.equal(failing.text.split("\n\n")[1], "item 1 after 0,1", "item 2 never started");
+		const caught = JSON.parse(failing.text.split("\n\n")[1]!);
+		assert.equal(caught.name, "MapError");
+		assert.deepEqual(caught.failed, [1, 4]);
+		assert.equal(caught.started, 6, "every item ran after the first failure");
+		assert.deepEqual(caught.results, [0, null, 2, 3, null, 5], "the finished items' results (JSON shows the failed ones' undefined as null)");
+		assert.deepEqual(caught.errors, ["item 1 broke", "item 4 broke"]);
+		assert.match(caught.message, /^map: 2 of 6 items failed; the other 4 finished \(their results are recorded\)\.\n- items\[1\]: item 1 broke\n- items\[4\]: item 4 broke\nA resume \(workflow \{ resume: "<id>" \}\) runs only the failed agent and llm calls again/);
+		// Uncaught, the run fails with that message.
+		const uncaught = await run("await map([1, 2], async (n) => { if (n === 2) throw new Error('two'); return n; });\nreturn 'never';");
+		assert.equal(uncaught.details.status, "failed");
+		assert.match(uncaught.details.error!, /map: 1 of 2 items failed[\s\S]*items\[1\]: two/);
 		const bad = await run("await map([1], async (n) => n, { concurrency: 0 });");
 		assert.match(bad.details.error!, /concurrency must be a positive integer/);
+		const badSettle = await run("await map([1], async (n) => n, { settle: 'yes' } as never);");
+		assert.match(badSettle.details.error!, /settle must be a boolean/);
+	});
+
+	test("map with settle: never throws for an item; each item's value or error, in order", async () => {
+		const { text, details } = await run(
+			"const out = await map([1, 2, 3], async (n) => { if (n === 2) throw new Error('two'); return n * 10; }, { settle: true });\nreturn JSON.stringify(out.map((o) => (o.ok ? { ok: true, value: o.value } : { ok: false, message: o.error.message })));",
+		);
+		assert.equal(details.status, "completed", details.error);
+		assert.deepEqual(JSON.parse(text.split("\n\n")[1]!), [{ ok: true, value: 10 }, { ok: false, message: "two" }, { ok: true, value: 30 }]);
+	});
+
+	test("map: a stop ends it at once, also with settle; items not started yet never start", async () => {
+		const controller = new AbortController();
+		const started: number[] = [];
+		const pending = run(
+			"await map([0, 1, 2, 3, 4, 5], async (n) => { await shell(`echo ${n} >> started; sleep 1`); return n; }, { concurrency: 2, settle: true });\nreturn 'never';",
+			1,
+			{ signal: controller.signal },
+		);
+		await new Promise((r) => setTimeout(r, 300));
+		controller.abort(new Error("stop now"));
+		const { details } = await pending;
+		assert.equal(details.status, "aborted");
+		started.push(...readFileSync(join(repo, "started"), "utf8").split("\n").filter(Boolean).map(Number));
+		assert.deepEqual(started.sort(), [0, 1], "only the first two started");
 	});
 
 	test("abort stops a running command at once and reports aborted", async () => {

@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { blockingCalls, type CallSpec, DivergenceError, Durable, foldJournal, type InFlightPolicy, inFlightCalls, InterruptedCallError, type Settled, type Work } from "../extensions/workflow/durable.ts";
+import { blockingCalls, type CallSpec, DivergenceError, Durable, foldJournal, type InFlightPolicy, inFlightCalls, InterruptedCallError, retryableFailures, type Settled, type Work } from "../extensions/workflow/durable.ts";
 import { argsHash, canonicalJson, codeHash, Journal, type JournalEntry, journalPath, listRuns, parseJournal, readJournal, runDir, sweepRuns } from "../extensions/workflow/journal.ts";
 import { layout, pageHeight, renderWorkflow, viewOf } from "../extensions/workflow/render.ts";
 import { INLINE_FILE, type RunEnv, resumeWorkflow, runWorkflow } from "../extensions/workflow/run.ts";
@@ -34,6 +34,8 @@ function durable(entries: readonly JournalEntry[] = [], inFlight: InFlightPolicy
 	/** The recorded cost of each replayed call, in order. */
 	const costs: number[] = [];
 	const dropped: { key: string; meta: Record<string, unknown> }[] = [];
+	/** The kind and recorded cost of each call whose failure ran again. */
+	const retried: [string, number][] = [];
 	const signal = new AbortController().signal;
 	const d = new Durable({
 		journal,
@@ -47,10 +49,11 @@ function durable(entries: readonly JournalEntry[] = [], inFlight: InFlightPolicy
 			replayed.push(kind);
 			costs.push(cost);
 		},
+		retried: (kind, cost) => retried.push([kind, cost]),
 		diverged: (e) => diverged.push(e),
 		dropped: (calls) => dropped.push(...calls.map((c) => ({ key: c.start.key, meta: c.meta }))),
 	});
-	return { d, journal, diverged, replayed, costs, dropped, entries: () => readJournal(journal.path) };
+	return { d, journal, diverged, replayed, costs, dropped, retried, entries: () => readJournal(journal.path) };
 }
 const spec = (kind: CallSpec["kind"], args: unknown, extra: Partial<CallSpec> = {}): CallSpec => ({ kind, args, label: `${kind} ${JSON.stringify(args)}`, ...extra });
 const value = (v: unknown) => async () => ({ value: v });
@@ -145,10 +148,12 @@ describe("replay", () => {
 		assert.deepEqual(outcomes, [["failed", 0.75], ["done", 0.1], ["done", undefined]]);
 
 		const replay = durable(first.entries());
-		await assert.rejects(replay.d.call(spec("delegate", { n: 1 }), never), /no end/);
+		// The failed agent run runs again; what its failed attempt spent still counts.
+		assert.equal(await replay.d.call(spec("delegate", { n: 1 }), value("now done")), "now done");
 		await replay.d.call(spec("llm", { n: 2 }), never);
 		await replay.d.call(spec("shell", { n: 3 }), never);
-		assert.deepEqual(replay.costs, [0.75, 0.1, 0]);
+		assert.deepEqual(replay.retried, [["delegate", 0.75]]);
+		assert.deepEqual(replay.costs, [0.1, 0]);
 	});
 
 	test("a replayed nested workflow skips its calls and counts what they spent", async () => {
@@ -187,6 +192,53 @@ describe("replay", () => {
 		const replay = durable(first.entries());
 		await assert.rejects(replay.d.call(spec("tool", { name: "x" }), never), (error: Error) => error.name === "TypeError" && error.message === "bad input");
 		assert.equal(await replay.d.call(spec("tool", { name: "y" }), never), undefined);
+	});
+
+	test("a resume runs failed agent runs, llm calls and nested workflows again (their spend counts); tool and budget failures replay", async () => {
+		const first = durable();
+		const fail = (name: string, message: string) => async (context: { spend(usd: number): void }) => {
+			context.spend(0.25);
+			const error = new Error(message);
+			error.name = name;
+			throw error;
+		};
+		await assert.rejects(first.d.call(spec("delegate", { m: "research" }), fail("HarnessFault", "no end of run 1")), /no end of run 1/);
+		await assert.rejects(first.d.call(spec("llm", { p: "q" }), fail("Error", "llm(): overloaded")), /overloaded/);
+		await assert.rejects(first.d.call(spec("workflow", { w: "x" }), fail("MapError", "map: 1 of 2 items failed")), /map: 1 of 2/);
+		await assert.rejects(first.d.call(spec("tool", { t: "write" }), fail("Error", "disk full")), /disk full/);
+		await assert.rejects(first.d.call(spec("delegate", { m: "costly" }), fail("PhaseBudgetExceeded", "phase review is over its budget")), /over its budget/);
+		assert.equal(await first.d.call(spec("llm", { p: "done" }), value("kept")), "kept");
+		assert.deepEqual(retryableFailures(first.entries()).map((s) => s.kind), ["delegate", "llm", "workflow"]);
+
+		const resume = durable(first.entries());
+		assert.equal(await resume.d.call(spec("delegate", { m: "research" }), value("findings")), "findings");
+		assert.equal(await resume.d.call(spec("llm", { p: "q" }), value("answer")), "answer");
+		assert.equal(await resume.d.call(spec("workflow", { w: "x" }), value("nested ok")), "nested ok");
+		await assert.rejects(resume.d.call(spec("tool", { t: "write" }), never), /disk full/, "a tool's failure replays: running it again could repeat its effect");
+		await assert.rejects(resume.d.call(spec("delegate", { m: "costly" }), never), /over its budget/, "a budget's failure replays");
+		assert.equal(await resume.d.call(spec("llm", { p: "done" }), never), "kept");
+		assert.deepEqual(resume.retried, [["delegate", 0.25], ["llm", 0.25], ["workflow", 0.25]], "what the failed attempts spent counts");
+		assert.equal(resume.d.retriedCalls, 3);
+		assert.deepEqual(resume.diverged, []);
+		assert.deepEqual(retryableFailures(resume.entries()), [], "the journal of the resume has none left");
+	});
+
+	test("a call that ran again and succeeds may take another path: the resume takes over there instead of stopping", async () => {
+		const first = durable();
+		// The script caught the failure and took its fallback.
+		await assert.rejects(first.d.call(spec("delegate", { m: "a" }), async () => Promise.reject(new Error("request failed"))));
+		await first.d.call(spec("shell", { c: "fallback" }), value("fb"));
+		const resume = durable(first.entries());
+		assert.equal(await resume.d.call(spec("delegate", { m: "a" }), value("ok now")), "ok now");
+		// The success path: another call than the recorded fallback.
+		assert.equal(await resume.d.call(spec("shell", { c: "use result" }), value("used")), "used");
+		resume.d.finish();
+		assert.deepEqual(resume.diverged, []);
+		assert.deepEqual(resume.d.unused.map((s) => s.label), ['shell {"c":"fallback"}'], "the fallback is reported unused");
+		// The same call failing again: the recorded fallback still answers.
+		const again = durable(first.entries());
+		await assert.rejects(again.d.call(spec("delegate", { m: "a" }), async () => Promise.reject(new Error("request failed"))));
+		assert.equal(await again.d.call(spec("shell", { c: "fallback" }), never), "fb");
 	});
 
 	test("a script that takes another path stops the resume, naming the recorded call and the new one", async () => {
@@ -480,6 +532,37 @@ describe("resume", () => {
 		assert.equal(resumed.details.cost, first.details.cost, "recorded costs count against the budget");
 		assert.match(resumed.text, /4 replayed from the journal/);
 		await assert.rejects(resumeWorkflow({ id: first.details.id }, env()), /ended \(completed\); there is nothing to resume/);
+	});
+
+	test("a failed run resumes: map's failed item runs again, the finished ones come from the journal; a script error is no failure to retry", async () => {
+		let failing = true;
+		faux.setResponses(Array.from({ length: 20 }, () => (context: { messages: { role: string; content: unknown }[] }) => {
+			llmRequests++;
+			const asked = JSON.stringify(context.messages.at(-1)?.content);
+			if (failing && asked.includes("item b")) return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded" });
+			return fauxAssistantMessage(`answer to ${asked.includes("item a") ? "a" : asked.includes("item b") ? "b" : "c"}`);
+		}));
+		const script = "const out = await map(['a', 'b', 'c'], (x) => llm(`item ${x}`, { model: 'faux/faux-1' }), { concurrency: 3 });\nreturn out.join(' | ');";
+		const first = await runWorkflow({ source: script, filename: INLINE_FILE, inline: true }, 1, env());
+		assert.equal(first.details.status, "failed");
+		assert.equal(llmRequests, 3);
+		assert.match(first.text, /map: 1 of 3 items failed; the other 2 finished/);
+		assert.match(first.text, new RegExp(`1 agent or llm call failed\\. workflow \\{ resume: "${first.details.id}" \\} runs it again; everything that finished comes from the journal at no cost\\.`));
+		failing = false;
+		const resumed = await resumeWorkflow({ id: first.details.id }, env());
+		assert.equal(resumed.details.status, "completed", resumed.details.error);
+		assert.equal(resultOf(resumed.text), "answer to a | answer to b | answer to c");
+		assert.equal(llmRequests, 4, "only the failed item asked again");
+		assert.equal(resumed.details.retriedCalls, 1);
+		assert.equal(resumed.details.replayedCalls, 2);
+		assert.match(resumed.text, /1 failed call ran again/);
+		assert.equal(resumed.details.llmCalls, 3, "two replayed and one live");
+		await assert.rejects(resumeWorkflow({ id: first.details.id }, env()), /ended \(completed\)/);
+		// A script's own error leaves nothing to run again: no plain resume.
+		const broken = await runWorkflow({ source: "throw new Error('bug in the script');", filename: INLINE_FILE, inline: true }, 1, env());
+		assert.equal(broken.details.status, "failed");
+		assert.doesNotMatch(broken.text, /runs it again/);
+		await assert.rejects(resumeWorkflow({ id: broken.details.id }, env()), /ended \(failed\); there is nothing to resume/);
 	});
 
 	test("an llm call in flight runs again", async () => {
