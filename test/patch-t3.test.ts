@@ -40,7 +40,14 @@ const bundle = unpatched(PATCHES);
 const chunkPatches = Object.fromEntries(
 	[...new Set(PATCHES.map(patchFile))].map((id, i) => [`apps/server/dist/chunk${i}.mjs`, PATCHES.filter((patch) => patchFile(patch) === id)]),
 );
-const chunks = Object.fromEntries(Object.entries(chunkPatches).map(([path, patches]) => [path, unpatched(patches)]));
+/** Each chunk holds the text that identifies its file, as t3's bundle does, and its patches' anchors. */
+const chunks = Object.fromEntries(Object.entries(chunkPatches).map(([path, patches]) => [path, `${patchFile(patches[0]!)}\n${unpatched(patches)}`]));
+/** What keepPatched posted to the user; a test never notifies the real desktop. */
+let told: string[] = [];
+const tell = (message: string) => void told.push(message);
+beforeEach(() => {
+	told = [];
+});
 /** The chunk as patchApp leaves it. */
 const patchedChunk = (path: string) => patchBundle(chunks[path]!, chunkPatches[path]).text;
 
@@ -155,6 +162,9 @@ describe("patchBundle", () => {
 		"background-released",
 		"background-released-contract",
 		"between-turns-ordinal",
+		"effect-slot-wait",
+		"effect-slot-handback",
+		"keyed-lock-contended",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -692,13 +702,14 @@ describe("keeping t3 patched", () => {
 			writeArchive(archive, { ...chunks, "apps/server/dist/other.mjs": "export {};\n" });
 			const original = readFileSync(archive);
 			assert.match(
-				await keepPatched(app),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal;/,
+				await keepPatched(app, tell),
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 			assert.equal(readFile(archive, "apps/server/dist/other.mjs").toString(), "export {};\n");
-			assert.equal(await keepPatched(app), "already patched");
+			assert.equal(await keepPatched(app, tell), "already patched");
+			assert.deepEqual(told, [], "t3 is not running: nothing to tell");
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original, "the backup stays t3's own archive");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
@@ -717,7 +728,7 @@ describe("keeping t3 patched", () => {
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract;/);
+			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 
@@ -725,8 +736,9 @@ describe("keeping t3 patched", () => {
 			const toolChunk = Object.keys(chunks).find((path) => chunks[path]!.includes("resolveTargetRechecking"))!;
 			writeArchive(archive, { ...chunks, [toolChunk]: chunks[toolChunk]!.replace("task: taskPrompt(input),", "task: buildTask(input),") });
 			const broken = readFileSync(archive);
-			// patchApp, not keepPatched: that one also posts the failure as a macOS notification.
-			assert.throws(() => patchApp(app), /delegate-fork-tool patch\): expected the anchor once, found it 0 times/);
+			await assert.rejects(keepPatched(app, tell), /delegate-fork-tool patch\): expected the anchor once, found it 0 times/);
+			assert.equal(told.length, 1);
+			assert.match(told[0]!, /^t3 is not patched for the harness: t3 changed \(delegate-fork-tool patch\)/);
 			assert.deepEqual(readFileSync(archive), broken);
 			assert.notDeepEqual(broken, original);
 

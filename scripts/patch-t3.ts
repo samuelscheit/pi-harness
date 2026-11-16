@@ -115,6 +115,14 @@
 //   (2026-11-16). The adapter now remembers its newest turn and orders such a dialog after its
 //   items. t3code also keeps an open question's row in the renderer whatever its ordinal; that half
 //   is in the minified client, which this script does not patch.
+// - effect-slot-wait (backports t3code main's EFFECT_WORKER_SLOT_WAIT), effect-slot-handback and
+//   keyed-lock-contended (mirror t3code's branch pi-dialogs-outlive-turns, 7e099329 "an effect waiting
+//   on another thread's checkpoint lock hands its worker slot back"): every thread's effects share 4
+//   worker slots, and a slot waited for its effect without limit. Delegated children in a huge repo
+//   (law-formalization, 1M tracked files, a checkpoint capture ~40 s) held all 4 while waiting on that
+//   repo's checkpoint lock, so a turn start in another repo waited 6 minutes for a slot: the user's
+//   messages reached Pi minutes late (2026-11-16, thread c07fa621). A slot now moves on after 30 s, and
+//   at once when its effect is about to wait on a contended workspace lock (the effect finishes later).
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -936,6 +944,49 @@ export const PATCHES: Patch[] = [
 			],
 		],
 	},
+	{
+		name: "effect-slot-wait",
+		// runDaemonWithOptions shares the Pi adapter's chunk.
+		marker: "slotScope",
+		edits: [
+			[
+				'const runWorker = gen$1(function* () {\n\t\twhile (true) {\n\t\t\tconst outcome = yield* worker.runOnce.pipe(map((worked) => worked ? "worked" : "idle"), catchCause((cause) => logWarning$1("Orchestration effect worker failed", cause).pipe(as("failed"))));',
+				'const slotScope = yield* scope;\n\tconst runWorker = gen$1(function* () {\n\t\twhile (true) {\n\t\t\tconst attempt = yield* worker.runOnce.pipe(map((worked) => worked ? "worked" : "idle"), catchCause((cause) => logWarning$1("Orchestration effect worker failed", cause).pipe(as("failed"))), forkIn(slotScope));\n\t\t\tconst outcome = yield* join(attempt).pipe(timeoutOption(seconds(30)), map(getOrElse(() => "worked")));',
+			],
+		],
+	},
+	{
+		name: "effect-slot-handback",
+		// The last two anchors are effect-slot-wait's output.
+		marker: "EffectWorkerSlot",
+		edits: [
+			[
+				"const layer$49 = effect(CheckpointServiceV2, gen$1(function* () {",
+				'const EffectWorkerSlot = Reference("t3/orchestration-v2/EffectWorkerSlot", { defaultValue: () => ({ handBack: void_ }) });\nconst handBackEffectWorkerSlot = gen$1(function* () {\n\tconst slot = yield* EffectWorkerSlot;\n\tyield* slot.handBack;\n});\nconst layer$49 = effect(CheckpointServiceV2, gen$1(function* () {',
+			],
+			[
+				"const withWorkspaceLock = (cwd, effect) => workspaceLocks.withLock(cwd, effect);",
+				"const withWorkspaceLock = (cwd, effect) => workspaceLocks.withLock(cwd, effect, { onContended: handBackEffectWorkerSlot });",
+			],
+			["const attempt = yield* worker.runOnce.pipe(", "const handedBack = yield* make$74();\n\t\t\tconst attempt = yield* worker.runOnce.pipe("],
+			[
+				"forkIn(slotScope));\n\t\t\tconst outcome = yield* join(attempt).pipe(",
+				'provideService(EffectWorkerSlot, { handBack: asVoid(succeed$1(handedBack, void 0)) }), forkIn(slotScope));\n\t\t\tconst outcome = yield* raceFirst(join(attempt), _await(handedBack).pipe(as("worked"))).pipe(',
+			],
+		],
+	},
+	{
+		name: "keyed-lock-contended",
+		file: 'fn("KeyedLock.make")',
+		marker: "contended",
+		edits: [
+			["return [semaphore, next];", "return [{ semaphore, contended: existing !== void 0 }, next];"],
+			[
+				"withLock: (key, effect) => acquireUseRelease(acquire(key), (semaphore) => semaphore.withPermit(effect), () => release(key)),",
+				"withLock: (key, effect, options) => acquireUseRelease(acquire(key), ({ semaphore, contended }) => contended && options?.onContended !== void 0 ? andThen(options.onContended, semaphore.withPermit(effect)) : semaphore.withPermit(effect), () => release(key)),",
+			],
+		],
+	},
 ];
 
 /** Identifies the bundled Pi adapter, patched or not. */
@@ -1065,8 +1116,12 @@ async function restart(app: string): Promise<boolean> {
 	return true;
 }
 
-/** Patches the app (waiting out an update that is still swapping the bundle) and brings the running t3 onto the patches. */
-export async function keepPatched(app: string): Promise<string> {
+/**
+ * Patches the app (waiting out an update that is still swapping the bundle) and brings the running t3 onto the patches.
+ * `tell` posts what the user must know (default a macOS notification; tests record it instead: 2026-11-16 a test's
+ * fixture failure reached the user as "t3 is not patched for the harness").
+ */
+export async function keepPatched(app: string, tell: (message: string) => void = notify): Promise<string> {
 	const archive = join(app, "Contents/Resources/app.asar");
 	// ShipIt moves the old bundle out before moving the new one in.
 	for (let waited = 0; !existsSync(archive); waited += 1_000) {
@@ -1077,7 +1132,7 @@ export async function keepPatched(app: string): Promise<string> {
 	try {
 		result = patchApp(app);
 	} catch (error) {
-		notify(notPatchedMessage(error, process.execPath));
+		tell(notPatchedMessage(error, process.execPath));
 		throw error;
 	}
 	switch (afterPatch(result.applied, startedAgoS(executable(app)))) {
@@ -1089,7 +1144,7 @@ export async function keepPatched(app: string): Promise<string> {
 		case "notify":
 			break;
 	}
-	notify(`t3 was patched for the harness (${result.applied.join(", ")}). Restart t3 to apply.`);
+	tell(`t3 was patched for the harness (${result.applied.join(", ")}). Restart t3 to apply.`);
 	return `${result.message}; asked to restart t3`;
 }
 
