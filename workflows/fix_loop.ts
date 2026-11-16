@@ -11,6 +11,13 @@
 // tasks), so this workflow holds its own contract: a round counts as green only when the check passes and
 // nothing outside `files` changed since the workflow started. Changes outside are not undone for the
 // child; it is told to undo them, and they are returned as `outside` while they remain.
+//
+// The check runs with `pipefail` (checkCommand): a check ending in a filter (`pytest … | tail -1`)
+// otherwise exits with the filter's code, 0, so a failing check read as "already passes" before any
+// round (2026-11-16).
+
+/** The check as the workflow runs it: a pipeline fails when any of its commands fails. */
+export const checkCommand = (check: string): string => `set -o pipefail\n${check}`;
 
 export const meta: WorkflowMeta = {
 	description: [
@@ -27,7 +34,7 @@ export const meta: WorkflowMeta = {
 		properties: {
 			goal: { type: "string", description: "What to achieve, in one or two sentences (e.g. 'make test_parse_dates pass without changing its expectations')." },
 			files: { type: "array", items: { type: "string" }, minItems: 1, description: "Files or directories the child may change, relative to the working directory or absolute." },
-			check: { type: "string", description: "Shell command that passes with exit code 0 when the goal is reached, e.g. 'npm test -- parse.test.ts'. Keep it focused and fast." },
+			check: { type: "string", description: "Shell command that passes with exit code 0 when the goal is reached, e.g. 'npm test -- parse.test.ts'. Keep it focused and fast. It runs with pipefail, so `… | tail -20` fails when the command before the pipe fails." },
 			context: { type: "string", description: "Short hints the child needs: the suspected cause, conventions, what not to touch." },
 			maxRounds: { type: "integer", minimum: 1, maximum: 20, description: "Most rounds (child turns between two checks), default 6." },
 			model: { type: "string", description: "Child model as provider/id, default anthropic/claude-sonnet-5-5." },
@@ -65,7 +72,7 @@ const relativePath = (path: string) => {
 };
 
 export default async function ({ goal, files, check, context, maxRounds = 6, model = "anthropic/claude-sonnet-5-5", checkTimeoutSeconds = 600 }: Input) {
-	const runCheck = () => shell(check, { timeoutSeconds: checkTimeoutSeconds });
+	const runCheck = () => shell(checkCommand(check), { timeoutSeconds: checkTimeoutSeconds });
 	let result = await runCheck();
 	if (result.exitCode === 0) return { ok: true, rounds: 0, summary: "The check already passes; nothing to fix." };
 
