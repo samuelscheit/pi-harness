@@ -20,7 +20,7 @@ import { SOURCE_ROOT } from "../../extensions/lib/repository.ts";
 import { indexAll, metricsPath } from "../../extensions/metrics/stats.ts";
 import { openStore } from "../../extensions/metrics/store.ts";
 import { type Ask, askJson, isNegative, labelMessages } from "../lib/labels.ts";
-import { type Applied, applyDelta } from "./apply.ts";
+import { type Applied, applyDelta, plannedTarget } from "./apply.ts";
 import { collect, repositories } from "./collect.ts";
 import { type Candidate, curate, type Delta } from "./curate.ts";
 import { appendLedger, dreamsDir, type LedgerRecord, readLedger, readSince, report, writeSince } from "./ledger.ts";
@@ -74,16 +74,12 @@ export async function dream({ source, db, now = new Date(), since = readSince(so
 	const known = new Map<string, KnownRule>([...global, ...[...projects.values()].flat()].map((r) => [r.id, r]));
 	const byRef = new Map(candidates.map((c) => [c.ref, c]));
 	const applied: Applied[] = deltas.map((delta) => {
-		if (dryRun) return { delta, ...("rule" in delta ? { target: delta.rule } : {}) };
-		try {
-			return applyDelta(delta, { source, now, rules: known, evidence: (ref) => byRef.get(ref)!.observation });
-		} catch (error) {
-			return { delta, skipped: `failed: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}` };
-		}
+		const target = plannedTarget(delta);
+		return dryRun ? { delta, ...(target ? { target } : {}) } : applyDelta(delta, { source, now, rules: known, evidence: (ref) => byRef.get(ref)!.observation });
 	});
 
 	const run = now.toISOString();
-	const records: LedgerRecord[] = applied.flatMap(({ delta, target, commit, skipped }) =>
+	const records: LedgerRecord[] = applied.flatMap(({ delta, target, commit, branch, refused, skipped }) =>
 		delta.evidence.map((ref) => {
 			const c = byRef.get(ref)!;
 			const targetText = delta.op === "add" || delta.op === "update" ? delta.text : target ? known.get(target)?.text : undefined;
@@ -99,6 +95,7 @@ export async function dream({ source, db, now = new Date(), since = readSince(so
 				...(target ? { target } : {}),
 				...(targetText ? { targetText } : {}),
 				...(commit ? { commit } : {}),
+				...(branch ? { branch, refused } : {}),
 				...(skipped ? { skipped } : {}),
 				...(delta.op === "skip" || delta.op === "update" ? { reason: delta.reason } : {}),
 			};

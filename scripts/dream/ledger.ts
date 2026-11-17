@@ -4,7 +4,8 @@
 //
 //   .agents/dreams/ledger.jsonl   one record per correction a run considered: its label, the rule
 //                                 derived from it, the delta (recur, add, update, skip), the rule it
-//                                 concerns (id and text: line ids move, texts identify) and the commit
+//                                 concerns (id and text: line ids move, texts identify), the commit
+//                                 and, when its repository refused it, the branch that holds it
 //   .agents/dreams/state.json     the time up to which messages were read
 //   .agents/dreams/<date>.md      the run's report
 //
@@ -29,6 +30,9 @@ export interface LedgerRecord {
 	target?: string;
 	targetText?: string;
 	commit?: string;
+	/** The branch holding the commit when the checked-out branch refused it: committed, not landed. */
+	branch?: string;
+	refused?: string;
 	skipped?: string;
 	reason?: string;
 }
@@ -74,7 +78,7 @@ const normalize = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase
 /** Recurrences per rule over the whole ledger, the most repeated first. */
 export function recurrences(ledger: readonly LedgerRecord[]): Recurrence[] {
 	const written = new Map<string, number>();
-	for (const r of ledger) if ((r.op === "add" || r.op === "update") && r.commit && r.targetText) written.set(normalize(r.targetText), Math.min(written.get(normalize(r.targetText)) ?? Infinity, r.ts));
+	for (const r of ledger) if ((r.op === "add" || r.op === "update") && r.commit && !r.branch && r.targetText) written.set(normalize(r.targetText), Math.min(written.get(normalize(r.targetText)) ?? Infinity, r.ts));
 	const groups = new Map<string, { text: string; ids: Set<string>; sessions: Set<string>; count: number; last: number }>();
 	for (const r of ledger) {
 		if (r.op !== "recur" || !r.targetText) continue;
@@ -113,6 +117,8 @@ export function report(summary: RunSummary, ledger: readonly LedgerRecord[]): st
 	/** Deltas, not corrections: several corrections can make one rule. */
 	const rules = (op: "add" | "update") => new Set(ops(op).map((r) => r.targetText)).size;
 	const changed = summary.records.filter((r) => r.commit);
+	const outcome = (r: LedgerRecord) =>
+		r.commit ? ` (${r.commit.slice(0, 9)})${r.branch ? ` — committed on branch ${r.branch}, not landed: ${r.refused}` : ""}` : ` — not applied: ${r.skipped}`;
 	const runs = new Map<string, LedgerRecord[]>();
 	for (const r of ledger) runs.set(r.run, [...(runs.get(r.run) ?? []), r]);
 	const rate = (records: LedgerRecord[]) => {
@@ -132,7 +138,7 @@ export function report(summary: RunSummary, ledger: readonly LedgerRecord[]): st
 		"## Changes",
 		"",
 		...(changed.length || summary.records.some((r) => r.skipped)
-			? [...new Map(summary.records.filter((r) => r.commit || r.skipped).map((r) => [`${r.op}\0${r.targetText ?? r.derived}`, r])).values()].map((r) => `- ${r.op} ${r.target ?? ""}: ${clip(r.targetText ?? r.derived)}${r.commit ? ` (${r.commit.slice(0, 9)})` : ` — not applied: ${r.skipped}`}`)
+			? [...new Map(summary.records.filter((r) => r.commit || r.skipped).map((r) => [`${r.op}\0${r.targetText ?? r.derived}`, r])).values()].map((r) => `- ${r.op} ${r.target ?? r.repo}: ${clip(r.targetText ?? r.derived)}${outcome(r)}`)
 			: ["None."]),
 		"",
 		"## Recurrences this run",
@@ -158,6 +164,8 @@ export function report(summary: RunSummary, ledger: readonly LedgerRecord[]): st
 		"## Improvement notes",
 		"",
 		"Friction agents noted (`note_improvement`), moved here from their backlogs: fix each, or put it back into its backlog to read it again next run.",
+		"",
+		"Fix a note of a project repository the way its AGENTS.md or CLAUDE.md prescribes: in a worktree made with its own worktree tool, landed with its own landing tool. Never edit or commit in its main checkout: on 16.11.2026 a fixing pass committed on law-formalization's `main` past `tools/kernel/land.py`, and its changes to tracked files blocked every landing.",
 		"",
 		...(summary.notes.length ? [...Map.groupBy(summary.notes, (n) => n.backlog)].flatMap(([backlog, notes]) => [`### ${backlog}`, "", ...notes.flatMap((n) => [`#### ${n.at} UTC`, "", n.body, ""])]) : ["None."]),
 		"",

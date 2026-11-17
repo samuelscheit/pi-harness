@@ -50,7 +50,17 @@ function render(candidates: readonly Candidate[], rules: { global: readonly Know
 	return [`<global_rules>\n${rules.global.map(ruleLine).join("\n")}\n</global_rules>`, ...projects, `<candidates>\n${items.join("\n")}\n</candidates>`].join("\n\n");
 }
 
-const text = (value: unknown): string | undefined => (typeof value === "string" && value.trim() && value.trim().length <= MAX_RULE_CHARS ? value.trim() : undefined);
+/**
+ * A rule's text as the model wrote it, trimmed and without the list markers it may start with
+ * ("- ", "* ", "1. "; apply writes a project rule as a list item itself). A project rule is one
+ * line: its id is its line. Undefined when nothing is left or it is too long.
+ */
+function ruleText(value: unknown, oneLine: boolean): string | undefined {
+	if (typeof value !== "string") return undefined;
+	let text = value.trim().replace(/^(?:(?:[-*+]|\d+[.)])(?:\s+|$))+/, "");
+	if (oneLine) text = text.replace(/\s+/g, " ");
+	return /[\p{L}\p{N}]/u.test(text) && text.length <= MAX_RULE_CHARS ? text : undefined;
+}
 
 /** The model's deltas, validated against the candidates and rules; throws on anything malformed. */
 export function parseDeltas(value: unknown, candidates: readonly Candidate[], rules: readonly KnownRule[]): Delta[] {
@@ -70,12 +80,11 @@ export function parseDeltas(value: unknown, candidates: readonly Candidate[], ru
 		}
 		const ev = evidence as string[];
 		const rule = typeof raw.rule === "string" ? byId.get(raw.rule) : undefined;
+		const text = ruleText(raw.text, raw.op === "add" ? raw.scope === "project" : !rule?.id.startsWith("rules/"));
 		if (raw.op === "recur" && rule) result.push({ op: "recur", rule: rule.id, evidence: ev });
-		else if (raw.op === "update" && rule?.editable && text(raw.text)) result.push({ op: "update", rule: rule.id, text: text(raw.text)!, reason: String(raw.reason ?? ""), evidence: ev });
-		else if (raw.op === "add" && raw.scope === "global" && typeof raw.name === "string" && NAME.test(raw.name) && text(raw.text))
-			result.push({ op: "add", scope: "global", name: raw.name, text: text(raw.text)!, evidence: ev });
-		else if (raw.op === "add" && raw.scope === "project" && typeof raw.repo === "string" && repos.has(raw.repo) && text(raw.text))
-			result.push({ op: "add", scope: "project", repo: raw.repo, text: text(raw.text)!, evidence: ev });
+		else if (raw.op === "update" && rule?.editable && text) result.push({ op: "update", rule: rule.id, text, reason: String(raw.reason ?? ""), evidence: ev });
+		else if (raw.op === "add" && raw.scope === "global" && typeof raw.name === "string" && NAME.test(raw.name) && text) result.push({ op: "add", scope: "global", name: raw.name, text, evidence: ev });
+		else if (raw.op === "add" && raw.scope === "project" && typeof raw.repo === "string" && repos.has(raw.repo) && text) result.push({ op: "add", scope: "project", repo: raw.repo, text, evidence: ev });
 		else if (raw.op === "skip") result.push({ op: "skip", reason: String(raw.reason ?? ""), evidence: ev });
 		else throw new Error(`invalid delta ${JSON.stringify(raw)}`);
 	}

@@ -6,15 +6,16 @@
 //   project add    a line under `## Learned rules` in the repository's instruction file
 //   project update that line, which must still read as the curator saw it
 //
-// A file with uncommitted edits is not touched (the delta is reported as skipped), so dreaming
-// never commits the user's own work in progress. `git commit --only <file>` leaves anything else
-// staged alone.
+// A file with uncommitted changes is not touched (the delta is reported as skipped), so dreaming
+// never commits the user's own work in progress. The commit is built without the checkout and the
+// branch moved after (commit.ts): a branch that refuses the move keeps the checkout as it was and
+// the commit lands on `dream/<date>-<slug>` instead, reported as not landed.
 
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
+import { type Committed, commitFile, dirty, firstLine, isRepository } from "./commit.ts";
 import type { Delta } from "./curate.ts";
 import { instructionFile, type KnownRule, LEARNED_HEADING } from "./rules.ts";
 
@@ -32,34 +33,20 @@ export interface ApplyContext {
 	evidence: (ref: string) => Evidence;
 }
 
-export interface Applied {
+export interface Applied extends Partial<Committed> {
 	delta: Delta;
-	/** The rule the delta is about: an existing id, or the new rule's id. */
+	/** The rule the delta is about: an existing id, the new rule's id, or where a new rule was meant to go. */
 	target?: string;
-	commit?: string;
 	skipped?: string;
 }
 
-const git = (repo: string, args: string[], input?: string) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"] }).trim();
-
-const isRepository = (dir: string) => {
-	try {
-		return git(dir, ["rev-parse", "--show-toplevel"]) !== "";
-	} catch {
-		return false;
-	}
-};
-
-/** Uncommitted changes to `file` (staged or not, or untracked). */
-const dirty = (repo: string, file: string) => git(repo, ["status", "--porcelain", "--", file]) !== "";
-
-function commitFile(repo: string, file: string, message: string): string {
-	git(repo, ["add", "--", file]);
-	git(repo, ["commit", "--only", "-F", "-", "--", file], message);
-	return git(repo, ["rev-parse", "HEAD"]);
-}
-
 const day = (at: Date | number) => new Date(at).toISOString().slice(0, 10);
+
+/** The branch that keeps a commit the checked-out branch refused. */
+function fallbackBranch(ctx: ApplyContext, text: string): string {
+	const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, "-").split("-").filter(Boolean).slice(0, 6).join("-").slice(0, 48).replace(/-$/, "");
+	return `dream/${day(ctx.now)}-${slug || "rule"}`;
+}
 
 function message(title: string, rule: string, delta: Delta, ctx: ApplyContext, why?: string): string {
 	const quotes = delta.evidence.map((ref) => {
@@ -92,11 +79,11 @@ function message(title: string, rule: string, delta: Delta, ctx: ApplyContext, w
 }
 
 /** The rule file for a new global rule: the name, or the name with the first free numeric suffix. */
-function freeRuleFile(rulesDir: string, name: string): { file: string; name: string } {
+function freeRuleFile(source: string, rulesDir: string, name: string): { file: string; name: string } {
 	for (let i = 1; ; i++) {
 		const candidate = i === 1 ? name : `${name}-${i}`;
 		const file = join(rulesDir, `${candidate}.md`);
-		if (!existsSync(file)) return { file, name: candidate };
+		if (!existsSync(file) && !dirty(source, file)) return { file, name: candidate };
 	}
 }
 
@@ -118,47 +105,54 @@ export function withLearnedLine(content: string, line: string): string {
 function applyGlobal(delta: Extract<Delta, { op: "add"; scope: "global" }> | Extract<Delta, { op: "update" }>, ctx: ApplyContext): Applied {
 	const rulesDir = join(ctx.source, "prompt", "rules");
 	if (delta.op === "add") {
-		const { file, name } = freeRuleFile(rulesDir, delta.name);
-		mkdirSync(rulesDir, { recursive: true });
-		writeFileSync(file, `---\n${stringify({ source: "dream", added: day(ctx.now) })}---\n\n${delta.text}\n`);
-		return { delta, target: `rules/${name}`, commit: commitFile(ctx.source, file, message(`feat(rules): learned rule ${name}`, delta.text, delta, ctx)) };
+		const { file, name } = freeRuleFile(ctx.source, rulesDir, delta.name);
+		const content = `---\n${stringify({ source: "dream", added: day(ctx.now) })}---\n\n${delta.text}\n`;
+		return { delta, target: `rules/${name}`, ...commitFile(ctx.source, file, content, message(`feat(rules): learned rule ${name}`, delta.text, delta, ctx), fallbackBranch(ctx, name)) };
 	}
 	const name = delta.rule.slice("rules/".length);
 	const file = join(rulesDir, `${name}.md`);
 	if (dirty(ctx.source, file)) return { delta, target: delta.rule, skipped: `${relative(ctx.source, file)} has uncommitted changes` };
 	const { frontmatter } = parseFrontmatter(readFileSync(file, "utf8"));
-	writeFileSync(file, `---\n${stringify({ ...frontmatter, updated: day(ctx.now) })}---\n\n${delta.text}\n`);
-	return { delta, target: delta.rule, commit: commitFile(ctx.source, file, message(`fix(rules): sharpen rule ${name}`, delta.text, delta, ctx, delta.reason)) };
+	const content = `---\n${stringify({ ...frontmatter, updated: day(ctx.now) })}---\n\n${delta.text}\n`;
+	return { delta, target: delta.rule, ...commitFile(ctx.source, file, content, message(`fix(rules): sharpen rule ${name}`, delta.text, delta, ctx, delta.reason), fallbackBranch(ctx, name)) };
 }
 
-function applyProject(delta: Extract<Delta, { op: "add"; scope: "project" }> | Extract<Delta, { op: "update" }>, ctx: ApplyContext): Applied {
-	const separator = delta.op === "update" ? delta.rule.lastIndexOf(":") : -1;
-	const repo = delta.op === "add" ? delta.repo : delta.rule.slice(0, separator);
-	if (!isRepository(repo)) return { delta, ...(delta.op === "update" ? { target: delta.rule } : {}), skipped: `${repo} is not a git repository` };
+function applyProject(delta: Extract<Delta, { op: "add"; scope: "project" }> | Extract<Delta, { op: "update" }>, ctx: ApplyContext, target: string): Applied {
+	const repo = delta.op === "add" ? delta.repo : delta.rule.slice(0, delta.rule.lastIndexOf(":"));
+	if (!isRepository(repo)) return { delta, target, skipped: `${repo} is not a git repository` };
 	const file = instructionFile(repo);
 	const name = relative(repo, file);
-	if (existsSync(file) && dirty(repo, file)) return { delta, ...(delta.op === "update" ? { target: delta.rule } : {}), skipped: `${name} in ${repo} has uncommitted changes` };
+	if (dirty(repo, file)) return { delta, target, skipped: `${name} in ${repo} has uncommitted changes` };
 	const content = existsSync(file) ? readFileSync(file, "utf8") : "";
 	if (delta.op === "add") {
 		const next = withLearnedLine(content, `- ${delta.text}`);
 		const line = next.split("\n").indexOf(`- ${delta.text}`) + 1;
-		mkdirSync(dirname(file), { recursive: true });
-		writeFileSync(file, next);
-		return { delta, target: `${repo}:${line}`, commit: commitFile(repo, file, message(`docs(agents): learned rule`, delta.text, delta, ctx)) };
+		return { delta, target: `${repo}:${line}`, ...commitFile(repo, file, next, message(`docs(agents): learned rule`, delta.text, delta, ctx), fallbackBranch(ctx, delta.text)) };
 	}
 	const lines = content.split("\n");
-	const index = Number(delta.rule.slice(separator + 1)) - 1;
+	const index = Number(delta.rule.slice(delta.rule.lastIndexOf(":") + 1)) - 1;
 	const known = ctx.rules.get(delta.rule)?.text;
-	if (lines[index]?.trim() !== known) return { delta, target: delta.rule, skipped: `${name}:${index + 1} changed since the rules were read` };
+	if (lines[index]?.trim() !== known) return { delta, target, skipped: `${name}:${index + 1} changed since the rules were read` };
 	lines[index] = `${/^\s*-\s/.test(lines[index]!) ? "- " : ""}${delta.text}`;
-	writeFileSync(file, lines.join("\n"));
-	return { delta, target: delta.rule, commit: commitFile(repo, file, message(`docs(agents): sharpen learned rule`, delta.text, delta, ctx, delta.reason)) };
+	return { delta, target, ...commitFile(repo, file, lines.join("\n"), message(`docs(agents): sharpen learned rule`, delta.text, delta, ctx, delta.reason), fallbackBranch(ctx, delta.text)) };
 }
 
-/** Apply one delta: recurrences and skips change no file. */
+/** What a delta is about before it is applied: the rule it names, or where a new rule goes. */
+export function plannedTarget(delta: Delta): string | undefined {
+	if (delta.op === "recur" || delta.op === "update") return delta.rule;
+	if (delta.op === "add") return delta.scope === "global" ? `rules/${delta.name}` : instructionFile(delta.repo);
+	return undefined;
+}
+
+/** Apply one delta: recurrences and skips change no file; a failure is reported as skipped. */
 export function applyDelta(delta: Delta, ctx: ApplyContext): Applied {
+	const target = plannedTarget(delta);
 	if (delta.op === "recur") return { delta, target: delta.rule };
 	if (delta.op === "skip") return { delta };
-	if (delta.op === "add") return delta.scope === "global" ? applyGlobal(delta, ctx) : applyProject(delta, ctx);
-	return delta.rule.startsWith("rules/") ? applyGlobal(delta, ctx) : applyProject(delta, ctx);
+	try {
+		if (delta.op === "add") return delta.scope === "global" ? applyGlobal(delta, ctx) : applyProject(delta, ctx, target!);
+		return delta.rule.startsWith("rules/") ? applyGlobal(delta, ctx) : applyProject(delta, ctx, target!);
+	} catch (error) {
+		return { delta, ...(target ? { target } : {}), skipped: `failed: ${firstLine(error)}` };
+	}
 }

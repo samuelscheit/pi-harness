@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -198,6 +198,21 @@ describe("curator validation", () => {
 		assert.equal(parse([{ op: "add", scope: "global", name: "no-idle-waits", text: "t", evidence: ["c1"] }, { op: "skip", reason: "one-off", evidence: ["c2"] }]).length, 2);
 	});
 
+	test("rule text loses the list markers the model starts it with; a project rule is one line", () => {
+		const projectText = (text: string) => (parse([{ op: "add", scope: "project", repo: "/r", text, evidence: ["c1", "c2"] }])[0] as { text: string }).text;
+		assert.equal(projectText("- A decision briefing is complete."), "A decision briefing is complete.");
+		assert.equal(projectText("  * Use bun."), "Use bun.");
+		assert.equal(projectText("- - Twice."), "Twice.");
+		assert.equal(projectText("1. Numbered.\n   Second line."), "Numbered. Second line.");
+		assert.equal(projectText("**Bold** stays."), "**Bold** stays.");
+		assert.equal(projectText("-5 degrees is cold."), "-5 degrees is cold.", "a minus sign is no list marker");
+		const global = parse([{ op: "add", scope: "global", name: "x", text: "+ First.\n\nSecond paragraph.", evidence: ["c1", "c2"] }])[0] as { text: string };
+		assert.equal(global.text, "First.\n\nSecond paragraph.", "a global rule file keeps its lines");
+		const update = parse([{ op: "update", rule: "rules/batch", text: "- Batch.", reason: "", evidence: ["c1", "c2"] }])[0] as { text: string };
+		assert.equal(update.text, "Batch.");
+		for (const text of ["", "   ", "-", "- ", "* -", "1.", "- …"]) assert.throws(() => projectText(text), /invalid delta/, JSON.stringify(text));
+	});
+
 	test("refuses what would break the rules or lose a candidate", () => {
 		const bad: [unknown[], RegExp][] = [
 			[[{ op: "update", rule: "AGENTS.md:3", text: "z", evidence: ["c1", "c2"] }], /invalid delta/],
@@ -279,6 +294,94 @@ describe("applying deltas", () => {
 		assert.match(applyDelta({ op: "add", scope: "project", repo, text: "x", evidence: ["c1"] }, context(dir)).skipped!, /uncommitted changes/);
 	});
 
+	/** A hook like law-formalization's: only its landing tool may move `main`. */
+	function guardMain(repo: string): void {
+		mkdirSync(join(repo, "hooks"));
+		writeFileSync(
+			join(repo, "hooks/reference-transaction"),
+			'#!/bin/sh\n[ "$1" = prepared ] || exit 0\nwhile read -r old new ref; do\n  [ "$ref" = refs/heads/main ] || continue\n  echo "refused: \\`main\\` moves only by a landing (tools/kernel/land.py)" >&2\n  echo "more detail" >&2\n  exit 1\ndone\n',
+			{ mode: 0o755 },
+		);
+		git(repo, "add", "hooks");
+		git(repo, "commit", "-qm", "hook");
+		git(repo, "config", "core.hooksPath", "hooks");
+	}
+	const snapshot = (repo: string, file: string) => ({ head: git(repo, "rev-parse", "HEAD"), status: git(repo, "status", "--porcelain"), index: git(repo, "ls-files", "-s"), file: existsSync(file) ? readFileSync(file, "utf8") : null });
+
+	test("a branch that refuses the move: checkout and index untouched, the commit kept on a dream branch", () => {
+		const repo = repository("guarded", { "AGENTS.md": "# Rules\n\nUse the kernel.\n" });
+		guardMain(repo);
+		writeFileSync(join(repo, "work.txt"), "staged by another agent\n");
+		git(repo, "add", "work.txt");
+		const before = snapshot(repo, join(repo, "AGENTS.md"));
+		const applied = applyDelta({ op: "add", scope: "project", repo, text: "A decision briefing is complete.", evidence: ["c1"] }, context(dir));
+		assert.deepEqual(snapshot(repo, join(repo, "AGENTS.md")), before, "files, index and main as before");
+		assert.equal(applied.skipped, undefined);
+		assert.equal(applied.branch, "dream/2026-11-13-a-decision-briefing-is-complete");
+		assert.equal(applied.refused, "refused: `main` moves only by a landing (tools/kernel/land.py)");
+		assert.equal(git(repo, "rev-parse", `refs/heads/${applied.branch}`), applied.commit);
+		assert.equal(git(repo, "rev-parse", `${applied.commit}^`), before.head, "built on main");
+		assert.equal(git(repo, "show", `${applied.commit}:AGENTS.md`), "# Rules\n\nUse the kernel.\n\n## Learned rules\n\n- A decision briefing is complete.");
+		assert.deepEqual(git(repo, "show", "--name-only", "--format=", applied.commit!).split("\n"), ["AGENTS.md"], "the staged work is not in it");
+
+		// The same rule again the same day gets a free branch name; a new global rule file is not created.
+		assert.equal(applyDelta({ op: "add", scope: "project", repo, text: "A decision briefing is complete.", evidence: ["c1"] }, context(dir)).branch, "dream/2026-11-13-a-decision-briefing-is-complete-2");
+		const global = applyDelta({ op: "add", scope: "global", name: "no-idle-waits", text: "Never wait idly.", evidence: ["c1"] }, context(repo));
+		assert.equal(global.branch, "dream/2026-11-13-no-idle-waits");
+		assert.equal(existsSync(join(repo, "prompt/rules/no-idle-waits.md")), false);
+		assert.deepEqual(snapshot(repo, join(repo, "AGENTS.md")), before);
+	});
+
+	test("a detached HEAD moves nothing; the commit goes to a dream branch", () => {
+		const repo = repository("detached", { "AGENTS.md": "x\n" });
+		git(repo, "checkout", "-q", "--detach");
+		const applied = applyDelta({ op: "add", scope: "project", repo, text: "Rule.", evidence: ["c1"] }, context(dir));
+		assert.equal(applied.refused, "HEAD is detached");
+		assert.equal(applied.branch, "dream/2026-11-13-rule");
+		assert.equal(readFileSync(join(repo, "AGENTS.md"), "utf8"), "x\n");
+	});
+
+	test("a normal branch advances and the checkout's file follows; a staged or untracked file is skipped", () => {
+		const repo = repository("normal", { "AGENTS.md": "x\n" });
+		const old = git(repo, "rev-parse", "HEAD");
+		const applied = applyDelta({ op: "add", scope: "project", repo, text: "Rule.", evidence: ["c1"] }, context(dir));
+		assert.equal(applied.branch, undefined);
+		assert.equal(git(repo, "rev-parse", "HEAD"), applied.commit);
+		assert.equal(git(repo, "rev-parse", "HEAD^"), old);
+		assert.equal(readFileSync(join(repo, "AGENTS.md"), "utf8"), "x\n\n## Learned rules\n\n- Rule.\n");
+		assert.equal(git(repo, "status", "--porcelain"), "");
+		assert.match(git(repo, "reflog", "-1", "--format=%gs", "main"), /^dream: docs\(agents\): learned rule$/);
+
+		writeFileSync(join(repo, "AGENTS.md"), "staged\n");
+		git(repo, "add", "AGENTS.md");
+		writeFileSync(join(repo, "AGENTS.md"), "x\n\n## Learned rules\n\n- Rule.\n");
+		const head = git(repo, "rev-parse", "HEAD");
+		assert.match(applyDelta({ op: "add", scope: "project", repo, text: "Other.", evidence: ["c1"] }, context(dir)).skipped!, /AGENTS\.md in .* has uncommitted changes/);
+		assert.equal(git(repo, "rev-parse", "HEAD"), head);
+		assert.equal(git(repo, "show", ":AGENTS.md"), "staged", "the staged version stays");
+
+		const fresh = repository("untracked");
+		writeFileSync(join(fresh, "AGENTS.md"), "the user's draft\n");
+		assert.match(applyDelta({ op: "add", scope: "project", repo: fresh, text: "Rule.", evidence: ["c1"] }, context(dir)).skipped!, /uncommitted changes/);
+		assert.equal(readFileSync(join(fresh, "AGENTS.md"), "utf8"), "the user's draft\n");
+	});
+
+	test("a failure is reported with its target and git's own first line", () => {
+		const repo = repository("read-only", { "AGENTS.md": "x\n" });
+		const objects = join(repo, ".git/objects");
+		const directories = [objects, ...readdirSync(objects, { recursive: true, withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(e.parentPath, e.name))];
+		for (const d of directories) chmodSync(d, 0o555);
+		try {
+			const before = snapshot(repo, join(repo, "AGENTS.md"));
+			const applied = applyDelta({ op: "add", scope: "project", repo, text: "Rule.", evidence: ["c1"] }, context(dir));
+			assert.equal(applied.target, join(repo, "AGENTS.md"));
+			assert.match(applied.skipped!, /^failed: (fatal|error): /);
+			assert.deepEqual(snapshot(repo, join(repo, "AGENTS.md")), before);
+		} finally {
+			for (const d of directories) chmodSync(d, 0o755);
+		}
+	});
+
 	test("recurrences and skips change nothing", () => {
 		assert.deepEqual(applyDelta({ op: "recur", rule: "AGENTS.md:3", evidence: ["c1"] }, context(dir)), { delta: { op: "recur", rule: "AGENTS.md:3", evidence: ["c1"] }, target: "AGENTS.md:3" });
 		assert.deepEqual(applyDelta({ op: "skip", reason: "one-off", evidence: ["c1"] }, context(dir)).target, undefined);
@@ -320,6 +423,7 @@ describe("ledger and report", () => {
 		assert.match(text, /Corrections with a rule: 4: 1 recurring an existing rule, 1 making 1 new rules, 1 making 1 updates, 1 skipped\./);
 		assert.match(text, /- add rules\/x: Never wait idly\. \(abcdef123\)/);
 		assert.match(text, /- update \/r:4: Run make check\. — not applied: AGENTS\.md in \/r has uncommitted changes/);
+		assert.match(text, /Fix a note of a project repository the way its AGENTS\.md or CLAUDE\.md prescribes: .*own landing tool\. Never edit or commit in its main checkout/);
 		assert.match(text, /\| Find the root cause\. \| 2 \| 2 \| 1970-01-01 \| – \|/);
 		assert.match(text, /\| 2026-11-12 03:00 \| 1 \| 100% \|\n\| 2026-11-13 03:00 \| 4 \| 33% \|/);
 		assert.match(
@@ -327,6 +431,18 @@ describe("ledger and report", () => {
 			/### \/h\/\.agents\/improvements\.md\n\n#### 2026-11-11 08:00 UTC\n\n- \*\*Observation:\*\* old friction\n- \*\*Proposal:\*\* fix it\n\n#### 2026-11-12 21:57 UTC\n\n- \*\*Observation:\*\* pi-lens noise\n\n### \/p\/\.agents\/improvements\.md\n\n#### 2026-11-12 22:00 UTC\n\n- \*\*Observation:\*\* project friction\n/,
 		);
 		assert.doesNotMatch(text, /\n\n\n/);
+	});
+
+	test("the report names a refused commit's branch and why, and a failed project add by its file; neither counts as written", () => {
+		const records = [
+			record({ op: "add", target: "/p:7", targetText: "Brief completely.", commit: "abcdef1234567", branch: "dream/2026-11-13-brief-completely", refused: "refused: `main` moves only by a landing" }),
+			record({ op: "add", repo: "/q", targetText: "Other.", skipped: "failed: fatal: x" }),
+			record({ op: "recur", target: "/p:7", targetText: "Brief completely.", session: "s2" }),
+		];
+		const text = report({ run: new Date("2026-11-13T03:00:00Z"), since: 0, until: 1, messages: 3, labelled: {}, records, notes: [] }, records);
+		assert.match(text, /- add \/p:7: Brief completely\. \(abcdef123\) — committed on branch dream\/2026-11-13-brief-completely, not landed: refused: `main` moves only by a landing\n/);
+		assert.match(text, /- add \/q: Other\. — not applied: failed: fatal: x/);
+		assert.equal(recurrences(records)[0]!.written, undefined);
 	});
 
 
