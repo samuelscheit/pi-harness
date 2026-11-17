@@ -17,6 +17,12 @@
 // shows it (2026-11-16, one thread, twice: `cd repo/tools/kernel && tool edit -` with
 // `tools/kernel/dead_refs.py`; each refusal cost a turn over the whole context, and the check
 // after it ran on the old code).
+//
+// An empty REPLACE part deletes the SEARCH lines with their line breaks, as `edit` does when its
+// newText leaves out the newline. The parts are lines without their breaks, so an empty REPLACE
+// used to become newText "" for oldText "line" and left a blank line (2026-11-16, twice: a deleted
+// `"test_copied_conditions.py": 19,` entry of a Python dict stayed as an empty line). REPLACE with
+// one empty line is told apart: it leaves one blank line in place of the SEARCH lines.
 
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -25,9 +31,19 @@ import { promisify } from "node:util";
 import { computeEditsDiff, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { ToolResponse } from "./bridge.ts";
 
+export interface Edit {
+	oldText: string;
+	newText: string;
+}
+
+/** A block; `deleteLines` when its REPLACE part is empty: whole SEARCH lines go with their line breaks. */
+export interface Block extends Edit {
+	deleteLines?: true;
+}
+
 export interface FileEdits {
 	path: string;
-	edits: { oldText: string; newText: string }[];
+	edits: Block[];
 }
 
 export class EditBlocksError extends Error {}
@@ -52,6 +68,7 @@ export const EDIT_BLOCKS_HELP = `Several files from stdin: \`tool edit - <<'EOF'
   =======
   new text
   >>>>>>> REPLACE
+An empty REPLACE part (\`=======\` directly followed by \`>>>>>>> REPLACE\`) deletes the SEARCH text; when SEARCH is whole lines, their line breaks go too, so no blank line is left. A REPLACE of one empty line leaves one blank line in their place. A SEARCH that is part of a line deletes only that part.
 Relative paths resolve against the shell's current directory, or, when it holds no such file, the git repository's root. Every file is checked before any is written: if a block does not match, nothing changes. Quote the delimiter ('EOF') so the shell leaves $ and backticks alone.
 Inside a block no other line may be \`=======\` or start with \`<<<<<<<\`/\`>>>>>>>\`: such text (git conflict hunks, a 7-character === underline) is ambiguous and refused; change it with --path and --edits instead. A file that still holds a git conflict (\`<<<<<<<\` … \`=======\` … \`>>>>>>>\`) after the edit, when the edit added it or git lists the file as unmerged, exits 1.`;
 
@@ -101,7 +118,7 @@ export function parseEditBlocks(text: string): FileEdits[] {
 				throw new EditBlocksError(`${path}: the block at line ${start} has an empty SEARCH part; create files with \`tool write\``);
 			}
 			const file = files.get(path) ?? files.set(path, { path, edits: [] }).get(path)!;
-			file.edits.push({ oldText: search.join("\n"), newText: replace.join("\n") });
+			file.edits.push({ oldText: search.join("\n"), newText: replace.join("\n"), ...(replace.length === 0 && { deleteLines: true as const }) });
 			blocksOfPath += 1;
 		} else if (isMarker(line)) {
 			throw new EditBlocksError(`line ${i + 1}: \`${line.trim()}\` outside a block`);
@@ -114,6 +131,31 @@ export function parseEditBlocks(text: string): FileEdits[] {
 	endPath();
 	if (files.size === 0) throw new EditBlocksError(`no blocks on stdin\n\n${EDIT_BLOCKS_HELP}`);
 	return [...files.values()];
+}
+
+const occurrences = (text: string, part: string) => text.split(part).length - 1;
+
+/**
+ * The edit of a block in a file with this content: a deletion of SEARCH text that is whole lines
+ * there takes the line break after it, or, on the last line without one, the line break before
+ * it, as the file's own text. Lines compare without trailing whitespace, as Pi's edit matching
+ * does. Anything else, an ambiguous SEARCH included, stays as written for `edit` to apply or refuse.
+ */
+export function editOf(content: string, block: Block): Edit {
+	const { oldText, newText } = block;
+	if (!block.deleteLines) return { oldText, newText };
+	const text = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+	const lines = text.split("\n");
+	const search = oldText.split("\n").map((line) => line.trimEnd());
+	const starts = lines.flatMap((_, start) =>
+		start + search.length <= lines.length && search.every((line, offset) => lines[start + offset]!.trimEnd() === line) ? [start] : [],
+	);
+	if (starts.length !== 1 || occurrences(text, oldText) > 1) return { oldText, newText };
+	const start = starts[0]!;
+	const end = start + search.length;
+	const matched = lines.slice(start, end).join("\n");
+	const whole = end < lines.length ? `${matched}\n` : start > 0 ? `\n${matched}` : matched;
+	return occurrences(text, whole) === 1 ? { oldText: whole, newText } : { oldText, newText };
 }
 
 const textOf = (content: readonly { type: string; text?: string }[] | undefined) =>
@@ -192,18 +234,22 @@ export async function runEditBlocks(
 	cwd: string,
 	signal: AbortSignal,
 ): Promise<ToolResponse> {
-	let files: FileEdits[];
+	let parsed: FileEdits[];
 	try {
-		files = parseEditBlocks(stdin);
+		parsed = parseEditBlocks(stdin);
 	} catch (error) {
 		if (!(error instanceof EditBlocksError)) throw error;
 		return { stdout: "", stderr: `tool edit: ${error.message}\n`, code: 2 };
 	}
 	const paths = await resolvePaths(
-		files.map((file) => file.path),
+		parsed.map((file) => file.path),
 		cwd,
 	);
-	files = files.map((file, index) => ({ ...file, path: paths[index]! }));
+	const files = parsed.map((file, index) => {
+		const path = paths[index]!;
+		const content = existsSync(path) ? readFileSync(path, "utf8") : "";
+		return { path, before: content, edits: file.edits.map((block) => editOf(content, block)) };
+	});
 	const checks = await Promise.all(files.map((file) => computeEditsDiff(file.path, file.edits, cwd)));
 	const failures = checks.flatMap((check, index) => {
 		if (!("error" in check)) return [];
@@ -214,7 +260,6 @@ export async function runEditBlocks(
 	if (failures.length > 0) {
 		return { stdout: "", stderr: `tool edit: nothing changed, ${failures.length} of ${files.length} files do not match:\n${failures.join("\n")}\n`, code: 1 };
 	}
-	const before = files.map((file) => readFileSync(file.path, "utf8"));
 	const out: string[] = [];
 	const warnings: string[] = [];
 	for (const [index, file] of files.entries()) {
@@ -231,7 +276,7 @@ export async function runEditBlocks(
 			};
 		}
 		out.push(text);
-		const warning = await conflictWarning(file.path, before[index]!);
+		const warning = await conflictWarning(file.path, file.before);
 		if (warning) warnings.push(warning);
 	}
 	if (warnings.length > 0) return { stdout: withNewline(out.join("\n")), stderr: `tool edit: ${warnings.join("\n")}\n`, code: 1 };

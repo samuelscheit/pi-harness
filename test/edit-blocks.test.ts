@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { beforeEach, describe, test } from "node:test";
 import { createEditTool } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { conflictLines, EditBlocksError, parseEditBlocks, pathOf, runEditBlocks } from "../extensions/bash/edit-blocks.ts";
+import { conflictLines, EditBlocksError, editOf, parseEditBlocks, pathOf, runEditBlocks } from "../extensions/bash/edit-blocks.ts";
 
 const block = (search: string, replace: string) => `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
 const hunk = (ours: string, theirs: string, sha = "1a2b3c4 (fix land)") => `<<<<<<< HEAD\n${ours}\n=======\n${theirs}\n>>>>>>> ${sha}`;
@@ -30,12 +30,35 @@ describe("parseEditBlocks", () => {
 		]);
 	});
 
-	test("an empty REPLACE deletes; marker-like lines that are not exactly markers are text", () => {
-		const text = ["md.md", block("Title\n========\n  =======\n<<<<<<<<x\n>>>>>>>>y", "Title\n-------\n= ======"), "x.ts", "<<<<<<< SEARCH\ngone\n=======\n>>>>>>> REPLACE"].join("\n");
+	test("an empty REPLACE deletes lines, one empty line replaces them by a blank line; marker-like lines that are not exactly markers are text", () => {
+		const text = [
+			"md.md",
+			block("Title\n========\n  =======\n<<<<<<<<x\n>>>>>>>>y", "Title\n-------\n= ======"),
+			"x.ts",
+			"<<<<<<< SEARCH\ngone\n=======\n>>>>>>> REPLACE",
+			block("blank", ""),
+		].join("\n");
 		assert.deepEqual(parseEditBlocks(text), [
 			{ path: "md.md", edits: [{ oldText: "Title\n========\n  =======\n<<<<<<<<x\n>>>>>>>>y", newText: "Title\n-------\n= ======" }] },
-			{ path: "x.ts", edits: [{ oldText: "gone", newText: "" }] },
+			{ path: "x.ts", edits: [{ oldText: "gone", newText: "", deleteLines: true }, { oldText: "blank", newText: "" }] },
 		]);
+	});
+
+	test("editOf: a deletion of whole lines takes a line break, anything else stays as written", () => {
+		const del = (oldText: string) => ({ oldText, newText: "", deleteLines: true as const });
+		const content = "a\n  b = 1,  \nc\nab\n";
+		assert.deepEqual(editOf(content, del("  b = 1,")), { oldText: "  b = 1,  \n", newText: "" }, "the file's own text, trailing spaces included");
+		assert.deepEqual(editOf(content, del("a\n  b = 1,")), { oldText: "a\n  b = 1,  \n", newText: "" }, "several lines");
+		assert.deepEqual(editOf("a\nlast", del("last")), { oldText: "\nlast", newText: "" }, "last line without a line break: the one before goes");
+		assert.deepEqual(editOf("only", del("only")), { oldText: "only", newText: "" }, "the whole file");
+		assert.deepEqual(editOf("\uFEFFx\r\ny\r\n", del("x")), { oldText: "x\n", newText: "" }, "BOM and CRLF: matched in LF text");
+		assert.deepEqual(editOf(content, del("b = 1")), { oldText: "b = 1", newText: "" }, "part of a line");
+		assert.deepEqual(editOf(content, del("c\na")), { oldText: "c\na", newText: "" }, "starts a line but ends inside one");
+		assert.deepEqual(editOf("x\nx\n", del("x")), { oldText: "x", newText: "" }, "twice as whole lines: left for edit to refuse");
+		assert.deepEqual(editOf(content, del("a")), { oldText: "a", newText: "" }, "once a whole line, again inside `ab`: left for edit to refuse");
+		assert.deepEqual(editOf(content, { oldText: "c", newText: "" }), { oldText: "c", newText: "" }, "REPLACE of one empty line");
+		assert.deepEqual(editOf(content, { oldText: "c", newText: "d" }), { oldText: "c", newText: "d" });
+		assert.deepEqual(editOf("", del("x")), { oldText: "x", newText: "" }, "missing file");
 	});
 
 	test("a conflict marker inside a block is ambiguous and refuses the whole input", () => {
@@ -181,6 +204,38 @@ describe("runEditBlocks", () => {
 		assert.doesNotMatch(response.stderr, /b\.ts: [^\n]*no such file/, "an existing file that does not match gets no path hint");
 		assert.equal(readFileSync(file("a.ts"), "utf8"), "const a = 1;\nconst b = 2;\n");
 		assert.deepEqual(calls, []);
+	});
+
+	test("an empty REPLACE deletes whole lines with their line breaks; one empty line leaves a blank line", async () => {
+		const run = async (name: string, content: string, ...blocks: string[]) => {
+			writeFileSync(file(name), content);
+			const response = await runEditBlocks(ctx(), [name, ...blocks].join("\n"), dir, signal);
+			assert.equal(response.code, 0, response.stderr);
+			return readFileSync(file(name), "utf8");
+		};
+		const empty = (search: string) => `<<<<<<< SEARCH\n${search}\n=======\n>>>>>>> REPLACE`;
+		// The incident: one entry of a Python dict.
+		const dict = 'COUNTS = {\n    "test_a.py": 3,\n    "test_copied_conditions.py": 19,\n    "test_z.py": 1,\n}\n';
+		assert.equal(await run("d.py", dict, empty('    "test_copied_conditions.py": 19,')), 'COUNTS = {\n    "test_a.py": 3,\n    "test_z.py": 1,\n}\n');
+		assert.equal(await run("d.py", dict, empty('"test_copied_conditions.py": 19,')), 'COUNTS = {\n    "test_a.py": 3,\n    \n    "test_z.py": 1,\n}\n', "part of a line keeps the rest");
+		assert.equal(await run("d.py", dict, block('    "test_copied_conditions.py": 19,', "")), 'COUNTS = {\n    "test_a.py": 3,\n\n    "test_z.py": 1,\n}\n', "one empty line in REPLACE");
+		assert.equal(await run("m.txt", "1\n2\n3\n4\n", empty("2\n3")), "1\n4\n", "several lines");
+		assert.equal(await run("m.txt", "1\n2\n3\n4\n", empty("1"), empty("3"), block("4", "four")), "2\nfour\n", "several blocks of one file, the first line");
+		assert.equal(await run("e.txt", "1\n2\n3", empty("3")), "1\n2", "last line without a line break");
+		assert.equal(await run("e.txt", "1\n2\n3", block("2", "two"), empty("3")), "1\ntwo", "next to another block");
+		assert.equal(await run("e.txt", "1\n2\n3\n", empty("3")), "1\n2\n", "last line with a line break");
+		assert.equal(await run("c.txt", "a\r\nb\r\nc\r\n", empty("b")), "a\r\nc\r\n", "CRLF");
+		assert.equal(await run("c.txt", "a\r\nb\r\nc", empty("c")), "a\r\nb", "CRLF, last line");
+		assert.equal(await run("t.txt", "a\nb  \nc\n", empty("b")), "a\nc\n", "trailing whitespace in the file");
+		assert.equal(await run("o.txt", "only\n", empty("only")), "", "the whole file");
+	});
+
+	test("an empty REPLACE of a SEARCH found twice is refused, nothing changes", async () => {
+		writeFileSync(file("a.ts"), "x\nax\n");
+		const response = await runEditBlocks(ctx(), ["a.ts", "<<<<<<< SEARCH\nx\n=======\n>>>>>>> REPLACE"].join("\n"), dir, signal);
+		assert.equal(response.code, 1);
+		assert.match(response.stderr, /a\.ts: Found 2 occurrences/);
+		assert.equal(readFileSync(file("a.ts"), "utf8"), "x\nax\n");
 	});
 
 	test("a diff-style path line edits the file it names", async () => {
