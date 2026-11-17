@@ -45,8 +45,8 @@
 // keeps every end reported once: whoever removes a leftover from the map reports it, the sweep
 // here when the process is gone, the bridge (`release`) when the call answers or its client dies.
 
-import { clip, minutes, type SessionJobs, wake } from "../background/jobs.ts";
-import { reportWork } from "../background/work.ts";
+import { clip, minutes, type SessionJobs } from "../background/jobs.ts";
+import { leftoverId, reportWork, wake } from "../background/work.ts";
 import { commandsOf, type Ps, type PsRow, parseTable, TABLE_ARGS } from "../lib/ps.ts";
 import { SOCKET_ENV } from "./socket.ts";
 
@@ -190,14 +190,14 @@ const stopPollWhenEmpty = (jobs: SessionJobs) => {
 };
 
 /**
- * Take leftover `pid` of group `pgid` out of tracking, so the caller reports its end; whether it
- * was tracked (else its end is reported already, or it is no leftover).
+ * Take leftover `pid` of group `pgid` out of tracking, so the caller reports its end (work.ts
+ * `wake`) or its absence (`reportWork`); whether it was tracked (else its end is reported already,
+ * or it is no leftover).
  */
 export function release(jobs: SessionJobs, pid: number, pgid: number): boolean {
 	if (jobs.leftovers.get(pid)?.pgid !== pgid) return false;
 	jobs.leftovers.delete(pid);
 	stopPollWhenEmpty(jobs);
-	reportWork(jobs);
 	return true;
 }
 
@@ -217,8 +217,10 @@ async function checkLeftovers(jobs: SessionJobs, ps: Ps): Promise<void> {
 	const ended = sweep(jobs.leftovers, rows, Date.now(), commands, jobs.named);
 	if (ended.length === 0) return;
 	stopPollWhenEmpty(jobs);
-	reportWork(jobs);
-	for (const { ended: leftover, orphans } of ended) wake(jobs, endedText(leftover, orphans, Date.now()), `the end of pid ${leftover.pid}`);
+	wake(
+		jobs,
+		ended.map(({ ended: leftover, orphans }) => ({ id: leftoverId(leftover), content: endedText(leftover, orphans, Date.now()), what: `the end of pid ${leftover.pid}` })),
+	);
 }
 
 /**

@@ -30,8 +30,8 @@ import { isAbsolute, join, resolve } from "node:path";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { clip, minutes, type SessionJobs, wake } from "../background/jobs.ts";
-import { reportWork } from "../background/work.ts";
+import { clip, minutes, type SessionJobs } from "../background/jobs.ts";
+import { leftoverId, reportWork, wake } from "../background/work.ts";
 import { EDIT_BLOCKS_HELP, runEditBlocks } from "./edit-blocks.ts";
 import { type Leftover, release } from "./leftovers.ts";
 import { SOCKET_ENV } from "./socket.ts";
@@ -440,7 +440,7 @@ export async function openBridge(
 		if (!job || !release(jobs, job.pid, job.pgid)) return;
 		const text = toolEndedText(job, client.label, end, Date.now() - client.startedAt);
 		const images = end === "killed" ? [] : client.images;
-		wake(jobs, images.length ? [{ type: "text", text }, ...images] : text, `the end of ${client.label}`);
+		wake(jobs, [{ id: leftoverId(job), content: images.length ? [{ type: "text", text }, ...images] : text, what: `the end of ${client.label}` }]);
 	};
 
 	const serve = (socket: Socket) => {
@@ -524,10 +524,11 @@ export async function openBridge(
 			signal?.removeEventListener("abort", abortAll);
 			const result = await adopt();
 			pgid = result.pgid;
+			let released = false;
 			const left = result.left.filter((leftover) => {
 				// Answered already and about to exit: nothing to track.
 				if (answered.has(leftover.pid)) {
-					release(jobs, leftover.pid, leftover.pgid);
+					released = release(jobs, leftover.pid, leftover.pgid) || released;
 					return false;
 				}
 				const client = [...clients].find((c) => c.pid === leftover.pid);
@@ -536,7 +537,7 @@ export async function openBridge(
 				return true;
 			});
 			// The `tool` commands among them are items of their own kind.
-			if (left.some((leftover) => leftover.tool)) reportWork(jobs);
+			if (released || left.some((leftover) => leftover.tool)) reportWork(jobs);
 			phase = "ended";
 			adopted();
 			// Late clients (`tool x &` as the last command still starting) connect while the group lives.

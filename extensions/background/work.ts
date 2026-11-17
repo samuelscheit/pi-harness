@@ -20,11 +20,18 @@
 // A delegated child that submitted its run's result releases its jobs (`releaseWork`): every item
 // says `awaited: false`, so t3 delivers the result to the parent at once instead of after the last
 // job ends (a 3-hour Miri run held one for hours, 2026-11-15). The jobs still wake the child.
+//
+// A job that ends stays reported until the turn its end message wakes has settled (`wake`,
+// `settleWoken`). t3 finalizes a delegated child as soon as its last held item goes: reported gone
+// before the woken turn started, the child's previous turn, which only said what it waits for, was
+// delivered to the parent as the child's result. Four children of workflow run
+// 20261116-174918-b2d928 did so ("Waiting for the e2e regression run (call toolu_…)"), each the
+// moment its job ended, and the coordinator sent each one a message to continue.
 
 import type { BackgroundWorkItem } from "@earendil-works/pi-coding-agent";
 import type { Leftover, Named } from "../bash/leftovers.ts";
 import { defaultPs, type Ps, parseTable, signal, TABLE_ARGS, treeOf } from "../lib/ps.ts";
-import { argsText, clip, type Job, minutes, type Run, type SessionJobs } from "./jobs.ts";
+import { argsText, clip, type EndContent, JOB_MESSAGE_TYPE, type Job, minutes, type Run, type SessionJobs } from "./jobs.ts";
 
 export const BACKGROUND_WORK_KEY = "background-jobs";
 /** Longest label, in characters. */
@@ -60,12 +67,14 @@ function callItem(job: Job, run: Run | undefined): WorkItem {
 	};
 }
 
+/** A leftover's item id: a `tool … &` job's or an `&` process's. */
+export const leftoverId = (leftover: Pick<Leftover, "pid" | "tool">) => `${leftover.tool ? "tool" : "process"}-${leftover.pid}`;
+
 function leftoverItem(leftover: Leftover, ps: Ps): WorkItem {
-	const kind = leftover.tool ? "tool" : "process";
 	const label = leftover.tool ? clip(leftover.command, LABEL_MAX) : `process: ${clip(leftover.command, LABEL_MAX)}`;
 	return {
-		id: `${kind}-${leftover.pid}`,
-		kind,
+		id: leftoverId(leftover),
+		kind: leftover.tool ? "tool" : "process",
 		label,
 		command: leftover.command,
 		startedAt: leftover.adoptedAt,
@@ -106,14 +115,20 @@ export function workItems(jobs: SessionJobs, ps: Ps = defaultPs): WorkItem[] {
 }
 
 /**
- * Report the session's background work to the host. Never throws: it also runs outside any call,
- * where a throw would be an unhandled rejection in Pi's process (the API is stale once the session
- * ended).
+ * Report the session's background work to the host: the running jobs, then the ended ones whose end
+ * message is not answered yet. Never throws: it also runs outside any call, where a throw would be
+ * an unhandled rejection in Pi's process (the API is stale once the session ended).
  */
 export function reportWork(jobs: SessionJobs): void {
+	const tracked = workItems(jobs).map(({ stop: _, ...item }): BackgroundWorkItem => item);
+	const ids = new Set(tracked.map((item) => item.id));
+	// Oldest first; jobs that started together keep their order, so a job that ends changes nothing until its turn settled.
+	const before = new Map(jobs.reported.map((item, index) => [item.id, index]));
+	const at = (item: BackgroundWorkItem) => before.get(item.id) ?? Number.POSITIVE_INFINITY;
+	jobs.reported = [...tracked, ...[...jobs.woken.values()].flatMap(({ item }) => (ids.has(item.id) ? [] : [item]))].sort((a, b) => a.startedAt - b.startedAt || at(a) - at(b));
 	const api = jobs.api;
 	if (!api) return;
-	const items = workItems(jobs).map(({ stop: _, ...item }) => (jobs.released ? { ...item, awaited: false } : item));
+	const items = jobs.reported.map((item) => (jobs.released ? { ...item, awaited: false } : item));
 	try {
 		api.setBackgroundWork(BACKGROUND_WORK_KEY, items);
 	} catch (error) {
@@ -138,6 +153,61 @@ export function releaseWork(jobs: SessionJobs, released: boolean): void {
 	if (jobs.released === released) return;
 	jobs.released = released;
 	reportWork(jobs);
+}
+
+/** A job's end: its item's id, its end message, and what it is (for an error). */
+export interface JobEnd {
+	id: string;
+	content: EndContent;
+	what: string;
+}
+
+/**
+ * Wake the session with one message per job that ended; the caller took them out of tracking and
+ * did not report that. Each item stays reported, as it was last, until the turn its message wakes
+ * has settled (`settleWoken`), so t3 never sees the session without work and without a run in
+ * between. Never throws: it runs outside any call.
+ */
+export function wake(jobs: SessionJobs, ends: readonly JobEnd[]): void {
+	const api = jobs.api;
+	for (const { id } of ends) {
+		const item = jobs.reported.find((reported) => reported.id === id);
+		// Without an API (a reload) no message wakes the session: nothing to hold for.
+		if (item && api) jobs.woken.set(id, { item, sentAfterRuns: jobs.agentRuns, seen: false });
+	}
+	reportWork(jobs);
+	let lost = false;
+	for (const { id, content, what } of ends) {
+		try {
+			api?.sendMessage({ customType: JOB_MESSAGE_TYPE, content, display: true, details: { workId: id } }, { triggerTurn: true, deliverAs: "steer" });
+		} catch (error) {
+			lost = jobs.woken.delete(id) || lost;
+			console.error(`[background] cannot report ${what}:`, error);
+		}
+	}
+	if (lost) reportWork(jobs);
+}
+
+/** The id of the job a message reports the end of, if it is such a message. */
+export function endedWorkId(message: { role: string; customType?: string; details?: unknown }): string | undefined {
+	if (message.role !== "custom" || message.customType !== JOB_MESSAGE_TYPE) return undefined;
+	const id = (message.details as { workId?: unknown } | undefined)?.workId;
+	return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * The session settled: the ended jobs it answered are no longer reported. Answered: its end message
+ * entered the conversation, or a run started after the message was sent (a cleared queue dropped
+ * it: it never comes). A message sent while the session settles waits for the run it starts.
+ */
+export function settleWoken(jobs: SessionJobs): void {
+	let changed = false;
+	for (const [id, woken] of jobs.woken) {
+		if (!woken.seen && woken.sentAfterRuns >= jobs.agentRuns) continue;
+		jobs.woken.delete(id);
+		changed = true;
+	}
+	if (changed) reportWork(jobs);
 }
 
 /** The named processes still running (the others are forgotten); `ps` lists the live ones. */

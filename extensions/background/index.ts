@@ -12,7 +12,8 @@
 // output. The call keeps running and, when it ends, its normal result (images included) reaches the
 // session as a message that starts a run if the session is idle. While jobs run, the session
 // reports background work (`pi.setBackgroundWork`, one item per job: work.ts), so t3 keeps it
-// loaded, keeps a delegated child's run open and lists each job. `/jobs` lists the same items and
+// loaded, keeps a delegated child's run open and lists each job; an ended job stays reported until
+// the turn its end message woke has settled (work.ts `wake`). `/jobs` lists the running jobs and
 // `/jobs stop <n>` stops one.
 //
 // Some tools (`BACKGROUND_TOOLS`: `workflow`) run long as a rule and their caller rarely needs the
@@ -49,9 +50,8 @@ import {
 	processGroupOf,
 	sessionJobs,
 	textOf,
-	wake,
 } from "./jobs.ts";
-import { jobsText, liveNamed, reportWork, stopItem, workItems } from "./work.ts";
+import { endedWorkId, jobsText, liveNamed, reportWork, settleWoken, stopItem, wake, workItems } from "./work.ts";
 
 /** How long a call runs in the foreground before it moves to the background. */
 export const DETACH_AFTER_MS = 2 * 60_000;
@@ -143,6 +143,17 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 		rmSync(join(logRoot, encodeURIComponent(id)), { recursive: true, force: true });
 	});
 
+	// An ended job is reported until the session answered its end message (work.ts `settleWoken`).
+	pi.on("agent_start", (_event, ctx) => {
+		sessionJobs(ctx.sessionManager.getSessionId()).agentRuns++;
+	});
+	pi.on("message_end", (event, ctx) => {
+		const id = endedWorkId(event.message);
+		const woken = id === undefined ? undefined : sessionJobs(ctx.sessionManager.getSessionId()).woken.get(id);
+		if (woken) woken.seen = true;
+	});
+	pi.on("agent_settled", (_event, ctx) => settleWoken(sessionJobs(ctx.sessionManager.getSessionId())));
+
 	// A message arriving during a run: every foreground call moves to the background, so the agent
 	// reads the message after this tool call instead of after the call.
 	pi.on("input", (event, ctx) => {
@@ -206,8 +217,7 @@ export default function background(pi: ExtensionAPI, options: BackgroundOptions 
 			if ("result" in outcome) output.update(outcome.result);
 			output.write();
 			if (!jobs.jobs.delete(callId)) return;
-			reportWork(jobs);
-			wake(jobs, finishedContent(finishedText(job, outcome, Date.now()), outcome), `the end of ${callId}`);
+			wake(jobs, [{ id: callId, content: finishedContent(finishedText(job, outcome, Date.now()), outcome), what: `the end of ${callId}` }]);
 		});
 		return { content: [{ type: "text", text: detachedText(job, first, textOf(output.latest), Date.now()) }], details: output.latest?.details } satisfies AgentToolResult<unknown>;
 	});

@@ -8,7 +8,7 @@
 import { writeFileSync } from "node:fs";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { BackgroundWorkItem, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Leftovers, Named } from "../bash/leftovers.ts";
 
 export const JOB_MESSAGE_TYPE = "background-job";
@@ -66,6 +66,22 @@ export interface SessionJobs {
 	 * (../workflow/child.ts), so t3 delivers it while they run on. Their ends still wake the session.
 	 */
 	released: boolean;
+	/** The items as reported last (without `released`), tracked and woken. */
+	reported: BackgroundWorkItem[];
+	/** Ended jobs whose end message has not been answered yet, by item id. */
+	woken: Map<string, Woken>;
+	/** How many runs the session started: a run started after an end message was sent has seen it or never will. */
+	agentRuns: number;
+}
+
+/** An ended job's item, still reported while the turn its end message wakes has not settled (work.ts `wake`). */
+export interface Woken {
+	/** The item as it was reported last. */
+	item: BackgroundWorkItem;
+	/** The session's runs started (`agentRuns`) when its end message was sent. */
+	sentAfterRuns: number;
+	/** Whether its end message entered the conversation. */
+	seen: boolean;
 }
 
 /** The process group a call of one tool runs in, if any. */
@@ -79,7 +95,19 @@ const state = globalThis as { __harnessJobs?: Map<string, SessionJobs>; __harnes
  */
 export function sessionJobs(sessionId: string): SessionJobs {
 	const all = (state.__harnessJobs ??= new Map());
-	const fresh: SessionJobs = { foreground: new Map(), jobs: new Map(), leftovers: new Map(), named: new Map(), runs: new Map(), poll: undefined, api: undefined, released: false };
+	const fresh: SessionJobs = {
+		foreground: new Map(),
+		jobs: new Map(),
+		leftovers: new Map(),
+		named: new Map(),
+		runs: new Map(),
+		poll: undefined,
+		api: undefined,
+		released: false,
+		reported: [],
+		woken: new Map(),
+		agentRuns: 0,
+	};
 	const jobs = all.get(sessionId);
 	if (!jobs) {
 		all.set(sessionId, fresh);
@@ -163,8 +191,11 @@ export function finishedText(job: Pick<Job, "callId" | "toolName" | "input" | "s
 	return `${head} ${status} after ${took}:\n\n${textOf(outcome.result) || "(no output)"}`;
 }
 
+/** A job's end message: its text, with images when its result has any. */
+export type EndContent = string | (ImageContent | { type: "text"; text: string })[];
+
 /** The content of a job's end message: its text, and the images of its result. */
-export function finishedContent(text: string, outcome: Outcome): string | (ImageContent | { type: "text"; text: string })[] {
+export function finishedContent(text: string, outcome: Outcome): EndContent {
 	const images = "result" in outcome ? outcome.result.content.filter((c): c is ImageContent => c.type === "image") : [];
 	return images.length ? [{ type: "text", text }, ...images] : text;
 }
@@ -200,15 +231,5 @@ export class OutputLog {
 		} catch {
 			// The session ended and took its log directory: nothing reads this log any more.
 		}
-	}
-}
-
-
-/** Send `content` to the session as a message that wakes it. Never throws: it runs outside any call. */
-export function wake(jobs: SessionJobs, content: string | (ImageContent | { type: "text"; text: string })[], what: string): void {
-	try {
-		jobs.api?.sendMessage({ customType: JOB_MESSAGE_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "steer" });
-	} catch (error) {
-		console.error(`[background] cannot report ${what}:`, error);
 	}
 }

@@ -22,10 +22,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import background from "../extensions/background/index.ts";
-import { JOB_MESSAGE_TYPE, sessionJobs } from "../extensions/background/jobs.ts";
-import { BACKGROUND_WORK_KEY, jobsText, reportWork } from "../extensions/background/work.ts";
+import { dropSession, JOB_MESSAGE_TYPE, sessionJobs } from "../extensions/background/jobs.ts";
+import { BACKGROUND_WORK_KEY, jobsText, releaseWork, reportWork, wake } from "../extensions/background/work.ts";
 import bashExtension from "../extensions/bash/index.ts";
-import { delegationMessage, delegationsDir, writeSpec } from "../extensions/workflow/delegation.ts";
+import { delegationMessage, delegationsDir, readState, writeSpec } from "../extensions/workflow/delegation.ts";
 import workflow from "../extensions/workflow/index.ts";
 
 const item = (extra: Partial<BackgroundWorkItem>): BackgroundWorkItem => ({ id: "c1", kind: "call", label: "bash: make", startedAt: 0, ...extra });
@@ -137,6 +137,8 @@ interface Session {
 	s: AgentSession;
 	/** The items of each `background_work` event. */
 	events: BackgroundWorkItem[][];
+	/** The session's events in order: `work: <ids>`, `start`, `end message` (a job's), `settled`. */
+	timeline: string[];
 	notices: string[];
 }
 
@@ -166,14 +168,18 @@ async function newSession(): Promise<Session> {
 	await session.bindExtensions({ uiContext, onError: (error) => extensionErrors.push(`${error.event}: ${error.error}`) });
 	session.setActiveToolsByName([...session.getActiveToolNames(), "slow", "workflow"]);
 	const events: BackgroundWorkItem[][] = [];
+	const timeline: string[] = [];
 	session.subscribe((event) => {
 		if (event.type === "background_work") {
 			assert.equal(event.pending, event.items.length);
 			events.push(event.items);
-		}
+			timeline.push(`work: ${event.items.map((i) => i.kind).join(", ")}`);
+		} else if (event.type === "agent_start") timeline.push("start");
+		else if (event.type === "agent_settled") timeline.push("settled");
+		else if (event.type === "message_end" && event.message.role === "custom" && event.message.customType === JOB_MESSAGE_TYPE) timeline.push("end message");
 	});
 	open.push(session);
-	return { s: session, events, notices };
+	return { s: session, events, timeline, notices };
 }
 
 const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
@@ -273,6 +279,118 @@ describe("every job is an item", () => {
 		);
 		await until("its end", () => latest(x).length === 0 && jobMessages(x.s).length === 1);
 		assert.ok(x.events.every((items) => items.length <= 1), "never the run and its call as two items");
+	});
+});
+
+// t3 finalizes a delegated child once its last held item goes. Reported gone before the turn its end
+// woke had started, the child's previous turn ("Waiting for the e2e regression run (call toolu_…)")
+// was delivered to the parent as its result (workflow run 20261116-174918-b2d928, four children).
+describe("an ended job stays reported until the turn its end message woke has settled", () => {
+	const afterFirstTurn = (x: Session) => x.timeline.slice(x.timeline.indexOf("settled"));
+
+	for (const [kind, command] of [
+		["a bash call in the background", "sleep 0.8; echo done"],
+		["an `&` job", "sleep 0.8 > /dev/null 2>&1 &"],
+		["a `tool … &` job", "tool slow --ms 800 --text a > a.out 2>&1 &"],
+	] as const) {
+		test(`${kind}: its end wakes the idle session, and the item goes only when that run settles`, async () => {
+			const x = await newSession();
+			model(bash(command));
+			await x.s.prompt("go");
+			await until("idle", idle(x));
+			assert.equal(latest(x).length, 1);
+			await until("the woken run settled", () => jobMessages(x.s).length === 1 && x.timeline.filter((e) => e === "settled").length === 2);
+			assert.deepEqual(afterFirstTurn(x), ["settled", "start", "end message", "work: ", "settled"]);
+			assert.deepEqual(sessionJobs(x.s.sessionManager.getSessionId()).woken.size, 0);
+		});
+	}
+
+	test("a job that ends while a run goes on: its message steers that run, and the item goes when it settles", async () => {
+		const x = await newSession();
+		const jobs = () => sessionJobs(x.s.sessionManager.getSessionId());
+		faux.setResponses([
+			bash("sleep 0.6; echo done"),
+			async () => {
+				await until("the job's end", () => jobs().jobs.size === 0);
+				assert.equal(latest(x).length, 1, "still reported while the run has not taken in its end");
+				return fauxAssistantMessage("Still working.");
+			},
+			...Array.from({ length: 5 }, () => fauxAssistantMessage("ok")),
+		]);
+		await x.s.prompt("go");
+		await until("idle", idle(x));
+		assert.deepEqual(x.timeline, ["start", "work: call", "end message", "work: ", "settled"]);
+	});
+
+	test("an end message a cleared queue dropped: the item goes when the next run settles", async () => {
+		const x = await newSession();
+		const jobs = () => sessionJobs(x.s.sessionManager.getSessionId());
+		faux.setResponses([
+			bash("sleep 0.6; echo done"),
+			async () => {
+				await until("its end message queued", () => jobs().jobs.size === 0 && x.s.agent.hasQueuedMessages());
+				x.s.clearQueue();
+				return fauxAssistantMessage("Cleared.");
+			},
+			...Array.from({ length: 5 }, () => fauxAssistantMessage("ok")),
+		]);
+		await x.s.prompt("go");
+		await until("idle", idle(x));
+		assert.equal(jobMessages(x.s).length, 0, "the end message was dropped");
+		assert.equal(latest(x).length, 1, "held: the run that settled started before the message was sent");
+		await x.s.prompt("next");
+		assert.deepEqual(latest(x), [], "a run that started after it has settled");
+		assert.equal(jobs().woken.size, 0);
+	});
+
+	test("a delegated child: its first turn waits for the job, the woken turn ends its run; the item is held until then", async () => {
+		const x = await newSession();
+		const delegations = delegationsDir(join(dir, "agent"));
+		const spec = { id: "woken-1" };
+		writeSpec(delegations, spec);
+		faux.setResponses([bash("sleep 0.8; echo done"), fauxAssistantMessage("Waiting for the e2e run."), fauxAssistantMessage("The e2e run passed: done.")]);
+		await x.s.prompt(delegationMessage(spec, 1, "Run the e2e tests."));
+		const waiting = readState(delegations, spec.id);
+		assert.equal(waiting?.done, false);
+		assert.deepEqual(waiting?.waiting, ["bash: sleep 0.8; echo done"]);
+		await until("the woken run settled", () => x.timeline.filter((e) => e === "settled").length === 2);
+		assert.deepEqual(afterFirstTurn(x), ["settled", "start", "end message", "work: ", "settled"]);
+		const done = readState(delegations, spec.id);
+		assert.equal(done?.done, true);
+		assert.equal(done?.waiting, undefined);
+		assert.equal(done?.text, "The e2e run passed: done.");
+	});
+
+	test("a released child's woken item says awaited: false too, and a new run holds it again; without an API nothing is held", () => {
+		const id = `woken-release-${process.pid}`;
+		const jobs = sessionJobs(id);
+		const reported: BackgroundWorkItem[][] = [];
+		const sent: unknown[] = [];
+		jobs.api = { setBackgroundWork: (_key: string, items: BackgroundWorkItem[]) => reported.push(items), sendMessage: (message: unknown) => sent.push(message) } as unknown as ExtensionAPI;
+		try {
+			jobs.leftovers.set(7, { pid: 7, pgid: 5, command: "sleep 9", startedBy: "sleep 9 &", adoptedAt: 0 });
+			reportWork(jobs);
+			jobs.leftovers.delete(7);
+			wake(jobs, [{ id: "process-7", content: "ended", what: "pid 7" }]);
+			assert.deepEqual(sent, [{ customType: JOB_MESSAGE_TYPE, content: "ended", display: true, details: { workId: "process-7" } }]);
+			releaseWork(jobs, true);
+			releaseWork(jobs, false);
+			assert.deepEqual(
+				reported.map((items) => items.map((i) => [i.id, i.awaited])),
+				[[["process-7", undefined]], [["process-7", undefined]], [["process-7", false]], [["process-7", undefined]]],
+			);
+			// A reload: no API, no message, so nothing waits for its answer.
+			jobs.woken.clear();
+			jobs.leftovers.set(8, { pid: 8, pgid: 5, command: "sleep 9", startedBy: "sleep 9 &", adoptedAt: 0 });
+			reportWork(jobs);
+			jobs.leftovers.delete(8);
+			jobs.api = undefined;
+			wake(jobs, [{ id: "process-8", content: "ended", what: "pid 8" }]);
+			assert.equal(jobs.woken.size, 0);
+			assert.deepEqual(jobs.reported, []);
+		} finally {
+			dropSession(id);
+		}
 	});
 });
 
