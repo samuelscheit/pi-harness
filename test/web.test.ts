@@ -10,7 +10,8 @@ import {
 	rawPageBlock,
 	visibleText,
 } from "../extensions/web/challenge.ts";
-import web, { fetchedDocument, formatSearch, searchResults } from "../extensions/web/index.ts";
+import { RenderError } from "../extensions/web/browser.ts";
+import { fetchedDocument, formatSearch, registerWeb, searchResults } from "../extensions/web/index.ts";
 
 const result = (title: string, url: string, page_age?: string) => ({ type: "web_search_result", title, url, page_age, encrypted_content: "x" });
 
@@ -118,15 +119,21 @@ test("probes only inaccessible or thin documents and prefers what the probe show
 	assert.equal(probed.length, 6);
 });
 
-test("names the session's browser tools only when it has them", () => {
-	const both = browserNeeded("https://x.test/", "a Cloudflare challenge", [PREVIEW_TOOLS.open, PREVIEW_TOOLS.evaluate, "read"]);
+test("after a failed render, points to the open tab or names the session's browser tools only when it has them", () => {
+	const failed = { message: "fabric is not installed (set FABRIC_BIN)", tabOpen: false };
+	const both = browserNeeded("https://x.test/", "a Cloudflare challenge", failed, [PREVIEW_TOOLS.open, PREVIEW_TOOLS.evaluate, "read"]);
 	assert.match(both, /^https:\/\/x\.test\/ needs a real browser: web_fetch got a Cloudflare challenge, not the page content/);
+	assert.match(both, /Rendering it in the fabric browser failed: fabric is not installed \(set FABRIC_BIN\)\./);
 	assert.match(both, /Open it with mcp__t3-code__preview_open \(url\) and read it with mcp__t3-code__preview_evaluate \(expression: document\.body\.innerText\)\.$/);
 	for (const tools of [[], ["read"], [PREVIEW_TOOLS.open]]) {
-		const text = browserNeeded("https://x.test/", "a Cloudflare challenge", tools);
+		const text = browserNeeded("https://x.test/", "a Cloudflare challenge", failed, tools);
 		assert.doesNotMatch(text, /preview/);
-		assert.match(text, /This session has no browser tool/);
+		assert.match(text, /This session has no other browser tool/);
 	}
+	// A challenge left open in the browser beats the preview tools: the user solves it there.
+	const open = browserNeeded("https://x.test/", "a Cloudflare challenge", { message: "still a challenge", tabOpen: true }, [PREVIEW_TOOLS.open, PREVIEW_TOOLS.evaluate]);
+	assert.match(open, /stays open in the fabric browser window: ask the user to solve the challenge there, then call web_fetch again/);
+	assert.doesNotMatch(open, /preview/);
 });
 
 describe("web_fetch tool", () => {
@@ -137,17 +144,28 @@ describe("web_fetch tool", () => {
 	const requests: { url: string; body?: any }[] = [];
 	const tools: Record<string, any> = {};
 	let toolNames: string[] = [];
-	web({ registerTool: (tool: any) => (tools[tool.name] = tool), getAllTools: () => toolNames.map((name) => ({ name })) } as any);
+	let render: (url: string) => Promise<{ url: string; title: string; text: string }>;
+	const rendered: string[] = [];
+	registerWeb({ registerTool: (tool: any) => (tools[tool.name] = tool), getAllTools: () => toolNames.map((name) => ({ name })) } as any, async (url) => {
+		rendered.push(url);
+		return render(url);
+	});
+	const RENDERED = { url: PAGE, title: "Judgment C-311/18", text: `Paragraph 1. ${"The Court rules on the transfer of personal data. ".repeat(10)}` };
 	const model = { id: "claude-haiku-5-5", provider: "anthropic", baseUrl: "https://api.test", cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } };
 	const ctx = { modelRegistry: { find: () => model, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }) } };
 
 	beforeEach(() => {
 		requests.length = 0;
+		rendered.length = 0;
 		toolNames = [];
+		render = async () => RENDERED;
 		globalThis.fetch = (async (input: string, init?: RequestInit) => {
 			const url = String(input);
-			requests.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+			const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+			requests.push({ url, body });
 			if (url !== "https://api.test/v1/messages") return page();
+			// The answer about a rendered page: a plain request without the fetch tool.
+			if (!body.tools) return Response.json({ content: [{ type: "text", text: "Paragraph 1 reads: The Court rules." }], stop_reason: "end_turn", usage: { input_tokens: 2000, output_tokens: 20 } });
 			const content = [
 				{ type: "server_tool_use", id: "f", name: "web_fetch", input: { url: PAGE } },
 				{
@@ -162,33 +180,92 @@ describe("web_fetch tool", () => {
 	});
 	afterEach(() => (globalThis.fetch = realFetch));
 
-	test("returns a browser error, not a summary of the empty shell, naming the preview tools", async () => {
+	test("answers the prompt from the page rendered in the browser, not from the empty shell", async () => {
 		documentText = CURIA_TEXT;
 		page = () => new Response(fixture("js-shell.html"), { headers: html });
-		toolNames = [PREVIEW_TOOLS.open, PREVIEW_TOOLS.evaluate];
 		const result = await tools.web_fetch.execute("id", { url: PAGE, prompt: "Quote paragraph 1 verbatim" }, undefined, undefined, ctx);
-		assert.equal(result.isError, true);
-		assert.match(result.content[0].text, /needs a real browser: web_fetch got a JavaScript-only page .* Open it with mcp__t3-code__preview_open/);
-		assert.doesNotMatch(result.content[0].text, /does not contain/);
-		assert.ok(result.usage.cost.total > 0);
-		assert.deepEqual(requests.map((r) => r.url), ["https://api.test/v1/messages", PAGE]);
-		assert.match(requests[0].body.system, /verbatim and complete, without summarizing/);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.content[0].text, `Paragraph 1 reads: The Court rules.\n\nSource: ${PAGE} (rendered in a browser)`);
+		assert.deepEqual(rendered, [PAGE]);
+		assert.deepEqual(requests.map((r) => r.url), ["https://api.test/v1/messages", PAGE, "https://api.test/v1/messages"]);
+		assert.match(requests[0].body.system, /^You read web pages.*Fetch the URL, then answer.*verbatim and complete, without summarizing/);
+		const answer = requests[2].body;
+		assert.equal(answer.tools, undefined);
+		assert.match(answer.system, /^You read web pages for a coding agent\. Answer the request.*verbatim and complete/);
+		assert.match(answer.messages[0].content, /^The page https:\/\/curia\.europa\.eu\/\S+, rendered in a browser:\n\n<page>\n# Judgment C-311\/18\n\nParagraph 1\. The Court rules/);
+		assert.match(answer.messages[0].content, /<\/page>\n\nRequest: Quote paragraph 1 verbatim$/);
+		// Both requests count: 100 + 2000 input tokens at $1/M, 10 + 20 output at $5/M.
+		assert.equal(result.usage.input, 2100);
+		assert.equal(result.usage.output, 30);
+		assert.ok(Math.abs(result.usage.cost.total - (2100 * 1 + 30 * 5) / 1e6) < 1e-12);
+		assert.deepEqual(result.details, { url: PAGE, rendered: true });
 	});
 
-	test("reports the AWS WAF challenge the fetcher hid", async () => {
+	test("returns the rendered text itself without a prompt", async () => {
 		documentText = "";
 		page = () => new Response(null, { status: 202, headers: { "x-amzn-waf-action": "challenge" } });
+		render = async () => ({ ...RENDERED, url: `${PAGE}&after-challenge` });
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.content[0].text, `# ${RENDERED.title}\n\n${RENDERED.text}`);
+		assert.deepEqual(result.details, { url: `${PAGE}&after-challenge`, rendered: true });
+		assert.equal(requests.filter((r) => r.url === "https://api.test/v1/messages").length, 1);
+	});
+
+	test("caps the rendered text sent to the model", async () => {
+		documentText = CURIA_TEXT;
+		page = () => new Response(fixture("js-shell.html"), { headers: html });
+		render = async () => ({ ...RENDERED, title: "", text: "x".repeat(1_000_000) });
+		await tools.web_fetch.execute("id", { url: PAGE, prompt: "anything" }, undefined, undefined, ctx);
+		const content: string = requests[2].body.messages[0].content;
+		assert.equal(content.match(/x+/)![0].length, 400_000);
+	});
+
+	test("reports the AWS WAF challenge when the browser can't get through, naming the preview tools", async () => {
+		documentText = "";
+		page = () => new Response(null, { status: 202, headers: { "x-amzn-waf-action": "challenge" } });
+		render = async () => {
+			throw new RenderError("fabric is not installed (set FABRIC_BIN)");
+		};
+		toolNames = [PREVIEW_TOOLS.open, PREVIEW_TOOLS.evaluate];
+		const result = await tools.web_fetch.execute("id", { url: PAGE, prompt: "Quote paragraph 1" }, undefined, undefined, ctx);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /got an AWS WAF challenge \(x-amzn-waf-action: challenge\).*failed: fabric is not installed.*Open it with mcp__t3-code__preview_open/);
+		assert.doesNotMatch(result.content[0].text, /does not contain/);
+		assert.deepEqual(result.details.render, { message: "fabric is not installed (set FABRIC_BIN)", tabOpen: false });
+		assert.ok(result.usage.cost.total > 0);
+	});
+
+	test("points to the open tab when a challenge stays in the browser", async () => {
+		documentText = CLOUDFLARE_TEXT;
+		page = () => new Response(fixture("cloudflare-challenge.html"), { status: 403, headers: html });
+		render = async () => {
+			throw new RenderError("the fabric browser still showed a Cloudflare challenge after 30 s", true);
+		};
 		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
 		assert.equal(result.isError, true);
-		assert.match(result.content[0].text, /got an AWS WAF challenge \(x-amzn-waf-action: challenge\).*This session has no browser tool/);
+		assert.match(result.content[0].text, /still showed a Cloudflare challenge after 30 s\. The page stays open in the fabric browser window/);
+	});
+
+	test("an abort while rendering ends the call", async () => {
+		documentText = CURIA_TEXT;
+		page = () => new Response(fixture("js-shell.html"), { headers: html });
+		const controller = new AbortController();
+		render = async () => {
+			controller.abort();
+			throw new Error("aborted");
+		};
+		await assert.rejects(tools.web_fetch.execute("id", { url: PAGE }, controller.signal, undefined, ctx), /aborted/);
 	});
 
 	test("returns a normal page as is without probing it", async () => {
 		documentText = ARTICLE_TEXT;
 		page = () => assert.fail("a page with content is not probed");
+		render = () => assert.fail("a page with content is not rendered");
 		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
 		assert.equal(result.isError, undefined);
 		assert.equal(result.content[0].text, ARTICLE_TEXT);
+		assert.deepEqual(result.details, { url: PAGE, rendered: false });
 		assert.equal(requests.length, 1);
 	});
 });

@@ -19,7 +19,7 @@ export interface FetchedPage {
 /** Less text than this is no page content worth trusting without a closer look. */
 export const THIN_TEXT = 200;
 /** Challenge markers count only on pages with less text than this, not in an article that mentions them. */
-const MARKER_TEXT = 1000;
+export const MARKER_TEXT = 1000;
 /** An HTML page this large with almost no text is a shell that renders its content with JavaScript. */
 const SHELL_HTML_BYTES = 2048;
 const PROBE_TIMEOUT_MS = 15_000;
@@ -41,7 +41,8 @@ const CHALLENGE_MARKERS: { pattern: RegExp; name: string }[] = [
 
 const JAVASCRIPT_REQUIRED = /(enable|requires?|turn on)\s+javascript|javascript (is )?(required|disabled)/i;
 
-const challengeIn = (text: string) => CHALLENGE_MARKERS.find((m) => m.pattern.test(text))?.name;
+/** The challenge whose marker the page's HTML or text shows, if any. */
+export const challengeIn = (text: string) => CHALLENGE_MARKERS.find((m) => m.pattern.test(text))?.name;
 
 /** The text a reader sees in an HTML page without running its scripts. */
 export function visibleText(html: string): string {
@@ -124,11 +125,18 @@ export async function pageBlock(url: string, page: FetchedPage, signal?: AbortSi
 
 export const PREVIEW_TOOLS = { open: "mcp__t3-code__preview_open", evaluate: "mcp__t3-code__preview_evaluate" };
 
-/** The error for a page that needs a real browser, naming the session's browser tools when it has them. */
-export function browserNeeded(url: string, reason: string, toolNames: readonly string[]): string {
-	const head = `${url} needs a real browser: web_fetch got ${reason}, not the page content; curl and other plain HTTP clients get the same.`;
+/**
+ * The error for a page that needs a real browser and that the fabric browser could not render
+ * either. A tab left open holds a challenge the user can solve; otherwise the session's browser
+ * tools are named when it has them.
+ */
+export function browserNeeded(url: string, reason: string, render: { message: string; tabOpen: boolean }, toolNames: readonly string[]): string {
+	const head = `${url} needs a real browser: web_fetch got ${reason}, not the page content; curl and other plain HTTP clients get the same. Rendering it in the fabric browser failed: ${render.message}.`;
+	if (render.tabOpen) {
+		return `${head} The page stays open in the fabric browser window: ask the user to solve the challenge there, then call web_fetch again (the browser keeps the cookies).`;
+	}
 	if (toolNames.includes(PREVIEW_TOOLS.open) && toolNames.includes(PREVIEW_TOOLS.evaluate)) {
 		return `${head} Open it with ${PREVIEW_TOOLS.open} (url) and read it with ${PREVIEW_TOOLS.evaluate} (expression: document.body.innerText).`;
 	}
-	return `${head} This session has no browser tool: ask the user to open it in a browser and share the content.`;
+	return `${head} This session has no other browser tool: ask the user to open it in a browser and share the content.`;
 }

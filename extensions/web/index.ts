@@ -9,6 +9,7 @@
 import { calculateCost } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { RenderError, renderPage } from "./browser.ts";
 import { browserNeeded, pageBlock } from "./challenge.ts";
 
 export const WEB_MODEL = { provider: "anthropic", id: "claude-haiku-5-5" };
@@ -16,6 +17,8 @@ export const WEB_MODEL = { provider: "anthropic", id: "claude-haiku-5-5" };
 const SEARCH_REQUEST_COST = 10 / 1000;
 const MAX_CONTINUATIONS = 4;
 const MAX_FETCH_TOKENS = 100_000;
+/** About MAX_FETCH_TOKENS of rendered page text, at roughly four characters a token. */
+const MAX_RENDERED_CHARS = MAX_FETCH_TOKENS * 4;
 
 type Block = Record<string, any>;
 
@@ -24,9 +27,10 @@ export interface ServerToolReply {
 	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; searches: number };
 }
 
-async function serverToolRequest(
+/** One Messages request on the web model, with a server tool or none; it follows pause_turn continuations. */
+async function messagesRequest(
 	ctx: ExtensionContext,
-	tool: Block,
+	tool: Block | undefined,
 	system: string,
 	prompt: string,
 	signal: AbortSignal | undefined,
@@ -51,10 +55,10 @@ async function serverToolRequest(
 				...(beta ? { "anthropic-beta": beta } : {}),
 				...(auth.headers as Record<string, string> | undefined),
 			},
-			body: JSON.stringify({ model: model.id, max_tokens: 4096, system, tools: [tool], messages }),
+			body: JSON.stringify({ model: model.id, max_tokens: 4096, system, ...(tool ? { tools: [tool] } : {}), messages }),
 		});
 		const body = (await response.json()) as Block;
-		if (!response.ok) throw new Error(`${tool.name} request failed: HTTP ${response.status} ${JSON.stringify(body.error ?? body).slice(0, 500)}`);
+		if (!response.ok) throw new Error(`${tool?.name ?? "web model"} request failed: HTTP ${response.status} ${JSON.stringify(body.error ?? body).slice(0, 500)}`);
 		reply.content.push(...body.content);
 		const u = body.usage ?? {};
 		reply.usage.input += u.input_tokens ?? 0;
@@ -68,10 +72,16 @@ async function serverToolRequest(
 	return reply;
 }
 
-/** Pi usage for a server-tool reply, priced like the model plus the per-search fee. */
-function piUsage(ctx: ExtensionContext, reply: ServerToolReply) {
+/** Pi usage for the replies of one tool call, priced like the model plus the per-search fee. */
+function piUsage(ctx: ExtensionContext, ...replies: ServerToolReply[]) {
 	const model = ctx.modelRegistry.find(WEB_MODEL.provider, WEB_MODEL.id)!;
-	const { searches, ...tokens } = reply.usage;
+	const { searches, ...tokens } = replies.reduce(
+		(sum, { usage }) => {
+			for (const key of Object.keys(sum) as (keyof ServerToolReply["usage"])[]) sum[key] += usage[key];
+			return sum;
+		},
+		{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, searches: 0 },
+	);
 	const usage = {
 		...tokens,
 		totalTokens: tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite,
@@ -142,7 +152,15 @@ const fetchParameters = Type.Object({
 	),
 });
 
+const ANSWER_SYSTEM =
+	"You read web pages for a coding agent. Answer the request from the page's content only, quoting code and exact values. When the request asks for the exact, full or verbatim text of a part of the page, reproduce that part verbatim and complete, without summarizing or paraphrasing. Say so when the page doesn't answer it.";
+
 export default function web(pi: ExtensionAPI) {
+	registerWeb(pi);
+}
+
+/** Registers web_search and web_fetch; `render` opens a page in a real browser (tests pass their own). */
+export function registerWeb(pi: ExtensionAPI, render: typeof renderPage = renderPage) {
 	pi.registerTool({
 		name: "web_search",
 		label: "Web search",
@@ -158,7 +176,7 @@ export default function web(pi: ExtensionAPI) {
 				...(params.allowed_domains?.length ? { allowed_domains: params.allowed_domains } : {}),
 				...(params.blocked_domains?.length ? { blocked_domains: params.blocked_domains } : {}),
 			};
-			const reply = await serverToolRequest(
+			const reply = await messagesRequest(
 				ctx,
 				tool,
 				"You search the web for a coding agent. Search for the query, then report what the results say about it: concrete facts, versions, dates and code, each with its source URL. Be concise. Do not answer from memory.",
@@ -174,33 +192,56 @@ export default function web(pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web fetch",
 		description:
-			"Fetch a web page or PDF by URL. Without a prompt, returns the page text itself: use that when you need exact wording (statutes, specs, code). With a prompt, returns an answer extracted from the page. Only fetches URLs that came from the user, a search or fetch result, or the workspace. A page behind a bot challenge or rendered only by JavaScript returns an error that says so; it needs a real browser.",
+			"Fetch a web page or PDF by URL. Without a prompt, returns the page text itself: use that when you need exact wording (statutes, specs, code). With a prompt, returns an answer extracted from the page. Only fetches URLs that came from the user, a search or fetch result, or the workspace. A page behind a bot challenge or rendered only by JavaScript is rendered in a real browser.",
 		promptSnippet: "Fetch a URL and read it or answer a question about it",
 		parameters: fetchParameters,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const tool = { type: "web_fetch_20250910", name: "web_fetch", max_uses: 2, max_content_tokens: MAX_FETCH_TOKENS };
-			const reply = await serverToolRequest(
-				ctx,
-				tool,
-				params.prompt
-					? "You read web pages for a coding agent. Fetch the URL, then answer the request from the page's content only, quoting code and exact values. When the request asks for the exact, full or verbatim text of a part of the page, reproduce that part verbatim and complete, without summarizing or paraphrasing. Say so when the page doesn't answer it."
-					: "Fetch the URL. Then reply with only: done.",
-				params.prompt ? `Fetch ${params.url}\n\nRequest: ${params.prompt}` : `Fetch ${params.url}`,
-				signal,
-				"web-fetch-2025-09-10",
-			);
-			const usage = piUsage(ctx, reply);
-			const document = fetchedDocument(reply.content);
+			const replies = [
+				await messagesRequest(
+					ctx,
+					tool,
+					params.prompt ? ANSWER_SYSTEM.replace("Answer the request", "Fetch the URL, then answer the request") : "Fetch the URL. Then reply with only: done.",
+					params.prompt ? `Fetch ${params.url}\n\nRequest: ${params.prompt}` : `Fetch ${params.url}`,
+					signal,
+					"web-fetch-2025-09-10",
+				),
+			];
+			let document = fetchedDocument(replies[0].content);
+			let answer = textOf(replies[0].content);
 			const blocked = await pageBlock(params.url, document, signal);
+			let rendered = false;
 			if (blocked) {
-				const text = browserNeeded(document.url ?? params.url, blocked, pi.getAllTools().map((tool) => tool.name));
-				return { content: [{ type: "text", text }], details: { ...document, blocked }, usage, isError: true };
+				const url = document.url ?? params.url;
+				let page: Awaited<ReturnType<typeof renderPage>>;
+				try {
+					page = await render(url, signal);
+				} catch (error) {
+					if (signal?.aborted) throw error;
+					const failure = { message: (error as Error).message, tabOpen: error instanceof RenderError && error.tabOpen };
+					const text = browserNeeded(url, blocked, failure, pi.getAllTools().map((tool) => tool.name));
+					return { content: [{ type: "text", text }], details: { ...document, blocked, render: failure }, usage: piUsage(ctx, ...replies), isError: true };
+				}
+				rendered = true;
+				document = { url: page.url, text: page.title ? `# ${page.title}\n\n${page.text}` : page.text };
+				if (params.prompt) {
+					const reply = await messagesRequest(
+						ctx,
+						undefined,
+						ANSWER_SYSTEM,
+						`The page ${page.url}, rendered in a browser:\n\n<page>\n${document.text!.slice(0, MAX_RENDERED_CHARS)}\n</page>\n\nRequest: ${params.prompt}`,
+						signal,
+					);
+					replies.push(reply);
+					answer = textOf(reply.content);
+				}
 			}
+			const usage = piUsage(ctx, ...replies);
 			if (document.error) {
 				return { content: [{ type: "text", text: `Could not fetch ${params.url}: ${document.error}` }], details: document, usage, isError: true };
 			}
 			let text: string;
-			if (params.prompt) text = `${textOf(reply.content)}\n\nSource: ${document.url ?? params.url}`;
+			if (params.prompt) text = `${answer}\n\nSource: ${document.url ?? params.url}${rendered ? " (rendered in a browser)" : ""}`;
 			else if (document.text === undefined) text = `${document.url ?? params.url} is not a text document; pass a prompt to read it.`;
 			else {
 				const truncated = truncateHead(document.text);
@@ -208,7 +249,7 @@ export default function web(pi: ExtensionAPI) {
 					? `${truncated.content}\n\n[Truncated: showing ${truncated.outputLines} of ${truncated.totalLines} lines. For the rest, pass a prompt that names the part you need (asking for its verbatim text if you need the exact wording).]`
 					: document.text;
 			}
-			return { content: [{ type: "text", text }], details: { url: document.url ?? params.url }, usage };
+			return { content: [{ type: "text", text }], details: { url: document.url ?? params.url, rendered }, usage };
 		},
 	});
 }
