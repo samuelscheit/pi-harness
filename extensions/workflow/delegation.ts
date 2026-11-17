@@ -163,6 +163,8 @@ export interface DelegationState {
 	result?: unknown;
 	/** Why the run failed. */
 	error?: string;
+	/** The files the run's own tool calls changed (own-writes.ts): absolute, canonical, sorted. */
+	wrote?: string[];
 	/** Compactions the session went through (succeeded or failed), and why the latest failed. */
 	compactions?: number;
 	compactionError?: string;

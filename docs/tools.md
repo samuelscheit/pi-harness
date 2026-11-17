@@ -163,7 +163,7 @@ A delegated child that does not know how to go on asks with `ask_user` (blocking
 - In-process children load `ask_user` with a headless UI whose questions dialog is the same handler.
 - Every question and its answer (or that it passed up) is a journaled call (kind `ask`), so a resume replays the answer instead of calling the handler again.
 
-The parent counts the child's cost against the workflow's budget while it runs, cancels the T3 task when the run is aborted or over budget, and returns the run's text, result, cost, thread and the files the working tree changed meanwhile. Spec and state are deleted when the workflow ends; files older than a day are swept at startup. Why: on 2026-11-14 a workflow with six in-process children ran 233 minutes for $107, and the user could not see, steer or stop any of them.
+The parent counts the child's cost against the workflow's budget while it runs, cancels the T3 task when the run is aborted or over budget, and returns the run's text, result, cost, thread, the files the working tree changed meanwhile (`changed`, other agents' changes too) and the files the child's own tool calls changed (`wrote`: `edit`/`write` paths, and files a `bash` call changed during its run and names; [own-writes.ts](../extensions/workflow/own-writes.ts)). Spec and state are deleted when the workflow ends; files older than a day are swept at startup. Why: on 2026-11-14 a workflow with six in-process children ran 233 minutes for $107, and the user could not see, steer or stop any of them.
 
 ### Phases
 
@@ -209,7 +209,7 @@ Why: on 2026-11-14 a workflow had run 130 minutes ($15.87, one Opus agent) when 
 
 Saved workflows become tools of their own: `<repo>/.pi/workflows/<name>.ts` for a project, [`workflows/`](../workflows) for every session. They are read on every run, so a workflow the agent saves can be called from its next turn.
 
-[`fix_loop`](../workflows/fix_loop.ts) is the shipped workflow. It hands a failing check with a clear error and a known set of files to a cheaper child agent (Sonnet) with a short context. The workflow runs the check itself before the first round and after every round, so "green" means the check's exit code, not the child's claim, and no change outside `files`. A change outside them is sent back to the child to undo and reported as `outside` while it remains.
+[`fix_loop`](../workflows/fix_loop.ts) is the shipped workflow. It hands a failing check with a clear error and a known set of files to a cheaper child agent (Sonnet) with a short context. The workflow runs the check itself before the first round and after every round, so "green" means the check's exit code, not the child's claim, and no change of the child's outside `files`. Only the child's own changes (`wrote`) count: a change of its outside `files` is sent back to it to undo and reported as `outside` while it remains; files others (the caller, other agents) change in the same tree meanwhile never reach the child, never block green, and are reported as `changedByOthers`. The returned diff covers `files` and `outside` only. Why: attributing the whole tree's diff to the child sent it 4 rounds to "undo" files the parent was editing in parallel (2026-11-16).
 
 Why: in one large project, repair chains (failed check → … → green) cost 17% of all spend, 59% of it cache reads of a median 379k-token context per turn.
 

@@ -148,6 +148,8 @@ export interface DelegateRun {
 	result?: unknown;
 	/** Files the working tree changed during the run, relative to cwd (also other agents' changes meanwhile). */
 	changed: string[];
+	/** Files the child's own tool calls changed during the run (own-writes.ts), relative to cwd. */
+	wrote: string[];
 	/** This run's cost in USD. */
 	cost: number;
 	sessionId?: string;
@@ -653,6 +655,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			text: state.text ?? "",
 			...(current.schema ? { result: state.result } : {}),
 			changed,
+			wrote: (state.wrote ?? []).map((path) => relative(canonical(env.cwd), path)),
 			cost: cost - costBefore,
 			sessionId: state.sessionId,
 			...(transport.threadId ? { threadId: transport.threadId } : {}),

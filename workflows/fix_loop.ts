@@ -7,10 +7,15 @@
 // check's exit code, never the child's claim. A round is one message to the child (it may run the
 // check itself in between). The `fix-loop` rule (prompt/rules/fix-loop.md) activates it.
 //
-// The child (delegate()) is only told `files` (children run in parallel in one working tree, as t3
-// tasks), so this workflow holds its own contract: a round counts as green only when the check passes and
-// nothing outside `files` changed since the workflow started. Changes outside are not undone for the
-// child; it is told to undo them, and they are returned as `outside` while they remain.
+// The child (delegate()) is only told `files`, so this workflow holds its own contract: a round
+// counts as green only when the check passes and no file outside `files` the child changed differs
+// from the start. Only the child's own changes count (`run.wrote`: its edit and write paths, files
+// its bash commands changed and name; extensions/workflow/own-writes.ts): agents work in parallel in
+// one working tree, and attributing the tree's diff to the child sent it 4 rounds to "undo" files
+// the parent agent was editing meanwhile, which it rightly refused (2026-11-16). Out-of-scope files
+// the child changed are not undone for it; it is told to undo them, and they are returned as
+// `outside` while they remain. Files others changed meanwhile never reach the child and do not block
+// green; they are returned as `changedByOthers`, and the diff covers only `files` and `outside`.
 //
 // The check runs with `pipefail` (checkCommand): a check ending in a filter (`pytest … | tail -1`)
 // otherwise exits with the filter's code, 0, so a failing check read as "already passes" before any
@@ -22,8 +27,8 @@ export const checkCommand = (check: string): string => `set -o pipefail\n${check
 export const meta: WorkflowMeta = {
 	description: [
 		"Make a failing check pass with a cheaper model in a fresh child agent that sees only the goal, the files, the check and its failure, not this conversation.",
-		"The tool runs `check` itself before the first and after every round: green means exit code 0 and no file outside `files` changed. Between checks the child reads, edits and runs commands; changes outside `files` are sent back to it to undo.",
-		"Returns whether it is green, the rounds, the diff of the changed files, files changed outside `files`, the last failure output when the check fails, and the child's summary.",
+		"The tool runs `check` itself before the first and after every round: green means exit code 0 and no file outside `files` changed by the child. Between checks the child reads, edits and runs commands; its own changes outside `files` are sent back to it to undo. Files others (you, other agents) change meanwhile are not the child's: they never block green and are only reported.",
+		"Returns whether it is green, the rounds, the diff of the child's files, files the child changed outside `files`, files changed by someone else meanwhile, the last failure output when the check fails, and the child's summary.",
 	].join(" "),
 	guidelines: [
 		"Use fix_loop when a test, type check, lint or build fails with a clear error and the fix is confined to files you can name: give it the check command, those files and a one-line goal, then review the returned diff instead of rereading the files.",
@@ -97,14 +102,20 @@ export default async function ({ goal, files, check, context, maxRounds = 6, mod
 	let message = `The check fails (${exitText(result)}):\n${tail(result.output, 200)}`;
 	let rounds = 0;
 	let summary = "";
+	// Out-of-scope files the child changed in any round: while one differs from the start, it is the child's to undo.
+	const touched = new Set<string>();
 	let outside: string[] = [];
+	let others: string[] = [];
 	while (rounds < maxRounds) {
 		rounds++;
 		log(`round ${rounds}/${maxRounds}`);
 		const reply = await child.run(message);
 		summary = reply.text;
+		for (const path of reply.wrote) if (!isAllowed(path)) touched.add(path);
 		result = await runCheck();
-		outside = (await changes()).files.filter((path) => !isAllowed(path));
+		const changedOutside = (await changes()).files.filter((path) => !isAllowed(path));
+		outside = changedOutside.filter((path) => touched.has(path));
+		others = changedOutside.filter((path) => !touched.has(path));
 		if (result.exitCode === 0 && !outside.length) break;
 		const note = outside.length ? `\nYou changed files outside ${files.join(", ")}: ${outside.join(", ")}. Undo those changes (put them back as they were); change only ${files.join(", ")}.` : "";
 		message =
@@ -114,11 +125,12 @@ export default async function ({ goal, files, check, context, maxRounds = 6, mod
 	}
 
 	const ok = result.exitCode === 0 && !outside.length;
-	const { diff } = await changes();
+	const { diff } = await changes([...files, ...outside]);
 	return {
 		ok,
 		rounds,
 		...(outside.length ? { outside } : {}),
+		...(others.length ? { changedByOthers: others } : {}),
 		diff: diff || "No files changed.",
 		...(result.exitCode === 0 ? {} : { lastCheckOutput: tail(result.output, 40) }),
 		summary,

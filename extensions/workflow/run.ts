@@ -628,12 +628,16 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		map: (items: unknown, fn: unknown, options: unknown) => mapItems(items, fn, options, controller.signal),
 		sh,
 		log: (...values: unknown[]) => progress(values.map((v) => (typeof v === "string" ? v : show(v))).join(" ")),
-		changes: () =>
-			durable.call({ kind: "changes", args: {}, label: "changes()" }, async () => {
+		changes: (paths?: unknown) => {
+			if (paths !== undefined && !(Array.isArray(paths) && paths.every((p) => typeof p === "string"))) throw new TypeError("changes(paths): paths must be an array of strings");
+			const only = paths?.map((p: string) => canonical(resolve(env.cwd, p)));
+			const wanted = (file: string) => !only || only.some((p) => file === p || file.startsWith(`${p}/`));
+			return durable.call({ kind: "changes", args: only ? { paths } : {}, label: "changes()" }, async () => {
 				if (!root || !start) throw new Error(`changes() needs a git repository; ${env.cwd} is not in one`);
-				const files = await changedPaths(start, await snapshot(root));
+				const files = (await changedPaths(start, await snapshot(root))).filter(wanted);
 				return { value: { files: files.map((f) => relative(canonical(env.cwd), f)), diff: await diffSince(start, files) } };
-			}),
+			});
+		},
 		budget: Object.freeze({
 			limit: budgetLimit,
 			get spent() {

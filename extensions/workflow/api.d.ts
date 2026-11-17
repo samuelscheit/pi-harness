@@ -51,8 +51,9 @@ declare function llm(prompt: string, options?: { model?: string; system?: string
  * or `tools` the child has your model and the default prompt and tools. `schema` (JSON Schema of
  * an object): the child must submit a matching object, returned as `result`. The child starts on
  * its first run(); later runs continue its conversation; each resolves once it stops, with `text`
- * (its final message), `changed` (files the working tree changed meanwhile, other agents' too) and
- * `cost`. `compact` is Pi's /compact, `warm` the harness's /warm ("2h", "until 18:00", "off": hold
+ * (its final message), `changed` (files the working tree changed meanwhile, other agents' too),
+ * `wrote` (the files the child's own tool calls changed: edit and write paths, and files a bash
+ * command changed and names) and `cost`. `compact` is Pi's /compact, `warm` the harness's /warm ("2h", "until 18:00", "off": hold
  * the child's prompt cache warm until its next run); `fork` starts a new child from this one's conversation.
  * `template` (a name from .pi/templates/ or `/template list`) starts the child from that prepared
  * session (role, files read, examples) on its model, cached once for every task: use one when a
@@ -79,6 +80,7 @@ interface DelegateRun {
 	text: string;
 	result?: any;
 	changed: string[];
+	wrote: string[];
 	cost: number;
 	sessionId?: string;
 	threadId?: string;
@@ -121,8 +123,8 @@ declare function map<T, R>(items: readonly T[], fn: (item: T, index: number) => 
 /** A progress line (console.log does the same). The last lines are returned when the script fails. */
 declare function log(...values: unknown[]): void;
 
-/** The files changed since this run started, with their unified diff (git repositories only). */
-declare function changes(): Promise<{ files: string[]; diff: string }>;
+/** The files changed since this run started (only those `paths` name, files or directories, when given), with their unified diff (git repositories only). */
+declare function changes(paths?: string[]): Promise<{ files: string[]; diff: string }>;
 
 /** This run's spending limit in USD and what llm() and delegates spent so far. Exceeding it aborts the run. */
 declare const budget: { readonly limit: number; readonly spent: number };

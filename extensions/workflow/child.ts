@@ -12,7 +12,8 @@
 //   (t3's summary, the parent's wake message); a submitted result releases the session's background
 //   jobs (../background/work.ts `releaseWork`), so t3 delivers it without waiting for them, and the
 //   next run (by the parent or the user) holds them again until it submits;
-// - reports its state (session, cost, the run's text, result or error, compactions) to the parent;
+// - reports its state (session, cost, the run's text, result or error, compactions, the files its
+//   own tool calls changed: own-writes.ts) to the parent;
 //   a turn that ends while background work the session waits for runs does not end the run (the
 //   state says `waiting`, with the jobs): the job's end wakes the child into another turn of the same
 //   run, in t3 a new t3 run. Reporting such a turn as the run's end handed the parent "waiting for
@@ -29,6 +30,7 @@ import { sessionJobs } from "../background/jobs.ts";
 import { releaseWork, workItems } from "../background/work.ts";
 import { TOOL_GUIDELINES_SECTION, toolGuidelinesSection } from "../prompt/index.ts";
 import { type DelegationSpec, type DelegationState, parseMarker, readSpec, readState, SUBMIT_TOOL, writeState } from "./delegation.ts";
+import { ownWrites } from "./own-writes.ts";
 
 export const REMINDER_TYPE = "delegation-result";
 /** Starts the result a run's final message ends with; the run's text is what comes before it. */
@@ -117,6 +119,9 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 	};
 
 	const save = (child: Child) => writeState(dir, child.spec.id, child.state);
+	/** Tool calls in flight, for the files they change, and the child each belongs to. */
+	const writes = ownWrites();
+	const callers = new Map<string, Child>();
 
 	const registerSubmit = (child: Child) => {
 		if (!child.spec.schema || child.submitRegistered) return;
@@ -147,6 +152,23 @@ export function delegatedChild(pi: ExtensionAPI, dir: string): DelegatedChild {
 	};
 
 	pi.on("session_start", (_event, ctx) => void resolve(ctx));
+
+	pi.on("tool_call", async (event, ctx) => {
+		const child = resolve(ctx);
+		if (!child) return;
+		callers.set(event.toolCallId, child);
+		await writes.started(event.toolCallId, event.toolName, event.input, ctx.cwd);
+	});
+	// No ctx here: it is stale when the session ended during the call (a parent's long workflow call).
+	pi.on("tool_result", async (event) => {
+		const child = callers.get(event.toolCallId);
+		if (!child) return;
+		callers.delete(event.toolCallId);
+		const paths = await writes.ended(event.toolCallId, event.isError);
+		if (!paths.length) return;
+		child.state = { ...child.state, wrote: [...new Set([...(child.state.wrote ?? []), ...paths])].sort() };
+		save(child);
+	});
 
 	pi.on("before_agent_start", (event, ctx) => {
 		const prompt = event.messageType === "user" ? event.prompt : undefined;
