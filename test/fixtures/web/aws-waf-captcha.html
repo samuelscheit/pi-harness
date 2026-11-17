@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title></title>
+    <style>body{font-family:Arial,sans-serif}#captcha-container{margin:40px auto;width:320px}</style>
+    <script type="text/javascript" src="https://3e3378af7cd0.0d2c4a3e.eu-west-1.captcha.awswaf.com/3e3378af7cd0/jsapi.js" defer></script>
+</head>
+<body>
+    <div id="captcha-container"></div>
+    <script type="text/javascript">
+        window.addEventListener("load", function () {
+            AwsWafIntegration.saveReferrer();
+            AwsWafCaptcha.renderCaptcha(document.getElementById("captcha-container"), { apiKey: "key", onSuccess: function () { window.location.reload(true); } });
+        });
+    </script>
+    <noscript><h1>JavaScript is disabled</h1>In order to continue, you need to verify that you're not a robot by solving a CAPTCHA puzzle.</noscript>
+</body>
+</html>

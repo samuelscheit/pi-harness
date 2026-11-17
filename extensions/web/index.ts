@@ -9,6 +9,7 @@
 import { calculateCost } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { browserNeeded, pageBlock } from "./challenge.ts";
 
 export const WEB_MODEL = { provider: "anthropic", id: "claude-haiku-5-5" };
 // Anthropic bills web search per request; tokens are billed as usual.
@@ -134,7 +135,10 @@ const searchParameters = Type.Object({
 const fetchParameters = Type.Object({
 	url: Type.String({ description: "The http(s) URL to fetch. It must come from the user, an earlier search or fetch result, or a file in the workspace." }),
 	prompt: Type.Optional(
-		Type.String({ description: "What to extract from the page. Omit it to get the page text itself (truncated if long)." }),
+		Type.String({
+			description:
+				"What to extract from the page; the answer quotes the page verbatim when the request asks for exact text. Omit it to get the page text itself (truncated if long).",
+		}),
 	),
 });
 
@@ -170,7 +174,7 @@ export default function web(pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web fetch",
 		description:
-			"Fetch a web page or PDF by URL. With a prompt, returns the answer to it from the page's content; without one, returns the page text. Only fetches URLs that came from the user, a search or fetch result, or the workspace.",
+			"Fetch a web page or PDF by URL. Without a prompt, returns the page text itself: use that when you need exact wording (statutes, specs, code). With a prompt, returns an answer extracted from the page. Only fetches URLs that came from the user, a search or fetch result, or the workspace. A page behind a bot challenge or rendered only by JavaScript returns an error that says so; it needs a real browser.",
 		promptSnippet: "Fetch a URL and read it or answer a question about it",
 		parameters: fetchParameters,
 		async execute(_id, params, signal, _onUpdate, ctx) {
@@ -179,7 +183,7 @@ export default function web(pi: ExtensionAPI) {
 				ctx,
 				tool,
 				params.prompt
-					? "You read web pages for a coding agent. Fetch the URL, then answer the request from the page's content only, quoting code and exact values. Say so when the page doesn't answer it."
+					? "You read web pages for a coding agent. Fetch the URL, then answer the request from the page's content only, quoting code and exact values. When the request asks for the exact, full or verbatim text of a part of the page, reproduce that part verbatim and complete, without summarizing or paraphrasing. Say so when the page doesn't answer it."
 					: "Fetch the URL. Then reply with only: done.",
 				params.prompt ? `Fetch ${params.url}\n\nRequest: ${params.prompt}` : `Fetch ${params.url}`,
 				signal,
@@ -187,6 +191,11 @@ export default function web(pi: ExtensionAPI) {
 			);
 			const usage = piUsage(ctx, reply);
 			const document = fetchedDocument(reply.content);
+			const blocked = await pageBlock(params.url, document, signal);
+			if (blocked) {
+				const text = browserNeeded(document.url ?? params.url, blocked, pi.getAllTools().map((tool) => tool.name));
+				return { content: [{ type: "text", text }], details: { ...document, blocked }, usage, isError: true };
+			}
 			if (document.error) {
 				return { content: [{ type: "text", text: `Could not fetch ${params.url}: ${document.error}` }], details: document, usage, isError: true };
 			}
@@ -196,7 +205,7 @@ export default function web(pi: ExtensionAPI) {
 			else {
 				const truncated = truncateHead(document.text);
 				text = truncated.truncated
-					? `${truncated.content}\n\n[Truncated: showing ${truncated.outputLines} of ${truncated.totalLines} lines. Pass a prompt to ask about the rest.]`
+					? `${truncated.content}\n\n[Truncated: showing ${truncated.outputLines} of ${truncated.totalLines} lines. For the rest, pass a prompt that names the part you need (asking for its verbatim text if you need the exact wording).]`
 					: document.text;
 			}
 			return { content: [{ type: "text", text }], details: { url: document.url ?? params.url }, usage };
