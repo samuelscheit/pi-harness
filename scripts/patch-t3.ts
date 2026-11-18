@@ -129,6 +129,20 @@
 //   can be older; every later thread update re-published it, and background-items' merge kept every
 //   task it had not published itself. Now every update carries Pi's last report, a report replaces
 //   the list, and closing the session clears it (the harness stops a session's jobs with it).
+// - followup-after-disposed-delivery (a parent's follow-up to a child whose task can no longer
+//   deliver is a new task): a stop of the parent thread ("Stopped by user" during a rate limit)
+//   disposed the completion delivery of every task it had open, also one whose child had failed
+//   without a result. The parent later resumed and sent that child follow-ups; t3 makes a follow-up a
+//   new delegated task only once the original task has a result, so these runs stayed the original
+//   task's, and its completion (2026-11-16 16:51, "Werkzeuge auf den Leser des Kerns umstellen")
+//   was dropped as disposed: the parent waited all night (session 01a1e159). A follow-up to a task
+//   without a result whose delivery is disposed now starts a new task owned by the sending run, as a
+//   follow-up after a result does.
+// - task-id-resolution (task_status and task_cancel take any unique part of a task id): the same
+//   parent then called task_status with the task id's last UUID and got `task_not_found … does not
+//   belong to thread <its own thread>`, which read as if its thread had changed. Both tools now take
+//   a task id, any part of it unique among the thread's tasks, or its child's thread id, part or link
+//   (that child's newest task); an unknown or ambiguous one fails naming the thread's newest tasks.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -1013,6 +1027,70 @@ export const PATCHES: Patch[] = [
 			[
 				"pendingWake = null;\n\t\t\t\tif (extensionStatusReset !== null)",
 				"pendingWake = null;\n\t\t\t\tbackgroundWork = [];\n\t\t\t\tif (threadState !== null && (threadState.providerThread.pendingBackgroundTasks ?? []).length > 0) yield* updateProviderThread(threadState, {}).pipe(ignore);\n\t\t\t\tif (extensionStatusReset !== null)",
+			],
+		],
+	},
+	{
+		name: "followup-after-disposed-delivery",
+		// recordSubagentFollowup shares the Pi adapter's chunk.
+		marker: "followupAfterDisposedDelivery",
+		edits: [
+			[
+				"if (original === void 0 || original.result === null) return;",
+				'if (original === void 0 || original.result === null && original.completionDelivery?.state !== "disposed" /* followupAfterDisposedDelivery */) return;',
+			],
+		],
+	},
+	{
+		name: "task-id-resolution",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "delegatedTaskMatches",
+		edits: [
+			[
+				"function delegatedTaskRun(childProjection, task) {",
+				[
+					"/** The tasks a `taskId` that is no task's exact id names: tasks whose id holds it, else the newest task of the one child whose thread id or link holds it. */",
+					"function delegatedTaskMatches(tasks, query) {",
+					'\tconst decode = (value) => value.toLowerCase().replaceAll("%25", "%").replaceAll("%25", "%").replaceAll("%3a", ":");',
+					"\tconst text = query.trim().toLowerCase();",
+					"\tconst needle = decode(/t3-thread:\\/\\/v(?:1|2\\/[^/\\s)>]+)\\/([^\\s)>]+)/.exec(text)?.[1] ?? text);",
+					"\tif (needle.length < 6 || !/\\d/.test(needle) || /\\s/.test(needle)) return [];",
+					"\tconst byId = tasks.filter((task) => decode(task.id).includes(needle));",
+					"\tif (byId.length > 0) return byId;",
+					"\tconst byChild = tasks.filter((task) => task.childThreadId !== null && decode(task.childThreadId).includes(needle));",
+					"\treturn new Set(byChild.map((task) => task.childThreadId)).size === 1 ? newestDelegatedTasks(byChild).slice(0, 1) : byChild;",
+					"}",
+					"function newestDelegatedTasks(tasks) {",
+					'\treturn tasks.toSorted((a, b) => String(b.startedAt ?? "").localeCompare(String(a.startedAt ?? "")));',
+					"}",
+					"function delegatedTaskRun(childProjection, task) {",
+				].join("\n"),
+			],
+			[
+				"\tconst loadTaskParent = (threadId) => ",
+				[
+					"\tconst resolveTaskId = fn(\"OrchestratorMcpService.resolveTaskId\")(function* (scope, taskId) {",
+					"\t\tconst tasks = (yield* loadTasks(scope.thread.threadId, void 0)).filter((task) => task.origin === \"app_owned\" && task.threadId === scope.thread.threadId);",
+					"\t\tif (tasks.some((task) => task.id === taskId)) return taskId;",
+					"\t\tconst matches = delegatedTaskMatches(tasks, taskId);",
+					"\t\tif (matches.length === 1) return matches[0].id;",
+					"\t\tconst listed = newestDelegatedTasks(matches.length > 0 ? matches : tasks).slice(0, 10).map((task) => `${task.id} (${task.title}, ${task.status})`).join(\"; \");",
+					"\t\treturn yield* failure$2(\"task_not_found\", matches.length > 1 ? `${taskId} names ${matches.length} delegated tasks of thread ${scope.thread.threadId}: ${listed}. Pass one of their taskIds.` : `Thread ${scope.thread.threadId} has no delegated task ${taskId}. ${tasks.length === 0 ? \"It started none.\" : `Its newest: ${listed}.`}`);",
+					"\t});",
+					"\tconst loadTaskParent = (threadId) => ",
+				].join("\n"),
+			],
+			[
+				'requireThreadScope(callerScope, "task_status");\n\t\t\treturn yield* readTask(scope, taskId, false, true);',
+				'requireThreadScope(callerScope, "task_status");\n\t\t\treturn yield* readTask(scope, yield* resolveTaskId(scope, taskId), false, true);',
+			],
+			[
+				'const scope = yield* requireThreadScope(callerScope, "task_cancel");',
+				'const scope = yield* requireThreadScope(callerScope, "task_cancel");\n\t\t\tinput = {\n\t\t\t\t...input,\n\t\t\t\ttaskId: yield* resolveTaskId(scope, input.taskId)\n\t\t\t};',
+			],
+			[
+				'description: "Read one delegated task you started. ',
+				'description: "Read one delegated task you started, by `taskId` or any unique part of it, or by its child\'s thread id or link. ',
 			],
 		],
 	},

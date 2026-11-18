@@ -166,6 +166,8 @@ describe("patchBundle", () => {
 		"effect-slot-handback",
 		"keyed-lock-contended",
 		"background-tasks-from-pi",
+		"followup-after-disposed-delivery",
+		"task-id-resolution",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -589,6 +591,143 @@ describe("patchBundle", () => {
 		// The tool lists them: ids first, then the title search, then delegated titles, then messages.
 		assert.ok(server.includes('...identityHits.filter((hit) => hit.source === "id"),\n\t\t\t...titleHits.filter((hit) => !identified.has(hit.threadId)).slice(0, limit - messageSlots),\n\t\t\t...identityHits.filter((hit) => hit.source !== "id"),\n\t\t\t...messageHits'));
 
+		// A parent's follow-up to its delegated child, run as bundled (recordSubagentFollowup) with stand-ins
+		// for the projection store. The incident (2026-11-16): the parent's stop disposed the delivery of a
+		// task whose child had failed without a result; the parent's later follow-ups stayed that task's.
+		const effect = (value?: unknown) => ({
+			*[Symbol.iterator]() {
+				return value;
+			},
+			pipe() {
+				return this;
+			},
+		});
+		const followupStart = text.indexOf("const recordSubagentFollowup = ");
+		const followupSource = text.slice(followupStart, text.indexOf("\n\t});\n", followupStart) + 4).replace("const recordSubagentFollowup = ", "");
+		assert.ok(followupSource.includes('original.result === null && original.completionDelivery?.state !== "disposed"'));
+		const pendingEvents = /yield\* ([\w$]+)\(events\);/.exec(followupSource)![1]!;
+		const isActiveRun = /\.filter\(([\w$]+)\)\.toSorted/.exec(followupSource)![1]!;
+		const mayStartSubagentFollowup = new Function(`${fnSource("mayStartSubagentFollowup")}\nreturn mayStartSubagentFollowup;`)();
+		const parentId = "thread:parent";
+		const childId = "thread:child";
+		const originalId = "node:delegated-task:original";
+		const childRun = { id: "run:child:5", status: "starting", providerInstanceId: "pi", providerThreadId: "provider-thread:child", modelSelection: { instanceId: "pi", model: "opus" } };
+		const parentRuns = [
+			{ id: "run:parent:9", status: "completed", ordinal: 9, rootNodeId: "node:9", providerThreadId: "provider-thread:parent" },
+			{ id: "run:parent:14", status: "running", ordinal: 14, rootNodeId: "node:14", providerThreadId: "provider-thread:parent" },
+		];
+		const followUp = (original: Record<string, unknown>, command: Record<string, unknown> = {}) => {
+			const emitted: Record<string, any>[] = [];
+			const deps: Record<string, unknown> = {
+				fnUntraced: (body: unknown) => body,
+				mayStartSubagentFollowup,
+				[pendingEvents]: () =>
+					effect([
+						{ type: "message.updated", payload: { id: "message:1", runId: childRun.id, createdAt: "2026-11-16T11:40:40.000Z" } },
+						{ type: "run.created", payload: childRun },
+					]),
+				projectionStore: {
+					getThread: () => effect({ id: childId, title: "Werkzeuge", lineage: { relationshipToParent: "subagent", parentThreadId: parentId }, forkedFrom: { type: "node", nodeId: originalId } }),
+					getThreadRecords: (threadId: string) => {
+						assert.equal(threadId, parentId, "the child's run comes from the pending events");
+						return effect({ runs: parentRuns, subagents: [{ id: originalId, origin: "app_owned", childThreadId: childId, threadId: parentId, runId: "run:parent:9", ...original }], providerTurns: [], attempts: [] });
+					},
+				},
+				mapDispatchError: () => (value: unknown) => value,
+				[isActiveRun]: (run: { status: string }) => ["preparing", "starting", "running"].includes(run.status),
+				latestExecutedRun: (runs: unknown[]) => runs.at(-1),
+				providerAdapters: { get: () => effect({ driver: "pi" }) },
+				idAllocator: { derive: { delegatedTaskNode: ({ commandId }: { commandId: string }) => `node:delegated-task:${commandId}`, delegatedTaskTurnItem: ({ commandId }: { commandId: string }) => `turn-item:${commandId}` } },
+				providerTurnForRun: () => undefined,
+				nextTurnItemOrdinal: () => effect(1400),
+				emit: () => (event: Record<string, unknown>) => (emitted.push(event), effect()),
+			};
+			const record = new Function("deps", `with (deps) { return ${followupSource}; }`)(deps);
+			const send = { type: "message.dispatch", commandId: "command:mcp:s1:thread-send:x", threadId: childId, messageId: "message:1", text: "Rebase onto main.", createdBy: "agent", creationSource: "mcp", senderThreadId: parentId, ...command };
+			assert.equal(record(send, []).next().done, true);
+			return emitted;
+		};
+		const disposed = { status: "running", result: null, completionWake: "always", completionDelivery: { state: "disposed", observedByRunId: null } };
+		const created = followUp(disposed);
+		assert.deepEqual(created.map((event) => event.type), ["run.updated", "node.updated", "subagent.updated", "turn-item.updated"]);
+		const newTaskId = "node:delegated-task:command:mcp:s1:thread-send:x";
+		assert.equal(created[0]!.payload.delegatedTaskId, newTaskId, "the follow-up run is the new task's");
+		const newTask = created[2]!.payload;
+		assert.deepEqual(
+			{ id: newTask.id, threadId: newTask.threadId, childThreadId: newTask.childThreadId, runId: newTask.runId, completionWake: newTask.completionWake, completionDelivery: newTask.completionDelivery, status: newTask.status, result: newTask.result, prompt: newTask.prompt },
+			{ id: newTaskId, threadId: parentId, childThreadId: childId, runId: "run:parent:14", completionWake: "always", completionDelivery: { state: "pending", observedByRunId: null }, status: "running", result: null, prompt: "Rebase onto main." },
+			"owned by the sending run, its completion pending delivery",
+		);
+		assert.deepEqual(followUp({ ...disposed, completionDelivery: { state: "pending", observedByRunId: null } }), [], "a deliverable task without a result keeps its follow-ups: its own completion wakes the parent");
+		assert.deepEqual(followUp({ ...disposed, completionDelivery: undefined }), [], "so does one with no delivery state yet");
+		assert.equal(followUp({ ...disposed, status: "completed", result: "done", completionDelivery: { state: "delivered", observedByRunId: null } }).length, 4, "after a result a follow-up is a new task, as before");
+		assert.equal(followUp(disposed, { createdBy: "user", creationSource: "web", senderThreadId: undefined }).length, 4, "also when the user continues the child");
+		assert.deepEqual(followUp(disposed, { senderThreadId: "thread:coordinator" }), [], "another thread's agent message is no follow-up of the parent");
+		assert.deepEqual(followUp(disposed, { notification: { source: { kind: "monitor" } } }), [], "nor a monitor's notification");
+		assert.deepEqual(followUp(disposed, { restartContinuationOfRunId: "run:child:4" }), [], "nor a restart's continuation, which stays its run's task");
+
+		// task_status and task_cancel resolve a task named by part of its id or by its child, run as bundled.
+		const serverFn = (name: string) => {
+			const start = server.indexOf(`function ${name}(`);
+			return server.slice(start, server.indexOf("\n}\n", start) + 2);
+		};
+		const resolveSource = between(server, "\tconst resolveTaskId = ", "\tconst loadTaskParent = ");
+		const failureName = /yield\* ([\w$]+)\("task_not_found"/.exec(resolveSource)![1]!;
+		const threadTasks: Record<string, any>[] = [];
+		const { delegatedTaskMatches, resolveTaskId } = new Function(
+			"fn",
+			"loadTasks",
+			failureName,
+			`${serverFn("delegatedTaskMatches")}\n${serverFn("newestDelegatedTasks")}\n${resolveSource}\nreturn { delegatedTaskMatches, resolveTaskId };`,
+		)(
+			() => (body: unknown) => body,
+			(threadId: string, taskIds: unknown) => (assert.equal(taskIds, undefined, "every task of the thread"), effect(threadTasks.filter((task) => task.threadId === threadId || task.threadId === "elsewhere"))),
+			(code: string, message: string) => ({
+				*[Symbol.iterator]() {
+					throw Object.assign(new Error(message), { code });
+				},
+			}),
+		);
+		const werkzeugeChild = "thread:delegated-task:command%3Amcp%3Aa1933538-3b98-47bc-852c-0358a6e42848%3Adelegate-task%3A06818319-12fa-48c5-9e63-e9d9e8b8edbe";
+		const werkzeuge = { id: "node:delegated-task:command%3Amcp%3Aa1933538-3b98-47bc-852c-0358a6e42848%3Adelegate-task%3A06818319-12fa-48c5-9e63-e9d9e8b8edbe", origin: "app_owned", threadId: parentId, childThreadId: werkzeugeChild, title: "Werkzeuge", status: "completed", startedAt: "2026-11-16T10:23:22.811Z" };
+		const rebase = { ...werkzeuge, id: "node:delegated-task:command%3Amcp%3Ab2c33702-2858-46c5-8773-90be22444b06%3Athread-send%3Aa330d203-4935-4bb0-953d-3f5991303e51", status: "running", startedAt: "2026-11-17T05:59:27.563Z" };
+		const sibling = { ...werkzeuge, id: "node:delegated-task:command%3Amcp%3Aa1933538-3b98-47bc-852c-0358a6e42848%3Adelegate-task%3A11111111-0000-4000-8000-000000000001", childThreadId: "thread:delegated-task:command%3Amcp%3Aa1933538-3b98-47bc-852c-0358a6e42848%3Adelegate-task%3A11111111-0000-4000-8000-000000000001", title: "Kommentar", startedAt: "2026-11-16T09:00:00.000Z" };
+		const remote = { ...werkzeuge, id: "node:delegated-task:remote-77777777", childThreadId: null, title: "Remote", startedAt: "2026-11-15T09:00:00.000Z" };
+		const native = { ...werkzeuge, id: "node:native:55555555", origin: "provider_native", childThreadId: null };
+		const foreign = { ...werkzeuge, id: "node:delegated-task:99999999-foreign", threadId: "elsewhere" };
+		threadTasks.push(werkzeuge, rebase, sibling, remote, native, foreign);
+		const ids = (query: string) => delegatedTaskMatches(threadTasks.slice(0, 4), query).map((task: { id: string }) => task.id);
+		assert.deepEqual(ids("06818319-12fa-48c5-9e63-e9d9e8b8edbe"), [werkzeuge.id], "the incident's call: the last UUID of the task id");
+		assert.deepEqual(ids(" A330D203 "), [rebase.id], "any case, trimmed");
+		assert.deepEqual(ids("command%253Amcp%253Ab2c33702"), [rebase.id], "encoded parts are compared decoded");
+		assert.deepEqual(ids(`[Werkzeuge](t3-thread://v2/env-1/${werkzeugeChild})`), [rebase.id], "the child's link names its newest task");
+		assert.deepEqual(ids("thread:delegated-task:command:mcp:a1933538-3b98-47bc-852c-0358a6e42848:delegate-task:06818319"), [rebase.id], "so does part of the child's decoded id");
+		assert.deepEqual(ids("thread:delegated-task:command:mcp:a1933538"), [werkzeuge.id, rebase.id, sibling.id], "a part two children share names all their tasks");
+		assert.deepEqual(ids("a1933538"), [werkzeuge.id, sibling.id], "a part task ids share is ambiguous");
+		assert.deepEqual(ids("remote-77777777"), [remote.id], "a remote task has no child thread");
+		for (const vague of ["delegate-task", "06818", "0681 8319", "zzzz9999", ""]) assert.deepEqual(ids(vague), [], vague);
+		const resolve = (taskId: string, scopeThread = parentId) => {
+			try {
+				return resolveTaskId({ thread: { threadId: scopeThread } }, taskId).next().value;
+			} catch (error) {
+				return error as Error & { code: string };
+			}
+		};
+		assert.equal(resolve(werkzeuge.id), werkzeuge.id, "an exact id is taken as is");
+		assert.equal(resolve("06818319-12fa-48c5-9e63-e9d9e8b8edbe"), werkzeuge.id);
+		assert.equal(resolve(werkzeugeChild), rebase.id);
+		const ambiguous = resolve("a1933538") as Error & { code: string };
+		assert.equal(ambiguous.code, "task_not_found");
+		assert.equal(ambiguous.message, `a1933538 names 2 delegated tasks of thread ${parentId}: ${werkzeuge.id} (Werkzeuge, completed); ${sibling.id} (Kommentar, completed). Pass one of their taskIds.`);
+		const unknown = resolve("zzzz9999") as Error & { code: string };
+		assert.equal(unknown.code, "task_not_found");
+		assert.equal(unknown.message, `Thread ${parentId} has no delegated task zzzz9999. Its newest: ${rebase.id} (Werkzeuge, running); ${werkzeuge.id} (Werkzeuge, completed); ${sibling.id} (Kommentar, completed); ${remote.id} (Remote, completed).`, "newest first, only this thread's app-owned tasks");
+		assert.match((resolve("55555555") as Error).message, /has no delegated task 55555555\./, "a native subagent is no delegated task");
+		assert.match((resolve("99999999-foreign") as Error).message, /has no delegated task 99999999-foreign\./, "nor another thread's task");
+		assert.equal((resolve("06818319", "thread:empty") as Error).message, "Thread thread:empty has no delegated task 06818319. It started none.");
+		assert.ok(server.includes('requireThreadScope(callerScope, "task_status");\n\t\t\treturn yield* readTask(scope, yield* resolveTaskId(scope, taskId), false, true);'), "task_status resolves first");
+		assert.ok(server.includes('requireThreadScope(callerScope, "task_cancel");\n\t\t\tinput = {\n\t\t\t\t...input,\n\t\t\t\ttaskId: yield* resolveTaskId(scope, input.taskId)\n\t\t\t};'), "task_cancel resolves before every use of its id");
+
 		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
 		try {
 			for (const [path, patchedText] of patched) {
@@ -707,7 +846,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, task-id-resolution;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -732,7 +871,7 @@ describe("keeping t3 patched", () => {
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi;/);
+			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi, task-id-resolution;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 
