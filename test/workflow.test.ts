@@ -275,6 +275,41 @@ describe("llm()", () => {
 		assert.equal(details.llmCalls, 1);
 	});
 
+	test("llm() retries transient network errors before succeeding", async () => {
+		const fail: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "faux" as any,
+			provider: "faux",
+			model: "faux-1",
+			usage: { input: 0, output: 0, totalTokens: 0, cost: { input: 0, output: 0, total: 0 } },
+			stopReason: "error",
+			errorMessage: "read ECONNRESET",
+			timestamp: Date.now(),
+		};
+		respond(fail, say("Recovered"));
+		const { text, details } = await run("return await llm('hello', { model: 'faux/faux-1', cache: false });");
+		assert.equal(details.status, "completed", details.error);
+		assert.equal(text.split("\n\n")[1], "Recovered");
+	});
+
+	test("llm() prompts for final answer when thinking finished without text", async () => {
+		const thoughtOnly: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "My deep legal thoughts" }],
+			api: "faux" as any,
+			provider: "faux",
+			model: "faux-1",
+			usage: { input: 0, output: 0, totalTokens: 0, cost: { input: 0, output: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		respond(thoughtOnly, say("Here is the final report"));
+		const { text, details } = await run("return await llm('review', { model: 'faux/faux-1', cache: false });");
+		assert.equal(details.status, "completed", details.error);
+		assert.equal(text.split("\n\n")[1], "Here is the final report");
+	});
+
 	test("invalid options and models fail before any request", async () => {
 		const before = faux.state.callCount;
 		for (const [code, error] of [

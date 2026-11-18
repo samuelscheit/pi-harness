@@ -15,13 +15,30 @@
 // at once; only invalid structured answers are asked again.
 
 import { createHash } from "node:crypto";
-import { type AssistantMessage, type Message, type Tool, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Message, type Tool, type Usage, isRetryableAssistantError, validateToolArguments } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { CACHE_RETENTION, checkServed, resolveModel, type Thinking, thinkingOption } from "./models.ts";
 
 export const DEFAULT_LLM_MODEL = "anthropic/claude-haiku-5-5";
 const MAX_ATTEMPTS = 3;
+const MAX_NETWORK_RETRIES = 3;
+const BASE_RETRY_DELAY_MS = 2000;
 const RESPOND = "respond";
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject(signal.reason ?? new Error("llm(): aborted"));
+		const timer = setTimeout(resolve, ms);
+		signal?.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				reject(signal.reason ?? new Error("llm(): aborted"));
+			},
+			{ once: true },
+		);
+	});
+}
 
 export interface LlmOptions {
 	model?: string;
@@ -95,19 +112,57 @@ export async function llm(promptArg: unknown, optionsArg: unknown, env: LlmEnv):
 	const systemPrompt = [system?.trim(), instruction].filter(Boolean).join("\n\n") || undefined;
 	const messages: Message[] = [{ role: "user", content: prompt, timestamp: Date.now() }];
 	let problem = "";
+	let accumulatedText = "";
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-		const message = await env.runtime.completeSimple(
-			model,
-			{ systemPrompt, messages, tools: tool ? [tool] : undefined },
-			{ signal: env.signal, cacheRetention: CACHE_RETENTION, ...(thinking && thinking !== "off" ? { reasoning: thinking } : {}) },
-		);
-		env.spend(message.usage);
-		if (message.stopReason === "aborted" || env.signal.aborted) throw env.signal.reason ?? new Error("llm(): aborted");
-		if (message.stopReason === "error") throw new Error(`llm(): ${message.errorMessage ?? "the request failed"}`);
+		let message: AssistantMessage | undefined;
+		for (let networkAttempt = 0; networkAttempt <= MAX_NETWORK_RETRIES; networkAttempt++) {
+			try {
+				message = await env.runtime.completeSimple(
+					model,
+					{ systemPrompt, messages, tools: tool ? [tool] : undefined },
+					{ signal: env.signal, cacheRetention: CACHE_RETENTION, ...(thinking && thinking !== "off" ? { reasoning: thinking } : {}) },
+				);
+				env.spend(message.usage);
+				if (message.stopReason === "aborted" || env.signal.aborted) throw env.signal.reason ?? new Error("llm(): aborted");
+				if (message.stopReason === "error") {
+					if (networkAttempt < MAX_NETWORK_RETRIES && isRetryableAssistantError(message)) {
+						await sleep(BASE_RETRY_DELAY_MS * 2 ** networkAttempt, env.signal);
+						continue;
+					}
+					throw new Error(`llm(): ${message.errorMessage ?? "the request failed"}`);
+				}
+				break;
+			} catch (error) {
+				if (env.signal.aborted) throw env.signal.reason ?? error;
+				const isRetryable = error instanceof Error && /ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|fetch failed/i.test(error.message);
+				if (networkAttempt < MAX_NETWORK_RETRIES && isRetryable) {
+					await sleep(BASE_RETRY_DELAY_MS * 2 ** networkAttempt, env.signal);
+					continue;
+				}
+				throw error;
+			}
+		}
+		if (!message) throw new Error("llm(): request failed without a message");
+
 		let value: unknown;
 		if (!tool) {
+			const currentText = textOf(message);
+			accumulatedText += currentText;
+			if (message.stopReason === "length" && attempt < MAX_ATTEMPTS) {
+				messages.push(message);
+				messages.push({ role: "user", content: "Continue exactly from where you stopped.", timestamp: Date.now() });
+				continue;
+			}
+			if (!accumulatedText.trim() && attempt < MAX_ATTEMPTS) {
+				const hasThinking = message.content.some((b) => b.type === "thinking");
+				if (hasThinking) {
+					messages.push(message);
+					messages.push({ role: "user", content: "State your complete final answer now.", timestamp: Date.now() });
+					continue;
+				}
+			}
 			if (message.stopReason === "length") throw new Error(`llm(): the answer was cut off at the model's output limit`);
-			value = textOf(message);
+			value = accumulatedText;
 		} else {
 			const calls = message.content.filter((block) => block.type === "toolCall");
 			const call = calls.find((block) => block.name === RESPOND);
