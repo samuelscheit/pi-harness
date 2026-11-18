@@ -53,10 +53,11 @@ export type {
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
+const DEFAULT_COMPACTION_TOKEN_SETTINGS = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
-};
+	maxContextTokens: undefined,
+} as const satisfies Record<keyof CompactionModelOverride, number | undefined>;
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -843,10 +844,10 @@ export class SettingsManager {
 		this.save();
 	}
 
-	private getCompactionTokenSetting(
-		field: keyof CompactionModelOverride,
+	private getCompactionTokenSetting<K extends keyof CompactionModelOverride>(
+		field: K,
 		model?: Pick<Model<string>, "provider" | "id">,
-	): number {
+	): number | (typeof DEFAULT_COMPACTION_TOKEN_SETTINGS)[K] {
 		const compaction = this.settings.compaction;
 		const ordinary = compaction?.[field];
 		if (ordinary !== undefined && (typeof ordinary !== "number" || !Number.isSafeInteger(ordinary) || ordinary < 0)) {
@@ -884,11 +885,14 @@ export class SettingsManager {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		maxContextTokens?: number;
 	} {
+		const maxContextTokens = this.getCompactionTokenSetting("maxContextTokens", model);
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			...(maxContextTokens === undefined ? {} : { maxContextTokens }),
 		};
 	}
 
@@ -900,7 +904,11 @@ export class SettingsManager {
 		if (slash <= 0 || slash === economic.model.length - 1) return undefined;
 		const minSaving = economic.minSaving ?? 0;
 		if (!Number.isFinite(minSaving) || minSaving < 0) return undefined;
-		return { minSaving, warm: economic.warm === true, model: { provider: economic.model.slice(0, slash), id: economic.model.slice(slash + 1) } };
+		return {
+			minSaving,
+			warm: economic.warm === true,
+			model: { provider: economic.model.slice(0, slash), id: economic.model.slice(slash + 1) },
+		};
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
@@ -964,7 +972,9 @@ export class SettingsManager {
 	/** Read from global settings only because warming costs money. */
 	getCacheWarmingIdleMs(): number {
 		const minutes = this.globalSettings.cacheWarmingIdleMinutes;
-		return (typeof minutes === "number" && minutes >= 1 ? minutes : SETTINGS_DEFAULTS.cacheWarmingIdleMinutes) * 60_000;
+		return (
+			(typeof minutes === "number" && minutes >= 1 ? minutes : SETTINGS_DEFAULTS.cacheWarmingIdleMinutes) * 60_000
+		);
 	}
 
 	/** Prompt cache retention for requests; undefined leaves it to PI_CACHE_RETENTION and the provider default. */

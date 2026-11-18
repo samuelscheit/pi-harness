@@ -29,10 +29,10 @@ Both use closely related structured formats and track file operations cumulative
 Auto-compaction triggers when:
 
 ```
-contextTokens > contextWindow - reserveTokens
+contextTokens > min(contextWindow - reserveTokens, maxContextTokens)
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). It only decides when compaction starts. Summary requests use the model's output limit, reduced when needed so input and output fit the context window.
+By default, `reserveTokens` is 16384 tokens and `maxContextTokens` is unset, so the window decides (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). `maxContextTokens` caps the context at an absolute size whatever the window, e.g. 200k on a 1M model, where `reserveTokens` alone starts at 98.4%. An extension can set both for one session with `pi.setCompactionOverrides()`. They only decide when compaction starts. Summary requests use the model's output limit, reduced when needed so input and output fit the context window.
 
 During a multi-turn agent run, Pi checks the canonical projected context after tools finish and their results are appended, before starting the next assistant response. If the threshold is crossed, Pi compacts during `prepareNextTurn`, then performs the existing catch-up steering poll before `turn_start`. It skips this between-turn check when the completed tool batch terminates the run and no queued message requires another response. Pi also checks before a new user prompt and performs final-attempt overflow recovery after the low-level run ends.
 
@@ -445,6 +445,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Free context tokens below which auto-compaction starts |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `maxContextTokens` | unset | Most context tokens before auto-compaction starts, whatever the context window; the lower of it and `contextWindow - reserveTokens` applies |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
 
@@ -468,8 +469,8 @@ Use `compaction.modelOverrides` to tune token budgets for different models:
 
 For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve.
 
-Keys are exact, case-sensitive `provider/modelId` values, including any slashes within the model ID. Each `reserveTokens` and `keepRecentTokens` value falls back independently from the model override to the ordinary setting to the built-in default. Values must be non-negative safe integers. Invalid values in the matching model override produce an error when read; only omitted fields fall back to the ordinary setting. Model override entries must be objects. Invalid ordinary token settings produce an error when read, even if the active model has a valid override. Only omitted ordinary values use built-in defaults. `enabled` remains global, not model-specific.
+Keys are exact, case-sensitive `provider/modelId` values, including any slashes within the model ID. Each `reserveTokens`, `keepRecentTokens` and `maxContextTokens` value falls back independently from the model override to the ordinary setting to the built-in default. Values must be non-negative safe integers. Invalid values in the matching model override produce an error when read; only omitted fields fall back to the ordinary setting. Model override entries must be objects. Invalid ordinary token settings produce an error when read, even if the active model has a valid override. Only omitted ordinary values use built-in defaults. `enabled` remains global, not model-specific.
 
-These resolved values are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
+A session's overrides (`pi.setCompactionOverrides()`, see [extensions.md](extensions.md#pisetcompactionoverridesoverrides-and-pigetcompactionsettings)) apply over these resolved values. They are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
 
 Overrides work in both global and project settings. The files merge recursively before lookup, so a global model-specific value beats a project-wide fallback; a project must override that model entry to change it. See [Settings](settings.md#per-model-compaction-overrides) for details.

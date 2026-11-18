@@ -462,6 +462,8 @@ export class ExtensionRunner {
 		this.runtime.setBackgroundWork = actions.setBackgroundWork;
 		this.runtime.setCacheWarmingHold = actions.setCacheWarmingHold;
 		this.runtime.getCacheWarmingStatus = actions.getCacheWarmingStatus;
+		this.runtime.setCompactionOverrides = actions.setCompactionOverrides;
+		this.runtime.getCompactionSettings = actions.getCompactionSettings;
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;

@@ -70,12 +70,15 @@ import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
+import { validBackgroundWork } from "./background-work.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import { type CacheWarmer, type CacheWarmingStatus, isPromptCacheCold } from "./cache-warmer.ts";
 import {
+	type CompactionOverrides,
 	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
@@ -124,7 +127,6 @@ import {
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BackgroundWorkItem } from "./extensions/types.ts";
-import { validBackgroundWork } from "./background-work.ts";
 import type { ForkBaseMeta } from "./fork-base.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
@@ -544,6 +546,8 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 
 	private _modelRuntime: ModelRuntime;
+	/** This session's compaction token settings over the configured ones (see setCompactionOverrides). */
+	private _compactionOverrides: CompactionOverrides = {};
 	private _cacheWarmer?: Pick<
 		CacheWarmer,
 		| "cancel"
@@ -932,7 +936,7 @@ export class AgentSession {
 		return shouldCompact(
 			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
 			model.contextWindow,
-			this.settingsManager.getCompactionSettings(this.model),
+			this.getCompactionSettings(this.model),
 		);
 	}
 
@@ -988,11 +992,7 @@ export class AgentSession {
 		// A cold prefix compacts into a fork base shared by every session that reaches it cold.
 		const base =
 			cold && prefixRequest
-				? this._sharedPrefix?.baseKey(
-						prefixRequest,
-						summaryModel,
-						this.settingsManager.getCompactionSettings(model),
-					)
+				? this._sharedPrefix?.baseKey(prefixRequest, summaryModel, this.getCompactionSettings(model))
 				: undefined;
 		// Taking an existing base costs no summary.
 		const summarised = !base || !this._sharedPrefix?.bases.load(base.key);
@@ -1001,7 +1001,7 @@ export class AgentSession {
 			resolvePromptCacheRetention(streamOptions) === "long" ? model.cost.input * 2 : model.cost.cacheWrite;
 		const saving = compactionSaving({
 			contextTokens: estimateProjectedContextTokens(this.sessionManager.buildSessionProjection(), branch).tokens,
-			keepTokens: this.settingsManager.getCompactionKeepRecentTokens(model),
+			keepTokens: this.getCompactionSettings(model).keepRecentTokens,
 			cold,
 			prices: {
 				read: model.cost.cacheRead / 1e6,
@@ -1836,6 +1836,21 @@ export class AgentSession {
 	setCacheWarmingMode(mode: CacheWarmingMode): void {
 		this.settingsManager.setCacheWarmingMode(mode);
 		this._cacheWarmer?.onModeChanged();
+	}
+
+	/**
+	 * Compaction settings of `model` in this session: the configured ones (settings and their
+	 * `modelOverrides`), then the session's overrides (`setCompactionOverrides`).
+	 */
+	getCompactionSettings(model: Model<any> | undefined = this.model): CompactionSettings {
+		return { ...this.settingsManager.getCompactionSettings(model), ...this._compactionOverrides };
+	}
+
+	/** Replace this session's compaction overrides; `undefined` or `{}` returns to the configured settings. */
+	setCompactionOverrides(overrides: CompactionOverrides | undefined): void {
+		this._compactionOverrides = Object.fromEntries(
+			Object.entries(overrides ?? {}).filter(([, value]) => value !== undefined),
+		) as CompactionOverrides;
 	}
 
 	/** Hold this session's prompt cache warm until `untilMs`, or end the hold (see ExtensionAPI.setCacheWarmingHold). */
@@ -3281,7 +3296,7 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const settings = this.settingsManager.getCompactionSettings(model);
+			const settings = this.getCompactionSettings(model);
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
@@ -3449,7 +3464,7 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings(this.model);
+		const settings = this.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
@@ -3603,7 +3618,7 @@ export class AgentSession {
 		base?: CompactionEntry,
 	): Promise<boolean> {
 		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings(model);
+		const settings = this.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
 		let started = false;
 		let fromExtension = false;
@@ -3943,6 +3958,8 @@ export class AgentSession {
 				setBackgroundWork: (key, items) => this.setBackgroundWork(key, items),
 				setCacheWarmingHold: (untilMs) => this.setCacheWarmingHold(untilMs),
 				getCacheWarmingStatus: () => this.cacheWarmingStatus,
+				setCompactionOverrides: (overrides) => this.setCompactionOverrides(overrides),
+				getCompactionSettings: () => this.getCompactionSettings(),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {
@@ -4185,14 +4202,17 @@ export class AgentSession {
 	/** Set `key`'s pending background work; emits `background_work` when the items of all keys change. */
 	setBackgroundWork(key: string, items: readonly BackgroundWorkItem[]): void {
 		const checked = validBackgroundWork(items);
-		const others = new Set([...this._backgroundWork].flatMap(([k, work]) => (k === key ? [] : work.map((item) => item.id))));
+		const others = new Set(
+			[...this._backgroundWork].flatMap(([k, work]) => (k === key ? [] : work.map((item) => item.id))),
+		);
 		const taken = checked.find((item) => others.has(item.id));
 		if (taken) throw new Error(`Invalid background work: id ${JSON.stringify(taken.id)} is another key's`);
 		const before = JSON.stringify(this.backgroundWork);
 		if (checked.length === 0) this._backgroundWork.delete(key);
 		else this._backgroundWork.set(key, checked);
 		const after = this.backgroundWork;
-		if (JSON.stringify(after) !== before) this._emit({ type: "background_work", pending: after.length, items: after });
+		if (JSON.stringify(after) !== before)
+			this._emit({ type: "background_work", pending: after.length, items: after });
 	}
 
 	/**

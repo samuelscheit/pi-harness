@@ -64,7 +64,13 @@ import type {
 	CacheWarmingDecisionEventResult,
 	CacheWarmingStatus,
 } from "../cache-warmer.ts";
-import type { CompactionModel, CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type {
+	CompactionModel,
+	CompactionOverrides,
+	CompactionPreparation,
+	CompactionResult,
+	CompactionSettings,
+} from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
@@ -1948,6 +1954,19 @@ export interface ExtensionAPI {
 	/** Current cache warming state: schedule, the pending decision with its costs, the hold, and the cache lifetime. */
 	getCacheWarmingStatus(): CacheWarmingStatus | undefined;
 
+	/**
+	 * Set this session's compaction token settings over the configured ones (settings.json and its
+	 * `compaction.modelOverrides`), e.g. `{ maxContextTokens: 200_000 }` to compact automatically
+	 * once the context passes 200k tokens. Replaces the previous overrides; `undefined` or `{}`
+	 * returns to the configured settings. Session state: it lasts until the session is replaced,
+	 * not across reloads of the process, so an extension that persists it restores it on
+	 * `session_start`.
+	 */
+	setCompactionOverrides(overrides: CompactionOverrides | undefined): void;
+
+	/** The compaction settings in effect for the current model, overrides included. */
+	getCompactionSettings(): CompactionSettings | undefined;
+
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
 
@@ -2406,6 +2425,8 @@ export interface ExtensionActions {
 	setBackgroundWork: SetBackgroundWorkHandler;
 	setCacheWarmingHold: (untilMs: number | undefined) => void;
 	getCacheWarmingStatus: () => CacheWarmingStatus | undefined;
+	setCompactionOverrides: (overrides: CompactionOverrides | undefined) => void;
+	getCompactionSettings: () => CompactionSettings | undefined;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;

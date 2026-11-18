@@ -2017,6 +2017,19 @@ pi.setCacheWarmingHold(Date.now() + 3 * 60 * 60_000);
 const { decision, cache } = pi.getCacheWarmingStatus() ?? {};
 ```
 
+### pi.setCompactionOverrides(overrides) and pi.getCompactionSettings()
+
+Set this session's compaction token settings (`reserveTokens`, `keepRecentTokens`, `maxContextTokens`) over the configured ones, which are the settings files with their `compaction.modelOverrides` for the current model. Each call replaces the previous overrides; `undefined` or `{}` returns to the configured settings, and fields set to `undefined` are ignored. The overrides apply to every automatic threshold check, manual and overflow compaction, and `preparation.settings` of `session_before_compact`. `enabled` stays a setting.
+
+They are session state: a replaced session (`/new`, `/resume`, `/fork`) starts without them, and they do not survive the process, so an extension that persists them (with `pi.appendEntry`) sets them again in `session_start` and `session_tree`.
+
+`pi.getCompactionSettings()` returns the settings in effect for the current model, overrides included.
+
+```typescript
+pi.setCompactionOverrides({ maxContextTokens: 200_000 }); // compact above 200k tokens, whatever the window
+const { maxContextTokens, keepRecentTokens } = pi.getCompactionSettings() ?? {};
+```
+
 ### pi.wrapToolExecution(wrapper)
 
 Wrap the execution of every tool call the model makes, of any tool (built-in, extension or MCP). The wrapper runs after `tool_call` handlers and before `tool_result` handlers. `execution.execute(signal, onUpdate)` runs the call (through wrappers registered later); the tool's context gets that signal, so it is also the default signal of the tool's `ctx.executeTool()` calls. Calls a tool makes through `ctx.executeTool()` do not pass through wrappers. Wrappers nest in extension load order, the first outermost.

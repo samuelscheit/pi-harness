@@ -42,6 +42,21 @@ describe("compaction model overrides", () => {
 		expect(manager.getCompactionSettings(model)).toEqual({ ...defaults, keepRecentTokens: 1024 });
 	});
 
+	it("resolves maxContextTokens through the model override and the ordinary setting, unset by default", () => {
+		const manager = SettingsManager.inMemory({
+			compaction: { maxContextTokens: 300_000, modelOverrides: { [modelKey]: { maxContextTokens: 150_000 } } },
+		});
+		expect(manager.getCompactionSettings(model)).toEqual({ ...defaults, maxContextTokens: 150_000 });
+		expect(manager.getCompactionSettings({ provider: "other", id: "x" })).toEqual({
+			...defaults,
+			maxContextTokens: 300_000,
+		});
+		expect(SettingsManager.inMemory().getCompactionSettings(model)).not.toHaveProperty("maxContextTokens");
+		expect(() =>
+			SettingsManager.inMemory({ compaction: { maxContextTokens: -1 } }).getCompactionSettings(model),
+		).toThrow("Invalid compaction.maxContextTokens setting: -1");
+	});
+
 	it("matches exact provider/model IDs, including IDs containing slashes", () => {
 		const manager = SettingsManager.inMemory({
 			compaction: {

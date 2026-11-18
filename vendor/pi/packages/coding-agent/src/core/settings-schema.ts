@@ -10,15 +10,20 @@ function timeoutSetting(options?: TSchemaOptions) {
 	return Type.Union([Type.Number({ minimum: 0 }), Type.Literal("disabled")], options);
 }
 
+const MAX_CONTEXT_TOKENS_DESCRIPTION =
+	"Most context tokens before automatic compaction starts, whatever the context window. Unset: the context window minus reserveTokens.";
+
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	maxContextTokens: Type.Optional(nonNegativeSafeInteger({ description: MAX_CONTEXT_TOKENS_DESCRIPTION })),
 });
 
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	maxContextTokens: Type.Optional(nonNegativeSafeInteger({ description: MAX_CONTEXT_TOKENS_DESCRIPTION })),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
@@ -27,9 +32,14 @@ const CompactionSettingsSchema = Type.Object({
 	economic: Type.Optional(
 		Type.Object(
 			{
-				model: Type.String({ description: 'The model that writes the summary, as "provider/modelId" (a cheap one).' }),
+				model: Type.String({
+					description: 'The model that writes the summary, as "provider/modelId" (a cheap one).',
+				}),
 				minSaving: Type.Optional(
-					Type.Number({ minimum: 0, description: "Compact only when the expected saving is at least this many dollars." }),
+					Type.Number({
+						minimum: 0,
+						description: "Compact only when the expected saving is at least this many dollars.",
+					}),
 				),
 				warm: Type.Optional(
 					Type.Boolean({

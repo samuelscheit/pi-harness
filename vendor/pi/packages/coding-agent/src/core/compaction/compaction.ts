@@ -139,7 +139,12 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/** Most context tokens before automatic compaction starts, whatever the context window; unset means the window. */
+	maxContextTokens?: number;
 }
+
+/** Token settings one session sets over the configured ones (`pi.setCompactionOverrides`). */
+export type CompactionOverrides = Partial<Omit<CompactionSettings, "enabled">>;
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
@@ -284,7 +289,7 @@ export function estimateProjectedContextTokens(
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	return contextTokens > Math.min(contextWindow - settings.reserveTokens, settings.maxContextTokens ?? Infinity);
 }
 
 // ============================================================================

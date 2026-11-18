@@ -292,6 +292,22 @@ describe("shouldCompact", () => {
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 	});
+
+	it("caps the threshold at maxContextTokens, whichever of it and window minus reserve is lower", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+			maxContextTokens: 200_000,
+		};
+		expect(shouldCompact(200_000, 1_000_000, settings)).toBe(false);
+		expect(shouldCompact(200_001, 1_000_000, settings)).toBe(true);
+		// A cap above the window's own threshold changes nothing.
+		expect(shouldCompact(183_000, 200_000, settings)).toBe(false);
+		expect(shouldCompact(183_617, 200_000, settings)).toBe(true);
+		expect(shouldCompact(1, 1_000_000, { ...settings, maxContextTokens: 0 })).toBe(true);
+		expect(shouldCompact(10 ** 9, 1_000_000, { ...settings, enabled: false })).toBe(false);
+	});
 });
 
 describe("findCutPoint", () => {

@@ -57,6 +57,7 @@ flowchart TB
 | [`extensions/goal`](../extensions/goal/index.ts) | `/goal` and the `goal` tool: a session goal that holds the run at its end until it is achieved, blocked or out of budget ([goal.md](goal.md)). |
 | [`extensions/template`](../extensions/template/index.ts) | Session templates: recipes in `.pi/templates/`, deterministic builds, staleness and rebuilds, `/template` ([templates.md](templates.md)). |
 | [`extensions/warm`](../extensions/warm/index.ts) | `/warm` and the `keep_warm` tool: hold the prompt cache warm until a time, with a budget ([tools.md](tools.md#warm-and-keep_warm)). |
+| [`extensions/context-limit`](../extensions/context-limit/index.ts) | `/context-limit`: compact one session above a context size instead of near the end of the window ([tools.md](tools.md#context-limit)). |
 | [`extensions/lens`](../extensions/lens/index.ts) | Layered global and per-project configuration for pi-lens. |
 | [`dashboard/`](../dashboard) | `node:http` JSON API over the query layer, plus a React frontend. |
 | [`scripts/dream`](../scripts/dream/run.ts) | Nightly learning from user corrections. |

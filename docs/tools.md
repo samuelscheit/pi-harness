@@ -259,6 +259,19 @@ The agent's `keep_warm` tool takes `{ for?, until?, off?, max_usd? }`. Without `
 - **Cost:** setting a hold reports the price of a refresh (Pi's `warmCost`), the refresh interval (90% of the cache lifetime), and the total until the end. The status line shows the end, the next refresh and the spend.
 - **Five-minute cache:** with it, a long hold refreshes every 4.5 minutes, which adds up to about what the misses would cost. The message then says how to switch to the one-hour cache. Retention comes from the request (none sets it today), else the `cacheRetention` setting (the project's `.pi/settings.json` over `~/.pi/agent/settings.json`, read at start and on `/reload`), else `PI_CACHE_RETENTION=long`, else short. The installer sets `"long"`, so this applies to models with only a five-minute tier, or where a setting chose `"short"`.
 
+## /context-limit
+
+[`extensions/context-limit`](../extensions/context-limit/index.ts) caps one session's context: automatic compaction starts once the context passes the limit, instead of at the context window minus `reserveTokens` (16k by default, so 98.4% of a 1M window). It sets `maxContextTokens` with `pi.setCompactionOverrides` (added in `vendor/pi`); for every session, set `compaction.maxContextTokens` (or per model under `compaction.modelOverrides`) in Pi's settings instead.
+
+| Command | Effect |
+|---|---|
+| `/context-limit 200k`, `1.5m`, `150000` | compact this session above that many tokens; the lower of it and the window's threshold applies |
+| `/context-limit off` | back to the configured settings |
+| `/context-limit` | show where compaction starts and why |
+
+- **Storage:** a custom entry `harness-context-limit` (`null` removes it), so it survives reloads and restarts and follows the branch: `session_start` and `session_tree` apply the branch's latest one. Forks inherit it; a new session starts without.
+- **Effect:** a limit below the current context makes the next prompt compact first. A limit at or below `keepRecentTokens` is refused: after a compaction the context would still be above it, so every turn would compact again. The status line shows `compact above 200k` while a limit is set.
+
 ## note_improvement
 
 [`extensions/improvements`](../extensions/improvements/index.ts). The agent records friction (a correction, a missing or wrong instruction, a misleading tool) with an observation and a proposal. It only appends to a backlog, so it costs almost nothing during the task. See [self-improvement.md](self-improvement.md).

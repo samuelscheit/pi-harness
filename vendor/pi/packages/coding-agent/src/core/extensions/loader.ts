@@ -13,6 +13,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.ts";
+import type { CompactionOverrides } from "../compaction/index.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
@@ -190,6 +191,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setBackgroundWork: notInitialized,
 		setCacheWarmingHold: notInitialized,
 		getCacheWarmingStatus: notInitialized,
+		setCompactionOverrides: notInitialized,
+		getCompactionSettings: notInitialized,
 		// registerTool() is valid during extension load; refresh is only needed post-bind.
 		refreshTools: () => {},
 		getCommands: notInitialized,
@@ -473,6 +476,16 @@ function createExtensionAPI(
 		getCacheWarmingStatus() {
 			assertActive();
 			return runtime.getCacheWarmingStatus();
+		},
+
+		setCompactionOverrides(overrides: CompactionOverrides | undefined): void {
+			assertActive();
+			runtime.setCompactionOverrides(overrides);
+		},
+
+		getCompactionSettings() {
+			assertActive();
+			return runtime.getCompactionSettings();
 		},
 
 		getCommands() {
