@@ -12,6 +12,37 @@ import {
 } from "../extensions/web/challenge.ts";
 import { RenderError } from "../extensions/web/browser.ts";
 import { fetchedDocument, formatSearch, registerWeb, searchResults } from "../extensions/web/index.ts";
+import { pdfText } from "../extensions/web/pdf.ts";
+
+/** A minimal PDF with one Helvetica text line per entry, one page per array. */
+function pdf(pages: string[][]): Buffer {
+	const objects = [
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		`<< /Type /Pages /Kids [${pages.map((_, i) => `${4 + 2 * i} 0 R`).join(" ")}] /Count ${pages.length} >>`,
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	];
+	pages.forEach((lines, i) => {
+		const stream = `BT /F1 10 Tf 12 TL 40 800 Td ${lines.map((line) => `(${line.replace(/[\\()]/g, "\\$&")}) Tj T*`).join(" ")} ET`;
+		objects.push(
+			`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + 2 * i} 0 R >>`,
+			`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+		);
+	});
+	let out = "%PDF-1.4\n";
+	const offsets = objects.map((object, i) => {
+		const offset = out.length;
+		out += `${i + 1} 0 obj\n${object}\nendobj\n`;
+		return offset;
+	});
+	const xref = out.length;
+	out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map((o) => `${String(o).padStart(10, "0")} 00000 n \n`).join("")}`;
+	out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+	return Buffer.from(out, "latin1");
+}
+const noPdftotext = !(await pdfText(pdf([["probe"]])).then(
+	() => true,
+	() => false,
+)) && "pdftotext is not installed";
 
 const result = (title: string, url: string, page_age?: string) => ({ type: "web_search_result", title, url, page_age, encrypted_content: "x" });
 
@@ -44,7 +75,9 @@ test("reads the fetched document, a fetch error, or a missing fetch", () => {
 	};
 	assert.deepEqual(fetchedDocument([page]), { url: "https://example.com/", text: "hello" });
 	const pdf = { ...page, content: { ...page.content, content: { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBER" } } } };
-	assert.deepEqual(fetchedDocument([pdf]), { url: "https://example.com/", text: undefined });
+	assert.deepEqual(fetchedDocument([pdf]), { url: "https://example.com/", text: undefined, pdf: "JVBER" });
+	const image = { ...page, content: { ...page.content, content: { type: "document", source: { type: "base64", media_type: "image/png", data: "iVBOR" } } } };
+	assert.deepEqual(fetchedDocument([image]), { url: "https://example.com/", text: undefined });
 	const error = { type: "web_fetch_tool_result", tool_use_id: "f", content: { type: "web_fetch_tool_result_error", error_code: "url_not_accessible" } };
 	assert.deepEqual(fetchedDocument([error]), { error: "url_not_accessible" });
 	assert.deepEqual(fetchedDocument([{ type: "text", text: "I will not fetch that" }]), { error: "the page was not fetched" });
@@ -141,7 +174,11 @@ describe("web_fetch tool", () => {
 	const realFetch = globalThis.fetch;
 	let page: () => Response;
 	let documentText: string;
-	const requests: { url: string; body?: any }[] = [];
+	/** The fetched document's source, when not the text documentText. */
+	let documentSource: Record<string, string> | undefined;
+	let answerText: string;
+	const requests: { url: string; headers?: Record<string, string>; body?: any }[] = [];
+	const pdfBin = process.env.PDFTOTEXT_BIN;
 	const tools: Record<string, any> = {};
 	let toolNames: string[] = [];
 	let render: (url: string) => Promise<{ url: string; title: string; text: string }>;
@@ -158,11 +195,13 @@ describe("web_fetch tool", () => {
 		requests.length = 0;
 		rendered.length = 0;
 		toolNames = [];
+		documentSource = undefined;
+		answerText = "The page does not contain the judgment.";
 		render = async () => RENDERED;
 		globalThis.fetch = (async (input: string, init?: RequestInit) => {
 			const url = String(input);
 			const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-			requests.push({ url, body });
+			requests.push({ url, headers: init?.headers as Record<string, string> | undefined, body });
 			if (url !== "https://api.test/v1/messages") return page();
 			// The answer about a rendered page: a plain request without the fetch tool.
 			if (!body.tools) return Response.json({ content: [{ type: "text", text: "Paragraph 1 reads: The Court rules." }], stop_reason: "end_turn", usage: { input_tokens: 2000, output_tokens: 20 } });
@@ -171,14 +210,114 @@ describe("web_fetch tool", () => {
 				{
 					type: "web_fetch_tool_result",
 					tool_use_id: "f",
-					content: { type: "web_fetch_result", url: PAGE, content: { type: "document", source: { type: "text", media_type: "text/plain", data: documentText } } },
+					content: {
+						type: "web_fetch_result",
+						url: PAGE,
+						retrieved_at: "2026-11-18T02:09:50+00:00",
+						content: { type: "document", source: documentSource ?? { type: "text", media_type: "text/plain", data: documentText } },
+					},
 				},
-				{ type: "text", text: "The page does not contain the judgment." },
+				{ type: "text", text: answerText },
 			];
 			return Response.json({ content, stop_reason: "end_turn", usage: { input_tokens: 100, output_tokens: 10 } });
 		}) as typeof fetch;
 	});
-	afterEach(() => (globalThis.fetch = realFetch));
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+		if (pdfBin === undefined) delete process.env.PDFTOTEXT_BIN;
+		else process.env.PDFTOTEXT_BIN = pdfBin;
+	});
+
+	const pdfSource = (bytes: Buffer) => ({ type: "base64", media_type: "application/pdf", data: bytes.toString("base64") });
+	const READINESS = [
+		["E-EVIDENCE PACKAGE: STATE OF READINESS", "Last updated: 6 November 2026", "1. FINLAND", "Issuing: ready (EPOC)"],
+		["7. LITHUANIA", "Receiving: ready (EPOC-PR)"],
+	];
+
+	test("fetches fresh: the cache-bypassing tool version, called directly, without a beta header", async () => {
+		documentText = ARTICLE_TEXT;
+		await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.deepEqual(requests[0].body.tools, [
+			{ type: "web_fetch_20260309", name: "web_fetch", max_uses: 2, max_content_tokens: 100_000, use_cache: false, allowed_callers: ["direct"] },
+		]);
+		assert.equal(requests[0].headers?.["anthropic-beta"], undefined);
+		assert.equal(requests[0].headers?.["x-api-key"], "k");
+	});
+
+	test("returns a PDF's text itself without a prompt", { skip: noPdftotext }, async () => {
+		documentSource = pdfSource(pdf(READINESS));
+		page = () => assert.fail("a PDF is not probed");
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.equal(result.isError, undefined);
+		const text: string = result.content[0].text;
+		assert.match(text, /^E-EVIDENCE PACKAGE: STATE OF READINESS\n+Last updated: 6 November 2026\n+1\. FINLAND\n+Issuing: ready \(EPOC\)\n+7\. LITHUANIA\n+Receiving: ready \(EPOC-PR\)$/);
+		assert.doesNotMatch(text, /[ \t]$|\f/m);
+		assert.deepEqual(result.details, { url: PAGE, rendered: false, pdf: true });
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0].body.system, "Fetch the URL. Then reply with only: done.");
+	});
+
+	test("truncates a long PDF's text like a page", { skip: noPdftotext }, async () => {
+		const lines = Array.from({ length: 3000 }, (_, i) => `Line ${i + 1} of the readiness table`);
+		documentSource = pdfSource(pdf(Array.from({ length: 50 }, (_, p) => lines.slice(p * 60, p * 60 + 60))));
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		const text: string = result.content[0].text;
+		assert.match(text, /^Line 1 of the readiness table\n/);
+		assert.match(text, /\n\n\[Truncated: showing \d+ of \d+ lines\. For the rest, pass a prompt that names the part you need/);
+		assert.doesNotMatch(text, /Line 3000 of/);
+		assert.ok(Buffer.byteLength(text) < 52 * 1024);
+	});
+
+	test("answers a prompt about a PDF from the fetched PDF, without extracting it", async () => {
+		process.env.PDFTOTEXT_BIN = "/nonexistent/pdftotext";
+		documentSource = pdfSource(pdf(READINESS));
+		answerText = 'The document says "Last updated: 6 November 2026"; Finland and Lithuania are listed.';
+		const result = await tools.web_fetch.execute("id", { url: PAGE, prompt: "Which states are ready, and when was it updated?" }, undefined, undefined, ctx);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.content[0].text, `${answerText}\n\nSource: ${PAGE}`);
+		assert.deepEqual(result.details, { url: PAGE, rendered: false, pdf: true });
+		assert.match(requests[0].body.system, /dates exactly as the document states them \(including its own date, such as "last updated"/);
+		assert.equal(requests[0].body.messages[0].content, `Fetch ${PAGE}\n\nRequest: Which states are ready, and when was it updated?`);
+	});
+
+	test("reports a corrupt PDF", { skip: noPdftotext }, async () => {
+		documentSource = pdfSource(Buffer.from("%PDF-1.4\nthis is not a PDF body"));
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0].text, /^Could not extract the text of the PDF https:\/\/curia\S+: pdftotext could not read the PDF: .+\. Pass a prompt to have the model read the PDF instead\.$/);
+		assert.ok(result.usage.cost.total > 0);
+	});
+
+	test("reports a missing pdftotext with how to install it", async () => {
+		process.env.PDFTOTEXT_BIN = "/nonexistent/pdftotext";
+		documentSource = pdfSource(pdf(READINESS));
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.equal(result.isError, true);
+		assert.match(
+			result.content[0].text,
+			/: pdftotext is not installed \(tried \/nonexistent\/pdftotext\); install poppler \(brew install poppler, apt install poppler-utils\) or set PDFTOTEXT_BIN\. Pass a prompt/,
+		);
+	});
+
+	test("says when a PDF has no text layer", { skip: noPdftotext }, async () => {
+		documentSource = pdfSource(pdf([[]]));
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.content[0].text, `The PDF ${PAGE} has no text layer (a scanned document?). Pass a prompt to have the model read its pages.`);
+	});
+
+	test("an abort while extracting a PDF ends the call", { skip: noPdftotext }, async () => {
+		documentSource = pdfSource(pdf(READINESS));
+		const controller = new AbortController();
+		controller.abort();
+		await assert.rejects(tools.web_fetch.execute("id", { url: PAGE }, controller.signal, undefined, ctx), { name: "AbortError" });
+	});
+
+	test("still asks for a prompt for a non-PDF binary document", async () => {
+		documentSource = { type: "base64", media_type: "image/png", data: "iVBOR" };
+		const result = await tools.web_fetch.execute("id", { url: PAGE }, undefined, undefined, ctx);
+		assert.equal(result.content[0].text, `${PAGE} is not a text document; pass a prompt to read it.`);
+	});
 
 	test("answers the prompt from the page rendered in the browser, not from the empty shell", async () => {
 		documentText = CURIA_TEXT;

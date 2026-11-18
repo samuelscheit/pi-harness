@@ -229,7 +229,9 @@ Why it blocks: until 2026-11 it followed Codex's asynchronous `request_user_inpu
 
 ## web_search and web_fetch
 
-[`extensions/web`](../extensions/web/index.ts). Pi keeps no server-tool blocks in its messages, so, as in Claude Code's WebSearch, each call is its own small Messages request to Haiku with Anthropic's `web_search_20250305` or `web_fetch_20250910` server tool. It returns the findings as text and reports its usage, so the cost counts toward the session and shows in the metrics. This works whatever model the session runs on.
+[`extensions/web`](../extensions/web/index.ts). Pi keeps no server-tool blocks in its messages, so, as in Claude Code's WebSearch, each call is its own small Messages request to Haiku with Anthropic's `web_search_20250305` or `web_fetch_20260309` server tool. It returns the findings as text and reports its usage, so the cost counts toward the session and shows in the metrics. This works whatever model the session runs on.
+
+`web_fetch` always fetches fresh: `use_cache: false` bypasses Anthropic's fetch cache, which served a Commission PDF last retrieved three months earlier ("Last updated: 20 August 2026" while the live file said 6 November). `allowed_callers: ["direct"]` keeps the fetch a plain tool call: that version otherwise lets the model call it from code execution (dynamic filtering), which returns no document to read. Without a prompt the tool returns the document's text: for a page the fetcher's text, for a PDF the text [`pdf.ts`](../extensions/web/pdf.ts) extracts with poppler's `pdftotext -layout` (on `PATH`, in `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`, or `PDFTOTEXT_BIN`), both truncated at 2000 lines or 50 KB. Without poppler, or for a corrupt PDF, the call fails and says so; with a prompt the model answers from the fetched PDF itself and needs no poppler.
 
 ## goal
 

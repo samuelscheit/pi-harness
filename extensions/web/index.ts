@@ -5,12 +5,16 @@
 // is its own small Messages request with the server tool; the tool returns the findings as text
 // and reports the request's usage, so it counts in session cost and the harness metrics. This
 // works whatever model the session runs on.
+//
+// web_fetch always fetches fresh (use_cache: false): Anthropic's fetch cache served a PDF months out
+// of date. A PDF comes back as bytes; without a prompt its text is extracted locally (pdf.ts).
 
 import { calculateCost } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { RenderError, renderPage } from "./browser.ts";
 import { browserNeeded, pageBlock } from "./challenge.ts";
+import { PdfTextError, pdfText } from "./pdf.ts";
 
 export const WEB_MODEL = { provider: "anthropic", id: "claude-haiku-5-5" };
 // Anthropic bills web search per request; tokens are billed as usual.
@@ -34,7 +38,6 @@ async function messagesRequest(
 	system: string,
 	prompt: string,
 	signal: AbortSignal | undefined,
-	beta?: string,
 ): Promise<ServerToolReply> {
 	const model = ctx.modelRegistry.find(WEB_MODEL.provider, WEB_MODEL.id);
 	if (!model) throw new Error(`model ${WEB_MODEL.provider}/${WEB_MODEL.id} is not configured`);
@@ -52,7 +55,6 @@ async function messagesRequest(
 				"content-type": "application/json",
 				"anthropic-version": "2023-06-01",
 				...(auth.apiKey ? { "x-api-key": auth.apiKey } : {}),
-				...(beta ? { "anthropic-beta": beta } : {}),
 				...(auth.headers as Record<string, string> | undefined),
 			},
 			body: JSON.stringify({ model: model.id, max_tokens: 4096, system, ...(tool ? { tools: [tool] } : {}), messages }),
@@ -124,14 +126,17 @@ export function formatSearch(query: string, content: Block[]): { text: string; i
 	return { text: `${textOf(content)}\n\nSources:\n${list}`, isError: false };
 }
 
-/** The fetched document and the answer about it, or the fetch error. */
-export function fetchedDocument(content: Block[]): { url?: string; text?: string; error?: string } {
+/**
+ * The fetched document, or the fetch error: `text` for a text document, `pdf` (base64) for a PDF.
+ */
+export function fetchedDocument(content: Block[]): { url?: string; text?: string; pdf?: string; error?: string } {
 	for (const block of content) {
 		if (block.type !== "web_fetch_tool_result") continue;
 		const result = block.content ?? {};
 		if (result.type === "web_fetch_tool_result_error" || result.error_code) return { error: result.error_code ?? "unknown error" };
 		const source = result.content?.source ?? {};
-		return { url: result.url, text: source.type === "text" ? source.data : undefined };
+		const pdf = source.type === "base64" && source.media_type === "application/pdf" ? source.data : undefined;
+		return { url: result.url, text: source.type === "text" ? source.data : undefined, ...(pdf !== undefined ? { pdf } : {}) };
 	}
 	return { error: "the page was not fetched" };
 }
@@ -153,7 +158,7 @@ const fetchParameters = Type.Object({
 });
 
 const ANSWER_SYSTEM =
-	"You read web pages for a coding agent. Answer the request from the page's content only, quoting code and exact values. When the request asks for the exact, full or verbatim text of a part of the page, reproduce that part verbatim and complete, without summarizing or paraphrasing. Say so when the page doesn't answer it.";
+	"You read web pages for a coding agent. Answer the request from the page's content only, quoting code and exact values, and dates exactly as the document states them (including its own date, such as \"last updated\", when it has one). When the request asks for the exact, full or verbatim text of a part of the page, reproduce that part verbatim and complete, without summarizing or paraphrasing. Say so when the page doesn't answer it.";
 
 export default function web(pi: ExtensionAPI) {
 	registerWeb(pi);
@@ -196,7 +201,17 @@ export function registerWeb(pi: ExtensionAPI, render: typeof renderPage = render
 		promptSnippet: "Fetch a URL and read it or answer a question about it",
 		parameters: fetchParameters,
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			const tool = { type: "web_fetch_20250910", name: "web_fetch", max_uses: 2, max_content_tokens: MAX_FETCH_TOKENS };
+			// use_cache: false (from web_fetch_20260309) bypasses Anthropic's fetch cache, which served stale copies.
+			// That version also lets the model call the fetch from code execution (dynamic filtering), which
+			// returns no document block; allowed_callers: direct keeps it a plain fetch whose result we read.
+			const tool = {
+				type: "web_fetch_20260309",
+				name: "web_fetch",
+				max_uses: 2,
+				max_content_tokens: MAX_FETCH_TOKENS,
+				use_cache: false,
+				allowed_callers: ["direct"],
+			};
 			const replies = [
 				await messagesRequest(
 					ctx,
@@ -204,7 +219,6 @@ export function registerWeb(pi: ExtensionAPI, render: typeof renderPage = render
 					params.prompt ? ANSWER_SYSTEM.replace("Answer the request", "Fetch the URL, then answer the request") : "Fetch the URL. Then reply with only: done.",
 					params.prompt ? `Fetch ${params.url}\n\nRequest: ${params.prompt}` : `Fetch ${params.url}`,
 					signal,
-					"web-fetch-2025-09-10",
 				),
 			];
 			let document = fetchedDocument(replies[0].content);
@@ -220,7 +234,7 @@ export function registerWeb(pi: ExtensionAPI, render: typeof renderPage = render
 					if (signal?.aborted) throw error;
 					const failure = { message: (error as Error).message, tabOpen: error instanceof RenderError && error.tabOpen };
 					const text = browserNeeded(url, blocked, failure, pi.getAllTools().map((tool) => tool.name));
-					return { content: [{ type: "text", text }], details: { ...document, blocked, render: failure }, usage: piUsage(ctx, ...replies), isError: true };
+					return { content: [{ type: "text", text }], details: { url, blocked, render: failure }, usage: piUsage(ctx, ...replies), isError: true };
 				}
 				rendered = true;
 				document = { url: page.url, text: page.title ? `# ${page.title}\n\n${page.text}` : page.text };
@@ -240,16 +254,31 @@ export function registerWeb(pi: ExtensionAPI, render: typeof renderPage = render
 			if (document.error) {
 				return { content: [{ type: "text", text: `Could not fetch ${params.url}: ${document.error}` }], details: document, usage, isError: true };
 			}
+			const url = document.url ?? params.url;
+			// With a prompt the model already answered from the fetched PDF itself; without one, its text is the result.
+			if (!params.prompt && document.pdf !== undefined) {
+				try {
+					document.text = await pdfText(Buffer.from(document.pdf, "base64"), signal);
+				} catch (error) {
+					if (!(error instanceof PdfTextError)) throw error;
+					const text = `Could not extract the text of the PDF ${url}: ${error.message}. Pass a prompt to have the model read the PDF instead.`;
+					return { content: [{ type: "text", text }], details: { url, rendered, pdf: true }, usage, isError: true };
+				}
+				if (!document.text) {
+					const text = `The PDF ${url} has no text layer (a scanned document?). Pass a prompt to have the model read its pages.`;
+					return { content: [{ type: "text", text }], details: { url, rendered, pdf: true }, usage };
+				}
+			}
 			let text: string;
-			if (params.prompt) text = `${answer}\n\nSource: ${document.url ?? params.url}${rendered ? " (rendered in a browser)" : ""}`;
-			else if (document.text === undefined) text = `${document.url ?? params.url} is not a text document; pass a prompt to read it.`;
+			if (params.prompt) text = `${answer}\n\nSource: ${url}${rendered ? " (rendered in a browser)" : ""}`;
+			else if (document.text === undefined) text = `${url} is not a text document; pass a prompt to read it.`;
 			else {
 				const truncated = truncateHead(document.text);
 				text = truncated.truncated
 					? `${truncated.content}\n\n[Truncated: showing ${truncated.outputLines} of ${truncated.totalLines} lines. For the rest, pass a prompt that names the part you need (asking for its verbatim text if you need the exact wording).]`
 					: document.text;
 			}
-			return { content: [{ type: "text", text }], details: { url: document.url ?? params.url, rendered }, usage };
+			return { content: [{ type: "text", text }], details: { url, rendered, ...(document.pdf !== undefined ? { pdf: true } : {}) }, usage };
 		},
 	});
 }
