@@ -375,6 +375,27 @@ describe("setsid", () => {
 	});
 });
 
+describe("a foreground wait", () => {
+	test("on CI or a long sleep is refused before anything of the command runs; in a background job it runs", async () => {
+		const s = await newSession();
+		const ran = marker();
+		respond(
+			bash(`touch '${ran}'; timeout 3000 gh run watch 1 --exit-status > /dev/null 2>&1; echo done`),
+			bash(`git push; sleep 20; tail ci.log`),
+			bash("sleep 30 > /dev/null 2>&1 & until true; do sleep 1; done; echo started"),
+			fauxAssistantMessage("ok"),
+		);
+		await s.prompt("push and check CI");
+		const texts = toolTexts(s);
+		assert.ok(!existsSync(ran), "nothing of the refused command ran");
+		assert.match(texts[0]!, /^Not run: this command waits idly in the foreground \(CI watch, or 10s or more of `sleep`\):\n- `timeout 3000 gh run watch 1 --exit-status > \/dev\/null 2>&1`\n/);
+		assert.match(texts[0]!, /`gh run watch <id> --exit-status > ci\.log 2>&1 &`/);
+		assert.match(texts[1]!, /^Not run: this command waits idly in the foreground [^\n]*\n- `sleep 20`\n/);
+		assert.match(texts[2]!, /^started\n/);
+		assert.equal(jobsOf(s).size + sessionJobs(s.sessionManager.getSessionId()).leftovers.size, 1, "the background sleep runs as a job");
+	});
+});
+
 describe("a publish gated on a filtered pipeline", () => {
 	test("is refused before anything of the command runs; with pipefail it runs and the failure holds the push", async () => {
 		const s = await newSession();
@@ -545,7 +566,7 @@ describe("long commands move to the background", () => {
 		const s = await newSession();
 		let steered = "";
 		respond(
-			bash("echo waiting; sleep 30"),
+			bash("echo waiting; tail -f /dev/null"),
 			(context) => {
 				steered = JSON.stringify(context.messages.slice(-2));
 				const [job] = [...jobsOf(s).values()];
@@ -564,7 +585,7 @@ describe("long commands move to the background", () => {
 		assert.match(steered, /stop that, do something else/);
 		assert.match(steered, /A new message arrived/, "the agent got the tool result and the message in one go");
 		await until("the job's report", () => jobMessages(s).length === 1 && !s.isStreaming);
-		assert.ok(Date.now() - t0 < 5000, "nothing waited for the 30 s sleep");
+		assert.ok(Date.now() - t0 < 5000, "nothing waited for the command");
 		assert.match(jobMessages(s)[0]!, /failed with exit code 143 after/);
 		assert.match(jobMessages(s)[0]!, /waiting/);
 	});
@@ -573,9 +594,9 @@ describe("long commands move to the background", () => {
 		// No command reaches the detach limit, however slow the machine: a message moves the first one
 		// to the background, so the second stays in the foreground until the abort.
 		const s = await newSession(FOREGROUND_MS);
-		// Durations of their own, so no other test run's `sleep` matches.
+		// Long commands (not `sleep`, refused in the foreground: wait.ts) with arguments of their own, so no other test run's matches.
 		const id = `${process.pid}${Date.now() % 1000}`;
-		const [first, second] = [`sleep 30.${id}`, `sleep 31.${id}`];
+		const [first, second] = [`tail -n 30${id} -f /dev/null`, `tail -n 31${id} -f /dev/null`];
 		respond(bash(first), bash(second), fauxAssistantMessage("unused"));
 		const run = s.prompt("go");
 		// pgrep, not every command line from ps: those exceed spawnSync's output limit when many processes run.
@@ -599,11 +620,11 @@ describe("long commands move to the background", () => {
 
 	test("a command's own timeout still ends it in the background, and the report says so", async () => {
 		const s = await newSession();
-		respond(bash("echo started; sleep 10", 1.5), fauxAssistantMessage("In the background."), fauxAssistantMessage("It timed out."));
+		respond(bash("echo started; tail -f /dev/null", 1.5), fauxAssistantMessage("In the background."), fauxAssistantMessage("It timed out."));
 		await s.prompt("go");
 		await until("the wake run", settled(s, "It timed out."));
 		// The command itself, not the call's JSON with its timeout.
-		assert.match(jobMessages(s)[0]!, /^Your background `bash` call `echo started; sleep 10` \(call [^)]+\) failed after \d s:\n\nstarted\n+Command timed out after 1\.5 seconds$/);
+		assert.match(jobMessages(s)[0]!, /^Your background `bash` call `echo started; tail -f \/dev\/null` \(call [^)]+\) failed after \d s:\n\nstarted\n+Command timed out after 1\.5 seconds$/);
 	});
 
 	test("a command a script runs through ctx.executeTool stays in the foreground of the script: only the script moves", async () => {

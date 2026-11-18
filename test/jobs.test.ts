@@ -432,14 +432,14 @@ describe("/jobs", () => {
 		model(bash("sleep 30 > /dev/null 2>&1 &\nbash -c 'sleep 31 > /dev/null 2>&1 &'\necho started"));
 		await x.s.prompt("go");
 		await until("idle", idle(x));
-		model(bash("sleep 32"));
+		model(bash("tail -f /dev/null"));
 		await x.s.prompt("again");
 		await x.s.prompt("/jobs");
 		const text = x.notices.at(-1)!;
 		const lines = text.split("\n");
 		assert.equal(lines[0], "Background work of this session (2):");
 		assert.match(lines[1]!, /^1\. process: sleep 30 · \d+ s · pid \d+ \(group \d+\)$/);
-		assert.match(lines[2]!, /^2\. bash: sleep 32 · \d+ s · process group \d+ · log \S+\.log$/);
+		assert.match(lines[2]!, /^2\. bash: tail -f \/dev\/null · \d+ s · process group \d+ · log \S+\.log$/);
 		assert.equal(lines[3], "Stop one with /jobs stop <number>.");
 		assert.equal(lines[5], "Left running by programs, not tracked (nothing waits for them; stop one with `kill <pid>`):");
 		assert.match(lines[6]!, /^- pid (\d+) \(group \d+\): sleep 31 · \d+ s · left by `sleep 30 > \/dev\/null 2>&1 & bash -c 'sleep 31 > \/dev\/null 2…`$/);
@@ -456,13 +456,13 @@ describe("/jobs", () => {
 
 	test("stop: a bash call's process group is killed and its call aborted; its end reaches the agent", async () => {
 		const x = await newSession();
-		model(bash("sleep 30"));
+		model(bash("tail -f /dev/null"));
 		await x.s.prompt("go");
 		const [job] = latest(x);
 		await x.s.prompt("/jobs stop 1");
-		assert.equal(x.notices.at(-1), `Stopped bash: sleep 30: killed process group ${job!.processGroup} and aborted its call ${job!.id}.`);
+		assert.equal(x.notices.at(-1), `Stopped bash: tail -f /dev/null: killed process group ${job!.processGroup} and aborted its call ${job!.id}.`);
 		await until("its end", () => latest(x).length === 0 && jobMessages(x.s).length === 1);
-		assert.match(jobMessages(x.s)[0]!, /^Your background `bash` call `sleep 30` \(call [^)]+\) failed after/);
+		assert.match(jobMessages(x.s)[0]!, /^Your background `bash` call `tail -f \/dev\/null` \(call [^)]+\) failed after/);
 		await until("the group gone", () => !alive(-job!.processGroup!));
 	});
 

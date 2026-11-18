@@ -10,7 +10,9 @@
 // - every process a command leaves running (`cmd &`, a script's server) is tracked, and each one's
 //   end wakes the session (leftovers.ts); a `tool` command left running (`tool workflow … &`)
 //   keeps its call, and its end brings its exit code and result (bridge.ts);
-// - `setsid`, which would move a job out of reach, is refused (detach.ts).
+// - `setsid`, which would move a job out of reach, is refused (detach.ts);
+// - so is a command that waits idly in the foreground, on CI (`gh run watch`) or with a `sleep` of
+//   10 seconds or more, where a background job would wake the session at the same end (wait.ts).
 //
 // Agents share checkouts, so commands that throw away other agents' uncommitted work are refused
 // too (git.ts: `git stash`, `git reset --hard`, `git clean -f`, whole-tree discards), and so is a
@@ -39,6 +41,7 @@ import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
 import { gateRefusal } from "./gate.ts";
 import { gitRefusal } from "./git.ts";
 import { messageFileRefusal } from "./message.ts";
+import { waitRefusal } from "./wait.ts";
 import { defaultPs, type Ps } from "../lib/ps.ts";
 import { adoptLeftovers, leftText, type Untracked, untrackedText } from "./leftovers.ts";
 
@@ -101,7 +104,7 @@ export function readGroup(file: string): number | undefined {
 const POLL_MS = 1000;
 
 /** What the tool refuses to run, for its description. */
-const REFUSED = "Refused before they run: `setsid`, `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), a `git commit` of changes your edit and write tools did not make, a commit or tag message read from a file (`-F <file>`; use `-F -` with a heredoc), and a commit or push gated (`&&`, `||`, `if`, `set -e`) on a pipeline ending in a filter (`tests | grep … && git commit`) without `set -o pipefail`.";
+const REFUSED = "Refused before they run: `setsid`, a foreground wait (`gh run watch`, `gh pr checks --watch`, `sleep` of 10 s or more outside a background job; per iteration in a loop), `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), a `git commit` of changes your edit and write tools did not make, a commit or tag message read from a file (`-F <file>`; use `-F -` with a heredoc), and a commit or push gated (`&&`, `||`, `if`, `set -e`) on a pipeline ending in a filter (`tests | grep … && git commit`) without `set -o pipefail`.";
 /** How to work beside other agents, for the tool's guidelines. */
 const SHARED_CHECKOUT_GUIDELINE =
 	"Other agents may work in the same checkout or worktrees of the same repository, so `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f` and whole-tree discards (`git checkout -- .`, `git restore .`) are refused: for a clean state use `git worktree add /tmp/<name> HEAD`, and restore or commit only your own paths. A `git commit` that would take changes your edit and write tools did not make is refused with the paths; after `git diff` shows they are yours, run it as `PI_COMMIT_CHECKED=1 git commit …`. Pass a commit message on stdin from a quoted heredoc in the same command (`git commit --only <paths> -F - <<'EOF'`), never through a message file: parallel agents overwrite each other's files in /tmp. For the same reason scratch work goes in a directory of your own, `D=$(mktemp -d) && cd \"$D\" && …`, never a fixed name in /tmp: such a name is often taken (2026-11-16: `mkdir -p /tmp/mm` met another agent's binary, the commands after `;` ran in /tmp itself, and `wc -c *` hung on its FIFOs until the timeout). Join a `cd` to the commands that depend on it with `&&`.";
@@ -139,7 +142,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 		if (FILE_TOOLS.has(event.toolName)) changeEnds(sessionFiles(ctx.sessionManager.getSessionId()), event.toolCallId, event.isError);
 	});
 
-	// A command using `setsid`, discarding uncommitted work (git.ts), committing changes that are
+	// A command using `setsid`, waiting idly in the foreground (wait.ts), discarding uncommitted work (git.ts), committing changes that are
 	// not the session's (commit.ts), reading its message from a file (message.ts) or publishing on a
 	// filter's status (gate.ts) is refused here;
 	// Pi then runs no later handler.
@@ -148,7 +151,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 		const { command } = event.input;
 		const setsid = setsidCommands(command);
 		const id = ctx.sessionManager.getSessionId();
-		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, gitRefusal(command), messageFileRefusal(command), gateRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
+		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, waitRefusal(command), gitRefusal(command), messageFileRefusal(command), gateRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
 		if (reasons.length > 0) return { block: true, reason: reasons.join("\n\n") };
 		mkdirSync(sessionDir(id), { recursive: true });
 		event.input.command = recordLine(groupFile(id, event.toolCallId)) + event.input.command;

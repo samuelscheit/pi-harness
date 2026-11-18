@@ -1,5 +1,5 @@
 // The commands a bash command line runs, for the refusals before it runs (detach.ts, git.ts,
-// commit.ts, gate.ts).
+// commit.ts, gate.ts, wait.ts).
 //
 // The command is parsed with unbash (a Bash 5.3 parser; pi-lens installs it), so a command name in
 // quoted text, a comment or a heredoc body does not count, while one behind wrappers (`nohup`,
@@ -19,7 +19,15 @@ export interface RunCommand {
 	env: Record<string, string>;
 	/** The file its standard input is redirected from (`< file`, `0< file`), if any; heredocs and here-strings are not files. */
 	stdin?: string;
+	/** It runs in a background job: under a list item ended by `&` (`cmd &`, `( … ) &`, `{ …; } &`) or a `coproc`. */
+	background?: boolean;
+	/** The innermost loop (`while`, `until`, `for`, `select`) it runs in, clause or body; one node per loop. */
+	loop?: SyntaxNode;
 }
+
+/** Where a command runs: in a background job, in a loop. */
+type Context = Pick<RunCommand, "background" | "loop">;
+const LOOPS = new Set(["While", "For", "ArithmeticFor", "Select"]);
 
 /** Commands that run their arguments as a command. */
 const WRAPPERS = new Set(["builtin", "caffeinate", "command", "env", "exec", "gtimeout", "nice", "nohup", "stdbuf", "sudo", "time", "timeout"]);
@@ -60,20 +68,27 @@ export function scriptOf({ name, args }: RunCommand): string | undefined {
 	return flag < 0 ? undefined : args[flag + 1];
 }
 
-/** Every command `source` runs, wrappers and the commands they run included, in source order. */
-export function commandsIn(source: string): RunCommand[] {
+/**
+ * Every command `source` runs, wrappers and the commands they run included, in source order, each
+ * with where it runs ({@link RunCommand.background}, {@link RunCommand.loop}); a script it runs
+ * (`bash -c`, `eval`) runs where the command does.
+ */
+export function commandsIn(source: string, context: Context = {}): RunCommand[] {
 	const found: RunCommand[] = [];
-	const visit = (node: SyntaxNode) => {
+	const visit = (node: SyntaxNode, context: Context) => {
+		if ((node.type === "Statement" && node.background) || node.type === "Coproc") context = { ...context, background: true };
+		if (LOOPS.has(node.type)) context = { ...context, loop: node };
 		if (node.type === "Command") {
 			for (const command of unwrap(node, source.slice(node.pos, node.end))) {
-				found.push(command);
+				const located = { ...command, ...(context.background ? { background: true } : {}), ...(context.loop ? { loop: context.loop } : {}) };
+				found.push(located);
 				const script = scriptOf(command);
-				if (script !== undefined) found.push(...commandsIn(script));
+				if (script !== undefined) found.push(...commandsIn(script, context));
 			}
 		}
-		forEachChild(node, visit);
+		forEachChild(node, (child) => visit(child, context));
 	};
-	visit(parse(source));
+	visit(parse(source), context);
 	return found;
 }
 
