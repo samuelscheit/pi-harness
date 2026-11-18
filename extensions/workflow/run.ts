@@ -22,7 +22,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { type ToolCall, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
-import { type ModelRuntime, SettingsManager, truncateHead } from "@earendil-works/pi-coding-agent";
+import { type ExtensionUIQuestion, type ModelRuntime, SettingsManager, truncateHead } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
 import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
@@ -521,7 +521,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 			: undefined;
 	let delegates = 0;
 	/** Ask whoever runs the workflow with its session's ask_user; resolves to the answers in order. */
-	const askUser = async (questions: readonly { title: string; options?: string[] }[], callSignal: AbortSignal) => {
+	const askUser = async (questions: readonly ExtensionUIQuestion[], callSignal: AbortSignal) => {
 		if (!executeTool) throw new Error("ask_user needs a session");
 		const outcome = await executeTool("ask_user", { questions: questions.map(({ title, options }) => ({ title, ...(options ? { options } : {}) })), wait_minutes: ASK_WAIT_MINUTES }, callSignal);
 		if (outcome.isError) throw new Error(outcome.text || "ask_user failed");
@@ -546,7 +546,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 								const asking = name === "ask_user";
 								const idempotent = asking || idempotentOption(options, `tools.${name}()`);
 								return durable.call({ kind: "tool", args: { name, args }, label: `${name} ${firstLine(JSON.stringify(args) ?? "", 100)}`, idempotent }, async (call) => {
-									if (asking) return { value: await askUser(((args ?? {}) as { questions?: { title: string; options?: string[] }[] }).questions ?? [], call.signal) };
+									if (asking) return { value: await askUser(((args ?? {}) as { questions?: ExtensionUIQuestion[] }).questions ?? [], call.signal) };
 									const outcome = await executeTool(name, args, call.signal);
 									live();
 									if (outcome.isError && !outcome.structured) throw new Error(outcome.text || `tool ${name} failed`);

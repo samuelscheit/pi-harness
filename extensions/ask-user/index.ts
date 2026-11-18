@@ -33,7 +33,7 @@ export const DEFAULT_WAIT_MINUTES = 15;
 // Codex's points that still hold (codex-rs/prompts/src/model_messages.rs): concise, self-contained
 // questions, options, free text always allowed.
 const DESCRIPTION =
-	"Ask whoever directs you one or more questions: at top level the user, as a delegated child your parent. Use it for missing information, preferences or approval, and whenever the plan no longer fits: ask rather than guess. Only for questions that need an answer: a status report or result goes into your normal reply, never into ask_user. The call waits for the answers, which are its result, up to `wait_minutes`; a reply in the chat answers too. Unanswered by then, it returns and the answers arrive later as a message. Set `wait_minutes: 0` when you have other work that does not depend on the answers. Keep questions concise and self-contained. The card shows only each title and the option labels: an explanation or context the user needs goes into your visible reply before the call, never only into your thinking. When an answer asks for an explanation, write it in your reply and end your turn instead of asking again. A free-text answer is always possible, also when options are given; a preselected option is not submitted automatically.";
+	"Ask whoever directs you one or more questions: at top level the user, as a delegated child your parent. Use it for missing information, preferences or approval, and whenever the plan no longer fits: ask rather than guess. Only for questions that need an answer: a status report or result goes into your normal reply, never into ask_user. The call waits for the answers, which are its result, up to `wait_minutes`; a reply in the chat answers too. Unanswered by then, it returns and the answers arrive later as a message. Set `wait_minutes: 0` when you have other work that does not depend on the answers. Keep questions concise and self-contained. Give each option a `description` that says what picking it means and what it costs: the card shows it under the label. A longer explanation goes into your visible reply before the call, never only into your thinking. When an answer asks for an explanation, write it in your reply and end your turn instead of asking again. A free-text answer is always possible, also when options are given; a preselected option is not submitted automatically.";
 
 const parameters = Type.Object(
 	{
@@ -42,11 +42,20 @@ const parameters = Type.Object(
 				{
 					title: Type.String({ description: "The complete question, including any context needed to answer it." }),
 					options: Type.Optional(
-						Type.Array(Type.String(), {
-							minItems: 1,
-							description:
-								"Suggested answers, recommended first (it is preselected). Do not add an Other option: free text is always possible. Omit for a free-text-only question.",
-						}),
+						Type.Array(
+							Type.Object(
+								{
+									label: Type.String({ description: "The answer when picked: short, a few words." }),
+									description: Type.Optional(Type.String({ description: "What picking it means: its effect and trade-off, in one or two sentences." })),
+								},
+								{ additionalProperties: false },
+							),
+							{
+								minItems: 1,
+								description:
+									"Suggested answers, recommended first (it is preselected). Do not add an Other option: free text is always possible. Omit for a free-text-only question.",
+							},
+						),
 					),
 				},
 				{ additionalProperties: false },
@@ -67,8 +76,8 @@ const parameters = Type.Object(
 export function invalidQuestions(questions: ExtensionUIQuestion[]): string | undefined {
 	if (questions.length === 0) return "questions must not be empty";
 	if (questions.some((q) => !q.title.trim())) return "question titles must not be empty";
-	if (questions.some((q) => q.options && (q.options.length === 0 || q.options.some((o) => !o.trim())))) {
-		return "options must contain at least one non-empty answer";
+	if (questions.some((q) => q.options && (q.options.length === 0 || q.options.some((o) => !o.label.trim())))) {
+		return "options must contain at least one answer, each with a non-empty label";
 	}
 	return undefined;
 }

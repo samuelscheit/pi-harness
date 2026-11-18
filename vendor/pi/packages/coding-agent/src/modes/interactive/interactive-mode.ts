@@ -95,6 +95,7 @@ import type {
 	UserBashEventResult,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { questionOptionLine } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -2976,8 +2977,13 @@ export class InteractiveMode {
 				answers.push(await this.showExtensionInput(title, undefined, { signal }));
 				continue;
 			}
-			const choice = await this.showExtensionSelector(title, [...question.options, TYPE_AN_ANSWER], { signal });
-			answers.push(choice === TYPE_AN_ANSWER ? await this.showExtensionInput(title, undefined, { signal }) : choice);
+			const lines = question.options.map(questionOptionLine);
+			const choice = await this.showExtensionSelector(title, [...lines, TYPE_AN_ANSWER], { signal });
+			answers.push(
+				choice === TYPE_AN_ANSWER
+					? await this.showExtensionInput(title, undefined, { signal })
+					: question.options[lines.indexOf(choice!)]?.label,
+			);
 		}
 		return signal?.aborted ? undefined : answers;
 	}

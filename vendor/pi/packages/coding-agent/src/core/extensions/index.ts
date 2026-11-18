@@ -97,6 +97,7 @@ export type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionUIQuestion,
+	ExtensionUIQuestionOption,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
 	FindToolCallEvent,
@@ -230,5 +231,6 @@ export {
 	isReadToolResult,
 	isToolCallEventType,
 	isWriteToolResult,
+	questionOptionLine,
 } from "./types.ts";
 export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.ts";

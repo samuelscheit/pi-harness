@@ -15,14 +15,14 @@
 // Every question and its answer is a journaled call (kind `ask`), so a resume replays the answer
 // instead of asking the handler again.
 
-import type { ExtensionUIContext, ExtensionUIQuestion } from "@earendil-works/pi-coding-agent";
+import type { ExtensionUIContext, ExtensionUIQuestion, ExtensionUIQuestionOption } from "@earendil-works/pi-coding-agent";
 import type { T3Call } from "./t3.ts";
 
 /** A question as onAsk sees it. */
 export interface Question {
 	id: string;
 	title: string;
-	options?: string[];
+	options?: ExtensionUIQuestionOption[];
 }
 
 /** What onAsk may return: answers in question order, or by question id; undefined passes the questions up. */
@@ -57,8 +57,12 @@ export type Ask = (questions: Question[], signal: AbortSignal) => Promise<(strin
 interface PendingQuestion {
 	id: string;
 	question: string;
-	options?: { label: string }[];
+	options?: { label: string; description?: string }[];
 }
+
+/** A card's option as asked: t3 repeats the label as the description of an option without one. */
+const askedOption = ({ label, description }: { label: string; description?: string }): ExtensionUIQuestionOption =>
+	description && description !== label ? { label, description } : { label };
 
 /**
  * The t3 side: answer the questions pending in a child's thread with `ask`. Each request is handled
@@ -71,7 +75,7 @@ export async function answerPending(call: T3Call, threadId: string, handled: Set
 	for (const requestId of ids) {
 		const read = await call("t3_pending_request", { action: "read", threadId, requestId }, signal);
 		const pending = (Array.isArray(read.questions) ? read.questions : []) as PendingQuestion[];
-		const questions: Question[] = pending.map((q) => ({ id: q.id, title: q.question, ...(q.options?.length ? { options: q.options.map((o) => o.label) } : {}) }));
+		const questions: Question[] = pending.map((q) => ({ id: q.id, title: q.question, ...(q.options?.length ? { options: q.options.map(askedOption) } : {}) }));
 		handled.add(requestId);
 		const answers = await ask(questions, signal);
 		if (!answers) continue;

@@ -22,7 +22,7 @@
  * `delegate_task` is `delegate`.
  */
 declare const tools: Record<string, (args: Record<string, unknown>, options?: { idempotent?: boolean }) => Promise<any>> & {
-	ask_user(args: { questions: { title: string; options?: string[] }[] }, options?: { idempotent?: boolean }): Promise<(string | undefined)[]>;
+	ask_user(args: { questions: { title: string; options?: { label: string; description?: string }[] }[] }, options?: { idempotent?: boolean }): Promise<(string | undefined)[]>;
 	"mcp__t3-code__delegate_task": typeof delegate;
 };
 
@@ -73,7 +73,7 @@ declare function delegate(params?: {
 	template?: string;
 	fork?: boolean;
 	forkThreadId?: string;
-	onAsk?: (questions: { id: string; title: string; options?: string[] }[]) => Promise<string[] | Record<string, string> | undefined>;
+	onAsk?: (questions: { id: string; title: string; options?: { label: string; description?: string }[] }[]) => Promise<string[] | Record<string, string> | undefined>;
 }): Delegate;
 
 interface DelegateRun {

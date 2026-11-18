@@ -80,7 +80,7 @@ Expected response: `extension_ui_response` with `value` (the entered text) or `c
 
 ### questions
 
-Ask several questions at once (`ctx.ui.questions()`), for example as one card the user pages through. Each question has suggested `options`, or none for a free-text question; the user may always type an answer instead of picking one. `title` summarizes the dialog: the question itself for one, `"<n> questions"` for several.
+Ask several questions at once (`ctx.ui.questions()`), for example as one card the user pages through. Each question has suggested `options` (a `label`, which is the answer when picked, and an optional `description` of what picking it means), or none for a free-text question; the user may always type an answer instead of picking one. A client without `questions` in `PI_RPC_DIALOGS` gets one `select` per question instead, its options as `label — description` lines. `title` summarizes the dialog: the question itself for one, `"<n> questions"` for several.
 
 ```json
 {
@@ -89,7 +89,13 @@ Ask several questions at once (`ctx.ui.questions()`), for example as one card th
   "method": "questions",
   "title": "2 questions",
   "questions": [
-    { "title": "Which area first?", "options": ["Limitation", "Contracts"] },
+    {
+      "title": "Which area first?",
+      "options": [
+        { "label": "Limitation", "description": "When claims become time-barred" },
+        { "label": "Contracts" }
+      ]
+    },
     { "title": "Anything else to consider?" }
   ]
 }

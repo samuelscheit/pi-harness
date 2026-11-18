@@ -39,9 +39,9 @@ describe("questions and answers", () => {
 	test("refuses unusable questions", () => {
 		assert.equal(invalidQuestions([]), "questions must not be empty");
 		assert.match(invalidQuestions([{ title: "  " }])!, /titles must not be empty/);
-		assert.match(invalidQuestions([{ title: "x", options: [] }])!, /at least one non-empty answer/);
-		assert.match(invalidQuestions([{ title: "x", options: ["a", " "] }])!, /at least one non-empty answer/);
-		assert.equal(invalidQuestions([{ title: "x", options: ["a"] }, { title: "y" }]), undefined);
+		assert.match(invalidQuestions([{ title: "x", options: [] }])!, /at least one answer/);
+		assert.match(invalidQuestions([{ title: "x", options: [{ label: "a" }, { label: " ", description: "blank label" }] }])!, /non-empty label/);
+		assert.equal(invalidQuestions([{ title: "x", options: [{ label: "a", description: "" }] }, { title: "y" }]), undefined);
 	});
 
 	test("formats answers: one question without a number, dismissed and empty answers distinct, chat replies noted", () => {
@@ -170,9 +170,9 @@ const waits = (s: AgentSession) => (globalThis as { __harnessAskUserWaits?: Map<
 describe("ask_user waits for the answers", () => {
 	test("the dialog's answers are the call's result; it waits past the background limit", async () => {
 		const { s, dialogs } = await newSession();
-		const questions: { title: string; options?: string[] }[] = [{ title: "Area?", options: ["A", "B"] }, { title: "Why?" }];
+		const questions: ExtensionUIQuestion[] = [{ title: "Area?", options: [{ label: "A", description: "the first area" }, { label: "B" }] }, { title: "Why?" }];
 		let seen = "";
-		respond(ask({ questions: questions as Args[string] }), (context) => {
+		respond(ask({ questions: questions as unknown as Args[string] }), (context) => {
 			seen = JSON.stringify(context.messages.at(-1));
 			return fauxAssistantMessage("Going with B.");
 		});
@@ -205,7 +205,7 @@ describe("ask_user waits for the answers", () => {
 	test("without an answer in time it returns; the late answer arrives as a message that starts a run", async () => {
 		const { s, dialogs } = await newSession();
 		let woken = "";
-		respond(ask({ questions: [{ title: "Deploy?", options: ["yes", "no"] }], wait_minutes: 0.005 }), fauxAssistantMessage("Doing other work."), (context) => {
+		respond(ask({ questions: [{ title: "Deploy?", options: [{ label: "yes" }, { label: "no" }] }], wait_minutes: 0.005 }), fauxAssistantMessage("Doing other work."), (context) => {
 			woken = JSON.stringify(context.messages.at(-1));
 			return fauxAssistantMessage("Deploying.");
 		});
@@ -242,7 +242,7 @@ describe("ask_user waits for the answers", () => {
 	test("a chat reply answers one question, closes the dialog, and is delivered once", async () => {
 		const { s, dialogs } = await newSession();
 		let seen = "";
-		respond(ask({ questions: [{ title: "Which database?", options: ["Postgres", "SQLite"] }] }), (context) => {
+		respond(ask({ questions: [{ title: "Which database?", options: [{ label: "Postgres" }, { label: "SQLite" }] }] }), (context) => {
 			seen = JSON.stringify(context.messages.map((m) => ("content" in m ? m.content : "")));
 			return fauxAssistantMessage("Using SQLite.");
 		});

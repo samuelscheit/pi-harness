@@ -29,16 +29,22 @@ function ask(answers: ((dialog: Dialog) => Promise<string | undefined> | string 
 
 describe("InteractiveMode questions dialog", () => {
 	it("asks one question after another: options with a typed-answer escape, free text as input, Escape skips", async () => {
-		const { shown, run } = ask([() => "B", () => "Type an answer…", () => "typed", () => "free", () => undefined]);
+		const { shown, run } = ask([
+			() => "B — the second",
+			() => "Type an answer…",
+			() => "typed",
+			() => "free",
+			() => undefined,
+		]);
 		const answers = await run([
-			{ title: "Pick", options: ["A", "B"] },
-			{ title: "Or type", options: ["C"] },
+			{ title: "Pick", options: [{ label: "A" }, { label: "B", description: "the second" }] },
+			{ title: "Or type", options: [{ label: "C" }] },
 			{ title: "Free" },
 			{ title: "Skip me" },
 		]);
 		expect(answers).toEqual(["B", "typed", "free", undefined]);
 		expect(shown.map(({ kind, title, options }) => [kind, title, options])).toEqual([
-			["select", "(1/4) Pick", ["A", "B", "Type an answer…"]],
+			["select", "(1/4) Pick", ["A", "B — the second", "Type an answer…"]],
 			["select", "(2/4) Or type", ["C", "Type an answer…"]],
 			["input", "(2/4) Or type", undefined],
 			["input", "(3/4) Free", undefined],
@@ -62,7 +68,7 @@ describe("InteractiveMode questions dialog", () => {
 				return undefined;
 			},
 		]);
-		const answers = await run([{ title: "One", options: ["A"] }, { title: "Two" }, { title: "Three" }], {
+		const answers = await run([{ title: "One", options: [{ label: "A" }] }, { title: "Two" }, { title: "Three" }], {
 			signal: controller.signal,
 		});
 		expect(answers).toBeUndefined();

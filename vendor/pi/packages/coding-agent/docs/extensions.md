@@ -2909,8 +2909,9 @@ const name = await ctx.ui.input("Name:", "placeholder");
 // Several questions in one dialog (one card in RPC clients, one after another in the terminal).
 // One answer per question (undefined if skipped), or undefined if the dialog was dismissed.
 // The user can type an answer instead of picking an option; omit options for free text.
+// A picked option answers with its label; its description says what picking it means.
 const answers = await ctx.ui.questions([
-  { title: "Which area first?", options: ["Limitation", "Contracts"] },
+  { title: "Which area first?", options: [{ label: "Limitation", description: "When claims become time-barred" }, { label: "Contracts" }] },
   { title: "Anything else?" },
 ]);
 

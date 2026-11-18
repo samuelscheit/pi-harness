@@ -143,6 +143,11 @@
 //   belong to thread <its own thread>`, which read as if its thread had changed. Both tools now take
 //   a task id, any part of it unique among the thread's tasks, or its child's thread id, part or link
 //   (that child's newest task); an unknown or ambiguous one fails naming the thread's newest tasks.
+// - question-descriptions (a Pi question's option carries a description): the questions patch filled
+//   each option's description with its label, so the card could not say what an option means, and an
+//   agent explained only in its thinking and asked again, twice (thread fa34a168, 2026-11-18). Pi's
+//   options are now `{ label, description? }`; the card shows the description, or the label again
+//   (t3 requires one and hides it when it equals the label). Edits the questions patch's result.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -1038,6 +1043,16 @@ export const PATCHES: Patch[] = [
 			[
 				"if (original === void 0 || original.result === null) return;",
 				'if (original === void 0 || original.result === null && original.completionDelivery?.state !== "disposed" /* followupAfterDisposedDelivery */) return;',
+			],
+		],
+	},
+	{
+		name: "question-descriptions",
+		marker: 'piRecordString(option, "description")',
+		edits: [
+			[
+				'options: Array.isArray(options) ? options.filter((option) => typeof option === "string").map((option) => ({ label: option || "Empty value", description: option || "Empty value", value: option })) : []',
+				'options: Array.isArray(options) ? options.flatMap((option) => { const label = piRecordString(option, "label"); if (label === void 0) return []; const shown = label.trim() || "Empty value"; return [{ label: shown, description: piRecordString(option, "description")?.trim() || shown, value: label }]; }) : []',
 			],
 		],
 	},

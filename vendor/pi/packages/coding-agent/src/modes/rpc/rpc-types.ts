@@ -266,7 +266,7 @@ export type RpcExtensionUIRequest =
 			method: "questions";
 			/** A summary for the dialog: the question for one, "<n> questions" for several. */
 			title: string;
-			questions: { title: string; options?: string[] }[];
+			questions: { title: string; options?: { label: string; description?: string }[] }[];
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string }

@@ -19,6 +19,7 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { questionOptionLine } from "../../core/extensions/index.ts";
 import {
 	flushRawStdout,
 	takeOverStdout,
@@ -179,9 +180,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				const values: string[] = [];
 				for (const [i, { title, options }] of questions.entries()) {
 					const shown = questions.length > 1 ? `(${i + 1}/${questions.length}) ${title}` : title;
-					const value = options ? await select(shown, options, opts) : await input(shown, undefined, opts);
+					const lines = options?.map(questionOptionLine);
+					const value = lines ? await select(shown, lines, opts) : await input(shown, undefined, opts);
 					if (value === undefined) return undefined;
-					values.push(value);
+					// A select client may still answer with text of its own.
+					values.push(options?.[lines!.indexOf(value)]?.label ?? value);
 				}
 				return values;
 			}
@@ -191,7 +194,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				{
 					method: "questions",
 					title: questions.length === 1 ? questions[0]!.title : `${questions.length} questions`,
-					questions: questions.map(({ title, options }) => (options ? { title, options } : { title })),
+					questions: questions.map(({ title, options }) =>
+						options
+							? {
+									title,
+									options: options.map(({ label, description }) =>
+										description ? { label, description } : { label },
+									),
+								}
+							: { title },
+					),
 					timeout: opts?.timeout,
 				},
 				(r) => ("values" in r ? questions.map((_, i) => r.values[i] ?? undefined) : undefined),

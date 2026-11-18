@@ -16,15 +16,15 @@ export default function (pi) {
 		description: "questions dialogs",
 		handler: async (_args, ctx) => {
 			const answered = await ctx.ui.questions([
-				{ title: "Which area?", options: ["Limitation", "Contracts"], extra: "dropped" },
+				{ title: "Which area?", options: [{ label: "Limitation", description: "time bars", extra: "dropped" }, { label: "Contracts", description: "" }], extra: "dropped" },
 				{ title: "Anything else?" },
-				{ title: "Skipped?", options: ["a"] },
+				{ title: "Skipped?", options: [{ label: "a" }] },
 			]);
 			const cancelled = await ctx.ui.questions([{ title: "cancel me" }, { title: "and me" }]);
 			const controller = new AbortController();
 			setTimeout(() => controller.abort(), 100);
 			const aborted = await ctx.ui.questions([{ title: "aborted" }, { title: "too" }], { signal: controller.signal });
-			const single = await ctx.ui.questions([{ title: "Only one?", options: ["yes"] }], { timeout: 60_000 });
+			const single = await ctx.ui.questions([{ title: "Only one?", options: [{ label: "yes", description: "go on" }] }], { timeout: 60_000 });
 			const shown = (value) => (value === undefined ? "undefined" : value.map((v) => (v === undefined ? "undefined" : v)));
 			ctx.ui.notify(JSON.stringify({ answered: shown(answered), cancelled: shown(cancelled), aborted: shown(aborted), single: shown(single) }));
 		},
@@ -85,9 +85,12 @@ describe("RPC questions dialogs", () => {
 			method: "questions",
 			title: "3 questions",
 			questions: [
-				{ title: "Which area?", options: ["Limitation", "Contracts"] },
+				{
+					title: "Which area?",
+					options: [{ label: "Limitation", description: "time bars" }, { label: "Contracts" }],
+				},
 				{ title: "Anything else?" },
-				{ title: "Skipped?", options: ["a"] },
+				{ title: "Skipped?", options: [{ label: "a" }] },
 			],
 		});
 		expect(cancelled).toMatchObject({ method: "questions", title: "2 questions" });
@@ -148,8 +151,8 @@ describe("RPC questions dialogs", () => {
 			["select", "Only one?"],
 			["notify", undefined],
 		]);
-		expect(ui[0]).toMatchObject({ options: ["Limitation", "Contracts"] });
-		expect(ui[6]).toMatchObject({ options: ["yes"], timeout: 60_000 });
+		expect(ui[0]).toMatchObject({ options: ["Limitation — time bars", "Contracts"] });
+		expect(ui[6]).toMatchObject({ options: ["yes — go on"], timeout: 60_000 });
 		expect(ui.some((e) => e.method === "questions")).toBe(false);
 	}, 30_000);
 

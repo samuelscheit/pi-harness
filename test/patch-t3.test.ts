@@ -167,6 +167,7 @@ describe("patchBundle", () => {
 		"keyed-lock-contended",
 		"background-tasks-from-pi",
 		"followup-after-disposed-delivery",
+		"question-descriptions",
 		"task-id-resolution",
 	];
 
@@ -292,9 +293,11 @@ describe("patchBundle", () => {
 			isString,
 			`${helpers}\n${source("function piQuestions(", "const PiAdapterV2Driver")}\nreturn { piQuestions, piUiResponse };`,
 		)((v: unknown) => typeof v === "object" && v !== null, (v: unknown) => typeof v === "string");
-		const questions = piQuestions("r1", { questions: [{ title: "Area?", options: ["A", ""] }, { title: " " }] });
+		const questions = piQuestions("r1", {
+			questions: [{ title: "Area?", options: [{ label: "A", description: " pick A " }, { label: "" }, "not an option", { description: "no label" }] }, { title: " " }],
+		});
 		assert.deepEqual(questions, [
-			{ id: "r1:0", header: "Question", question: "Area?", options: [{ label: "A", description: "A", value: "A" }, { label: "Empty value", description: "Empty value", value: "" }] },
+			{ id: "r1:0", header: "Question", question: "Area?", options: [{ label: "A", description: "pick A", value: "A" }, { label: "Empty value", description: "Empty value", value: "" }] },
 			{ id: "r1:1", header: "Question", question: "Question", options: [] },
 		]);
 		const pending = { method: "questions", turnItem: { type: "user_input_request", questions } };
@@ -846,7 +849,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, task-id-resolution;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);

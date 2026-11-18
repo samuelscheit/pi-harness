@@ -125,11 +125,23 @@ export interface ExtensionUIDialogOptions {
 	timeout?: number;
 }
 
+/** A suggested answer of an {@link ExtensionUIQuestion}. Picking it answers with its label. */
+export interface ExtensionUIQuestionOption {
+	label: string;
+	/** What picking it means: shown with the label (under it on a card, after it in the terminal). */
+	description?: string;
+}
+
 /** One question of a {@link ExtensionUIContext.questions} dialog. */
 export interface ExtensionUIQuestion {
 	title: string;
 	/** Suggested answers; the user can always type another. Omit for a free-text question. */
-	options?: string[];
+	options?: ExtensionUIQuestionOption[];
+}
+
+/** An option as one line of a text-only selector: its label, then its description. */
+export function questionOptionLine({ label, description }: ExtensionUIQuestionOption): string {
+	return description ? `${label} — ${description}` : label;
 }
 
 /** Placement for extension widgets. */

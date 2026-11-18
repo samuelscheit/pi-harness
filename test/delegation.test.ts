@@ -192,7 +192,7 @@ interface Thread {
 function newThread(): { thread: Omit<Thread, "session">; ui: ExtensionUIContext } {
 	let requests = 0;
 	const thread: Omit<Thread, "session"> = { runs: new Map(), pending: new Map() };
-	const questions = (asked: { title: string; options?: string[] }[]) =>
+	const questions = (asked: ExtensionUIQuestion[]) =>
 		new Promise<(string | undefined)[] | undefined>((resolve) => {
 			const id = `request-${++requests}`;
 			// Answered by respond or by the user on the card: no longer pending.
@@ -362,7 +362,7 @@ function fakeT3(childRuntime: ModelRuntime, options: { waitMs?: number; failWait
 			const pending = thread.pending.get(requestId);
 			if (!pending) throw new Error(`fake t3: no pending request ${requestId}`);
 			if (args.action === "read") {
-				return { requestId, questions: pending.questions.map((q, i) => ({ id: `${requestId}:${i}`, header: "Question", question: q.title, options: (q.options ?? []).map((label) => ({ label, description: "" })) })) };
+				return { requestId, questions: pending.questions.map((q, i) => ({ id: `${requestId}:${i}`, header: "Question", question: q.title, options: (q.options ?? []).map(({ label, description }) => ({ label, description: description || label })) })) };
 			}
 			// respond: one value per question, in order, as t3's adapter answers Pi.
 			const answers = args.answers as Record<string, unknown>;
@@ -947,7 +947,14 @@ describe("the handle", () => {
 });
 
 describe("questions go to the parent (onAsk)", () => {
-	const QUESTION = { title: "The plan no longer fits: how do I go on?", options: ["continue", "replan", "stop"] };
+	const QUESTION = {
+		title: "The plan no longer fits: how do I go on?",
+		options: [
+			{ label: "continue", description: "as planned" },
+			{ label: "replan", description: "rethink the remaining steps" },
+			{ label: "stop", description: "report what is done" },
+		],
+	};
 	/** A child that asks QUESTION on each new message, then reports the answer it got as its tool result. */
 	const asking: FauxResponseStep = (context) => {
 		const last = lastMessage(context);
@@ -958,7 +965,7 @@ describe("questions go to the parent (onAsk)", () => {
 
 	test("in t3: onAsk's answers reach the child's blocking ask_user as its tool result, in the same run, journaled", async () => {
 		const { details, text } = await runInT3(
-			"const asked = [];\nconst a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read', 'ask_user'], onAsk: async (questions) => { asked.push(questions); return [questions[0].options[1]]; } });\nconst r = await a.run('do the task');\nreturn JSON.stringify({ text: r.text, asked });",
+			"const asked = [];\nconst a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read', 'ask_user'], onAsk: async (questions) => { asked.push(questions); return [questions[0].options[1].label]; } });\nconst r = await a.run('do the task');\nreturn JSON.stringify({ text: r.text, asked });",
 			asking,
 		);
 		assert.equal(details.status, "completed", details.error);
@@ -1130,7 +1137,7 @@ describe("every tool as a typed, awaitable function", () => {
 		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime), askUser], SessionManager.create(fx.repo, fx.sessionsDir), runtime, ui);
 		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
 		const code = [
-			"const answers = await tools.ask_user({ questions: [{ title: 'Go on?', options: ['yes', 'no'] }, { title: 'Why?' }], wait_minutes: 0 });",
+			"const answers = await tools.ask_user({ questions: [{ title: 'Go on?', options: [{ label: 'yes', description: 'keep going' }, { label: 'no' }] }, { title: 'Why?' }], wait_minutes: 0 });",
 			"const handle = tools['mcp__t3-code__delegate_task']({ target: { model: 'faux/faux-1' }, tools: ['read'] });",
 			"const run = await handle.run('say hi');",
 			"return JSON.stringify({ answers, same: tools['mcp__t3-code__delegate_task'] === delegate, text: run.text, thread: handle.threadId });",
@@ -1147,7 +1154,7 @@ describe("every tool as a typed, awaitable function", () => {
 		const details = result.details as unknown as WorkflowDetails;
 		assert.equal(details.status, "completed", details.error);
 		assert.deepEqual(value(textOf(result.content)), { answers: ["no", null], same: true, text: "hi", thread: "thread-1" });
-		assert.deepEqual(shown, [{ questions: [{ title: "Go on?", options: ["yes", "no"] }, { title: "Why?" }] }], "one dialog; wait_minutes 0 does not stop the wait");
+		assert.deepEqual(shown, [{ questions: [{ title: "Go on?", options: [{ label: "yes", description: "keep going" }, { label: "no" }] }, { title: "Why?" }] }], "one dialog; wait_minutes 0 does not stop the wait");
 		const asked = readJournal(details.journal).find((e) => e.t === "start" && e.kind === "tool");
 		assert.equal(asked?.t === "start" && asked.idempotent, true, "a resume may ask again");
 	});
