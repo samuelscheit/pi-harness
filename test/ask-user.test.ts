@@ -23,7 +23,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
-import askUser, { formatAnswers, invalidQuestions, isT3Notification, isUserReply, pendingText } from "../extensions/ask-user/index.ts";
+import askUser, { formatAnswers, invalidQuestions, pendingText } from "../extensions/ask-user/index.ts";
+import { isT3Notification, isUserInput } from "../extensions/lib/user-input.ts";
 import background from "../extensions/background/index.ts";
 import { sessionJobs } from "../extensions/background/jobs.ts";
 
@@ -78,12 +79,12 @@ describe("questions and answers", () => {
 
 	test("a reply is the user's words: a client's notification never is, whatever its text; the text fallback covers an unpatched t3's plain prompts only", () => {
 		const input = (text: string, source: InputEvent["source"]): InputEvent => ({ type: "input", text, source, streamingBehavior: "steer" });
-		for (const source of ["interactive", "rpc"] as const) assert.equal(isUserReply(input("B, please", source)), true, source);
-		assert.equal(isUserReply(input("B, please", "extension")), false);
-		assert.equal(isUserReply(input(RESTARTED, "notification")), false, "a notification the text patterns do not know");
-		assert.equal(isUserReply(input("B, please", "notification")), false);
-		assert.equal(isUserReply(input(COMPLETED, "rpc")), false, "an unpatched t3's wake");
-		assert.equal(isUserReply(input(COMPLETED, "interactive")), true, "typed in the terminal, it is the user's");
+		for (const source of ["interactive", "rpc"] as const) assert.equal(isUserInput(input("B, please", source)), true, source);
+		assert.equal(isUserInput(input("B, please", "extension")), false);
+		assert.equal(isUserInput(input(RESTARTED, "notification")), false, "a notification the text patterns do not know");
+		assert.equal(isUserInput(input("B, please", "notification")), false);
+		assert.equal(isUserInput(input(COMPLETED, "rpc")), false, "an unpatched t3's wake");
+		assert.equal(isUserInput(input(COMPLETED, "interactive")), true, "typed in the terminal, it is the user's");
 	});
 });
 

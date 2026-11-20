@@ -23,7 +23,7 @@
 //   ("Delegated task … [completed]" answered a question three times and the real decision was lost).
 //   Fallback: a t3 without that patch (an update drops the patches; the new ones apply only when
 //   t3 restarts, which can wait on the user or on macOS's App Management permission) sends them
-//   as plain "rpc" input, so those are still told apart by their fixed text (`isT3Notification`).
+//   as plain "rpc" input, so those are still told apart by their fixed text (`isT3Notification` in ../lib/user-input.ts).
 // - The turn is aborted: the dialog closes and the call fails.
 // When the time runs out, or with `wait_minutes: 0` at once, the call returns that no answer is
 // there yet; the dialog stays open and its answers arrive later as a message that steers the
@@ -34,8 +34,9 @@
 // in bash can call it too.
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionUIQuestion, InputEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIQuestion } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { isUserInput } from "../lib/user-input.ts";
 
 export const DEFAULT_WAIT_MINUTES = 15;
 
@@ -104,29 +105,6 @@ export function formatAnswers(questions: ExtensionUIQuestion[], answers: (string
 export const pendingText = (waitedMinutes: number) =>
 	`${waitedMinutes > 0 ? `No answer after ${waitedMinutes} min. ` : ""}The questions stay open. Continue with the work that does not depend on the answers, or end your turn: the answers arrive later as a message.`;
 
-// Fallback for a t3 without the notification-origin patch (see the top): t3's server-written
-// messages (apps/server/src/orchestration-v2: Orchestrator.ts
-// delegatedCompletionWakeDetail, ProviderContinuationService.ts, DelegatedTaskQuestionReactor.ts,
-// pullRequestWatch.ts, UsageLimitRecoveryWorker.ts), each matched from its first line to its exact
-// wording, so a user's reply that quotes one, mentions one or starts like one is still a reply.
-const T3_NOTIFICATIONS = [
-	// A delegated task's completion wake, one block per task: "Delegated task <id> (<title>) [<status>]:\n<result>" or "…]. Use task_status …".
-	/^Delegated task \S+(?: \(.*\))? \[[a-z_]+\](?::\n|\. Use task_status with taskId \S+ to read the result\.)/,
-	/^Delegated task \S+ reached a terminal state\. Use task_status with taskId \S+ to read the result\./,
-	/^Delegated tasks \S+(?:, \S+)* reached terminal states\. Use task_status with each taskId to read the results\.$/,
-	/^Delegated task \S+ (?:asked a question and is still working|is blocked on a question and cannot continue until it is answered)\. Read it with t3_pending_request /,
-	/^Update on pull request #\d+ \(\S+\), which T3 Code is watching for you:\n/,
-	/^Background task completed\.$/,
-	/^Continue where you left off\.$/,
-];
-
-/** Whether a message is a notification t3 wrote (a delegated task finished or asks, a watched PR changed, …), not the user. */
-export const isT3Notification = (text: string) => T3_NOTIFICATIONS.some((shape) => shape.test(text));
-
-/** Whether input is the user's words, which answer waiting questions: not an extension's message, not a client's notification. */
-export const isUserReply = (event: InputEvent) =>
-	event.source !== "extension" && event.source !== "notification" && !(event.source === "rpc" && isT3Notification(event.text));
-
 /** A call waiting for its answers takes a chat reply. */
 type ChatWait = (text: string, images: ImageContent[] | undefined) => void;
 
@@ -144,7 +122,7 @@ export default function askUser(pi: ExtensionAPI) {
 	// A user message while calls wait: it is their answer, not a new message. Messages from
 	// extensions and t3's notifications go on to the agent as usual, after the waiting call.
 	pi.on("input", (event, ctx) => {
-		if (!isUserReply(event)) return;
+		if (!isUserInput(event)) return;
 		const waits = waitsOf(ctx.sessionManager.getSessionId());
 		if (waits.size === 0) return;
 		for (const answer of [...waits]) answer(event.text, event.images);

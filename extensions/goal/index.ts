@@ -49,6 +49,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { runShell } from "../lib/process.ts";
+import { isUserInput } from "../lib/user-input.ts";
 import {
 	budgetLimitText,
 	continueText,
@@ -233,6 +234,9 @@ export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
 		if (event.source === "extension") return;
 		memory.idle = 0;
 		memory.notified = false;
+		// Only the user's words unblock a goal: a t3 notification (a delegated task ended) is not the
+		// answer a blocked goal waits for.
+		if (!isUserInput(event)) return;
 		const { goal } = state(ctx);
 		if (goal?.status === "blocked") save(ctx, { ...goal, status: "active", reason: undefined });
 	});

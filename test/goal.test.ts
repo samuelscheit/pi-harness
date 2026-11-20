@@ -438,6 +438,13 @@ describe("a goal set by the agent", () => {
 		assert.deepEqual({ ...current(s), id: "" }, { id: "", objective: "Migrate every caller to the new API.", check: "true", status: "blocked", reason: "The last caller needs an API key only you have.", setBy: "agent" });
 		assert.match(ui.statuses.get("goal")!, /^goal blocked: Migrate every caller/);
 
+		// A t3 notification is not the user's reply: the goal stays blocked (patched t3 and the unpatched fallback).
+		respond(say("Noted."), say("Noted."));
+		await s.prompt("Delegated task abc (Review) [completed]:\nAll good.", { source: "notification" });
+		assert.equal(current(s)?.status, "blocked", "a notification does not unblock");
+		await s.prompt("Delegated task abc (Review) [completed]:\nAll good.", { source: "rpc" });
+		assert.equal(current(s)?.status, "blocked", "an unpatched t3's notification does not unblock");
+
 		respond(
 			() => {
 				prompts.push(s.systemPrompt);
