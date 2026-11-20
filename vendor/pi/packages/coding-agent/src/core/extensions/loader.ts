@@ -193,6 +193,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getCacheWarmingStatus: notInitialized,
 		setCompactionOverrides: notInitialized,
 		getCompactionSettings: notInitialized,
+		askAside: () => Promise.reject(new Error("Extension runtime not initialized")),
 		// registerTool() is valid during extension load; refresh is only needed post-bind.
 		refreshTools: () => {},
 		getCommands: notInitialized,
@@ -486,6 +487,11 @@ function createExtensionAPI(
 		getCompactionSettings() {
 			assertActive();
 			return runtime.getCompactionSettings();
+		},
+
+		askAside(question: string, options: { kind: string; signal?: AbortSignal }) {
+			assertActive();
+			return runtime.askAside(question, options);
 		},
 
 		getCommands() {

@@ -10,7 +10,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { DELEGATED_SQL } from "../../extensions/lib/variants.ts";
 import { clip, count, money, percent, table } from "../../extensions/metrics/format.ts";
 import { NEGATIVE_SQL } from "../../extensions/metrics/labels.ts";
-import { breakdown, categoryGroup, compactions, contentCosts, pauses, rebuilds, Scope, sessionList, subagents, tools, totals } from "../../extensions/metrics/queries/index.ts";
+import { breakdown, categoryGroup, compactionDecisions, compactions, contentCosts, pauses, rebuilds, Scope, sessionList, subagents, tools, totals } from "../../extensions/metrics/queries/index.ts";
 
 /** The baseline: this many days before the window. */
 export const BASELINE_DAYS = 7;
@@ -103,6 +103,28 @@ function costlyResults(scope: Scope): string[][] {
 		.map((r) => [String(r.tool), clip(String(r.summary), 70), count(Number(r.tokens)), String(r.requests_in_context), money(Number(r.lifetime_cost))]);
 }
 
+/** The compaction decider's decisions by framing, when there were any. */
+function decisionsSection(scope: Scope): string[] {
+	const stats = compactionDecisions(scope);
+	if (stats.decisions === 0) return [];
+	const share = (part: number, whole: number) => (whole ? percent(part / whole) : "–");
+	return [
+		block(
+			`Compaction decisions: ${stats.decisions} (each asked two framings; one acted)`,
+			["framing", "answers", "say compact", "acted", "compacted", "re-read after", "re-read tokens", "keep cost"],
+			stats.answers.map((a) => {
+				const o = stats.outcomes.find((x) => x.framing === a.framing)!;
+				return [a.framing, `${a.answered}/${a.asked}`, share(a.compact, a.answered), String(o.decisions), String(o.compacted), share(o.reread, o.compacted), count(o.rereadTokens), money(o.keepCost)];
+			}),
+		),
+		block(
+			"Framings asked at the same moment (disagreement: the wording, not the evidence, decided)",
+			["framings", "differ in", "both answered", "disagree"],
+			stats.pairs.map((p) => [p.pair.join(" / "), p.differs, String(p.both), share(p.disagree, p.both)]),
+		),
+	];
+}
+
 /** The spend facts of the window against the baseline, as Markdown, with the window's model turns. */
 export function spendFacts(db: DatabaseSync, window: Window, baseline: Window): { text: string; requests: number } {
 	const now = new Scope(db, window);
@@ -160,6 +182,7 @@ function factsText(now: Scope, window: Window, baseline: Window, n: Headline, b:
 		...(causes.length ? [block("Cache rebuilds", ["cause", "times", "extra cost"], causes.map((c) => [c.cause, String(c.requests), money(c.waste)]))] : []),
 		...(pauseRows.length ? [block("Pauses over 5 min", ["outcome", "pauses", "warming cost", "paid on resume"], pauseRows.map((p) => [p.outcome, String(p.pauses), money(p.warmCost), money(p.resumeCost)]))] : []),
 		...(compactionRows.length ? [block("Compactions", ["reason", "times", "avg tokens before", "cost"], compactionRows.map((c) => [c.reason, String(c.count), count(c.avgTokensBefore), money(c.cost)]))] : []),
+		...decisionsSection(now),
 		`Subagents: ${agents.started} started for ${money(agents.cost)}; results they fetched again that their parent already had: ${money(agents.rediscoveryCost)}; resuming an idle earlier subagent would have been cheaper ${agents.resumeWins} of ${agents.compared} times.`,
 		block(
 			"Costliest sessions",

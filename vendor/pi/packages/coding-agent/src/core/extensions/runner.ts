@@ -464,6 +464,7 @@ export class ExtensionRunner {
 		this.runtime.getCacheWarmingStatus = actions.getCacheWarmingStatus;
 		this.runtime.setCompactionOverrides = actions.setCompactionOverrides;
 		this.runtime.getCompactionSettings = actions.getCompactionSettings;
+		this.runtime.askAside = actions.askAside;
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;

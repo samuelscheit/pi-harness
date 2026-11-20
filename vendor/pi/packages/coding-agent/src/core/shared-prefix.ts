@@ -123,3 +123,45 @@ export async function sendCachePrime(
 	if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
 	return { usage: message.usage, provider: message.provider, model: message.responseModel ?? message.model };
 }
+
+/** What `sendAside` returns: the answer's text (tool calls ignored) and what the request cost. */
+export interface AsideResult {
+	text: string;
+	usage: Usage;
+	provider: string;
+	model: string;
+}
+
+/**
+ * Ask `question` on `messages` as the session's next request would send them (same system prompt,
+ * tools, model, thinking level and cache retention), so it reads the session's prompt cache, and
+ * return the answer without adding either to the session. No session id: the request must not
+ * replace the session's own cache warming or provider thread. Undefined when the request failed.
+ */
+export async function sendAside(
+	agent: Agent,
+	model: Model<Api>,
+	messages: AgentMessage[],
+	question: string,
+	options: SimpleStreamOptions,
+	signal?: AbortSignal,
+): Promise<AsideResult | undefined> {
+	const request: SimpleStreamOptions = {
+		...options,
+		reasoning: agent.state.thinkingLevel === "off" ? undefined : agent.state.thinkingLevel,
+		thinkingBudgets: agent.thinkingBudgets,
+		transport: agent.transport,
+		maxRetryDelayMs: agent.maxRetryDelayMs,
+		onPayload: agent.onPayload,
+		apiKey: options.apiKey ?? (await agent.getApiKey?.(model.provider)),
+		...(signal ? { signal } : {}),
+	};
+	const asked: AgentMessage[] = [...messages, { role: "user", content: [{ type: "text", text: question }], timestamp: Date.now() }];
+	const transformed = agent.transformContext ? await agent.transformContext(asked, signal) : asked;
+	const context = normalizeContext({ messages: await agent.convertToLlm(transformed) });
+	const stream = await agent.streamFunction(model, context, request);
+	const message = await stream.result();
+	if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
+	const text = message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+	return { text, usage: message.usage, provider: message.provider, model: message.responseModel ?? message.model };
+}

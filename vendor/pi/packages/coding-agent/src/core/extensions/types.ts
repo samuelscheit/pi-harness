@@ -91,6 +91,7 @@ import type {
 	SessionManager,
 } from "../session-manager.ts";
 import type { Settings } from "../settings-manager.ts";
+import type { AsideResult } from "../shared-prefix.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BuildSystemPromptOptions, NormalizedBuildSystemPromptOptions } from "../system-prompt.ts";
@@ -1626,6 +1627,11 @@ export interface SessionBeforeForkResult {
 export interface SessionBeforeCompactResult {
 	cancel?: boolean;
 	compaction?: CompactionResult;
+	/**
+	 * Instructions for the summary of this compaction (what to keep in detail), when it runs Pi's
+	 * own summary; added to the user's own instructions of a manual compaction.
+	 */
+	customInstructions?: string;
 }
 
 export interface SessionBeforeTreeResult {
@@ -1970,6 +1976,14 @@ export interface ExtensionAPI {
 
 	/** The compaction settings in effect for the current model, overrides included. */
 	getCompactionSettings(): CompactionSettings | undefined;
+
+	/**
+	 * Ask the session's model `question` on the session's current context, as its next request
+	 * would send it, so it reads the session's prompt cache; neither the question nor the answer is
+	 * added to the session. The cost is recorded as a usage entry of kind `aside: <kind>`.
+	 * Undefined without a model, under a virtual model (it routes each request), or on failure.
+	 */
+	askAside(question: string, options: { kind: string; signal?: AbortSignal }): Promise<AsideResult | undefined>;
 
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
@@ -2431,6 +2445,7 @@ export interface ExtensionActions {
 	getCacheWarmingStatus: () => CacheWarmingStatus | undefined;
 	setCompactionOverrides: (overrides: CompactionOverrides | undefined) => void;
 	getCompactionSettings: () => CompactionSettings | undefined;
+	askAside: (question: string, options: { kind: string; signal?: AbortSignal }) => Promise<AsideResult | undefined>;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;

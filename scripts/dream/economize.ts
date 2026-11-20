@@ -59,7 +59,7 @@ Propose at most {max} new A/B experiments. Each one runs on half of the new sess
 
 An experiment can change:
 - "body": a prompt section the agent reads in arm B: concrete working behaviour that wastes less (for example how much command output to read at once, when to compact or start fresh, what to delegate and how to brief it). Imperative, specific, short, never weakening verification, testing or review.
-- "settings": the session settings of arm B: "model" (provider/id; replaces only the default model), "thinking" (off, minimal, low, medium, high, xhigh, max; replaces only the default level), "maxContextTokens" (compact automatically above this many context tokens, at least 50000).
+- "settings": the session settings of arm B: "model" (provider/id; replaces only the default model), "thinking" (off, minimal, low, medium, high, xhigh, max; replaces only the default level). When to compact is not yours to set: a fixed context limit forces compactions on tasks that need their context and makes sessions read again what they lost; sessions decide it themselves (the compaction decider, with its own experiment and measurements in the facts).
 - "sessions": which new sessions it enrolls: "all", "delegated" (subagent sessions a parent started with delegate_task) or "top-level". Settings experiments enroll new sessions only.
 
 Rules for proposals:
@@ -123,7 +123,7 @@ export function economistInput({ source, db, now, facts }: EconomyContext): stri
 	const agents = join(source, "prompt", "AGENTS.md");
 	return [
 		`<facts>\n${facts}\n</facts>`,
-		`<settings>\nDefault model ${defaults.model ?? "(not set)"}, default thinking level ${defaults.thinking}. Without maxContextTokens Pi compacts at the model's context window minus a reserve (about 984k tokens on a 1M window).\n${
+		`<settings>\nDefault model ${defaults.model ?? "(not set)"}, default thinking level ${defaults.thinking}. Pi compacts at the model's context window minus a reserve (about 984k tokens on a 1M window), or where a session decided to (the compaction decider).\n${
 			rules.filter((r) => hasSettings(r.settings)).map((r) => `Rule ${r.name} sets ${describeSettings(r.settings)} for ${r.sessions} sessions.`).join("\n") || "No rule sets session settings."
 		}\n</settings>`,
 		`<prices>\n${prices(db, now.getTime())}\n</prices>`,
@@ -152,6 +152,7 @@ export function parseEconomy(value: unknown, existing: readonly Experiment[], ta
 			const risk = item.qualityRisk;
 			const saving = Number(item.expectedWeeklySaving);
 			if ("problem" in settings) refuse(settings.problem);
+			else if (settings.maxContextTokens !== undefined || settings.decideCompactionAbove !== undefined) refuse("when to compact is the compaction decider's, not a spend experiment's");
 			else if (!sessions) refuse(`invalid sessions ${JSON.stringify(item.sessions)}`);
 			else if (!body && !hasSettings(settings)) refuse("neither a body nor settings");
 			else if (body.length > MAX_BODY_CHARS) refuse(`body longer than ${MAX_BODY_CHARS} characters`);

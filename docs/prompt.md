@@ -79,13 +79,14 @@ settings:
   model: anthropic/claude-sonnet-5-5   # provider/id
   thinking: low                        # off | minimal | low | medium | high | xhigh | max
   maxContextTokens: 400000             # compact automatically above this, at least 50000
+  decideCompactionAbove: 300000        # above this, the session decides whether to compact (tools.md#the-compaction-decider)
 sessions: delegated                    # all (default) | delegated | top-level
 ---
 ```
 
 - **Kinds.** A delegated session is one a parent started with `delegate_task`; its first message is t3's preamble "Act as the … sub-agent for this task."
 - **Model and thinking level** are set once, on the session's first run, and only where the session still runs Pi's default (`defaultModel`, `defaultThinkingLevel` in the agent's `settings.json`, the project's `.pi/settings.json` over it): a subagent its parent gave a `target.model` or an effort keeps it, and is not enrolled in an experiment that would set it. A choice equal to the default cannot be told from none. Pi records the model and level in the session, so a resume keeps them and a later change by hand stays; for the same reason, stopping an experiment does not switch back sessions that already started in arm B.
-- **Context limit** applies on every run ([`extensions/context-limit`](../extensions/context-limit/index.ts)); the session's own `/context-limit` wins.
+- **Context limit** and the **compaction decider** apply on every run ([`extensions/context-limit`](../extensions/context-limit/index.ts)); the session's own `/context-limit` wins over both, a fixed `maxContextTokens` over the decider.
 - **Enrollment.** An experiment with settings enrolls only sessions that made no request yet, so no session switches model or cache mid-way and no measured session mixes two settings. An experiment with `sessions` enrolls only that kind.
 - **Precedence.** Rules first, then the arms B the session is in. Two running experiments may not set the same setting for sessions that can overlap: the one started later (`started`, then the name) gets a problem and does not run.
 

@@ -9,7 +9,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /** Meta key set once Claude Code transcripts were imported; it survives schema rebuilds. */
 const CLAUDE_IMPORTED = "claude_imported";
@@ -119,6 +119,14 @@ CREATE TABLE experiment_arms (
 	assigned_at INTEGER NOT NULL, ended_at INTEGER,
 	PRIMARY KEY (session_id, experiment)
 );
+-- The compaction decider's decisions (extensions/context-limit/decider.ts): the context size, the
+-- framing that acted and its decision, every framing's answer and the files a compaction would
+-- summarize (JSON arrays).
+CREATE TABLE compaction_decisions (
+	session_id TEXT NOT NULL, entry_id TEXT NOT NULL, ts INTEGER NOT NULL, context_tokens INTEGER NOT NULL,
+	acting TEXT, decision TEXT NOT NULL, answers TEXT NOT NULL, files TEXT NOT NULL,
+	PRIMARY KEY (session_id, entry_id)
+);
 -- What kind of message each user message is, as dreaming labelled it (labels.ts): loaded from
 -- dreaming's labels file, not from the session files, so not deleted with a session's rows.
 CREATE TABLE message_labels (
@@ -137,7 +145,7 @@ CREATE INDEX sessions_prompt ON sessions (prompt_digest);
 CREATE INDEX delegations_task ON delegations (task_digest);
 `;
 
-const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "tool_files", "delegations", "user_messages", "compactions", "idle_pauses", "experiment_arms"];
+const SESSION_TABLES = ["sessions", "requests", "request_costs", "tool_results", "tool_files", "delegations", "user_messages", "compactions", "idle_pauses", "experiment_arms", "compaction_decisions"];
 
 export function openStore(path: string): DatabaseSync {
 	mkdirSync(dirname(path), { recursive: true });

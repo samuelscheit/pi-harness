@@ -155,7 +155,14 @@ import {
 	DEFAULT_TOOL_NAMES,
 	type SettingsManager,
 } from "./settings-manager.ts";
-import { keptEntries, primeProjection, type SharedPrefixCache, sendCachePrime } from "./shared-prefix.ts";
+import {
+	type AsideResult,
+	keptEntries,
+	primeProjection,
+	type SharedPrefixCache,
+	sendAside,
+	sendCachePrime,
+} from "./shared-prefix.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
@@ -1855,6 +1862,25 @@ export class AgentSession {
 		) as CompactionOverrides;
 	}
 
+	/** Ask the session's model on its current context without adding to the session (see ExtensionAPI.askAside). */
+	async askAside(question: string, { kind, signal }: { kind: string; signal?: AbortSignal }): Promise<AsideResult | undefined> {
+		const model = this.model;
+		if (!model || isVirtualModel(model)) return undefined;
+		const projection = this.sessionManager.buildSessionProjection();
+		const result = await sendAside(
+			this.agent,
+			model,
+			projection.messages,
+			question,
+			{ cacheRetention: this.settingsManager.getCacheRetention() },
+			signal,
+		);
+		if (!result) return undefined;
+		const entry = this.sessionManager.appendUsage(`aside: ${kind}`, result.provider, result.model, result.usage);
+		this._emit({ type: "entry_appended", entry });
+		return result;
+	}
+
 	/** Hold this session's prompt cache warm until `untilMs`, or end the hold (see ExtensionAPI.setCacheWarmingHold). */
 	setCacheWarmingHold(untilMs: number | undefined): void {
 		this._cacheWarmer?.setHold(untilMs);
@@ -3335,6 +3361,9 @@ export class AgentSession {
 					extensionCompaction = result.compaction;
 					fromExtension = true;
 				}
+				if (result?.customInstructions) {
+					customInstructions = customInstructions ? `${customInstructions}\n\n${result.customInstructions}` : result.customInstructions;
+				}
 			}
 
 			// Extension provided compaction content, else the shared default summary generator, also used by automatic compaction.
@@ -3644,6 +3673,7 @@ export class AgentSession {
 			abortController.signal.throwIfAborted();
 
 			let extensionCompaction: CompactionResult | undefined;
+			let extensionInstructions: string | undefined;
 			if (base) {
 				fromExtension = base.fromHook === true;
 				extensionCompaction = {
@@ -3674,6 +3704,7 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+				extensionInstructions = extensionResult?.customInstructions;
 			}
 			abortController.signal.throwIfAborted();
 
@@ -3683,7 +3714,7 @@ export class AgentSession {
 			const signal = abortController.signal;
 			const compacted =
 				extensionCompaction ??
-				(await this._runDefaultCompaction(preparation!, summaryModel ?? model, undefined, signal, reason).catch(
+				(await this._runDefaultCompaction(preparation!, summaryModel ?? model, extensionInstructions, signal, reason).catch(
 					(error: unknown) => {
 						if (signal.aborted || !compactsWithoutSummary(reason, error)) throw error;
 						return compactWithoutSummary(preparation!, error instanceof Error ? error.message : String(error));
@@ -3964,6 +3995,7 @@ export class AgentSession {
 				getCacheWarmingStatus: () => this.cacheWarmingStatus,
 				setCompactionOverrides: (overrides) => this.setCompactionOverrides(overrides),
 				getCompactionSettings: () => this.getCompactionSettings(),
+				askAside: (question, options) => this.askAside(question, options),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {

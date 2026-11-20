@@ -554,6 +554,8 @@ describe("economize", () => {
 					proposal({ name: "long", settings: {}, body: "x".repeat(1201) }),
 					proposal({ name: "bad-sessions", sessions: "children" }),
 					proposal({ name: "lean-subagents", settings: { maxContextTokens: 200000 } }),
+					proposal({ name: "fixed-limit", settings: { maxContextTokens: 300000 } }),
+					proposal({ name: "decider-tuning", settings: { decideCompactionAbove: 200000 } }),
 				],
 				notes: [{ title: "Truncate bash output", body: "36% of cost." }, { title: 3 }],
 			},
@@ -566,7 +568,7 @@ describe("economize", () => {
 		assert.deepEqual(economy.refused, [
 			{ name: "Bad Name", reason: "invalid name" },
 			{ name: "thin", reason: "the name is taken by an experiment or rule" },
-			{ name: "unknown-setting", reason: "unknown settings temperature (known: model, thinking, maxContextTokens)" },
+			{ name: "unknown-setting", reason: "unknown settings temperature (known: model, thinking, maxContextTokens, decideCompactionAbove)" },
 			{ name: "tiny-context", reason: "settings.maxContextTokens must be an integer of at least 50000, got 1000" },
 			{ name: "nothing", reason: "neither a body nor settings" },
 			{ name: "risky", reason: 'quality risk "high": only low and medium risks are tested' },
@@ -576,9 +578,11 @@ describe("economize", () => {
 			{ name: "long", reason: "body longer than 1200 characters" },
 			{ name: "bad-sessions", reason: 'invalid sessions "children"' },
 			{ name: "lean-subagents", reason: "the name is taken by an experiment or rule" },
+			{ name: "fixed-limit", reason: "when to compact is the compaction decider's, not a spend experiment's" },
+			{ name: "decider-tuning", reason: "when to compact is the compaction decider's, not a spend experiment's" },
 		]);
 		assert.deepEqual(economy.notes, [{ title: "Truncate bash output", body: "36% of cost." }]);
-		assert.equal(parseEconomy({ experiments: [proposal(), proposal({ name: "second", settings: { maxContextTokens: 300000 } })] }, [], new Set(), 1).refused[0]!.reason, "only 1 new experiments this run");
+		assert.equal(parseEconomy({ experiments: [proposal(), proposal({ name: "second", settings: { thinking: "low" }, sessions: "top-level" })] }, [], new Set(), 1).refused[0]!.reason, "only 1 new experiments this run");
 		assert.throws(() => parseEconomy({}, [], new Set(), 2), /expected/);
 	});
 
@@ -616,7 +620,7 @@ describe("economize", () => {
 		const source = repository("harness", { ".gitignore": ".agents\n" });
 		const db = openStore(join(dir, "metrics.db"));
 		const calls: string[] = [];
-		const economist = { experiments: [proposal(), proposal({ name: "short-context", settings: { maxContextTokens: 300000 }, sessions: "all", qualityRisk: "low" })], notes: [] };
+		const economist = { experiments: [proposal(), proposal({ name: "short-context", settings: { model: "anthropic/claude-haiku-5-5" }, sessions: "top-level", qualityRisk: "low" })], notes: [] };
 		const now = new Date(T);
 		const dry = await economize({ source, db, now, facts: "F", ask: scripted(economist), dryRun: true });
 		assert.equal(dry.started.length, 2);
@@ -646,7 +650,7 @@ describe("economize", () => {
 			{ run: "r", kind: "started", experiment: "lean-subagents", branch: "dream/x" },
 			{ run: "r", kind: "started", experiment: "other", branch: "dream/y" },
 		]);
-		const { economy, started } = await economize({ source, db, now: new Date(T), facts: "F", ask: scripted({ experiments: [proposal(), proposal({ name: "fresh", settings: { maxContextTokens: 300000 } })] }), dryRun: true });
+		const { economy, started } = await economize({ source, db, now: new Date(T), facts: "F", ask: scripted({ experiments: [proposal(), proposal({ name: "fresh", settings: { thinking: "low" }, sessions: "top-level" })] }), dryRun: true });
 		assert.deepEqual(started.map((s) => s.proposal.name), ["fresh"]);
 		assert.deepEqual(economy.refused, [{ name: "lean-subagents", reason: "the name is taken by an experiment or rule" }]);
 		db.close();

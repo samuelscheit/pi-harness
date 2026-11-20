@@ -6,6 +6,8 @@
 //     model: anthropic/claude-sonnet-5-5   provider/id, as the model registry knows it
 //     thinking: low                        off | minimal | low | medium | high | xhigh | max
 //     maxContextTokens: 400000             compact above this many context tokens (>= 50000)
+//     decideCompactionAbove: 300000        above this, the session decides whether to compact
+//                                          (extensions/context-limit/decider.ts; >= 50000)
 //   sessions: delegated                    all (default) | delegated | top-level
 //
 // A delegated session is one a parent started with delegate_task: its first message is t3's role
@@ -46,9 +48,10 @@ export interface SessionSettings {
 	model?: string;
 	thinking?: Thinking;
 	maxContextTokens?: number;
+	decideCompactionAbove?: number;
 }
 
-const SETTING_KEYS = ["model", "thinking", "maxContextTokens"] as const;
+const SETTING_KEYS = ["model", "thinking", "maxContextTokens", "decideCompactionAbove"] as const;
 const MODEL = /^[\w.-]+\/[\w.:@-]+$/;
 
 /** The `settings` frontmatter value (absent: none), or why it is invalid. */
@@ -67,10 +70,11 @@ export function parseSettings(raw: unknown): SessionSettings | { problem: string
 		if (!(THINKING_LEVELS as readonly unknown[]).includes(record.thinking)) return { problem: `settings.thinking must be one of ${THINKING_LEVELS.join(", ")}, got ${JSON.stringify(record.thinking)}` };
 		settings.thinking = record.thinking as Thinking;
 	}
-	if (record.maxContextTokens !== undefined) {
-		const tokens = record.maxContextTokens;
-		if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < MIN_CONTEXT_TOKENS) return { problem: `settings.maxContextTokens must be an integer of at least ${MIN_CONTEXT_TOKENS}, got ${JSON.stringify(tokens)}` };
-		settings.maxContextTokens = tokens;
+	for (const key of ["maxContextTokens", "decideCompactionAbove"] as const) {
+		const tokens = record[key];
+		if (tokens === undefined) continue;
+		if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < MIN_CONTEXT_TOKENS) return { problem: `settings.${key} must be an integer of at least ${MIN_CONTEXT_TOKENS}, got ${JSON.stringify(tokens)}` };
+		settings[key] = tokens;
 	}
 	return settings;
 }

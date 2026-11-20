@@ -24,6 +24,7 @@ import {
 	type SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import { attribute, cacheEvent, type RequestState, requestState, type Usage } from "./attribution.ts";
+import { DECISION_ENTRY, type DecisionData } from "../context-limit/decider.ts";
 import { recordedArms } from "../lib/experiments.ts";
 import { parsePrompt, summarizeToolInput, versionId } from "./blocks.ts";
 import { droppedThinking } from "./payload.ts";
@@ -380,6 +381,15 @@ export function indexFile(db: DatabaseSync, path: string, content: string, size:
 		);
 		for (const [experiment, arm] of recordedArms(entries)) {
 			insertArm.run(sessionId, experiment, arm.arm, arm.forced ? 1 : 0, arm.assignedAt, arm.endedAt ?? null);
+		}
+		const insertDecision = db.prepare(
+			"INSERT INTO compaction_decisions (session_id, entry_id, ts, context_tokens, acting, decision, answers, files) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		);
+		for (const entry of entries) {
+			if (entry.type !== "custom" || entry.customType !== DECISION_ENTRY) continue;
+			const data = entry.data as Partial<DecisionData> | undefined;
+			if (typeof data?.contextTokens !== "number" || (data.decision !== "compact" && data.decision !== "keep")) continue;
+			insertDecision.run(sessionId, entry.id, time(entry), data.contextTokens, data.acting ?? null, data.decision, JSON.stringify(data.answers ?? []), JSON.stringify(data.files ?? []));
 		}
 		db.prepare(
 			`INSERT INTO sessions (id, file, cwd, parent_session, name, prompt_digest, started_at, ended_at, requests, cost, aborted, errors, compactions, user_messages)
