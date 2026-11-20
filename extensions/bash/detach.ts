@@ -28,7 +28,7 @@ export function refusal(commands: readonly string[], platform: NodeJS.Platform =
 /** The system the commands run on, for the bash tool's guidelines. */
 export function systemGuideline(platform: NodeJS.Platform = process.platform): string {
 	if (platform === "darwin")
-		return "Commands run on macOS with its BSD userland, not GNU: there is no `setsid`, `sed -i` takes a suffix argument (`sed -i ''`), and `grep` has no `-P`.";
+		return "Commands run on macOS with its BSD userland, not GNU: there is no `setsid`, `sed -i` takes a suffix argument (`sed -i ''`), and `grep` has no `-P` and rejects a bound over 255 (`.\\{0,600\\}` fails with \"maximum repetition exceeds 255\"; use `rg -o '.{0,600}X'`).";
 	if (platform === "linux") return "Commands run on Linux with the GNU userland.";
 	if (platform === "win32") return "Commands run in Git Bash on Windows.";
 	return `Commands run on ${platform}.`;

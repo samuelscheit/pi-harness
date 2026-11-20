@@ -64,7 +64,7 @@ describe("messages", () => {
 	});
 
 	test("the system guideline names the OS and the BSD userland on macOS", () => {
-		assert.match(systemGuideline("darwin"), /macOS with its BSD userland.*no `setsid`.*sed -i ''/);
+		assert.match(systemGuideline("darwin"), /macOS with its BSD userland.*no `setsid`.*sed -i ''.*over 255.*rg -o/);
 		assert.match(systemGuideline("linux"), /Linux with the GNU userland/);
 		assert.match(systemGuideline("freebsd"), /freebsd/);
 	});
