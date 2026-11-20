@@ -22,7 +22,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
-import askUser, { formatAnswers, invalidQuestions, pendingText } from "../extensions/ask-user/index.ts";
+import askUser, { formatAnswers, invalidQuestions, isT3Notification, pendingText } from "../extensions/ask-user/index.ts";
 import background from "../extensions/background/index.ts";
 import { sessionJobs } from "../extensions/background/jobs.ts";
 
@@ -55,7 +55,43 @@ describe("questions and answers", () => {
 		assert.equal(pendingText(0), "The questions stay open. Continue with the work that does not depend on the answers, or end your turn: the answers arrive later as a message.");
 		assert.match(pendingText(15), /^No answer after 15 min\. The questions stay open\./);
 	});
+
+	test("recognises t3's notifications by their exact text, not replies that quote or resemble them", () => {
+		for (const text of NOTIFICATIONS) assert.equal(isT3Notification(text), true, text);
+		for (const text of [
+			"yes",
+			"",
+			// Quoting or mentioning a notification is a reply.
+			`> ${COMPLETED}\nIgnore that, go with option B.`,
+			`Why did I get "${BLOCKED}"? Use option A.`,
+			"Delegated task abc failed for me too, so go with A",
+			"Delegated task abc (refactor) is fine, continue",
+			"Delegated tasks are fine, continue",
+			"Background task completed. Now deploy.",
+			"Continue where you left off.\nBut use Postgres.",
+			"Update on pull request #12: please merge it",
+		]) {
+			assert.equal(isT3Notification(text), false, text);
+		}
+	});
 });
+
+// t3's texts as its server writes them (apps/server/src/orchestration-v2).
+const COMPLETED = "Delegated task task-1 (Fix the parser) [completed]:\nChild task completed without an assistant result.";
+const BLOCKED =
+	"Delegated task task-2 is blocked on a question and cannot continue until it is answered. Read it with t3_pending_request action read, threadId thread-9, and requestId req-1. Answer it with action respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.";
+const NOTIFICATIONS = [
+	COMPLETED,
+	BLOCKED,
+	"Delegated task task-1 [failed]:\nboom",
+	"Delegated task task-1 (a (nested) title) [completed]. Use task_status with taskId task-1 to read the result.\n\nDelegated task task-3 [cancelled]:\nstopped",
+	"Delegated task task-4 reached a terminal state. Use task_status with taskId task-4 to read the result.",
+	"Delegated tasks task-4, task-5 reached terminal states. Use task_status with each taskId to read the results.",
+	"Delegated task task-2 asked a question and is still working. Read it with t3_pending_request action read, threadId thread-9, and requestId req-2. Answer it …",
+	"Update on pull request #42 (https://github.com/o/r/pull/42), which T3 Code is watching for you:\n- CI failed\n\nLook into each item …",
+	"Background task completed.",
+	"Continue where you left off.",
+];
 
 const DETACH_MS = 300;
 let faux: ReturnType<typeof registerFauxProvider>;
@@ -289,6 +325,52 @@ describe("ask_user waits for the answers", () => {
 		await run;
 		assert.deepEqual(askResults(s), ["The user answered your ask_user questions:\n\nGo?\nAnswer: yes"]);
 		assert.deepEqual(userTexts(s), ["go", "from an extension", "unrelated"]);
+	});
+
+	test("t3's notifications during the wait are not the answer; they reach the agent after the call, the reply still answers", async () => {
+		const { s, dialogs } = await newSession();
+		// Each model call after the answer records the messages it reads since the previous one (Pi steers one at a time).
+		const reads: string[][] = [];
+		let readUpTo = 0;
+		const read: FauxResponseStep = (context) => {
+			reads.push(context.messages.slice(readUpTo).flatMap((m) => (m.role !== "user" && m.role !== "toolResult" ? [] : [`${m.role}: ${textOf(m.content).split("\n")[0]}`])));
+			readUpTo = context.messages.length + 1;
+			return fauxAssistantMessage("ok");
+		};
+		respond(ask({ questions: [{ title: "Which option?", options: [{ label: "A" }, { label: "B" }] }] }), read, read, read, read);
+		const run = s.prompt("go");
+		await until("the dialog", () => dialogs.length === 1);
+		for (const text of [COMPLETED, BLOCKED, NOTIFICATIONS[5]!]) assert.equal(await s.steer(text, undefined, { source: "rpc" }), "queued", text);
+		await s.prompt(NOTIFICATIONS[6]!, { streamingBehavior: "steer", source: "rpc" });
+		await pause(50);
+		assert.equal(askResults(s).length, 0, "still waiting");
+		assert.equal(dialogs[0]!.closed, false, "the dialog stays open");
+		assert.equal(waits(s), 1);
+		// A reply quoting a notification is the user's answer.
+		const reply = `B. And about "${BLOCKED.slice(0, 60)}": answer it with B too.`;
+		assert.equal(await s.steer(reply, undefined, { source: "rpc" }), "handled");
+		await run;
+		assert.deepEqual(askResults(s), [`The user answered your ask_user questions with a reply in the chat:\n\nWhich option?\nAnswer: ${reply}`]);
+		assert.equal(dialogs[0]!.closed, true);
+		assert.deepEqual(userTexts(s), ["go", COMPLETED, BLOCKED, NOTIFICATIONS[5]!, NOTIFICATIONS[6]!], "every notification is delivered once, in order");
+		const user = (t: string) => `user: ${t.split("\n")[0]}`;
+		assert.deepEqual(
+			reads,
+			[["user: go", "toolResult: The user answered your ask_user questions with a reply in the chat:", user(COMPLETED)], [user(BLOCKED)], [user(NOTIFICATIONS[5]!)], [user(NOTIFICATIONS[6]!)]],
+			"the model reads the answer first, then each notification once",
+		);
+	});
+
+	test("a notification while the dialog is answered on the card is delivered after the answers", async () => {
+		const { s, dialogs } = await newSession();
+		respond(ask({ questions: [{ title: "Go?" }] }), fauxAssistantMessage("done"));
+		const run = s.prompt("go");
+		await until("the dialog", () => dialogs.length === 1);
+		assert.equal(await s.steer(COMPLETED, undefined, { source: "rpc" }), "queued");
+		dialogs[0]!.answer(["yes"]);
+		await run;
+		assert.deepEqual(askResults(s), ["The user answered your ask_user questions:\n\nGo?\nAnswer: yes"]);
+		assert.deepEqual(userTexts(s), ["go", COMPLETED]);
 	});
 
 	test("an abort ends the wait and closes the dialog", async () => {

@@ -15,6 +15,11 @@
 //   it does not reach the conversation a second time. Any user message counts: while the agent is
 //   blocked on its questions, a message is almost always the reply, and an unrelated instruction
 //   still reaches the agent in full, as the tool result, with a note that it was a chat reply.
+//   t3's own notifications are not replies: t3 sends them through the same RPC prompt as the
+//   user's messages and drops their origin (its Pi adapter forwards only the text), so they are
+//   told apart by their fixed text (`isT3Notification`). They are left to Pi, which queues them as
+//   steers delivered after this call returns. Until 2026-11-19 they were consumed as the answer
+//   ("Delegated task … [completed]" answered a question three times and the real decision was lost).
 // - The turn is aborted: the dialog closes and the call fails.
 // When the time runs out, or with `wait_minutes: 0` at once, the call returns that no answer is
 // there yet; the dialog stays open and its answers arrive later as a message that steers the
@@ -95,6 +100,24 @@ export function formatAnswers(questions: ExtensionUIQuestion[], answers: (string
 export const pendingText = (waitedMinutes: number) =>
 	`${waitedMinutes > 0 ? `No answer after ${waitedMinutes} min. ` : ""}The questions stay open. Continue with the work that does not depend on the answers, or end your turn: the answers arrive later as a message.`;
 
+// t3's server-written messages (apps/server/src/orchestration-v2: Orchestrator.ts
+// delegatedCompletionWakeDetail, ProviderContinuationService.ts, DelegatedTaskQuestionReactor.ts,
+// pullRequestWatch.ts, UsageLimitRecoveryWorker.ts), each matched from its first line to its exact
+// wording, so a user's reply that quotes one, mentions one or starts like one is still a reply.
+const T3_NOTIFICATIONS = [
+	// A delegated task's completion wake, one block per task: "Delegated task <id> (<title>) [<status>]:\n<result>" or "…]. Use task_status …".
+	/^Delegated task \S+(?: \(.*\))? \[[a-z_]+\](?::\n|\. Use task_status with taskId \S+ to read the result\.)/,
+	/^Delegated task \S+ reached a terminal state\. Use task_status with taskId \S+ to read the result\./,
+	/^Delegated tasks \S+(?:, \S+)* reached terminal states\. Use task_status with each taskId to read the results\.$/,
+	/^Delegated task \S+ (?:asked a question and is still working|is blocked on a question and cannot continue until it is answered)\. Read it with t3_pending_request /,
+	/^Update on pull request #\d+ \(\S+\), which T3 Code is watching for you:\n/,
+	/^Background task completed\.$/,
+	/^Continue where you left off\.$/,
+];
+
+/** Whether a message is a notification t3 wrote (a delegated task finished or asks, a watched PR changed, …), not the user. */
+export const isT3Notification = (text: string) => T3_NOTIFICATIONS.some((shape) => shape.test(text));
+
 /** A call waiting for its answers takes a chat reply. */
 type ChatWait = (text: string, images: ImageContent[] | undefined) => void;
 
@@ -109,9 +132,10 @@ const waitsOf = (sessionId: string): Set<ChatWait> => {
 type Outcome = { answers: (string | undefined)[] | undefined } | { chat: string; images: ImageContent[] | undefined } | { error: unknown } | { timeout: true } | { aborted: true };
 
 export default function askUser(pi: ExtensionAPI) {
-	// A user message while calls wait: it is their answer, not a new message.
+	// A user message while calls wait: it is their answer, not a new message. Messages from
+	// extensions and t3's notifications go on to the agent as usual, after the waiting call.
 	pi.on("input", (event, ctx) => {
-		if (event.source === "extension") return;
+		if (event.source === "extension" || isT3Notification(event.text)) return;
 		const waits = waitsOf(ctx.sessionManager.getSessionId());
 		if (waits.size === 0) return;
 		for (const answer of [...waits]) answer(event.text, event.images);
