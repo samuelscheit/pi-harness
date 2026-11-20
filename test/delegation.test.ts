@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import type { AssistantMessage, Context, JsonObject } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, type ExtensionUIContext, type ExtensionUIQuestion, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createAgentSession, createReadToolDefinition, DefaultResourceLoader, type ExtensionAPI, type ExtensionUIContext, type ExtensionUIQuestion, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import askUser from "../extensions/ask-user/index.ts";
 import warm from "../extensions/warm/index.ts";
 import { Type } from "typebox";
@@ -1188,7 +1188,9 @@ describe("every tool as a typed, awaitable function", () => {
 			},
 		]);
 		await parent.prompt("go");
-		assert.match(described, /\t\/\*\* Read the contents of a file\. \*\/\n\tread\(args: \{ path: string; offset\?: number; limit\?: number \}, options\?: CallOptions\): Promise<any>;/);
+		const readSignature = `\tread(args: ${tsType(createReadToolDefinition(".").parameters)}, options?: CallOptions): Promise<any>;`;
+		assert.match(readSignature, /^\tread\(args: \{ path: string; offset\?: number; limit\?: number[;}]/);
+		assert.ok(described.includes(`\t/** Read the contents of a file. */\n${readSignature}`), described);
 		assert.match(described, /\tedit\(args: \{ path: string; edits: \{ oldText: string; newText: string \}\[\] \}, options\?: CallOptions\): Promise<string>;/);
 		assert.match(described, /\t"mcp__t3-code__delegate_task": typeof delegate;/);
 		assert.match(described, /\n\t"mcp__t3-code__t3_pending_request"\(args: Record<string, unknown>/, "no description that only repeats the name");

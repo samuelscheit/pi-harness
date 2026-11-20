@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, getApiProvider, registerApiProvider, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createAgentSession, createReadToolDefinition, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import background from "../extensions/background/index.ts";
 import { JOB_MESSAGE_TYPE, type Job, sessionJobs } from "../extensions/background/jobs.ts";
@@ -692,7 +692,9 @@ describe("tools from bash", () => {
 		const text = textOf(toolResults(s)[0]!.content);
 		assert.match(text, /ENOENT|not found|No such file/i);
 		assert.match(text, /\nread 1\n/);
-		assert.match(text, /tool read: unknown option --bogus; options: --path, --offset, --limit\nRun `tool read --help` for its arguments\.\nusage 2\n/);
+		const options = Object.keys(createReadToolDefinition(dir).parameters.properties).map((p) => `--${p}`).join(", ");
+		assert.ok(options.startsWith("--path, --offset, --limit"), options);
+		assert.ok(text.includes(`tool read: unknown option --bogus; options: ${options}\nRun \`tool read --help\` for its arguments.\nusage 2\n`), text);
 		assert.match(text, /tool: unknown tool "nope"\. Tools: [^\n]*\bbash\b[^\n]*\nunknown 2\n$/);
 	});
 
