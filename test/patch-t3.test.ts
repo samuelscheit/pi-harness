@@ -5,7 +5,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { stripTypeScriptTypes } from "node:module";
 import { afterEach, beforeEach, describe, test } from "node:test";
+import { Agent, getGlobalDispatcher, setGlobalDispatcher, fetch as undiciFetch } from "undici";
 import { integrity, packedFiles, readFile, readHeader, replaceFiles } from "../scripts/lib/asar.ts";
 import { withHugePs } from "./fixtures/huge-ps.ts";
 import {
@@ -169,6 +173,10 @@ describe("patchBundle", () => {
 		"followup-after-disposed-delivery",
 		"question-descriptions",
 		"task-id-resolution",
+		"promoted-task-delivered",
+		"promoted-run-wait",
+		"thread-wait-description",
+		"bridge-long-calls",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -235,6 +243,14 @@ describe("patchBundle", () => {
 		assert.ok(text.includes("ordinal: (turn ?? state?.lastTurn ?? null) === null ? 0 : itemOrdinal(turn ?? state.lastTurn, nativeRequestId)"));
 		assert.ok(text.includes("const failure = connectionFailure === null ? reportedFailure : null;"));
 		assert.ok(text.includes("}\n\t\t\t\tif (failure !== null) {\n\t\t\t\t\tconst failureItemId = `terminal-failure:${turn.providerTurn.id}`;\n\t\t\t\t\tyield* emit({\n\t\t\t\t\t\ttype: \"turn.terminal\","), "only a real failure fails the turn");
+		// A follow-up whose queued message was steered into the running turn is delivered; a wait on its run follows the message.
+		assert.ok(text.indexOf("function promotedIntoRun(") < text.indexOf("function delegatedTaskProgress("));
+		assert.ok(text.includes('const outcome = promotedInto === void 0 ? runOutcome(childRun) : "completed";'));
+		assert.ok(text.includes("});\n\t\tif (promotedInto !== void 0) result.text = promotedTaskResult(promotedInto);"), "the result names where the message went");
+		assert.ok(text.includes("const current = selected === void 0 ? void 0 : promotedIntoRun(runs, movedMessages, selected) ?? selected;"));
+		assert.ok(text.includes("stored.event.payload.id === selectedRun.id || stored.event.payload.id === followedRunId ||"), "the wait hears the followed run");
+		assert.ok(text.includes("for a message you sent, pass the `runId` t3_thread_send returned"));
+		assert.ok(text.includes("      signal,\n      ...bridgeDispatch(),\n    });"), "the bridge's calls lift Pi's idle timeout");
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -265,7 +281,8 @@ describe("patchBundle", () => {
 
 	// t3's real bundle (the unpatched original the installer keeps), when this machine has it.
 	const original = "/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar.pre-pi-harness";
-	test("patches t3's installed server bundle into valid JavaScript", { skip: !existsSync(original) && "t3 not installed" }, () => {
+	/** The installed bundle's server files as patchApp patches them, the names applied, and the unpatched texts. */
+	const patchInstalled = () => {
 		const { texts, fileOf } = serverBundles(original);
 		const patched = new Map<string, string>();
 		const applied: string[] = [];
@@ -275,6 +292,10 @@ describe("patchBundle", () => {
 			patched.set(path, result.text);
 			applied.push(...result.applied);
 		}
+		return { texts, fileOf, patched, applied };
+	};
+	test("patches t3's installed server bundle into valid JavaScript", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const { fileOf, patched, applied } = patchInstalled();
 		assert.deepEqual(applied, ALL);
 		// The fork spans three chunks: contracts, the MCP service, and the orchestrator with the Pi adapter.
 		assert.equal(patched.size, 3);
@@ -731,6 +752,127 @@ describe("patchBundle", () => {
 		assert.ok(server.includes('requireThreadScope(callerScope, "task_status");\n\t\t\treturn yield* readTask(scope, yield* resolveTaskId(scope, taskId), false, true);'), "task_status resolves first");
 		assert.ok(server.includes('requireThreadScope(callerScope, "task_cancel");\n\t\t\tinput = {\n\t\t\t\t...input,\n\t\t\t\ttaskId: yield* resolveTaskId(scope, input.taskId)\n\t\t\t};'), "task_cancel resolves before every use of its id");
 
+		// A queued follow-up promoted to steer the running turn (thread 7761f101, 2026-11-19): runs 6 and 7
+		// never started, ended cancelled, and their messages moved into run 5.
+		const promotedIntoRun = new Function(`${fnSource("promotedIntoRun")}\nreturn promotedIntoRun;`)();
+		const promotedTaskResult = new Function(`${fnSource("promotedTaskResult")}\nreturn promotedTaskResult;`)();
+		const running = { id: "run:child:5", ordinal: 5, status: "running", startedAt: "2026-11-19T16:41:02.088Z", userMessageId: "message:5", delegatedTaskId: "node:delegated-task:first", providerInstanceId: "pi", providerThreadId: "provider-thread:child" };
+		const promoted = { ...running, id: "run:child:6", ordinal: 6, status: "cancelled", startedAt: null, completedAt: "2026-11-19T16:46:39.082Z", userMessageId: "message:6", delegatedTaskId: "node:delegated-task:followup" };
+		const childRuns = [running, promoted];
+		const moved = [{ id: "message:5", role: "user", runId: running.id }, { id: "message:6", role: "user", runId: running.id }];
+		const stayed = [{ id: "message:6", role: "user", runId: promoted.id }];
+		assert.equal(promotedIntoRun(childRuns, moved, promoted), running, "the run its message was moved into");
+		assert.equal(promotedIntoRun(childRuns, stayed, promoted), undefined, "a queued message removed from the queue stays with its run");
+		assert.equal(promotedIntoRun(childRuns, moved, { ...promoted, startedAt: "2026-11-19T16:46:00.000Z" }), undefined, "a run that ran and was stopped is cancelled");
+		assert.equal(promotedIntoRun(childRuns, moved, { ...promoted, status: "queued" }), undefined, "a queued run is still queued");
+		assert.equal(promotedIntoRun(childRuns, moved, running), undefined);
+		assert.equal(promotedIntoRun(childRuns, [], promoted), undefined, "its message not loaded: no guess");
+		assert.equal(promotedIntoRun(childRuns, [{ id: "message:6", runId: null }], promoted), undefined);
+		assert.equal(promotedIntoRun([promoted], moved, promoted), undefined, "the run it moved into is not in view");
+		assert.equal(
+			promotedTaskResult(running),
+			"Delivered: the message was moved from the queue into the child's running turn (run run:child:5, task node:delegated-task:first), so it started no run of its own. The child's reply comes with that run: t3_thread_wait with runId run:child:5 waits for it.",
+		);
+		assert.match(promotedTaskResult({ ...running, delegatedTaskId: undefined }), /running turn \(run run:child:5\), so/, "a run no task owns");
+
+		// The follow-up task's end, run as bundled with the bundle's own run helpers and recording stand-ins for the rest.
+		const isAwaitedWork = /\.some\(([\w$]+)\)/.exec(fnSource("runOutcome"))![1]!;
+		const runHelpers = new Function(
+			isAwaitedWork,
+			"latestProviderTurnForAttempt",
+			"toEpochMillis",
+			"withExecutedModelNote",
+			`${fnSource("runOutcome")}\n${fnSource("delegatedTaskTerminalStatus")}\n${fnSource("subagentResultForRun")}\nreturn { runOutcome, delegatedTaskTerminalStatus, subagentResultForRun };`,
+		)(() => true, () => undefined, Date.parse, (text: string) => text);
+		const finalizeTaskSource = source('const finalizeAppOwnedSubagentTask = fn("Orchestrator.finalizeAppOwnedSubagentTask")', "\tconst finalizeAppOwnedSubagent = fn(").replace("const finalizeAppOwnedSubagentTask = ", "").trimEnd().replace(/;$/, "");
+		const followupTask = { id: promoted.delegatedTaskId, origin: "app_owned", threadId: parentId, runId: "run:parent:175", childThreadId: childId, driver: "pi", providerInstanceId: "pi", status: "pending", result: null, completionWake: "always", completionDelivery: { state: "pending", observedByRunId: null } };
+		const finalizeTask = (runs: Record<string, unknown>[], messages: Record<string, unknown>[]) => {
+			const written: Record<string, any>[] = [];
+			const finalize = new Function("deps", `with (deps) { return ${finalizeTaskSource}; }`)({
+				...runHelpers,
+				fn: () => (body: unknown) => body,
+				now: effect("2026-11-19T16:46:39.100Z"),
+				promotedIntoRun,
+				promotedTaskResult,
+				childAwaitsRestartContinuation: () => effect(false),
+				projectionStore: {
+					getThreadRecords: (threadId: string) =>
+						effect(
+							threadId === childId
+								? { messages: [], turnItems: [] }
+								: { thread: { id: parentId, providerInstanceId: "pi" }, runs: [{ id: "run:parent:175", providerInstanceId: "pi" }], subagents: [followupTask], nodes: [], turnItems: [], contextTransfers: [], messages: [] },
+						),
+				},
+				planDelegatedCompletionDelivery: ({ updatedTask }: { updatedTask: unknown }) => effect({ task: updatedTask, offer: false }),
+				idAllocator: { allocate: { contextTransfer: () => effect("transfer:1") } },
+				contextSourcePointForRun: (_projection: unknown, run: { id: string }) => ({ threadId: childId, runId: run.id }),
+				delegatedCompletionPlanEvents: () => [],
+				writeSystemEvents: (events: Record<string, any>[]) => (written.push(...events), effect()),
+				offerDelegatedCompletionDelivery: () => effect(),
+			});
+			const child = { thread: { id: childId, lineage: { relationshipToParent: "subagent", parentThreadId: parentId }, forkedFrom: { type: "node", nodeId: originalId } }, runs, messages };
+			assert.equal(finalize(child, { task: followupTask, syncRunId: promoted.id }).next().done, true);
+			return written;
+		};
+		const delivered = finalizeTask(childRuns, moved);
+		const settled = delivered.find((event) => event.type === "subagent.updated")!.payload;
+		assert.equal(settled.status, "completed", "not cancelled: its message reached the child");
+		assert.equal(settled.result, promotedTaskResult(running));
+		assert.equal(delivered.find((event) => event.type === "context-transfer.created")!.payload.sourcePoint.runId, promoted.id, "its result is its own run's: the task of run 5 delivers that run's");
+		const removed = finalizeTask(childRuns, stayed).find((event) => event.type === "subagent.updated")!.payload;
+		assert.deepEqual([removed.status, removed.result], ["cancelled", "Child task ended with status cancelled."], "a message removed from the queue still ends its task cancelled");
+		const stoppedRun = finalizeTask([running, { ...promoted, startedAt: "2026-11-19T16:46:00.000Z" }], moved).find((event) => event.type === "subagent.updated")!.payload;
+		assert.equal(stoppedRun.status, "cancelled", "so does a run that was stopped while it ran");
+
+		// t3_thread_wait on such a run, run as bundled: it waits for the run the message was moved into.
+		const waitSource = source('const waitForThread = fn("ThreadManagementService.waitForThread")', "\tconst settleAfterRun = ").replace("const waitForThread = ", "").trimEnd().replace(/;$/, "");
+		const isTerminal = (status: string) => ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(status);
+		const waitFor = (runs: Record<string, any>[], messages: Record<string, unknown>[], runId: string) => {
+			const loads: unknown[][] = [];
+			const filters: ((stored: unknown) => boolean)[] = [];
+			const stub = () => ({ pipe: () => effect({ _tag: "None" }) });
+			const wait = new Function("deps", `with (deps) { return ${waitSource}; }`)({
+				fn: () => (body: unknown) => body,
+				fnUntraced: (body: unknown) => body,
+				"gen$1": (body: unknown) => body,
+				promotedIntoRun,
+				isTerminalRunStatus: isTerminal,
+				latestRun: (projection: { runs: { ordinal: number }[] }) => projection.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0],
+				latestRestartContinuation: (_runs: unknown, run: unknown) => run,
+				mapError: () => undefined,
+				orchestrator: { getThreadEventSequence: () => effect(41), restartContinuationPending: () => effect(false), streamStoredEventsFrom: () => "stream" },
+				getProjectThreadRecords: (_input: unknown, fields: string[], filter?: unknown) => (loads.push([fields, filter]), effect({ runs, messages })),
+				mergeAll$1: stub,
+				merge$3: stub,
+				"filter$2": (predicate: (stored: unknown) => boolean) => (filters.push(predicate), "op"),
+				"mapError$1": () => "op",
+				mapEffect: () => "op",
+				runHead: "op",
+				timeoutOption: () => "op",
+				"millis$1": () => "op",
+				fromEffect: () => "op",
+				"empty$8": "op",
+				"flatten$1": (value: unknown) => value,
+				isSome: (option: { _tag: string }) => option._tag === "Some",
+			});
+			const step = wait({ projectId: "project", threadId: childId, runId, timeoutMs: 1_000 }).next();
+			assert.equal(step.done, true);
+			return { result: step.value, loads, hears: (id: string) => filters[0]!({ event: { type: "run.updated", payload: { id } } }) };
+		};
+		const answered = waitFor([{ ...running, status: "completed" }, promoted], moved, promoted.id);
+		assert.deepEqual([answered.result.run.id, answered.result.timedOut], [running.id, false], "the run its message joined, once that run ended");
+		assert.deepEqual(answered.loads.filter(([fields]) => (fields as string[]).includes("messages")), [[["messages"], { messageIds: ["message:6"] }]], "only the selected run's message is read");
+		const ongoing = waitFor(childRuns, moved, promoted.id);
+		assert.deepEqual([ongoing.result.run.id, ongoing.result.timedOut], [running.id, true], "still running: the wait goes on with that run");
+		assert.ok(ongoing.hears(running.id), "the followed run's updates end the wait");
+		assert.ok(ongoing.hears(promoted.id));
+		assert.ok(!ongoing.hears("run:child:7"), "another run's do not");
+		const cancelled = waitFor(childRuns, stayed, promoted.id);
+		assert.deepEqual([cancelled.result.run.id, cancelled.result.run.status, cancelled.result.timedOut], [promoted.id, "cancelled", false], "a message removed from the queue: its run, cancelled");
+		const plain = waitFor([{ ...running, status: "completed" }], moved, running.id);
+		assert.equal(plain.result.run.id, running.id);
+		assert.deepEqual(plain.loads.filter(([fields]) => (fields as string[]).includes("messages")), [], "a run that ran reads no message");
+
 		const dir = mkdtempSync(join(tmpdir(), "t3-bundle-"));
 		try {
 			for (const [path, patchedText] of patched) {
@@ -740,6 +882,66 @@ describe("patchBundle", () => {
 			}
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// t3's MCP bridge, as t3 writes it out for Pi, calling an MCP server that answers after the call's
+	// tool ended, through a global dispatcher with Pi's idle timeouts (here 400 ms; undici's coarse timers
+	// cut at about 1 s) and Pi's undici fetch (Pi installs it as the global one).
+	test("t3's Pi bridge waits for a tool call longer than Pi's HTTP idle timeout, and its signal still ends it", { skip: !existsSync(original) && "t3 not installed" }, async () => {
+		const { texts, fileOf, patched } = patchInstalled();
+		const file = fileOf(PATCHES.find((patch) => patch.name === "bridge-long-calls")!);
+		/** The bridge's client: its section of the extension source, the template literal evaluated as t3 writes the file, its types stripped. */
+		const bridgeClient = (bundle: string, start: string) => {
+			const section = bundle.slice(bundle.indexOf(start), bundle.indexOf("export default async function t3McpExtension("));
+			const written = new Function(`return \`${section}\`;`)() as string;
+			return new Function("fetch", "PROTOCOL", "parseSseOrJson", `${stripTypeScriptTypes(written)}\nreturn createMcpClient;`)(undiciFetch, "2025-06-18", (body: string) => JSON.parse(body));
+		};
+		const patchedClient = bridgeClient(patched.get(file)!, "// Pi's global HTTP dispatcher (undici)");
+		const originalClient = bridgeClient(texts.get(file)!, "function createMcpClient(");
+		const calls: string[] = [];
+		const server = createServer((req, res) => {
+			let body = "";
+			req.on("data", (chunk) => (body += chunk));
+			req.on("end", () => {
+				const { id, params } = JSON.parse(body);
+				calls.push(`${params.name} ${req.headers.authorization}`);
+				const timer = setTimeout(() => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id, result: { structuredContent: { status: "completed" } } })), 2_500);
+				res.on("close", () => clearTimeout(timer));
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+		const pi = getGlobalDispatcher();
+		setGlobalDispatcher(new Agent({ headersTimeout: 400, bodyTimeout: 400 }));
+		try {
+			const wait = (client: (endpoint: string, token: string) => { callTool: Function }, signal?: AbortSignal) => client(endpoint, "secret").callTool("t3_thread_wait", { threadId: "thread-1", timeoutMs: 2_500 }, signal);
+			await assert.rejects(wait(originalClient), /fetch failed/, "unpatched, Pi's idle timeout cuts the call");
+			assert.deepEqual(await wait(patchedClient), { structuredContent: { status: "completed" } }, "patched, the call gets its answer");
+			await assert.rejects(wait(patchedClient, AbortSignal.timeout(300)), { name: "TimeoutError" }, "the call's signal still ends it");
+			assert.deepEqual(calls, ["t3_thread_wait Bearer secret", "t3_thread_wait Bearer secret", "t3_thread_wait Bearer secret"]);
+			const other = await undiciFetch(endpoint, { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 9, params: { name: "other" } }) }).catch((error: Error) => error);
+			assert.match(String(other), /fetch failed/, "other requests keep Pi's idle timeout");
+		} finally {
+			setGlobalDispatcher(pi);
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
+		// Without a global dispatcher (none set on this undici), the bridge sends its requests as before.
+		const bare = new Function(`${stripTypeScriptTypes(new Function(`return \`${patched.get(file)!.slice(patched.get(file)!.indexOf("function bridgeDispatch()"), patched.get(file)!.indexOf("function createMcpClient("))}\`;`)() as string)}\nreturn bridgeDispatch;`)();
+		const saved = Object.getOwnPropertyDescriptor(globalThis, Symbol.for("undici.globalDispatcher.2"));
+		assert.ok(saved?.writable, "undici's global dispatcher slot is writable");
+		const slot = globalThis as unknown as Record<symbol, unknown>;
+		const legacy = slot[Symbol.for("undici.globalDispatcher.1")];
+		try {
+			slot[Symbol.for("undici.globalDispatcher.2")] = undefined;
+			slot[Symbol.for("undici.globalDispatcher.1")] = undefined;
+			assert.deepEqual(bare(), {});
+			slot[Symbol.for("undici.globalDispatcher.1")] = { compose: () => "legacy" };
+			assert.deepEqual(bare(), { dispatcher: "legacy" }, "an older undici's slot");
+		} finally {
+			slot[Symbol.for("undici.globalDispatcher.2")] = saved!.value;
+			slot[Symbol.for("undici.globalDispatcher.1")] = legacy;
 		}
 	});
 });
@@ -849,7 +1051,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution, promoted-task-delivered, promoted-run-wait, thread-wait-description, bridge-long-calls;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -874,7 +1076,7 @@ describe("keeping t3 patched", () => {
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi, task-id-resolution;/);
+			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi, task-id-resolution, thread-wait-description;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 

@@ -148,6 +148,27 @@
 //   agent explained only in its thinking and asked again, twice (thread fa34a168, 2026-11-18). Pi's
 //   options are now `{ label, description? }`; the card shows the description, or the label again
 //   (t3 requires one and hides it when it equals the label). Edits the questions patch's result.
+// - promoted-task-delivered (a follow-up whose queued message was steered into the running turn is
+//   delivered, not cancelled): a coordinator's `t3_thread_send` with `mode:"queue"` to a busy child
+//   queues a run that is a new delegated task once the child's task has its result. Promoting the
+//   queued message to steer (the queue card's Steer button) moves the message into the running turn
+//   and ends the queued run `cancelled` (it never starts), so its task ended "Child task ended with
+//   status cancelled." and the parent read its decisions as dropped and sent them again
+//   (2026-11-19, thread 7761f101; 15 such tasks since 2026-11-14, every one delivered). Such a task
+//   now completes with where its message went: the run it steered, whose end carries the reply.
+// - promoted-run-wait (`t3_thread_wait` on such a run follows its message): waiting with the queued
+//   run's id returned `cancelled` at once; it now waits for the run the message was moved into and
+//   returns that run.
+// - thread-wait-description (the tool says how to wait for a sent message): without `runId` the wait
+//   takes the latest run, also one that had already ended, which read as "no way to wait for the
+//   next run" (2026-11-19); the description names `t3_thread_send`'s `runId`.
+// - bridge-long-calls (a t3 tool call may take longer than Pi's HTTP idle timeout): t3's Pi
+//   extension (`PI_T3_MCP_EXTENSION_SOURCE`) sends each MCP call as one HTTP request that t3 answers
+//   when the tool ends, through Pi's global undici dispatcher, whose headers and body timeouts are
+//   Pi's `httpIdleTimeoutMs` (default 300 s, meant for model streams). A `t3_thread_wait`, a
+//   `delegate_task` in `wait` mode or a question over 5 minutes failed with "fetch failed"
+//   (2026-11-19; 2026-11-14 for the workflow extension, which slices its waits since). The bridge's
+//   own requests now lift both timeouts per request; the call's abort signal still ends them.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -1106,6 +1127,97 @@ export const PATCHES: Patch[] = [
 			[
 				'description: "Read one delegated task you started. ',
 				'description: "Read one delegated task you started, by `taskId` or any unique part of it, or by its child\'s thread id or link. ',
+			],
+		],
+	},
+	{
+		name: "promoted-task-delivered",
+		marker: "promotedIntoRun",
+		edits: [
+			[
+				"function delegatedTaskProgress(projection) {",
+				[
+					"/** The run a queued run's message was moved into when it was promoted to steer that run: the queued run never started and ended cancelled, its message delivered there. */",
+					"function promotedIntoRun(runs, messages, run) {",
+					'\tif (run.status !== "cancelled" || run.startedAt !== null) return void 0;',
+					"\tconst movedTo = messages.find((message) => message.id === run.userMessageId)?.runId;",
+					"\treturn movedTo === void 0 || movedTo === null || movedTo === run.id ? void 0 : runs.find((candidate) => candidate.id === movedTo);",
+					"}",
+					"/** The result of a task whose queued message was promoted into a running turn. */",
+					"function promotedTaskResult(target) {",
+					'\treturn `Delivered: the message was moved from the queue into the child\'s running turn (run ${target.id}${target.delegatedTaskId === void 0 ? "" : `, task ${target.delegatedTaskId}`}), so it started no run of its own. The child\'s reply comes with that run: t3_thread_wait with runId ${target.id} waits for it.`;',
+					"}",
+					"function delegatedTaskProgress(projection) {",
+				].join("\n"),
+			],
+			[
+				"const outcome = runOutcome(childRun);",
+				'const promotedInto = childRun.delegatedTaskId === options.task.id ? promotedIntoRun(childControls.runs, childControls.messages, childRun) : void 0;\n\t\tconst outcome = promotedInto === void 0 ? runOutcome(childRun) : "completed";',
+			],
+			[
+				"const result = subagentResultForRun(childProjection, {\n\t\t\t...childRun,\n\t\t\tstatus: outcome\n\t\t});",
+				"const result = subagentResultForRun(childProjection, {\n\t\t\t...childRun,\n\t\t\tstatus: outcome\n\t\t});\n\t\tif (promotedInto !== void 0) result.text = promotedTaskResult(promotedInto);",
+			],
+		],
+	},
+	{
+		name: "promoted-run-wait",
+		// Uses promoted-task-delivered's promotedIntoRun.
+		marker: "followedRunId",
+		edits: [
+			[
+				"const outcome = fnUntraced(function* (runs) {\n\t\t\tconst current = runs.find((candidate) => candidate.id === selectedRun.id);\n\t\t\tif (current === void 0) return",
+				[
+					"let followedRunId = selectedRun.id;",
+					"\t\tconst outcome = fnUntraced(function* (runs) {",
+					"\t\t\tconst selected = runs.find((candidate) => candidate.id === selectedRun.id);",
+					'\t\t\tconst movedMessages = selected?.status === "cancelled" && selected.startedAt === null ? (yield* getProjectThreadRecords(input, ["messages"], { messageIds: [selected.userMessageId] })).messages : [];',
+					"\t\t\tconst current = selected === void 0 ? void 0 : promotedIntoRun(runs, movedMessages, selected) ?? selected;",
+					"\t\t\tif (current !== void 0) followedRunId = current.id;",
+					"\t\t\tif (current === void 0) return",
+				].join("\n"),
+			],
+			["stored.event.payload.id === selectedRun.id ||", "stored.event.payload.id === selectedRun.id || stored.event.payload.id === followedRunId ||"],
+		],
+	},
+	{
+		name: "thread-wait-description",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "pass the `runId` t3_thread_send returned",
+		edits: [
+			[
+				'description: "Wait for a thread\'s run to finish. No `runId`: latest. Idle: at once.',
+				'description: "Wait for a thread\'s run to finish. No `runId`: the latest, also one that already ended; for a message you sent, pass the `runId` t3_thread_send returned (a queued message moved into the running turn waits for that turn). Idle: at once.',
+			],
+		],
+	},
+	{
+		name: "bridge-long-calls",
+		// Inside the template literal t3 writes out as Pi's extension: no backslash, backtick or `${` here.
+		marker: "function bridgeDispatch()",
+		edits: [
+			[
+				"function createMcpClient(endpoint: string, token: string) {",
+				[
+					"// Pi's global HTTP dispatcher (undici) ends a request after its httpIdleTimeoutMs (default 300 s),",
+					"// a limit meant for model streams. A tool call is one request t3 answers when the tool ends, and a",
+					'// wait, a delegated task in wait mode or a question takes longer ("fetch failed"). The bridge\'s',
+					"// requests lift that limit for themselves; the call's signal still ends them.",
+					"function bridgeDispatch(): { dispatcher?: unknown } {",
+					"  type Dispatch = (options: Record<string, unknown>, handler: unknown) => unknown;",
+					"  type Dispatcher = { compose?: (interceptor: (dispatch: Dispatch) => Dispatch) => unknown };",
+					"  const globals = globalThis as unknown as Record<symbol, Dispatcher | undefined>;",
+					'  const global = globals[Symbol.for("undici.globalDispatcher.2")] ?? globals[Symbol.for("undici.globalDispatcher.1")];',
+					"  const dispatcher = global?.compose?.((dispatch) => (options, handler) => dispatch({ ...options, headersTimeout: 0, bodyTimeout: 0 }, handler));",
+					"  return dispatcher === undefined ? {} : { dispatcher };",
+					"}",
+					"",
+					"function createMcpClient(endpoint: string, token: string) {",
+				].join("\n"),
+			],
+			[
+				'    const response = await fetch(endpoint, {\n      method: "POST",\n      headers: headers(),\n      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),\n      signal,\n    });',
+				'    const response = await fetch(endpoint, {\n      method: "POST",\n      headers: headers(),\n      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),\n      signal,\n      ...bridgeDispatch(),\n    });',
 			],
 		],
 	},
