@@ -1446,9 +1446,14 @@ describe("stopping a run and resuming it with edited code, in t3", () => {
 		const parent = await newSession([(pi) => background(pi, { logRoot: join(dir, "logs") }), workflowExtension(runtime), fakeT3(runtime, parentRun ? { parentRun } : {})]);
 		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
 		if (t3Runs) {
+			// t3 adopts a turn `adoptMs` after it starts, unless it settled before: a settled turn is no run.
+			let adopt: ReturnType<typeof setTimeout> | undefined;
 			parent.subscribe((event) => {
-				if (event.type === "agent_start") setTimeout(() => (run = true), t3Runs.adoptMs);
-				if (event.type === "agent_settled") run = false;
+				if (event.type === "agent_start") adopt = setTimeout(() => (run = true), t3Runs.adoptMs);
+				if (event.type === "agent_settled") {
+					clearTimeout(adopt);
+					run = false;
+				}
 				if (event.type === "agent_start" || event.type === "agent_settled") t3Runs.log.push({ at: Date.now(), what: event.type });
 			});
 		}
