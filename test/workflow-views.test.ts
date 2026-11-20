@@ -41,8 +41,8 @@ after(() => faux.unregister());
 let dir: string;
 let repo: string;
 let sessions: AgentSession[];
-/** Each fake t3 call: tool, arguments, and whether a run of the session was active (t3 refuses otherwise). */
-let calls: { name: string; args: Record<string, unknown>; active: boolean }[];
+/** Each fake t3 call: tool, arguments, whether a run of the session was active (t3 refuses otherwise), and which load of the extensions (1, then 2 after a reload) served it. */
+let calls: { name: string; args: Record<string, unknown>; active: boolean; load: number }[];
 let errors: string[];
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "views-"));
@@ -76,7 +76,9 @@ const until = async (what: string, ok: () => boolean, ms = 10_000) => {
 async function newSession(options: { t3?: boolean; refuseRenders?: number } = {}) {
 	let refusals = options.refuseRenders ?? 0;
 	let session: AgentSession | undefined;
+	let loads = 0;
 	const fakeT3 = (pi: ExtensionAPI) => {
+		const load = ++loads;
 		for (const name of ["html_render", "preview_open"]) {
 			pi.registerTool({
 				name: `mcp__t3-code__${name}`,
@@ -84,7 +86,7 @@ async function newSession(options: { t3?: boolean; refuseRenders?: number } = {}
 				description: name,
 				parameters: Type.Object({}, { additionalProperties: true }),
 				async execute(_id, params) {
-					calls.push({ name, args: params as Record<string, unknown>, active: session?.isStreaming ?? false });
+					calls.push({ name, args: params as Record<string, unknown>, active: session?.isStreaming ?? false, load });
 					// As t3 answers before it adopted a woken run.
 					if (name === "html_render" && String((params as { title?: unknown }).title).endsWith("ended") && refusals-- > 0) {
 						throw new Error('{"_tag":"OrchestratorMcpFailure","code":"parent_not_active","message":"The calling provider no longer owns an active thread run."}');
@@ -179,22 +181,23 @@ describe("the run's page in the thread", () => {
 		assert.deepEqual(data.phases.map((p) => [p.phase, p.status]), [["one", "done"], ["two", "expected"]]);
 	});
 
-	test("a call whose context went stale (a harness reload) is interrupted, and its result asks the agent to show the page", async () => {
-		const told = model("await new Promise((r) => setTimeout(r, 500));\nawait tools.read({ path: 'README.md' });\nreturn 'never';");
+	test("a call keeps running across a harness reload: its tools are the reloaded ones, and its end page is rendered by them", async () => {
+		model("await new Promise((r) => setTimeout(r, 500));\nconst readme = await tools.read({ path: 'README.md' });\nreturn 'read: ' + JSON.stringify(readme);");
 		const session = await newSession();
 		await session.prompt("go");
 		await session.reload();
-		registerFaux();
 		// The model after a reload is a new faux provider; the result is read from the message the session got.
+		registerFaux();
+		faux.setResponses(Array.from({ length: 10 }, () => say("ok")));
 		const message = () =>
 			session.sessionManager.getEntries().flatMap((e) => (e.type === "custom_message" && e.customType === "background-job" && typeof e.content === "string" ? [e.content] : []))[0];
 		await until("the result", () => message() !== undefined);
 		const result = message()!;
-		assert.match(result, /Workflow interrupted/);
-		assert.match(result, /It can continue from its journal: call workflow with resume: "\d{8}-\d{6}-[0-9a-f]{6}"/);
-		assert.match(result, /interrupted: the harness reloaded/);
-		assert.match(result, /Show this run's page in the thread before you reply: call mcp__t3-code__html_render with path ".*\/page\.html", height \d+ and title "workflow \S+ · ended"\./);
-		assert.equal(renders().length, 1, "only the start page; the harness could not render the end");
+		assert.match(result, /Workflow completed/);
+		assert.match(result, /\n\nread: "x\\n"$/, "the tool call after the reload ran");
+		assert.doesNotMatch(result, /Show this run's page/, "no fallback: the harness renders the end page");
+		await until("the end page", () => renders().length === 2);
+		assert.deepEqual(renders().map((c) => [String(c.args.title).replace(/^workflow \S+ · /, ""), c.load, c.active]), [["started", 1], ["ended", 2]].map(([when, load]) => [when, load, true]), "the end page by the reloaded extensions, in a run");
 	});
 
 	test("an end page t3 refuses before it adopted the woken run is tried again at the next message", async () => {

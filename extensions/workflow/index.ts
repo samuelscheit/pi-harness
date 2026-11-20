@@ -121,13 +121,13 @@ export default function workflow(pi: ExtensionAPI, options: WorkflowExtensionOpt
 				),
 		);
 
-	/** The session's tools, called as the model calls them; a stale context (a harness reload) interrupts the run. */
+	/** The session's tools, called as the model calls them; a stale context (the session was replaced or disposed; a reload keeps it) interrupts the run. */
 	const executor = (ctx: ExtensionToolContext): Executor => async (name, args, callSignal) => {
 		let result: Awaited<ReturnType<ExtensionToolContext["executeTool"]>>;
 		try {
 			result = await ctx.executeTool(name, args, { signal: callSignal });
 		} catch (error) {
-			if (error instanceof Error && /\bstale\b/.test(error.message)) throw Object.assign(new Error(`the harness reloaded: ${error.message}`), { name: "ContextStale" });
+			if (error instanceof Error && /\bstale\b/.test(error.message)) throw Object.assign(new Error(`the session was replaced or ended: ${error.message}`), { name: "ContextStale" });
 			throw error;
 		}
 		return outcome(ctx.tools.find((t) => t.name === name), result.result as never, result.isError);

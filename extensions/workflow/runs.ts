@@ -11,7 +11,8 @@
 //   takes a page only while a run of the thread is active ("parent_not_active" otherwise, tested
 //   2026-11-14; at the woken run's turn_start t3 had not adopted it yet, so a refused page waits for
 //   the next message, up to END_RENDER_ATTEMPTS times). When the
-//   call's context went stale (a harness reload), the result asks the agent to show the page.
+//   call's context went stale (its session was replaced or disposed; a reload keeps it), the result
+//   asks the agent to show the page.
 // - The dashboard serves the same page live at /workflows/<id> (dashboard/server/workflows.ts); in
 //   t3 it opens in the preview panel at the start.
 
@@ -76,7 +77,7 @@ export function recordRun(pi: ExtensionAPI, sessionId: string, data: RunEntryDat
 export const liveUrl = (dashboardUrl: string, id: string) => `${dashboardUrl}/workflows/${id}`;
 export const runHeadline = (id: string, attempt: number, dashboardUrl: string) => `Workflow run ${id}${attempt > 1 ? ` (resume ${attempt - 1})` : ""} · live view ${liveUrl(dashboardUrl, id)}`;
 
-/** Whether a tool context can still call tools (a harness reload makes it stale). */
+/** Whether a tool context can still call tools (replacing or disposing its session makes it stale; a reload does not). */
 export function contextLive(ctx: ExtensionToolContext): boolean {
 	try {
 		void ctx.tools;
