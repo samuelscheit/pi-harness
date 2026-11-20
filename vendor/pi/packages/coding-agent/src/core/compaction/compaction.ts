@@ -9,6 +9,7 @@ import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-a
 import {
 	contentText,
 	getCurrentSystemMessage,
+	isRetryableAssistantError,
 	normalizeContext,
 	type RetryCallbacks,
 	type RetryPolicy,
@@ -28,6 +29,7 @@ import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
 	type CompactionEntry,
+	type CompactionReason,
 	type ProjectedSessionEntry,
 	type SessionEntry,
 	type SessionProjection,
@@ -42,6 +44,7 @@ import {
 	formatFileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
+	truncateForSummary,
 } from "./utils.ts";
 
 // ============================================================================
@@ -615,6 +618,27 @@ export function getSummarizationFailure(response: AssistantMessage, label: strin
 	return undefined;
 }
 
+/** A summary request whose answer cannot become a summary; `response` is that answer. */
+export class SummarizationError extends Error {
+	readonly response: AssistantMessage;
+
+	constructor(message: string, response: AssistantMessage) {
+		super(message);
+		this.name = "SummarizationError";
+		this.response = response;
+	}
+}
+
+/** The text of a summary response; throws a {@link SummarizationError} for one that has none. */
+function summaryText(response: AssistantMessage, label: string): string {
+	const failure = getSummarizationFailure(response, label);
+	if (failure) throw new SummarizationError(failure, response);
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new SummarizationError(`${label} attempted to call a tool`, response);
+	}
+	return contentText(response.content);
+}
+
 function createSummarizationOptions(
 	model: Model<any>,
 	apiKey: string | undefined,
@@ -762,17 +786,7 @@ export async function generateSummaryWithUsage(
 		callbacks,
 	);
 
-	const failure = getSummarizationFailure(response, "Summarization");
-	if (failure) {
-		throw new Error(failure);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Summarization attempted to call a tool");
-	}
-
-	const textContent = contentText(response.content);
-
-	return { text: textContent, usage: response.usage };
+	return { text: summaryText(response, "Summarization"), usage: response.usage };
 }
 
 // ============================================================================
@@ -1113,16 +1127,78 @@ async function generateTurnPrefixSummary(
 		callbacks,
 	);
 
-	const failure = getSummarizationFailure(response, "Turn prefix summarization");
-	if (failure) {
-		throw new Error(failure);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Turn prefix summarization attempted to call a tool");
-	}
+	return { text: summaryText(response, "Turn prefix summarization"), usage: response.usage };
+}
 
+// ============================================================================
+// Compaction without a summary
+// ============================================================================
+
+const UNSUMMARIZED_TEXT_MAX_CHARS = 2000;
+const UNSUMMARIZED_MAX_REQUESTS = 20;
+
+/**
+ * Whether automatic compaction goes on without a model summary after the summary request failed
+ * with `error`. Overflow recovery does: without a compaction the session cannot send another
+ * request. A threshold compaction does when the failure is deterministic (a refusal such as a
+ * provider's usage-policy block, another non-retryable error, a truncated summary): the next turn
+ * would send the same request, fail the same way, and the context keeps growing until it
+ * overflows. A transient failure (rate limit, server error, dropped stream) is left for the next
+ * turn to retry with a summary. Economic and cold compactions are optional savings and never drop
+ * history unsummarized.
+ */
+export function compactsWithoutSummary(reason: CompactionReason, error: unknown): boolean {
+	if (reason === "overflow") return true;
+	return reason === "threshold" && error instanceof SummarizationError && !isRetryableAssistantError(error.response);
+}
+
+/**
+ * Compact `preparation` without a model: the summary keeps the previous summary, says that the
+ * removed messages were not summarized and why (`failure`), and carries what the user asked in
+ * them (the latest {@link UNSUMMARIZED_MAX_REQUESTS}), the assistant's last message in them, and the
+ * files they read and changed. Lossy, but it always succeeds, so a session whose summary request
+ * keeps failing can still continue instead of dying at its context limit.
+ */
+export function compactWithoutSummary(preparation: CompactionPreparation, failure: string): CompactionResult {
+	const { firstKeptEntryId, messagesToSummarize, turnPrefixMessages, previousSummary, tokensBefore, fileOps } =
+		preparation;
+	if (!firstKeptEntryId) {
+		throw new Error("First kept entry has no UUID - session may need migration");
+	}
+	const removed = [...messagesToSummarize, ...turnPrefixMessages];
+	const textOf = (message: AgentMessage) =>
+		"content" in message && message.role !== "toolResult" ? contentText(message.content, "").trim() : "";
+	const requests = removed
+		.filter((message) => message.role === "user")
+		.map(textOf)
+		.filter((text) => text !== "");
+	const lastAssistantText = removed
+		.filter((message) => message.role === "assistant")
+		.map(textOf)
+		.findLast((text) => text !== "");
+	const truncate = (text: string) => truncateForSummary(text, UNSUMMARIZED_TEXT_MAX_CHARS);
+
+	const parts: string[] = [];
+	if (previousSummary) parts.push(previousSummary, "---");
+	parts.push(
+		`## Removed without a summary\n\n${removed.length} earlier messages were removed from the context without a summary, because the summary request failed: ${failure}`,
+	);
+	if (requests.length > 0) {
+		const shown = requests.slice(-UNSUMMARIZED_MAX_REQUESTS);
+		const heading =
+			shown.length < requests.length
+				? `### What the user asked in them (the last ${shown.length} of ${requests.length})`
+				: "### What the user asked in them";
+		parts.push(heading, ...shown.map((text) => `[User]: ${truncate(text)}`));
+	}
+	if (lastAssistantText) {
+		parts.push("### The assistant's last message in them", `[Assistant]: ${truncate(lastAssistantText)}`);
+	}
+	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	return {
-		text: contentText(response.content),
-		usage: response.usage,
+		summary: parts.join("\n\n") + formatFileOperations(readFiles, modifiedFiles),
+		firstKeptEntryId,
+		tokensBefore,
+		details: { readFiles, modifiedFiles } as CompactionDetails,
 	};
 }

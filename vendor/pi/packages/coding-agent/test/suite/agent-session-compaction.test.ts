@@ -80,6 +80,30 @@ function useSummaryStreamFn(
 	return () => callCount;
 }
 
+const POLICY_BLOCK =
+	"This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs.";
+
+/** Answer every summary request with an error response carrying `errorMessage`. */
+function useFailingSummaryStreamFn(harness: Harness, errorMessage: string): () => number {
+	let callCount = 0;
+	harness.session.agent.streamFunction = (model) => {
+		callCount++;
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => {
+			const message: AssistantMessage = {
+				...fauxAssistantMessage("", { stopReason: "error", errorMessage }),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: createUsage(0),
+			};
+			stream.push({ type: "error", reason: "error", error: message });
+		});
+		return stream;
+	};
+	return () => callCount;
+}
+
 function seedCompactableSession(harness: Harness): void {
 	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
 	const now = Date.now();
@@ -471,6 +495,131 @@ describe("AgentSession compaction characterization", () => {
 				errorMessage: "Auto-compaction failed: summary generator blew up",
 			}),
 		]);
+	});
+
+	it("compacts without a summary when the summary request is refused", async () => {
+		const failedEvents: unknown[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_compact_failed", (event) => void failedEvents.push(event));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const getStreamCallCount = useFailingSummaryStreamFn(harness, POLICY_BLOCK);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		const entries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
+		expect(entries).toHaveLength(1);
+		const summary = entries[0]?.type === "compaction" ? entries[0].summary : "";
+		// The seeded history is one split turn, so its turn-prefix summary is the refused request.
+		expect(summary).toContain(
+			`because the summary request failed: Turn prefix summarization failed: ${POLICY_BLOCK}`,
+		);
+		expect(summary).toContain("[User]: message to compact");
+		expect(entries[0]).not.toHaveProperty("model");
+		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
+		expect(compactionEnd).toMatchObject({ reason: "threshold", aborted: false, willRetry: false });
+		expect(compactionEnd?.errorMessage).toBeUndefined();
+		expect(compactionEnd?.result?.summary).toBe(summary);
+		expect(failedEvents).toEqual([]);
+		// A deterministic refusal is not retried.
+		expect(getStreamCallCount()).toBe(1);
+	});
+
+	it("leaves a threshold compaction for later when the summary request fails transiently", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: false } } });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		useFailingSummaryStreamFn(harness, "529 overloaded");
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+		expect(harness.eventsOfType("compaction_end").at(-1)?.errorMessage).toBe(
+			"Auto-compaction failed: Turn prefix summarization failed: 529 overloaded",
+		);
+	});
+
+	it("recovers from overflow without a summary when every summary request fails", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: false } } });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = () => {
+			throw new Error("summary generator blew up");
+		};
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("overflow", true)).resolves.toBe(true);
+
+		const entry = harness.sessionManager.getEntries().find((e) => e.type === "compaction");
+		expect(entry?.type === "compaction" ? entry.summary : "").toContain(
+			"because the summary request failed: summary generator blew up",
+		);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ reason: "overflow", willRetry: true });
+	});
+
+	it("does not compact without a summary when the summary request is aborted", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.agent.streamFunction = (model, _context, options) => {
+			const stream = createAssistantMessageEventStream();
+			options?.signal?.addEventListener("abort", () => {
+				const message: AssistantMessage = {
+					...fauxAssistantMessage("", { stopReason: "aborted" }),
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: createUsage(0),
+				};
+				stream.push({ type: "error", reason: "aborted", error: message });
+			});
+			queueMicrotask(() => harness.session.abortCompaction());
+			return stream;
+		};
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(sessionInternals._runAutoCompaction("overflow", true)).resolves.toBe(false);
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ reason: "overflow", aborted: true });
+	});
+
+	// Regression: a delegated session at 994k of a 1M window had every summary request refused by the
+	// provider, so threshold compaction and overflow recovery both failed and the session died on
+	// "prompt is too long".
+	it("resumes a truncated turn after compacting without a summary when the summary is refused", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 }, retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		let resumedRequest = "";
+		harness.setResponses([
+			fauxAssistantMessage("partial response", { stopReason: "length" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: POLICY_BLOCK }),
+			(context) => {
+				resumedRequest = JSON.stringify(context.messages);
+				return fauxAssistantMessage("completed response");
+			},
+		]);
+
+		await harness.session.prompt("x".repeat(5000));
+
+		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "overflow",
+			aborted: false,
+			willRetry: true,
+		});
+		expect(resumedRequest).toContain("Removed without a summary");
+		expect(harness.session.getLastAssistantText()).toBe("completed response");
 	});
 
 	it("compacts and resumes after a length stop below the desired output limit", async () => {

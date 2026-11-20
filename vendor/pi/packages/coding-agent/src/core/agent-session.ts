@@ -83,6 +83,8 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	compactionSaving,
+	compactsWithoutSummary,
+	compactWithoutSummary,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
@@ -3675,15 +3677,17 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			// A base or extension provided compaction content, else the shared default summary generator, also used by manual compaction.
+			// A base or extension provided compaction content, else the shared default summary generator, also
+			// used by manual compaction. When the summary request fails and the session cannot go on without
+			// this compaction, it compacts without a summary (see compactsWithoutSummary).
+			const signal = abortController.signal;
 			const compacted =
 				extensionCompaction ??
-				(await this._runDefaultCompaction(
-					preparation!,
-					summaryModel ?? model,
-					undefined,
-					abortController.signal,
-					reason,
+				(await this._runDefaultCompaction(preparation!, summaryModel ?? model, undefined, signal, reason).catch(
+					(error: unknown) => {
+						if (signal.aborted || !compactsWithoutSummary(reason, error)) throw error;
+						return compactWithoutSummary(preparation!, error instanceof Error ? error.message : String(error));
+					},
 				));
 			const { summary, firstKeptEntryId, tokensBefore, usage, details, generatedBy } = compacted;
 			abortController.signal.throwIfAborted();
