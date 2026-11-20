@@ -15,7 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
-import { type Committed, commitFile, dirty, firstLine, isRepository } from "./commit.ts";
+import { type Committed, commitFiles, dirty, firstLine, isRepository } from "./commit.ts";
 import type { Delta } from "./curate.ts";
 import { instructionFile, type KnownRule, LEARNED_HEADING } from "./rules.ts";
 
@@ -43,7 +43,7 @@ export interface Applied extends Partial<Committed> {
 const day = (at: Date | number) => new Date(at).toISOString().slice(0, 10);
 
 /** The branch that keeps a commit the checked-out branch refused. */
-function fallbackBranch(ctx: ApplyContext, text: string): string {
+export function fallbackBranch(ctx: { now: Date }, text: string): string {
 	const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, "-").split("-").filter(Boolean).slice(0, 6).join("-").slice(0, 48).replace(/-$/, "");
 	return `dream/${day(ctx.now)}-${slug || "rule"}`;
 }
@@ -107,14 +107,14 @@ function applyGlobal(delta: Extract<Delta, { op: "add"; scope: "global" }> | Ext
 	if (delta.op === "add") {
 		const { file, name } = freeRuleFile(ctx.source, rulesDir, delta.name);
 		const content = `---\n${stringify({ source: "dream", added: day(ctx.now) })}---\n\n${delta.text}\n`;
-		return { delta, target: `rules/${name}`, ...commitFile(ctx.source, file, content, message(`feat(rules): learned rule ${name}`, delta.text, delta, ctx), fallbackBranch(ctx, name)) };
+		return { delta, target: `rules/${name}`, ...commitFiles(ctx.source, [{ path: file, content }], message(`feat(rules): learned rule ${name}`, delta.text, delta, ctx), fallbackBranch(ctx, name)) };
 	}
 	const name = delta.rule.slice("rules/".length);
 	const file = join(rulesDir, `${name}.md`);
 	if (dirty(ctx.source, file)) return { delta, target: delta.rule, skipped: `${relative(ctx.source, file)} has uncommitted changes` };
 	const { frontmatter } = parseFrontmatter(readFileSync(file, "utf8"));
 	const content = `---\n${stringify({ ...frontmatter, updated: day(ctx.now) })}---\n\n${delta.text}\n`;
-	return { delta, target: delta.rule, ...commitFile(ctx.source, file, content, message(`fix(rules): sharpen rule ${name}`, delta.text, delta, ctx, delta.reason), fallbackBranch(ctx, name)) };
+	return { delta, target: delta.rule, ...commitFiles(ctx.source, [{ path: file, content }], message(`fix(rules): sharpen rule ${name}`, delta.text, delta, ctx, delta.reason), fallbackBranch(ctx, name)) };
 }
 
 function applyProject(delta: Extract<Delta, { op: "add"; scope: "project" }> | Extract<Delta, { op: "update" }>, ctx: ApplyContext, target: string): Applied {
@@ -127,14 +127,14 @@ function applyProject(delta: Extract<Delta, { op: "add"; scope: "project" }> | E
 	if (delta.op === "add") {
 		const next = withLearnedLine(content, `- ${delta.text}`);
 		const line = next.split("\n").indexOf(`- ${delta.text}`) + 1;
-		return { delta, target: `${repo}:${line}`, ...commitFile(repo, file, next, message(`docs(agents): learned rule`, delta.text, delta, ctx), fallbackBranch(ctx, delta.text)) };
+		return { delta, target: `${repo}:${line}`, ...commitFiles(repo, [{ path: file, content: next }], message(`docs(agents): learned rule`, delta.text, delta, ctx), fallbackBranch(ctx, delta.text)) };
 	}
 	const lines = content.split("\n");
 	const index = Number(delta.rule.slice(delta.rule.lastIndexOf(":") + 1)) - 1;
 	const known = ctx.rules.get(delta.rule)?.text;
 	if (lines[index]?.trim() !== known) return { delta, target, skipped: `${name}:${index + 1} changed since the rules were read` };
 	lines[index] = `${/^\s*-\s/.test(lines[index]!) ? "- " : ""}${delta.text}`;
-	return { delta, target, ...commitFile(repo, file, lines.join("\n"), message(`docs(agents): sharpen learned rule`, delta.text, delta, ctx, delta.reason), fallbackBranch(ctx, delta.text)) };
+	return { delta, target, ...commitFiles(repo, [{ path: file, content: lines.join("\n") }], message(`docs(agents): sharpen learned rule`, delta.text, delta, ctx, delta.reason), fallbackBranch(ctx, delta.text)) };
 }
 
 /** What a delta is about before it is applied: the rule it names, or where a new rule goes. */

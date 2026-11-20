@@ -6,6 +6,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { indexClaudeSessions } from "./claude.ts";
 import { type IndexResult, indexSessions } from "./indexer.ts";
+import { indexLabels, LABELS_FILE } from "./labels.ts";
 import type { Filters, Source } from "./queries/index.ts";
 import { report } from "./report.ts";
 import { importedClaude, openStore } from "./store.ts";
@@ -19,10 +20,12 @@ export const needsClaude = (source: Source | undefined) => source === "claude-co
 
 /**
  * Index changed Pi sessions, and Claude Code transcripts (imported for analysis only) when asked
- * or when the store imported them before a rebuild dropped them (see store.ts).
+ * or when the store imported them before a rebuild dropped them (see store.ts), and dreaming's
+ * message labels (labels.ts).
  */
-export function indexAll(db: DatabaseSync, { claude = false, agentDir = getAgentDir(), claudeDir = CLAUDE_PROJECTS } = {}): IndexResult[] {
+export function indexAll(db: DatabaseSync, { claude = false, agentDir = getAgentDir(), claudeDir = CLAUDE_PROJECTS, labelsFile = LABELS_FILE } = {}): IndexResult[] {
 	const results = [indexSessions(db, join(agentDir, "sessions")), ...(claude || claudeDropped(db) ? [indexClaudeSessions(db, claudeDir)] : [])];
+	indexLabels(db, labelsFile);
 	// Planner statistics: without them a time window scans every source's requests by time instead
 	// of the few sessions in scope (2 s instead of 60 ms for Pi's sessions next to Claude Code's).
 	// Cheap when they are current: optimize only analyzes tables never analyzed or grown a lot since.

@@ -16,8 +16,15 @@
 // Experiments that switch tools (frontmatter `tools`) add each tool's usage: the share of sessions
 // and of turns calling it, for tools that report a goal the share of calls reaching it, and for
 // tools that change files the share of calls after which the agent read a changed file again.
+//
+// Quality metrics sit next to cost: the share of the user's messages that correct the agent or
+// report a failure (dreaming's labels, labels.ts; only labelled messages count, so sessions without
+// human messages, such as delegated ones, have none), and interrupted turns per package. Dreaming's
+// judge (scripts/dream/judge.ts) promotes an experiment only when they did not get worse.
 
 import { type Arm, ARMS } from "../../lib/experiments.ts";
+import { DELEGATED_SQL } from "../../lib/variants.ts";
+import { NEGATIVE_SQL } from "../labels.ts";
 import type { Scope } from "./scope.ts";
 
 export interface ArmSession {
@@ -45,6 +52,15 @@ export interface ArmSession {
 	/** Edit tool calls, and the distinct files they wrote. */
 	editCalls: number;
 	editedFiles: number;
+	/** The user's messages dreaming labelled (labels.ts), and those correcting the agent or reporting a failure. */
+	labelled: number;
+	negatives: number;
+	/** Turns the user interrupted. */
+	interrupts: number;
+	/** 1 for a session a parent started with delegate_task, else 0. */
+	delegated: number;
+	/** 1 when the parent delegated the same task again later (same task or title): the subagent's work had to be redone. */
+	retried: number;
 	/** Usage of the tools the comparison follows, by tool (absent: never called). */
 	tools: Record<string, ToolUse>;
 }
@@ -83,11 +99,16 @@ export const EXPERIMENT_METRICS: readonly MetricDef[] = [
 	{ key: "turnsPerPackage", label: "turns per package", unit: "count", numerator: (s) => s.turns, denominator: (s) => s.packages },
 	{ key: "turnsPerSession", label: "turns per session", unit: "count", numerator: (s) => s.turns, denominator: perSession },
 	{ key: "costPerSession", label: "cost per session", unit: "usd", numerator: (s) => s.cost, denominator: perSession },
+	{ key: "costPerPackage", label: "cost per package", unit: "usd", numerator: (s) => s.cost, denominator: (s) => s.packages },
 	{ key: "readCostPerSession", label: "cache-read cost per session", unit: "usd", numerator: (s) => s.readCost, denominator: perSession },
 	{ key: "costPerTurn", label: "cost per turn", unit: "usd", numerator: (s) => s.cost, denominator: (s) => s.turns },
 	{ key: "readCostPerTurn", label: "cache-read cost per turn", unit: "usd", numerator: (s) => s.readCost, denominator: (s) => s.turns },
 	{ key: "toolErrorRate", label: "tool error rate", unit: "share", numerator: (s) => s.toolErrors, denominator: (s) => s.toolResults },
 	{ key: "childCostPerSession", label: "child-session cost per session", unit: "usd", numerator: (s) => s.childCost, denominator: perSession },
+	{ key: "negativeShare", label: "user messages correcting or reporting failures", unit: "share", numerator: (s) => s.negatives, denominator: (s) => s.labelled },
+	{ key: "interruptsPerPackage", label: "interrupted turns per package", unit: "count", numerator: (s) => s.interrupts, denominator: (s) => s.packages },
+	{ key: "followUpsPerSession", label: "follow-up requests per session", unit: "count", numerator: (s) => Math.max(0, s.packages - 1), denominator: perSession },
+	{ key: "retriedShare", label: "subagent tasks delegated again", unit: "share", numerator: (s) => s.retried, denominator: (s) => s.delegated },
 ];
 
 /** The usage metrics of a tool an experiment switches. */
@@ -104,7 +125,9 @@ export interface CellMetric {
 	unit: MetricDef["unit"];
 	/** The metric per cell (null without sessions or with a zero denominator). */
 	values: Record<string, number | null>;
-	/** The factorial contrast of the cells (B − A, or the interaction), and its 95% bootstrap interval (null with fewer than two sessions in a cell). */
+	/** The metric's denominator summed per cell (turns, packages, labelled messages, …): how much data each value rests on. */
+	denominators: Record<string, number>;
+	/** The factorial contrast of the cells (B − A, or the interaction), and its bootstrap interval at the comparison's level, 95% by default (null with fewer than two sessions in a cell). */
 	effect: number | null;
 	ci: [number, number] | null;
 }
@@ -207,7 +230,14 @@ export function armSessions(scope: Scope, experiments: string[], tools: readonly
 				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")} AND t.mutates = 1 AND t.tool IN ('edit', 'write')) tool_mutating,
 				(SELECT COUNT(*) FROM tool_results t WHERE ${during("t")} AND t.tool = 'edit') edits,
 				(SELECT COUNT(DISTINCT f.file) FROM tool_results t JOIN tool_files f ON f.session_id = t.session_id AND f.call_id = t.call_id
-					WHERE ${during("t")} AND t.tool = 'edit' AND f.write = 1) edited_files
+					WHERE ${during("t")} AND t.tool = 'edit' AND f.write = 1) edited_files,
+				(SELECT COUNT(*) FROM message_labels l WHERE ${during("l")}) labelled,
+				(SELECT COUNT(*) FROM message_labels l WHERE ${during("l")} AND l.label IN (${NEGATIVE_SQL})) negatives,
+				(SELECT COUNT(*) FROM requests r WHERE ${during("r")} AND r.kind = 'turn' AND r.stop_reason = 'aborted' ${model}) interrupts,
+				${DELEGATED_SQL("s.id")} delegated,
+				EXISTS (SELECT 1 FROM delegations d JOIN delegations again ON again.session_id = d.session_id AND again.kind = 'delegate' AND again.ts > d.ts
+					AND (again.task_digest = d.task_digest OR (d.title IS NOT NULL AND again.title = d.title))
+					WHERE d.kind = 'delegate' AND d.task_digest = s.prompt_digest) retried
 			FROM ${arms.sql} a JOIN sessions s ON s.id = a.session_id
 			WHERE ${scope.where("a", undefined)}
 			ORDER BY a.session_id`,
@@ -231,6 +261,11 @@ export function armSessions(scope: Scope, experiments: string[], tools: readonly
 			toolMutatingCalls: Number(r.tool_mutating),
 			editCalls: Number(r.edits),
 			editedFiles: Number(r.edited_files),
+			labelled: Number(r.labelled),
+			negatives: Number(r.negatives),
+			interrupts: Number(r.interrupts),
+			delegated: Number(r.delegated),
+			retried: Number(r.retried),
 			tools: usage.get(String(r.session_id)) ?? {},
 		}))
 		.filter((s) => s.turns > 0);
@@ -253,11 +288,11 @@ const ratio = (num: number, den: number) => (den > 0 ? num / den : null);
 export type Pairs = [number, number][];
 
 /**
- * 95% percentile interval of Σ weight × ratio(group), resampling each group's [numerator,
- * denominator] pairs with replacement. Null when a group has fewer than two sessions. Resamples
- * where a ratio is undefined (all denominators zero) are skipped.
+ * Percentile interval (`level`, 95% by default) of Σ weight × ratio(group), resampling each
+ * group's [numerator, denominator] pairs with replacement. Null when a group has fewer than two
+ * sessions. Resamples where a ratio is undefined (all denominators zero) are skipped.
  */
-export function bootstrapContrast(groups: { pairs: Pairs; weight: number }[], resamples = 2000, seed = 1): [number, number] | null {
+export function bootstrapContrast(groups: { pairs: Pairs; weight: number }[], { resamples = 2000, seed = 1, level = 0.95 }: { resamples?: number; seed?: number; level?: number } = {}): [number, number] | null {
 	if (groups.some((g) => g.pairs.length < 2)) return null;
 	const next = prng(seed);
 	const resample = (pairs: Pairs) => {
@@ -284,14 +319,15 @@ export function bootstrapContrast(groups: { pairs: Pairs; weight: number }[], re
 	if (contrasts.length === 0) return null;
 	contrasts.sort((x, y) => x - y);
 	const at = (p: number) => contrasts[Math.min(contrasts.length - 1, Math.max(0, Math.round(p * (contrasts.length - 1))))]!;
-	return [at(0.025), at(0.975)];
+	return [at((1 - level) / 2), at(1 - (1 - level) / 2)];
 }
 
 /**
  * Compare the cells of one or more experiments from their sessions (see the module comment for
  * what counts), with the usage metrics of `tools`; a metric undefined in every cell is left out.
+ * `level` is the intervals' confidence.
  */
-export function compareCells(experiments: string[], sessions: ArmSession[], tools: readonly string[] = []): ExperimentComparison {
+export function compareCells(experiments: string[], sessions: ArmSession[], tools: readonly string[] = [], level = 0.95): ExperimentComparison {
 	const cells = cellsOf(experiments.length);
 	const random = sessions.filter((s) => !s.forced);
 	const cellsIn = new Map<string, Set<string>>();
@@ -317,7 +353,7 @@ export function compareCells(experiments: string[], sessions: ArmSession[], tool
 				pairs: byCell.get(cell)!.map((s): [number, number] => [m.numerator(s), m.denominator(s)]),
 				weight: contrastWeight(cell),
 			}));
-			return [{ key: m.key, label: m.label, unit: m.unit, values, effect, ci: bootstrapContrast(groups) }];
+			return [{ key: m.key, label: m.label, unit: m.unit, values, denominators: perCell((list) => sum(list, m.denominator)), effect, ci: bootstrapContrast(groups, { level }) }];
 		}),
 	};
 }

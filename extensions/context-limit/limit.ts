@@ -50,9 +50,12 @@ export function refusal(maxContextTokens: number, settings: CompactionSettings):
 
 /**
  * Where automatic compaction starts for the current model, and what sets it. `settings` are the
- * effective ones (the session's limit included), `limit` the session's limit.
+ * effective ones (the session's limit included), `limit` the session's limit, `variant` the limit
+ * an experiment arm or rule sets for the session (lib/variants.ts), used without a session limit.
  */
-export function describeLimit(settings: CompactionSettings, contextWindow: number | undefined, limit: number | undefined): string {
+export function describeLimit(settings: CompactionSettings, contextWindow: number | undefined, limit: number | undefined, variant?: number): string {
+	const who = limit !== undefined ? "this session's limit" : variant !== undefined ? "the setting of this session's experiment or rule" : "compaction.maxContextTokens in the settings";
+	const Who = `${who[0]!.toUpperCase()}${who.slice(1)}`;
 	const lines: string[] = [];
 	if (contextWindow === undefined || contextWindow <= 0) {
 		lines.push(`The model's context window is unknown, so automatic compaction starts only on context overflow.`);
@@ -61,10 +64,10 @@ export function describeLimit(settings: CompactionSettings, contextWindow: numbe
 		const windowText = `the context window ${formatTokens(contextWindow)} minus ${formatTokens(settings.reserveTokens)} reserve`;
 		const max = settings.maxContextTokens;
 		if (max !== undefined && max < windowThreshold) {
-			lines.push(`Compacts automatically above ${formatTokens(max)} context tokens: ${limit !== undefined ? "this session's limit" : "compaction.maxContextTokens in the settings"} (${windowText} would be ${formatTokens(windowThreshold)}).`);
+			lines.push(`Compacts automatically above ${formatTokens(max)} context tokens: ${who} (${windowText} would be ${formatTokens(windowThreshold)}).`);
 		} else {
 			lines.push(`Compacts automatically above ${formatTokens(windowThreshold)} context tokens: ${windowText}.`);
-			if (max !== undefined) lines.push(`${limit !== undefined ? "This session's limit" : "compaction.maxContextTokens"} (${formatTokens(max)}) is above that, so it changes nothing on this model.`);
+			if (max !== undefined) lines.push(`${limit !== undefined || variant !== undefined ? Who : "compaction.maxContextTokens"} (${formatTokens(max)}) is above that, so it changes nothing on this model.`);
 		}
 	}
 	if (!settings.enabled) lines.push("Automatic compaction is off (compaction.enabled is false); /compact still works.");

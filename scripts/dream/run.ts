@@ -1,15 +1,23 @@
-// Dreaming: learn working rules from the corrections the user typed since the last run.
+// Dreaming: learn working rules from the corrections the user typed since the last run, and spend
+// less on models without working worse.
 //
-//   1. collect  the user's messages in Pi sessions since the last run (collect.ts)
-//   2. label    each one with a cheap model: kind, the reusable rule it implies, its scope (lib/labels.ts)
-//   3. curate   the corrections with a rule into small deltas against the known rules (curate.ts)
-//   4. apply    each delta as its own commit, live at once (apply.ts)
-//   5. record   the ledger, the read position and the report in .agents/dreams (ledger.ts); local
-//               state, git-ignored, never committed
+//   1. collect    the user's messages in Pi sessions since the last run (collect.ts)
+//   2. label      each one with a cheap model: kind, the reusable rule it implies, its scope
+//                 (lib/labels.ts); every label is kept (metrics/labels.ts) as the quality signal of
+//                 the A/B comparison
+//   3. curate     the corrections with a rule into small deltas against the known rules (curate.ts)
+//   4. apply      each delta as its own commit, live at once (apply.ts)
+//   5. judge      the spend experiments dreaming started: promote, stop or keep each, on cost and
+//                 quality including blind reviews of sampled sessions (judge.ts, review.ts)
+//   6. economize  the spend facts since the last run (spend.ts) to an economist model, whose
+//                 measurable proposals start as A/B experiments (economize.ts)
+//   7. record     the ledgers, the read position and the report in .agents/dreams (ledger.ts); local
+//                 state, git-ignored, never committed
 //
 // Runs nightly as a t3 scheduled task. Usage:
 //   node scripts/dream/run.ts [--dry-run] [--since <ISO date>]
-// --dry-run labels and curates but changes and commits nothing, and prints the deltas.
+// --dry-run labels, curates, reviews, judges and asks the economist, but changes, commits and
+// records nothing, and prints the deltas.
 
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,12 +27,16 @@ import { BACKLOG, readNotes, takeNotes } from "../../extensions/improvements/ind
 import { SOURCE_ROOT } from "../../extensions/lib/repository.ts";
 import { indexAll, metricsPath } from "../../extensions/metrics/stats.ts";
 import { openStore } from "../../extensions/metrics/store.ts";
-import { type Ask, askJson, isNegative, labelMessages } from "../lib/labels.ts";
+import { appendLabels, indexLabels, isNegative, LABELS_FILE_NAME } from "../../extensions/metrics/labels.ts";
+import { type Ask, askJson, labelMessages } from "../lib/labels.ts";
 import { type Applied, applyDelta, plannedTarget } from "./apply.ts";
 import { collect, repositories } from "./collect.ts";
 import { type Candidate, curate, type Delta } from "./curate.ts";
-import { appendLedger, dreamsDir, type LedgerRecord, readLedger, readSince, report, writeSince } from "./ledger.ts";
+import { type Economy, economize, type Started, spendSection } from "./economize.ts";
+import { type Judged, judge } from "./judge.ts";
+import { appendEconomy, appendLedger, dreamsDir, type EconomyRecord, type LedgerRecord, readLedger, readSince, report, writeSince } from "./ledger.ts";
 import { globalRules, type KnownRule, projectRules } from "./rules.ts";
+import { spendFacts, windows } from "./spend.ts";
 
 export const LABEL_MODEL = "claude-sonnet-5-5";
 export const CURATE_MODEL = "claude-opus-5-5";
@@ -45,6 +57,9 @@ export interface DreamResult {
 	deltas: Delta[];
 	applied: Applied[];
 	records: LedgerRecord[];
+	verdicts: Judged[];
+	economy: Economy;
+	started: Started[];
 	/** The report file, unless a dry run. */
 	reportFile?: string;
 	text: string;
@@ -54,10 +69,18 @@ export interface DreamResult {
 const ORDER: Record<Delta["op"], number> = { update: 0, add: 1, recur: 2, skip: 3 };
 
 export async function dream({ source, db, now = new Date(), since = readSince(source), ask = askJson, dryRun = false, log = () => {} }: DreamOptions): Promise<DreamResult> {
+	const labelsFile = join(dreamsDir(source), LABELS_FILE_NAME);
 	const until = now.getTime();
 	const observations = collect(db, since).filter((o) => o.ts <= until);
 	log(`${observations.length} messages since ${new Date(since).toISOString()}`);
 	const labels = observations.length ? await labelMessages(observations, LABEL_MODEL, { ask }) : [];
+	if (!dryRun) {
+		appendLabels(
+			observations.map((o, i) => ({ session: o.sessionId, entry: o.entryId, ts: o.ts, label: labels[i]!.label })),
+			labelsFile,
+		);
+		indexLabels(db, labelsFile);
+	}
 	const labelled: Record<string, number> = {};
 	for (const l of labels) labelled[l.label] = (labelled[l.label] ?? 0) + 1;
 
@@ -101,17 +124,38 @@ export async function dream({ source, db, now = new Date(), since = readSince(so
 			};
 		}),
 	);
+	const verdicts = await judge({ source, db, now, ask, dryRun, log });
+	const { window, baseline } = windows(since, until);
+	const facts = spendFacts(db, window, baseline);
+	// Without requests in the window there is nothing to economize on.
+	const { economy, started } = facts.requests ? await economize({ source, db, now, facts: facts.text, ask, dryRun }) : { economy: { proposals: [], notes: [], refused: [] }, started: [] };
+	log(`${verdicts.length} dream experiments judged, ${started.length} started`);
+	const spend = spendSection({ facts: facts.text, verdicts, started, economy });
+
 	const backlogs = [...new Set([source, ...repositories(db)])].map((repo) => join(repo, BACKLOG));
-	const summary = { run: now, since, until, messages: observations.length, labelled, records, notes: dryRun ? readNotes(backlogs) : takeNotes(backlogs) };
-	if (dryRun) return { deltas, applied, records, text: report(summary, [...readLedger(source), ...records]) };
+	const summary = { run: now, since, until, messages: observations.length, labelled, records, notes: dryRun ? readNotes(backlogs) : takeNotes(backlogs), spend };
+	const outcome = { deltas, applied, records, verdicts, economy, started };
+	if (dryRun) return { ...outcome, text: report(summary, [...readLedger(source), ...records]) };
 
 	appendLedger(source, records);
+	appendEconomy(source, economyRecords(run, verdicts, started, economy));
 	writeSince(source, until);
 	const text = report(summary, readLedger(source));
 	let reportFile = join(dreamsDir(source), `${run.slice(0, 10)}.md`);
 	if (existsSync(reportFile)) reportFile = join(dreamsDir(source), `${run.slice(0, 16).replace(":", "")}.md`);
 	writeFileSync(reportFile, text);
-	return { deltas, applied, records, reportFile, text };
+	return { ...outcome, reportFile, text };
+}
+
+/** The spend decisions of a run as ledger records. */
+function economyRecords(run: string, verdicts: readonly Judged[], started: readonly Started[], economy: Economy): EconomyRecord[] {
+	const landed = (r: { commit?: string; branch?: string }) => ({ ...(r.commit ? { commit: r.commit } : {}), ...(r.branch ? { branch: r.branch } : {}) });
+	return [
+		...verdicts.map((v): EconomyRecord => ({ run, kind: "verdict", experiment: v.experiment, decision: v.decision, reasons: v.reasons, ...landed(v) })),
+		...started.map((s): EconomyRecord => ({ run, kind: "started", experiment: s.proposal.name, text: s.proposal.hypothesis, ...landed(s), ...(s.skipped ? { reasons: [s.skipped] } : {}) })),
+		...economy.refused.map((r): EconomyRecord => ({ run, kind: "refused", experiment: r.name, reasons: [r.reason] })),
+		...economy.notes.map((n): EconomyRecord => ({ run, kind: "note", text: `${n.title}: ${n.body}` })),
+	];
 }
 
 async function main(): Promise<void> {

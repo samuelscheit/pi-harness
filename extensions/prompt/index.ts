@@ -15,10 +15,14 @@
 // it, and its cache, intact also for models that get no mid-conversation prompt updates.
 // Everything is read on every run, so an edit (by the user or the improvement loop), a forced arm
 // or a stopped experiment reaches running sessions as a section and tool update.
+// Session settings (lib/variants.ts) of the rules and of the arms B the session is in: the model
+// and thinking level on the session's first run only, and only in place of Pi's defaults; the
+// context limit on every run (extensions/context-limit, where the session's own limit wins).
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { applyContextLimit } from "../context-limit/index.ts";
 import {
 	applyToolSwitches,
 	ARM_ENTRY,
@@ -30,7 +34,8 @@ import {
 	toolSwitches,
 } from "../lib/experiments.ts";
 import { HARNESS_ROOT, inSource } from "../lib/repository.ts";
-import { applyRules, listRules, RULES_DIR } from "../lib/rules.ts";
+import { applyRules, listRules, RULES_DIR, sessionSettings } from "../lib/rules.ts";
+import { piDefaults, type SessionSettings, sessionFacts } from "../lib/variants.ts";
 
 const PROMPT_DIR = join(HARNESS_ROOT, "prompt");
 const BASE_PROMPT = join(PROMPT_DIR, "base.md");
@@ -48,9 +53,35 @@ export function toolGuidelinesSection(options: { selectedTools: readonly string[
 	return rules.map((rule) => `- ${rule}`).join("\n");
 }
 
-export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DIR, rulesDir = RULES_DIR) {
+type DefaultsPi = Pick<ExtensionAPI, "getThinkingLevel">;
+type DefaultsCtx = Pick<ExtensionContext, "model" | "cwd">;
+
+/** Whether the session runs Pi's default model and thinking level (lib/variants.ts). */
+export function onDefaults(pi: DefaultsPi, ctx: DefaultsCtx, agentDir?: string): { model: boolean; thinking: boolean } {
+	const defaults = piDefaults(agentDir, ctx.cwd);
+	return { model: !!ctx.model && `${ctx.model.provider}/${ctx.model.id}` === defaults.model, thinking: pi.getThinkingLevel() === defaults.thinking };
+}
+
+/**
+ * Set a fresh session's model and thinking level from its settings, each only where the session
+ * still runs Pi's default. Returns what could not be applied.
+ */
+export async function applyStartSettings(pi: DefaultsPi & Pick<ExtensionAPI, "setModel" | "setThinkingLevel">, ctx: DefaultsCtx & Pick<ExtensionContext, "modelRegistry">, settings: SessionSettings, agentDir?: string): Promise<string[]> {
+	const on = onDefaults(pi, ctx, agentDir);
+	const problems: string[] = [];
+	if (settings.model && on.model && settings.model !== `${ctx.model!.provider}/${ctx.model!.id}`) {
+		const split = settings.model.indexOf("/");
+		const model = ctx.modelRegistry.find(settings.model.slice(0, split), settings.model.slice(split + 1));
+		if (!model) problems.push(`model ${settings.model} is not in the model registry`);
+		else if (!(await pi.setModel(model))) problems.push(`model ${settings.model} has no credentials`);
+	}
+	if (settings.thinking && on.thinking) pi.setThinkingLevel(settings.thinking);
+	return problems;
+}
+
+export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DIR, rulesDir = RULES_DIR, agentDir?: string) {
 	let reported = "";
-	pi.on("before_agent_start", (event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		const options = event.systemPromptOptions;
 		const foreign = Object.entries(options.sections);
 		options.customPrompt = readFileSync(BASE_PROMPT, "utf8").trim();
@@ -60,7 +91,8 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		];
 
 		// Rules before experiments, so an experiment section can never take a rule's name.
-		const { tools: ruleTools, problems } = applyRules(listRules(rulesDir), options.sections);
+		const rules = listRules(rulesDir);
+		const { tools: ruleTools, problems } = applyRules(rules, options.sections);
 		if (problems && problems !== reported && ctx.hasUI) ctx.ui.notify(`Ignored prompt rules:\n${problems}`, "warning");
 		reported = problems;
 
@@ -70,8 +102,15 @@ export default function prompt(pi: ExtensionAPI, experimentsDir = EXPERIMENTS_DI
 		const sessionId = session.getSessionId();
 		const experiments = listExperiments(experimentsDir);
 		const running = experiments.filter((e) => e.status === "running" && !e.problem);
-		for (const update of armUpdates(sessionId, recordedArms(session.getEntries()), running)) pi.appendEntry(ARM_ENTRY, update);
+		const prompt = event.messageType === "user" ? event.prompt : undefined;
+		const facts = { ...sessionFacts(session.getEntries(), prompt), onDefaults: onDefaults(pi, ctx, agentDir) };
+		for (const update of armUpdates(sessionId, recordedArms(session.getEntries()), running, facts)) pi.appendEntry(ARM_ENTRY, update);
 		const arms = recordedArms(session.getEntries());
+		if (facts.fresh && !event.reloaded) {
+			const unapplied = await applyStartSettings(pi, ctx, sessionSettings(rules, experiments, arms, facts.firstPrompt), agentDir);
+			if (unapplied.length && ctx.hasUI) ctx.ui.notify(`Session settings not applied: ${unapplied.join("; ")}`, "warning");
+		}
+		applyContextLimit(pi, ctx, { experimentsDir, rulesDir, ...(prompt === undefined ? {} : { prompt }) });
 		for (const experiment of running) {
 			if (experiment.body && arms.get(experiment.name)?.arm === "B") options.sections[sectionName(experiment.name)] = experiment.body;
 		}

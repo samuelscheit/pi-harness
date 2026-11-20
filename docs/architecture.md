@@ -60,7 +60,7 @@ flowchart TB
 | [`extensions/context-limit`](../extensions/context-limit/index.ts) | `/context-limit`: compact one session above a context size instead of near the end of the window ([tools.md](tools.md#context-limit)). |
 | [`extensions/lens`](../extensions/lens/index.ts) | Layered global and per-project configuration for pi-lens. |
 | [`dashboard/`](../dashboard) | `node:http` JSON API over the query layer, plus a React frontend. |
-| [`scripts/dream`](../scripts/dream/run.ts) | Nightly learning from user corrections. |
+| [`scripts/dream`](../scripts/dream/run.ts) | Nightly learning from user corrections, and spend experiments judged on cost and quality. |
 | [`scripts/install.mjs`](../scripts/install.mjs) | Builds and links the bundled Pi, writes Pi's settings, deploys the first release. |
 | [`scripts/patch-t3.ts`](../scripts/patch-t3.ts) | Keeps T3 Code's Pi adapter patched across T3 updates. |
 

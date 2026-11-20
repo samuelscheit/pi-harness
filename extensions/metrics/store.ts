@@ -9,7 +9,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /** Meta key set once Claude Code transcripts were imported; it survives schema rebuilds. */
 const CLAUDE_IMPORTED = "claude_imported";
@@ -118,6 +118,12 @@ CREATE TABLE experiment_arms (
 	session_id TEXT NOT NULL, experiment TEXT NOT NULL, arm TEXT NOT NULL, forced INTEGER NOT NULL,
 	assigned_at INTEGER NOT NULL, ended_at INTEGER,
 	PRIMARY KEY (session_id, experiment)
+);
+-- What kind of message each user message is, as dreaming labelled it (labels.ts): loaded from
+-- dreaming's labels file, not from the session files, so not deleted with a session's rows.
+CREATE TABLE message_labels (
+	session_id TEXT NOT NULL, entry_id TEXT NOT NULL, ts INTEGER NOT NULL, label TEXT NOT NULL,
+	PRIMARY KEY (session_id, entry_id)
 );
 -- Harness versions: the prompt sections and tool definitions a request ran with, as hashes.
 CREATE TABLE versions (id TEXT PRIMARY KEY, sections TEXT NOT NULL, tools TEXT NOT NULL, first_seen INTEGER NOT NULL);

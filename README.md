@@ -12,6 +12,7 @@ Coding agents are usually tuned by gut feeling: someone edits the system prompt,
 - **Change in small, revertible steps.** The prompt is a minimal base plus one file per rule. Each rule began as an experiment and can be deleted on its own.
 - **Evaluate on real sessions.** Sessions are split 50/50 per experiment, and the arms are compared with bootstrap confidence intervals. There is no offline benchmark.
 - **Learn from corrections.** A nightly "dreaming" job labels what the user typed, turns repeated corrections into rules, and commits them.
+- **Spend less, never work worse.** Dreaming also analyzes where model spend goes, starts A/B experiments on prompt rules and session settings (model, thinking level, context limit), and promotes one only when it saved money and quality held, judged by correction labels, tool errors, interrupts and blind reviews of sampled sessions.
 - **Deploy by committing.** A commit to `main` reaches every running session within seconds, between two turns, without a restart.
 
 The design is grounded in a literature and source-code survey of how other harnesses manage context, and in an analysis of 1,616 of the author's own sessions. See [docs/research](docs/research/context-engineering/README.md).

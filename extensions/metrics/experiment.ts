@@ -20,11 +20,13 @@ import {
 	type ArmState,
 	EXPERIMENTS_DIR,
 	type Experiment,
-	hashArm,
 	listExperiments,
-	stopExperiment,
+	sessionArm,
+	stoppedExperiment,
+	writeChanges,
 } from "../lib/experiments.ts";
-import { promoteExperiment, RULES_DIR } from "../lib/rules.ts";
+import { promotedExperiment, RULES_DIR } from "../lib/rules.ts";
+import { describeSettings, hasSettings } from "../lib/variants.ts";
 import { SOURCE_ROOT } from "../lib/repository.ts";
 import { money, percent, table } from "./format.ts";
 import { type CellMetric, type ExperimentComparison, experiments, Scope } from "./queries/index.ts";
@@ -81,7 +83,10 @@ const armLabel = (arm: Arm) => (arm === "B" ? "B (variant)" : "A (control)");
 /** This session's arm in an experiment: recorded, else the one its next run will get. */
 function sessionLine(experiment: Experiment, sessionId: string, recorded: Map<string, ArmState>): string {
 	const state = recorded.get(experiment.name);
-	if (!state) return `this session: ${armLabel(hashArm(sessionId, experiment.name))} from its next run`;
+	if (!state) {
+		const arm = sessionArm(experiment, sessionId, recorded);
+		return arm ? `this session: ${armLabel(arm)} from its next run` : "this session: not enrolled (the experiment enrolls only some sessions)";
+	}
 	return `this session: ${armLabel(state.arm)}${state.forced ? ", forced" : ""}${state.endedAt !== undefined ? ", ended" : ""}`;
 }
 
@@ -93,6 +98,8 @@ export function experimentStatus(files: Experiment[], sessionId: string, recorde
 		const state = e.problem ? `ignored: ${e.problem}` : e.status;
 		const lines = [`## ${e.name} (${state}${e.frontmatter.started ? `, started ${String(e.frontmatter.started)}` : ""})`];
 		if (e.tools.length) lines.push(`tools in arm B: ${e.tools.join(", ")}`);
+		if (hasSettings(e.settings)) lines.push(`settings in arm B: ${describeSettings(e.settings)}`);
+		if (e.sessions !== "all") lines.push(`enrolls ${e.sessions} sessions`);
 		if (!e.problem && e.status === "running") lines.push(sessionLine(e, sessionId, recorded));
 		const result = singles.get(e.name);
 		lines.push(result ? renderComparison(result) : "no sessions recorded yet");
@@ -111,18 +118,18 @@ const ENDINGS = {
 	stop: {
 		title: "experiment stopped",
 		change: (name: string) =>
-			`\`prompt/experiments/${name}.md\` marked \`status: stopped\`; no session gets its section or tools any more. Promote it with \`/harness experiment ${name} promote\` after restarting it, or delete the file.`,
+			`\`prompt/experiments/${name}.md\` marked \`status: stopped\`; no session gets its section, tools or settings any more. Promote it with \`/harness experiment ${name} promote\` after restarting it, or delete the file.`,
 		revert: "set `status: running` in the file (arms stay as recorded).",
 	},
 	promote: {
 		title: "experiment promoted",
-		change: (name: string) => `\`prompt/experiments/${name}.md\` became the rule \`prompt/rules/${name}.md\`: every session gets its section \`${name}\` and its tools.`,
-		revert: "delete the rule file (the section and its tools go), or move it back to `prompt/experiments/` with `status: running` to test it again.",
+		change: (name: string) => `\`prompt/experiments/${name}.md\` became the rule \`prompt/rules/${name}.md\`: every session gets its section \`${name}\`, its tools and its settings.`,
+		revert: "delete the rule file (the section, its tools and its settings go), or move it back to `prompt/experiments/` with `status: running` to test it again.",
 	},
 } as const;
 
-/** The changelog entry for an experiment that ended, with its results at that point (alone and crossed). */
-export function endEntry(results: ExperimentComparison[], name: string, at: Date, ending: keyof typeof ENDINGS): string {
+/** The changelog entry for an experiment that ended, with its results at that point (alone and crossed) and why it ended (`why`, when decided by dreaming). */
+export function endEntry(results: ExperimentComparison[], name: string, at: Date, ending: keyof typeof ENDINGS, why?: string): string {
 	const { title, change, revert } = ENDINGS[ending];
 	return [
 		"",
@@ -130,6 +137,7 @@ export function endEntry(results: ExperimentComparison[], name: string, at: Date
 		"",
 		`**Change:** ${change(name)}`,
 		"",
+		...(why ? [`**Why:** ${why}`, ""] : []),
 		`**Result at ${ending} (random sessions, projects with every arm or cell):**`,
 		"",
 		"```",
@@ -191,7 +199,7 @@ export function experimentCommand(args: string[], context: ExperimentContext): {
 	if (action === "stop" || action === "promote") {
 		const at = context.now ?? new Date();
 		const results = compare([[name], ...crossed.filter((group) => group.includes(name))]);
-		const files = action === "stop" ? [stopExperiment(experiment, at)] : promoteExperiment(experiment, context.rulesDir ?? RULES_DIR, at);
+		const files = writeChanges(action === "stop" ? [stoppedExperiment(experiment, at)] : promotedExperiment(experiment, context.rulesDir ?? RULES_DIR, at));
 		const changelog = context.changelog ?? CHANGELOG;
 		appendFileSync(changelog, endEntry(results, name, at, action));
 		const published = context.publish ? `\n${context.publish(files, `chore(experiments): ${action} ${name}`)}` : "";

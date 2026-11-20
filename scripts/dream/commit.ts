@@ -4,13 +4,14 @@
 // commit that fails leaves the user's files and index exactly as they were, and a repository whose
 // branch refuses direct moves (a reference-transaction hook that lets only its landing tool move
 // `main`) is never edited: the commit stays on a branch of its own, `dream/<date>-<slug>`, for the
-// user or a fixing pass to land the repository's own way. Only after the branch moved is the one
-// changed file brought up to date in the checkout, and only while it still reads as before.
+// user or a fixing pass to land the repository's own way. Only after the branch moved are the
+// changed files brought up to date in the checkout, each only while it still reads as before.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import type { FileChange } from "../../extensions/lib/experiments.ts";
 
 export const git = (repo: string, args: string[], options: { input?: string; env?: NodeJS.ProcessEnv } = {}) =>
 	execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", input: options.input, env: options.env, stdio: ["pipe", "pipe", "pipe"] }).trim();
@@ -51,25 +52,35 @@ function freeBranch(root: string, name: string): string {
 }
 
 /**
- * Commit `content` as `file` (inside `repo`) on the checked-out branch, without touching the
- * checkout until the branch moved. The caller made sure `file` has no uncommitted changes.
- * `fallback` names the branch that keeps the commit when the checked-out branch refuses it.
+ * Commit the changes (files inside `repo` to write, or to delete with `content: null`) on the
+ * checked-out branch, without touching the checkout until the branch moved. The caller made sure
+ * the files have no uncommitted changes. `fallback` names the branch that keeps the commit when the
+ * checked-out branch refuses it.
  */
-export function commitFile(repo: string, file: string, content: string, message: string, fallback: string): Committed {
+export function commitFiles(repo: string, changes: readonly FileChange[], message: string, fallback: string): Committed {
 	const root = git(repo, ["rev-parse", "--show-toplevel"]);
-	const path = `${git(repo, ["rev-parse", "--show-prefix"])}${relative(repo, file)}`;
+	const prefix = git(repo, ["rev-parse", "--show-prefix"]);
 	const ref = tryGit(root, ["symbolic-ref", "-q", "HEAD"]);
 	const old = tryGit(root, ["rev-parse", "-q", "--verify", "HEAD^{commit}"]);
-	const before = { content: existsSync(file) ? readFileSync(file, "utf8") : undefined, staged: git(root, ["ls-files", "-s", "--", path]) };
+	const files = changes.map((change) => {
+		const path = `${prefix}${relative(repo, change.path)}`;
+		return { ...change, gitPath: path, before: { content: existsSync(change.path) ? readFileSync(change.path, "utf8") : undefined, staged: git(root, ["ls-files", "-s", "--", path]) } };
+	});
 
 	const scratch = mkdtempSync(join(tmpdir(), "dream-index-"));
 	let commit: string;
 	try {
 		const env = { ...process.env, GIT_INDEX_FILE: join(scratch, "index") };
 		git(root, old ? ["read-tree", old] : ["read-tree", "--empty"], { env });
-		const blob = git(root, ["hash-object", "-w", "--stdin"], { input: content });
-		const mode = (old && git(root, ["ls-tree", old, "--", path]).split(" ")[0]) || "100644";
-		git(root, ["update-index", "--add", "--cacheinfo", `${mode},${blob},${path}`], { env });
+		for (const { gitPath, content } of files) {
+			if (content === null) {
+				git(root, ["update-index", "--force-remove", "--", gitPath], { env });
+				continue;
+			}
+			const blob = git(root, ["hash-object", "-w", "--stdin"], { input: content });
+			const mode = (old && git(root, ["ls-tree", old, "--", gitPath]).split(" ")[0]) || "100644";
+			git(root, ["update-index", "--add", "--cacheinfo", `${mode},${blob},${gitPath}`], { env });
+		}
 		const tree = git(root, ["write-tree"], { env });
 		commit = git(root, ["commit-tree", tree, ...(old ? ["-p", old] : []), "-F", "-"], { input: message });
 	} finally {
@@ -87,8 +98,14 @@ export function commitFile(repo: string, file: string, content: string, message:
 		}
 	}
 	if (!refused) {
-		const unchanged = (existsSync(file) ? readFileSync(file, "utf8") : undefined) === before.content && git(root, ["ls-files", "-s", "--", path]) === before.staged;
-		if (unchanged) git(root, ["checkout", commit, "--", path]);
+		for (const { path, gitPath, content, before } of files) {
+			const unchanged = (existsSync(path) ? readFileSync(path, "utf8") : undefined) === before.content && git(root, ["ls-files", "-s", "--", gitPath]) === before.staged;
+			if (!unchanged) continue;
+			if (content === null) {
+				git(root, ["rm", "-q", "--cached", "--ignore-unmatch", "--", gitPath]);
+				rmSync(path, { force: true });
+			} else git(root, ["checkout", commit, "--", gitPath]);
+		}
 		return { commit };
 	}
 	const branch = freeBranch(root, fallback);

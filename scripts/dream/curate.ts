@@ -5,7 +5,8 @@
 // the playbook (18,282 to 122 tokens) and scoring below no memory at all.
 
 import { NAME } from "../../extensions/lib/experiments.ts";
-import { type Ask, askJson, type Label, type RuleScope } from "../lib/labels.ts";
+import type { Label } from "../../extensions/metrics/labels.ts";
+import { type Ask, askJson, type RuleScope } from "../lib/labels.ts";
 import type { KnownRule } from "./rules.ts";
 
 export interface Candidate {

@@ -7,7 +7,7 @@
 // Usage: node scripts/evidence/analyze.ts
 
 import { existsSync, readFileSync } from "node:fs";
-import { NEGATIVE } from "../lib/labels.ts";
+import { NEGATIVE } from "../../extensions/metrics/labels.ts";
 import { LABELS_FILE, type Labels, openIndex } from "./shared.ts";
 
 type Request = { ts: number; prompt: number; read: number; write: number; input: number; cost: number };

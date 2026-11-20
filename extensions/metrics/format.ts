@@ -8,6 +8,12 @@ export const count = (value: number) =>
 export const minutes = (ms: number) => (ms >= 3_600_000 ? `${(ms / 3_600_000).toFixed(1)}h` : `${Math.round(ms / 60_000)}m`);
 export const duration = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
 
+/** Text on one line, cut to `max` characters with an ellipsis. */
+export function clip(text: string, max: number): string {
+	const line = text.replace(/\s+/g, " ").trim();
+	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
 export function table(headers: string[], rows: string[][]): string {
 	const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i]!.length)));
 	// Numbers align right, text left.

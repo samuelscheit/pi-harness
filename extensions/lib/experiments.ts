@@ -21,19 +21,24 @@
 //            switches them from the next run. A stopped experiment turns its tools off for
 //            everyone; promoting one means activating the tool by default and deleting the file.
 //            The comparison adds each tool's usage per arm.
-// Other keys are kept as they are. An experiment with neither a body nor tools has nothing to test
-// and is ignored (listed with a problem), like one whose name is not a valid section name.
-//
-// Setting variants (such as the compaction threshold) would use the same files and entries: the
-// file names the setting and value in its frontmatter, and the extension owning the setting
-// applies the value in arm B after calling `sessionArm`. Not built yet.
+//   settings: session settings arm B runs with: model, thinking level, context limit (lib/variants.ts).
+//            Such an experiment enrolls only sessions that made no request yet, and two running
+//            experiments may not set the same setting for the same sessions (the one started
+//            later gets a problem).
+//   sessions: all (default) | delegated | top-level: the sessions the experiment enrolls.
+//   source:  `dream` for experiments dreaming started (scripts/dream/economize.ts), which it also
+//            judges (scripts/dream/judge.ts).
+// Other keys are kept as they are. An experiment with neither a body, tools nor settings has
+// nothing to test and is ignored (listed with a problem), like one whose name is not a valid
+// section name.
 
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
 import { HARNESS_ROOT, inSource } from "./repository.ts";
+import { hasSettings, matchesKind, parseSessionKind, parseSettings, type SessionFacts, type SessionKind, type SessionSettings } from "./variants.ts";
 
 export const EXPERIMENTS_DIR = join(HARNESS_ROOT, "prompt/experiments");
 /** The custom entry type that records arms in session files. */
@@ -61,12 +66,16 @@ export interface Experiment {
 	interacts: string[];
 	/** Tools active in arm B only (frontmatter `tools`). */
 	tools: string[];
+	/** Session settings of arm B (frontmatter `settings`). */
+	settings: SessionSettings;
+	/** The sessions it enrolls (frontmatter `sessions`). */
+	sessions: SessionKind;
 	/** Why the experiment cannot run (invalid name, nothing to test, unreadable frontmatter). */
 	problem?: string;
 }
 
 export function readExperiment(file: string, name: string): Experiment {
-	const base = { name, file, status: "running" as const, frontmatter: {}, body: "", interacts: [], tools: [] };
+	const base = { name, file, status: "running" as const, frontmatter: {}, body: "", interacts: [], tools: [], settings: {}, sessions: "all" as const };
 	if (!NAME.test(name)) return { ...base, problem: `invalid name (use ${NAME.source})` };
 	let parsed: { frontmatter: Record<string, unknown>; body: string };
 	try {
@@ -75,15 +84,41 @@ export function readExperiment(file: string, name: string): Experiment {
 		return { ...base, problem: `unreadable frontmatter: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	const status = parsed.frontmatter.status ?? "running";
-	if (status !== "running" && status !== "stopped") return { ...base, problem: `unknown status ${JSON.stringify(status)}` };
+	if (status !== "running" && status !== "stopped") return { ...base, frontmatter: parsed.frontmatter, problem: `unknown status ${JSON.stringify(status)}` };
+	// Problems from here keep the frontmatter and status, so who started the experiment stays known.
+	const read = { ...base, status: status as Experiment["status"], frontmatter: parsed.frontmatter };
 	const interacts = nameList(parsed.frontmatter.interacts, (other) => NAME.test(other) && other !== name);
-	if (!interacts) return { ...base, problem: `interacts must name other experiments, got ${JSON.stringify(parsed.frontmatter.interacts)}` };
+	if (!interacts) return { ...read, problem: `interacts must name other experiments, got ${JSON.stringify(parsed.frontmatter.interacts)}` };
 	const tools = nameList(parsed.frontmatter.tools, (tool) => TOOL.test(tool));
-	if (!tools) return { ...base, problem: `tools must name tools, got ${JSON.stringify(parsed.frontmatter.tools)}` };
+	if (!tools) return { ...read, problem: `tools must name tools, got ${JSON.stringify(parsed.frontmatter.tools)}` };
+	const settings = parseSettings(parsed.frontmatter.settings);
+	if ("problem" in settings) return { ...read, problem: settings.problem };
+	const sessions = parseSessionKind(parsed.frontmatter.sessions);
+	if (!sessions) return { ...read, problem: `sessions must be all, delegated or top-level, got ${JSON.stringify(parsed.frontmatter.sessions)}` };
 	const body = parsed.body.trim();
-	const problem = body || tools.length ? {} : { problem: "empty variant" };
-	return { name, file, status, frontmatter: parsed.frontmatter, body, interacts, tools, ...problem };
+	const problem = body || tools.length || hasSettings(settings) ? {} : { problem: "empty variant" };
+	return { name, file, status, frontmatter: parsed.frontmatter, body, interacts, tools, settings, sessions, ...problem };
 }
+
+/** Whether two experiments can enroll the same session. */
+const overlap = (a: SessionKind, b: SessionKind) => a === "all" || b === "all" || a === b;
+
+/** The settings `a` and `b` would both set for the same sessions (none: they can run together). */
+export const settingsConflict = (a: Pick<Experiment, "settings" | "sessions">, b: Pick<Experiment, "settings" | "sessions">): string[] =>
+	overlap(a.sessions, b.sessions) ? Object.keys(a.settings).filter((key) => key in b.settings) : [];
+
+/** Whether an experiment enrolls only some sessions: by kind, or only fresh ones (settings). */
+const restricted = (e: Experiment) => e.sessions !== "all" || hasSettings(e.settings);
+
+/**
+ * Whether a running experiment enrolls a session with these facts (lib/variants.ts): one of its
+ * kind; for settings, one that made no request yet and still runs the defaults the settings replace.
+ */
+export const enrolls = (e: Experiment, facts: SessionFacts) =>
+	matchesKind(e.sessions, facts.firstPrompt) &&
+	(!hasSettings(e.settings) || facts.fresh) &&
+	(e.settings.model === undefined || facts.onDefaults?.model !== false) &&
+	(e.settings.thinking === undefined || facts.onDefaults?.thinking !== false);
 
 /** A frontmatter value naming one thing or a list of them (absent: none); undefined when invalid. */
 export function nameList(raw: unknown, valid: (name: string) => boolean): string[] | undefined {
@@ -98,7 +133,23 @@ export function listExperiments(dir = EXPERIMENTS_DIR): Experiment[] {
 	return readdirSync(dir)
 		.filter((file) => file.endsWith(".md"))
 		.sort()
-		.map((file) => readExperiment(join(dir, file), file.slice(0, -".md".length)));
+		.map((file) => readExperiment(join(dir, file), file.slice(0, -".md".length)))
+		.map((e, _, all) => {
+			// The one started first keeps running; a later one setting the same thing gets the problem.
+			const first = conflictOrder(all).filter((o) => !o.problem && o.status === "running");
+			const earlier = e.problem || e.status !== "running" ? undefined : first.slice(0, first.indexOf(e)).find((o) => settingsConflict(e, o).length && !blocked(o, first));
+			return earlier ? { ...e, problem: `sets ${settingsConflict(e, earlier).join(", ")} for the same sessions as running experiment ${earlier.name}` } : e;
+		});
+}
+
+/** Experiments by when they started (`started`, missing last), then by name. */
+const conflictOrder = (list: readonly Experiment[]) =>
+	[...list].sort((a, b) => String(a.frontmatter.started ?? "~").localeCompare(String(b.frontmatter.started ?? "~")) || a.name.localeCompare(b.name));
+
+/** Whether an earlier-started experiment in `order` blocks `e` (so `e` itself does not run and blocks nothing). */
+function blocked(e: Experiment, order: readonly Experiment[]): boolean {
+	const index = order.indexOf(e);
+	return order.slice(0, index).some((o) => settingsConflict(e, o).length && !blocked(o, order));
 }
 
 /** Experiments that assign arms now: running and without a problem. */
@@ -110,9 +161,12 @@ export function hashArm(sessionId: string, experiment: string): Arm {
 	return digest.readUInt32BE(0) < 0x8000_0000 ? "A" : "B";
 }
 
-/** The arm a session is in for a running experiment: the recorded one, else the one its next run records. */
-export const sessionArm = (experiment: string, sessionId: string, recorded: Map<string, ArmState>): Arm =>
-	recorded.get(experiment)?.arm ?? hashArm(sessionId, experiment);
+/**
+ * The arm a session is in for a running experiment: the recorded one, else the one its next run
+ * records; undefined when not recorded and the experiment enrolls only some sessions.
+ */
+export const sessionArm = (experiment: Experiment, sessionId: string, recorded: Map<string, ArmState>): Arm | undefined =>
+	recorded.get(experiment.name)?.arm ?? (restricted(experiment) ? undefined : hashArm(sessionId, experiment.name));
 
 /**
  * Which tools the experiments switch for a session, and how: every tool an experiment file names
@@ -123,7 +177,7 @@ export function toolSwitches(experiments: readonly Experiment[], sessionId: stri
 	const switches = new Map<string, boolean>();
 	for (const e of experiments) {
 		if (e.problem) continue;
-		const on = e.status === "running" && sessionArm(e.name, sessionId, recorded) === "B";
+		const on = e.status === "running" && sessionArm(e, sessionId, recorded) === "B";
 		for (const tool of e.tools) switches.set(tool, (switches.get(tool) ?? false) || on);
 	}
 	return switches;
@@ -179,16 +233,17 @@ export function recordedArms(entries: readonly EntryLike[]): Map<string, ArmStat
 
 /**
  * The entries a run must append so the session's arms match the experiments: an assignment for
- * every running experiment the session has no arm in (or that ended for it and runs again), and
- * an end for every arm whose experiment no longer runs.
+ * every running experiment that enrolls the session (`enrolls`) and has no arm in it (or ended for
+ * it and runs again), and an end for every arm whose experiment no longer runs.
  */
-export function armUpdates(sessionId: string, recorded: Map<string, ArmState>, running: readonly Pick<Experiment, "name">[]): ArmEntryData[] {
+export function armUpdates(sessionId: string, recorded: Map<string, ArmState>, running: readonly Experiment[], facts: { firstPrompt: string; fresh: boolean }): ArmEntryData[] {
 	const names = new Set(running.map((e) => e.name));
 	const updates: ArmEntryData[] = [];
-	for (const { name } of running) {
-		const state = recorded.get(name);
-		if (!state) updates.push({ experiment: name, arm: hashArm(sessionId, name), forced: false });
-		else if (state.endedAt !== undefined) updates.push({ experiment: name, arm: state.arm, forced: state.forced });
+	for (const e of running) {
+		const state = recorded.get(e.name);
+		if (state && state.endedAt === undefined) continue;
+		if (!enrolls(e, facts)) continue;
+		updates.push(state ? { experiment: e.name, arm: state.arm, forced: state.forced } : { experiment: e.name, arm: hashArm(sessionId, e.name), forced: false });
 	}
 	for (const [name, state] of recorded) {
 		if (!names.has(name) && state.endedAt === undefined) updates.push({ experiment: name, ended: true });
@@ -196,14 +251,32 @@ export function armUpdates(sessionId: string, recorded: Map<string, ArmState>, r
 	return updates;
 }
 
+/** A file to write (`content`) or delete (`null`). */
+export interface FileChange {
+	path: string;
+	content: string | null;
+}
+
+/** Write the changes in the checkout; returns their paths. */
+export function writeChanges(changes: readonly FileChange[]): string[] {
+	for (const { path, content } of changes) {
+		if (content === null) rmSync(path, { force: true });
+		else {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, content);
+		}
+	}
+	return changes.map((c) => c.path);
+}
+
+/** A markdown file with YAML frontmatter. */
+export const withFrontmatter = (frontmatter: Record<string, unknown>, body: string) => `---\n${stringify(frontmatter)}---\n${body ? `\n${body}\n` : ""}`;
+
 /**
- * Mark an experiment stopped in its file in the harness repository (the source of a release, see
+ * An experiment marked stopped in its file in the harness repository (the source of a release, see
  * repository.ts): it stays in git history and can be restarted by setting `status: running`.
- * Returns the file written.
+ * `toSource` maps a path read to the path to write (identity for files read from the source).
  */
-export function stopExperiment(experiment: Experiment, at = new Date()): string {
-	const frontmatter = { ...experiment.frontmatter, status: "stopped", stopped: at.toISOString() };
-	const file = inSource(experiment.file);
-	writeFileSync(file, `---\n${stringify(frontmatter)}---\n\n${experiment.body}\n`);
-	return file;
+export function stoppedExperiment(experiment: Experiment, at = new Date(), toSource: (path: string) => string = inSource): FileChange {
+	return { path: toSource(experiment.file), content: withFrontmatter({ ...experiment.frontmatter, status: "stopped", stopped: at.toISOString() }, experiment.body) };
 }

@@ -181,15 +181,15 @@ describe("goal state", () => {
 		assert.doesNotMatch(pending, /goal/i, "no goal is involved");
 	});
 
-	test("the prompt extension puts other extensions' sections (the goal) after its own", () => {
-		let handler: ((event: unknown, ctx: unknown) => void) | undefined;
-		const pi = { on: (name: string, h: typeof handler) => void (name === "before_agent_start" && (handler = h)), appendEntry: () => {} };
+	test("the prompt extension puts other extensions' sections (the goal) after its own", async () => {
+		let handler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+		const pi = { on: (name: string, h: typeof handler) => void (name === "before_agent_start" && (handler = h)), appendEntry: () => {}, setCompactionOverrides: () => {}, getThinkingLevel: () => "medium" };
 		const rules = mkdtempSync(join(tmpdir(), "goal-rules-"));
 		try {
 			writeFileSync(join(rules, "a-rule.md"), "---\npromoted: 2026-11-14\n---\nRule body.\n");
 			prompt(pi as never, join(rules, "none"), rules);
 			const options = { contextFiles: [], sections: { goal: "The goal." } as Record<string, string>, selectedTools: ["bash"], toolGuidelines: { bash: ["Use bash."] }, promptGuidelines: [] };
-			handler!({ systemPromptOptions: options }, { hasUI: false, sessionManager: { getSessionId: () => "s", getEntries: () => [] } });
+			await handler!({ systemPromptOptions: options }, { hasUI: false, ui: { setStatus: () => {} }, sessionManager: { getSessionId: () => "s", getEntries: () => [], getBranch: () => [] } });
 			assert.deepEqual(Object.keys(options.sections), ["a-rule", "tool-guidelines", "goal"]);
 		} finally {
 			rmSync(rules, { recursive: true, force: true });

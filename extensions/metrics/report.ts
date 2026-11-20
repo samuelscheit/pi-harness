@@ -3,7 +3,7 @@
 
 import { basename } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { count, duration, minutes, money, percent, table } from "./format.ts";
+import { clip, count, duration, minutes, money, percent, table } from "./format.ts";
 import {
 	categoryGroup,
 	changeSummary,
@@ -27,7 +27,6 @@ import {
 } from "./queries/index.ts";
 
 const MAX_ROWS = 12;
-const cut = (text: string, length: number) => (text.length > length ? `${text.slice(0, length - 1)}…` : text);
 
 export function report(db: DatabaseSync, filters: Filters = {}): string {
 	const scope = new Scope(db, filters);
@@ -140,7 +139,7 @@ export function report(db: DatabaseSync, filters: Filters = {}): string {
 					percent(v.toolErrors / Math.max(1, v.toolCalls)),
 					String(v.interrupts),
 					String(v.corrections),
-					cut(v.previous ? changeSummary(v.changes) : "first", 70),
+					clip(v.previous ? changeSummary(v.changes) : "first", 70),
 				]),
 			)}`,
 		);
@@ -157,13 +156,13 @@ export function report(db: DatabaseSync, filters: Filters = {}): string {
 				table(
 					["subagent", "requests", "cost", "wall", "startup", "rediscovered", "resume instead (context, idle)", "est. resume", "verdict"],
 					shown.map((r) => [
-						cut(r.title, 36),
+						clip(r.title, 36),
 						String(r.requests),
 						money(r.cost),
 						minutes(r.wallMs),
 						money(r.startupCost),
 						r.rediscovered.calls ? `${r.rediscovered.calls} / ${count(r.rediscovered.tokens)} / ${money(r.rediscovered.cost)}` : "none",
-						r.alternative ? `${cut(r.alternative.title, 24)} (${count(r.alternative.contextTokens)}, idle ${minutes(r.alternative.idleMs)}, ${r.alternative.warm ? "warm" : "cold"})` : "none",
+						r.alternative ? `${clip(r.alternative.title, 24)} (${count(r.alternative.contextTokens)}, idle ${minutes(r.alternative.idleMs)}, ${r.alternative.warm ? "warm" : "cold"})` : "none",
 						r.alternative ? money(r.alternative.cost) : "",
 						r.alternative ? (r.difference > 0 ? `resume saves ${money(r.difference)}` : `new saved ${money(-r.difference)}`) : "",
 					]),
@@ -189,7 +188,7 @@ export function report(db: DatabaseSync, filters: Filters = {}): string {
 			lines.push(
 				`Best single compaction per session (knowing the later requests; keeps ${count(KEEP_TOKENS)} + summary, quality loss not priced): ${money(opportunities.total)} over ${opportunities.sessions.length} sessions\n${table(
 					["session", "requests", "cost", "peak context", "compact after", "at context", "saving"],
-					opportunities.sessions.slice(0, 8).map((s) => [cut(s.title, 36), String(s.requests), money(s.cost), count(s.peakTokens), `#${s.after}`, count(s.tokens), money(s.saving)]),
+					opportunities.sessions.slice(0, 8).map((s) => [clip(s.title, 36), String(s.requests), money(s.cost), count(s.peakTokens), `#${s.after}`, count(s.tokens), money(s.saving)]),
 				)}`,
 			);
 		}

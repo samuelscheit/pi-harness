@@ -50,6 +50,8 @@ describe("parsing and texts", () => {
 		assert.match(describeLimit({ ...SETTINGS, maxContextTokens: 500_000 }, 200_000, 500_000), /^Compacts automatically above 183\.6k context tokens: the context window 200k minus 16\.4k reserve\.\nThis session's limit \(500k\) is above that, so it changes nothing on this model\./);
 		assert.match(describeLimit({ ...SETTINGS, enabled: false, maxContextTokens: 1000 }, 200_000, 1000), /\nAutomatic compaction is off \(compaction\.enabled is false\); \/compact still works\./);
 		assert.match(describeLimit(SETTINGS, 0, undefined), /^The model's context window is unknown/);
+		assert.match(describeLimit({ ...SETTINGS, maxContextTokens: 300_000 }, 1_000_000, undefined, 300_000), /^Compacts automatically above 300k context tokens: the setting of this session's experiment or rule \(/);
+		assert.match(describeLimit({ ...SETTINGS, maxContextTokens: 500_000 }, 200_000, undefined, 500_000), /\nThe setting of this session's experiment or rule \(500k\) is above that/);
 	});
 });
 

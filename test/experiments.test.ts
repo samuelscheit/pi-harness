@@ -15,14 +15,20 @@ import {
 	recordedArms,
 	runningExperiments,
 	sectionName,
-	stopExperiment,
+	sessionArm,
+	settingsConflict,
+	stoppedExperiment,
 	toolSwitches,
+	writeChanges,
+	type Experiment,
 } from "../extensions/lib/experiments.ts";
 import { crossedGroups, experimentCommand, renderComparison } from "../extensions/metrics/experiment.ts";
 import { indexSessions } from "../extensions/metrics/indexer.ts";
 import { type ArmSession, bootstrapContrast, cellsOf, compareCells, contrastWeight, experiments, Scope } from "../extensions/metrics/queries/index.ts";
 import { openStore } from "../extensions/metrics/store.ts";
-import { applyRules, listRules, promoteExperiment } from "../extensions/lib/rules.ts";
+import { applyRules, listRules, promotedExperiment, sessionSettings } from "../extensions/lib/rules.ts";
+import { isDelegatedPrompt, matchesKind, mergeSettings, parseSessionKind, parseSettings, piDefaults, sessionFacts } from "../extensions/lib/variants.ts";
+import { LIMIT_ENTRY } from "../extensions/context-limit/limit.ts";
 import prompt from "../extensions/prompt/index.ts";
 
 let dir: string;
@@ -41,6 +47,11 @@ const experimentFile = (name: string, content: string, at = join(dir, "experimen
 function sessionIn(arm: Arm, experiment: string, prefix = "s"): string {
 	for (let i = 0; ; i++) if (hashArm(`${prefix}${i}`, experiment) === arm) return `${prefix}${i}`;
 }
+
+/** A running experiment as read from its file. */
+const experiment = (name: string, extra: Partial<Experiment> = {}): Experiment => ({ name, file: `/x/${name}.md`, status: "running", frontmatter: {}, body: "B", interacts: [], tools: [], settings: {}, sessions: "all", ...extra });
+/** A session's facts: a top-level session that made no request yet. */
+const FRESH = { firstPrompt: "fix the bug", fresh: true };
 
 let clock = Date.parse("2026-11-13T10:00:00Z");
 const armEntry = (data: ArmEntryData, ts = (clock += 1000)) => ({ type: "custom", customType: ARM_ENTRY, data, timestamp: new Date(ts).toISOString() });
@@ -68,14 +79,14 @@ describe("assignment", () => {
 	});
 
 	test("a new session gets the hash arm for each running experiment, a resumed one nothing", () => {
-		const running = [{ name: "one" }, { name: "two" }];
-		const updates = armUpdates("sess", new Map(), running);
+		const running = [experiment("one"), experiment("two")];
+		const updates = armUpdates("sess", new Map(), running, FRESH);
 		assert.deepEqual(updates, [
 			{ experiment: "one", arm: hashArm("sess", "one"), forced: false },
 			{ experiment: "two", arm: hashArm("sess", "two"), forced: false },
 		]);
 		const recorded = recordedArms(updates.map((u) => armEntry(u)));
-		assert.deepEqual(armUpdates("sess", recorded, running), []);
+		assert.deepEqual(armUpdates("sess", recorded, running, FRESH), []);
 	});
 
 	test("a forced arm wins over the hash, stays forced and keeps the first assignment time", () => {
@@ -85,18 +96,18 @@ describe("assignment", () => {
 		assert.deepEqual(recordedArms([first, forced]).get("x"), { arm: "B", forced: true, assignedAt: Date.parse(first.timestamp) });
 		assert.deepEqual(recordedArms([first, forced, back]).get("x"), { arm: "A", forced: true, assignedAt: Date.parse(first.timestamp) });
 		// A forced arm is an assignment: the next run adds nothing.
-		assert.deepEqual(armUpdates("sess", recordedArms([forced]), [{ name: "x" }]), []);
+		assert.deepEqual(armUpdates("sess", recordedArms([forced]), [experiment("x")], FRESH), []);
 	});
 
 	test("an experiment that no longer runs ends once; running again reassigns the same arm", () => {
 		const assigned = armEntry({ experiment: "x", arm: "B", forced: false });
-		const ended = armUpdates("sess", recordedArms([assigned]), []);
+		const ended = armUpdates("sess", recordedArms([assigned]), [], FRESH);
 		assert.deepEqual(ended, [{ experiment: "x", ended: true }]);
 		const endEntry = armEntry(ended[0]!);
 		const afterEnd = recordedArms([assigned, endEntry]);
 		assert.equal(afterEnd.get("x")!.endedAt, Date.parse(endEntry.timestamp));
-		assert.deepEqual(armUpdates("sess", afterEnd, []), [], "ended only once");
-		assert.deepEqual(armUpdates("sess", afterEnd, [{ name: "x" }]), [{ experiment: "x", arm: "B", forced: false }]);
+		assert.deepEqual(armUpdates("sess", afterEnd, [], FRESH), [], "ended only once");
+		assert.deepEqual(armUpdates("sess", afterEnd, [experiment("x")], FRESH), [{ experiment: "x", arm: "B", forced: false }]);
 		const again = recordedArms([assigned, endEntry, armEntry({ experiment: "x", arm: "B", forced: false })]).get("x")!;
 		assert.equal(again.endedAt, undefined);
 		assert.equal(again.assignedAt, Date.parse(assigned.timestamp));
@@ -192,7 +203,7 @@ describe("experiment files", () => {
 
 	test("stopping keeps the body and other keys and can be undone by status: running", () => {
 		const at = experimentFile("x", "---\nstarted: 2026-11-13\nhypothesis: fewer turns\n---\n\nBody line.\n");
-		stopExperiment(listExperiments(at)[0]!, new Date("2026-11-20T08:00:00Z"));
+		writeChanges([stoppedExperiment(listExperiments(at)[0]!, new Date("2026-11-20T08:00:00Z"))]);
 		const [stopped] = listExperiments(at);
 		assert.equal(stopped!.status, "stopped");
 		assert.equal(stopped!.body, "Body line.");
@@ -202,41 +213,78 @@ describe("experiment files", () => {
 	});
 });
 
-describe("prompt extension", () => {
-	/**
-	 * Run the extension's before_agent_start against an in-memory session; returns the custom
-	 * sections. The tool selection carries over between runs, as Pi's active tools do.
-	 */
-	function harness(sessionId: string, experimentsDir: string, initialTools = ["read", "bash", "edit", "write"], rulesDir = join(dir, "rules")) {
-		const entries: ReturnType<typeof armEntry>[] = [];
-		const notices: string[] = [];
-		let handler: ((event: unknown, ctx: unknown) => void) | undefined;
-		const pi = {
-			on: (name: string, h: typeof handler) => {
-				if (name === "before_agent_start") handler = h;
-			},
-			appendEntry: (customType: string, data: ArmEntryData) => entries.push({ ...armEntry(data), customType }),
-		};
-		prompt(pi as never, experimentsDir, rulesDir);
-		const ctx = { hasUI: true, ui: { notify: (text: string) => notices.push(text) }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries } };
-		let tools = initialTools;
-		const run = () => {
-			const options = { customPrompt: undefined, contextFiles: [], sections: { cwd: "Current working directory: /x" } as Record<string, string>, selectedTools: [...tools], toolGuidelines: {}, promptGuidelines: [] };
-			handler!({ systemPromptOptions: options }, ctx);
-			tools = options.selectedTools;
-			const { cwd: _, ...added } = options.sections;
-			return added;
-		};
-		return { entries, notices, run, tools: () => tools };
-	}
+/** Pi's settings.json with the defaults the session settings replace. */
+const agentDir = () => {
+	const at = join(dir, "agent");
+	mkdirSync(at, { recursive: true });
+	writeFileSync(join(at, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", defaultModel: "opus", defaultThinkingLevel: "medium" }));
+	return at;
+};
 
-	test("rules are sections and tools for every session, before the experiments", () => {
+/**
+ * Run the extension's before_agent_start against an in-memory session; returns the custom
+ * sections. The tool selection carries over between runs, as Pi's active tools do; each run adds
+ * its prompt and a reply to the session, as Pi does. The session's model, thinking level and
+ * compaction overrides are kept in `state`.
+ */
+function promptHarness(sessionId: string, experimentsDir: string, initialTools = ["read", "bash", "edit", "write"], rulesDir = join(dir, "rules"), start: { model?: string; thinking?: string } = {}) {
+	const entries: Record<string, unknown>[] = [];
+	const notices: string[] = [];
+	const models = new Map(["anthropic/opus", "anthropic/sonnet", "other/keyless"].map((id) => [id, { provider: id.split("/")[0], id: id.split("/")[1] }]));
+	const state = { model: models.get(start.model ?? "anthropic/opus") as { provider: string; id: string } | undefined, thinking: start.thinking ?? "medium", overrides: undefined as unknown, status: undefined as string | undefined };
+	let handler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+	const pi = {
+		on: (name: string, h: typeof handler) => {
+			if (name === "before_agent_start") handler = h;
+		},
+		appendEntry: (customType: string, data: ArmEntryData) => entries.push({ ...armEntry(data), customType }),
+		setModel: async (model: { provider: string; id: string }) => {
+			if (model.provider === "other") return false;
+			state.model = model;
+			return true;
+		},
+		getThinkingLevel: () => state.thinking,
+		setThinkingLevel: (level: string) => {
+			state.thinking = level;
+		},
+		setCompactionOverrides: (overrides: unknown) => {
+			state.overrides = overrides;
+		},
+	};
+	prompt(pi as never, experimentsDir, rulesDir, agentDir());
+	const ctx = {
+		hasUI: true,
+		ui: { notify: (text: string) => notices.push(text), setStatus: (_key: string, text: string | undefined) => (state.status = text) },
+		get model() {
+			return state.model;
+		},
+		modelRegistry: { find: (provider: string, id: string) => models.get(`${provider}/${id}`) },
+		sessionManager: { getSessionId: () => sessionId, getEntries: () => entries, getBranch: () => entries },
+	};
+	let tools = initialTools;
+	const run = async (text = "fix the bug") => {
+		const options = { customPrompt: undefined, contextFiles: [], sections: { cwd: "Current working directory: /x" } as Record<string, string>, selectedTools: [...tools], toolGuidelines: {}, promptGuidelines: [] };
+		await handler!({ systemPromptOptions: options, messageType: "user", prompt: text }, ctx);
+		entries.push({ type: "message", message: { role: "user", content: [{ type: "text", text }] } }, { type: "message", message: { role: "assistant", content: [] } });
+		tools = options.selectedTools;
+		const { cwd: _, ...added } = options.sections;
+		return added;
+	};
+	/** The arm entries recorded so far. */
+	const arms = () => entries.filter((e) => e.customType === ARM_ENTRY).map((e) => e.data);
+	return { entries, arms, notices, run, state, tools: () => tools };
+}
+
+describe("prompt extension", () => {
+	const harness = promptHarness;
+
+	test("rules are sections and tools for every session, before the experiments", async () => {
 		const rules = experimentFile("batch", "---\npromoted: 2026-11-12\n---\nBatch calls.\n", join(dir, "rules"));
 		experimentFile("loop", "---\ntools: [workflow, fix_loop]\n---\n", rules);
 		const at = experimentFile("x", "---\ntools: fix_loop\n---\nVariant.");
 		for (const arm of ["A", "B"] as const) {
 			const session = harness(sessionIn(arm, "x"), at);
-			const sections = session.run();
+			const sections = await session.run();
 			assert.deepEqual(Object.keys(sections), arm === "B" ? ["batch", "experiment-x"] : ["batch"], `arm ${arm}: the rule's section first`);
 			assert.equal(sections.batch, "Batch calls.");
 			assert.deepEqual(session.tools(), ["read", "bash", "edit", "write", "fix_loop", "workflow"], `arm ${arm}: a rule's tool stays on although the experiment switches it off in arm A`);
@@ -244,18 +292,18 @@ describe("prompt extension", () => {
 		}
 		rmSync(join(rules, "loop.md"));
 		const later = harness("later", join(dir, "none"), ["read", "workflow"]);
-		later.run();
+		await later.run();
 		assert.deepEqual(later.tools(), ["read", "workflow"], "a removed rule no longer switches anything; the tool's own registration decides");
 	});
 
-	test("rules with a problem or a taken section name are left out and reported once", () => {
+	test("rules with a problem or a taken section name are left out and reported once", async () => {
 		const rules = experimentFile("cwd", "Shadows Pi's section.", join(dir, "rules"));
 		experimentFile("empty", "---\npromoted: 2026-11-12\n---\n", rules);
 		experimentFile("Bad", "text", rules);
 		experimentFile("tools", "---\ntools: [\"no spaces\"]\n---\nX", rules);
 		experimentFile("ok", "Fine.", rules);
 		const session = harness("s", join(dir, "none"));
-		assert.deepEqual(session.run(), { ok: "Fine." });
+		assert.deepEqual(await session.run(), { ok: "Fine." });
 		assert.equal(session.notices.length, 1);
 		const lines = session.notices[0]!.split("\n");
 		assert.equal(lines[0], "Ignored prompt rules:");
@@ -263,11 +311,11 @@ describe("prompt extension", () => {
 			lines.slice(1).map((line) => line.slice(rules.length + 1)),
 			["Bad.md: invalid name (use ^[a-z0-9][a-z0-9_-]*$)", "cwd.md: the prompt has a section cwd already", "empty.md: empty rule", 'tools.md: tools must name tools, got ["no spaces"]'],
 		);
-		session.run();
+		await session.run();
 		assert.equal(session.notices.length, 1, "the same problems are not reported again");
 	});
 
-	test("applyRules adds sections in file order and collects tools, a tools-only rule adds no section", () => {
+	test("applyRules adds sections in file order and collects tools, a tools-only rule adds no section", async () => {
 		const rules = experimentFile("b", "---\ntools: [codemode, workflow]\n---\n", join(dir, "rules"));
 		experimentFile("a", "---\ntools: workflow\n---\nA.", rules);
 		const sections: Record<string, string> = {};
@@ -278,82 +326,82 @@ describe("prompt extension", () => {
 		assert.deepEqual(listRules(join(dir, "none")), []);
 	});
 
-	test("only arm B gets the variant as its own section, and the arm is recorded once", () => {
+	test("only arm B gets the variant as its own section, and the arm is recorded once", async () => {
 		const at = experimentFile("parallel-tools", "---\nstatus: running\n---\n- Batch calls.\n");
 		const b = harness(sessionIn("B", "parallel-tools"), at);
-		assert.deepEqual(b.run(), { [sectionName("parallel-tools")]: "- Batch calls." });
-		assert.deepEqual(b.run(), { "experiment-parallel-tools": "- Batch calls." }, "resumed: same section");
-		assert.deepEqual(b.entries.map((e) => e.data), [{ experiment: "parallel-tools", arm: "B", forced: false }]);
+		assert.deepEqual(await b.run(), { [sectionName("parallel-tools")]: "- Batch calls." });
+		assert.deepEqual(await b.run(), { "experiment-parallel-tools": "- Batch calls." }, "resumed: same section");
+		assert.deepEqual(b.arms(), [{ experiment: "parallel-tools", arm: "B", forced: false }]);
 
 		const a = harness(sessionIn("A", "parallel-tools"), at);
-		assert.deepEqual(a.run(), {});
-		assert.deepEqual(a.entries.map((e) => e.data), [{ experiment: "parallel-tools", arm: "A", forced: false }]);
+		assert.deepEqual(await a.run(), {});
+		assert.deepEqual(a.arms(), [{ experiment: "parallel-tools", arm: "A", forced: false }]);
 	});
 
-	test("a forced arm changes the section from the next run; a stopped or removed experiment drops it and ends the arm", () => {
+	test("a forced arm changes the section from the next run; a stopped or removed experiment drops it and ends the arm", async () => {
 		const at = experimentFile("x", "Variant.");
 		const session = harness(sessionIn("A", "x"), at);
-		assert.deepEqual(session.run(), {});
+		assert.deepEqual(await session.run(), {});
 		session.entries.push(armEntry({ experiment: "x", arm: "B", forced: true }));
-		assert.deepEqual(session.run(), { "experiment-x": "Variant." });
-		stopExperiment(listExperiments(at)[0]!);
-		assert.deepEqual(session.run(), {});
-		assert.deepEqual(session.entries.at(-1)!.data, { experiment: "x", ended: true });
+		assert.deepEqual(await session.run(), { "experiment-x": "Variant." });
+		writeChanges([stoppedExperiment(listExperiments(at)[0]!)]);
+		assert.deepEqual(await session.run(), {});
+		assert.deepEqual(session.arms().at(-1), { experiment: "x", ended: true });
 		rmSync(join(at, "x.md"));
-		assert.deepEqual(session.run(), {});
-		assert.equal(session.entries.length, 3, "ended once");
+		assert.deepEqual(await session.run(), {});
+		assert.equal(session.arms().length, 3, "ended once");
 	});
 
-	test("arm B gets the experiment's tools, arm A not; other tools keep their order", () => {
+	test("arm B gets the experiment's tools, arm A not; other tools keep their order", async () => {
 		const at = experimentFile("fix-loop", "---\ntools: fix_loop\n---\n");
 		experimentFile("both", "---\ntools: [define_tool, codemode]\n---\nUse them.", at);
 		const id = (arms: string) => {
 			for (let i = 0; ; i++) if (hashArm(`t${i}`, "fix-loop") + hashArm(`t${i}`, "both") === arms) return `t${i}`;
 		};
 		const bb = harness(id("BB"), at);
-		assert.deepEqual(bb.run(), { "experiment-both": "Use them." }, "a tools-only experiment adds no section");
+		assert.deepEqual(await bb.run(), { "experiment-both": "Use them." }, "a tools-only experiment adds no section");
 		assert.deepEqual(bb.tools(), ["read", "bash", "edit", "write", "define_tool", "codemode", "fix_loop"]);
-		assert.deepEqual(bb.run(), { "experiment-both": "Use them." });
+		assert.deepEqual(await bb.run(), { "experiment-both": "Use them." });
 		assert.deepEqual(bb.tools(), ["read", "bash", "edit", "write", "define_tool", "codemode", "fix_loop"], "resumed: same tools, no duplicates");
 
 		const ab = harness(id("AB"), at, ["read", "fix_loop", "bash"]);
-		ab.run();
+		await ab.run();
 		assert.deepEqual(ab.tools(), ["read", "bash", "define_tool", "codemode"], "arm A removes a tool even if something activated it");
 		const aa = harness(id("AA"), at);
-		aa.run();
+		await aa.run();
 		assert.deepEqual(aa.tools(), ["read", "bash", "edit", "write"]);
 	});
 
-	test("forcing an arm switches the tools from the next run; stopping turns them off for everyone", () => {
+	test("forcing an arm switches the tools from the next run; stopping turns them off for everyone", async () => {
 		const at = experimentFile("x", "---\ntools: [x_tool]\n---\nVariant.");
 		const session = harness(sessionIn("A", "x"), at);
-		session.run();
+		await session.run();
 		assert.deepEqual(session.tools(), ["read", "bash", "edit", "write"]);
 		session.entries.push(armEntry({ experiment: "x", arm: "B", forced: true }));
-		session.run();
+		await session.run();
 		assert.deepEqual(session.tools(), ["read", "bash", "edit", "write", "x_tool"]);
 		session.entries.push(armEntry({ experiment: "x", arm: "A", forced: true }));
-		session.run();
+		await session.run();
 		assert.deepEqual(session.tools(), ["read", "bash", "edit", "write"]);
 
 		const b = harness(sessionIn("B", "x"), at);
-		b.run();
+		await b.run();
 		assert.deepEqual(b.tools().at(-1), "x_tool");
-		stopExperiment(listExperiments(at)[0]!);
-		b.run();
+		writeChanges([stoppedExperiment(listExperiments(at)[0]!)]);
+		await b.run();
 		assert.deepEqual(b.tools(), ["read", "bash", "edit", "write"], "stopped: off");
 		rmSync(join(at, "x.md"));
 		const later = harness(sessionIn("B", "x"), at, ["read", "x_tool"]);
-		later.run();
+		await later.run();
 		assert.deepEqual(later.tools(), ["read", "x_tool"], "no file: the experiments no longer switch the tool");
 	});
 
-	test("empty or invalid experiments assign nothing", () => {
+	test("empty or invalid experiments assign nothing", async () => {
 		const at = experimentFile("empty", "---\nstatus: running\n---\n");
 		experimentFile("Bad", "text", at);
 		const session = harness("any", at);
-		assert.deepEqual(session.run(), {});
-		assert.equal(session.entries.length, 0);
+		assert.deepEqual(await session.run(), {});
+		assert.equal(session.arms().length, 0);
 	});
 });
 
@@ -583,7 +631,7 @@ describe("comparison", () => {
 
 	const armSession = (id: string, cell: string, turns: number, toolCalls: number): ArmSession => ({
 		session: id, project: "/p", cell, forced: false, turns, toolCalls, batchedTurns: 0, packages: 1, cost: 0, readCost: 0, toolResults: 0, toolErrors: 0,
-		mutatingCalls: 0, toolMutatingCalls: 0, editCalls: 0, editedFiles: 0, childCost: 0, tools: {},
+		mutatingCalls: 0, toolMutatingCalls: 0, editCalls: 0, editedFiles: 0, childCost: 0, labelled: 0, negatives: 0, interrupts: 0, delegated: 0, retried: 0, tools: {},
 	});
 
 	test("compareCells weighs sessions by their turns (ratio of sums)", () => {
@@ -706,16 +754,16 @@ describe("/harness experiment", () => {
 		assert.match(readFileSync(changelog, "utf8"), /promote/i, "the result is still logged locally");
 		assert.deepEqual(listExperiments(at).map((e) => e.name), ["y"], "the experiment file is gone");
 		assert.equal(readFileSync(join(rules, "x.md"), "utf8"), "---\ntools:\n  - x_tool\n  - y_tool\npromoted: 2026-11-20\n---\n\nVariant.\n");
-		assert.deepEqual(listRules(rules), [{ name: "x", file: join(rules, "x.md"), body: "Variant.", tools: ["x_tool", "y_tool"] }]);
+		assert.deepEqual(listRules(rules), [{ name: "x", file: join(rules, "x.md"), body: "Variant.", tools: ["x_tool", "y_tool"], settings: {}, sessions: "all" }]);
 		const log = readFileSync(changelog, "utf8");
 		assert.match(log, /^## 2026-11-20 — experiment promoted: x$/m);
 		assert.match(log, /became the rule `prompt\/rules\/x\.md`/);
 		assert.match(log, /\*\*Result at promote/);
 
 		experimentCommand(["y", "promote"], { ...ctx, rulesDir: rules });
-		assert.equal(readFileSync(join(rules, "y.md"), "utf8"), "---\ntools: y_tool\npromoted: 2026-11-20\n---\n\n\n", "a tools-only experiment keeps its single tool");
+		assert.equal(readFileSync(join(rules, "y.md"), "utf8"), "---\ntools: y_tool\npromoted: 2026-11-20\n---\n", "a tools-only experiment keeps its single tool");
 		experimentFile("y", "Again.", at);
-		assert.throws(() => promoteExperiment(listExperiments(at)[0]!, rules), /y\.md exists already/);
+		assert.throws(() => promotedExperiment(listExperiments(at)[0]!, rules), /y\.md exists already/);
 		assert.equal(readFileSync(join(at, "y.md"), "utf8"), "Again.", "a refused promotion keeps the experiment");
 	});
 
@@ -729,5 +777,210 @@ describe("/harness experiment", () => {
 			assert.deepEqual(experimentCommand(args, ctx), { text: "Usage: /harness experiment [<name> on|off|stop|promote]", level: "warning" });
 		}
 		assert.equal(appended.length, 0);
+	});
+});
+
+describe("session settings", () => {
+	test("parsing: settings, session kinds and their problems", () => {
+		assert.deepEqual(parseSettings(undefined), {});
+		assert.deepEqual(parseSettings({ model: "anthropic/claude-sonnet-5-5", thinking: "low", maxContextTokens: 300000 }), { model: "anthropic/claude-sonnet-5-5", thinking: "low", maxContextTokens: 300000 });
+		assert.deepEqual(parseSettings({ model: "gateway/gpt-5.5:high" }), { model: "gateway/gpt-5.5:high" });
+		for (const [raw, problem] of [
+			["low", /settings must be a map/],
+			[[1], /settings must be a map/],
+			[{ temperature: 1 }, /unknown settings temperature/],
+			[{ model: "sonnet" }, /settings\.model must be provider\/id/],
+			[{ thinking: "huge" }, /settings\.thinking must be one of off, minimal, low, medium, high, xhigh, max/],
+			[{ maxContextTokens: 49_999 }, /at least 50000/],
+			[{ maxContextTokens: 100_000.5 }, /at least 50000/],
+		] as const) assert.match((parseSettings(raw) as { problem: string }).problem, problem, JSON.stringify(raw));
+		assert.deepEqual([undefined, "all", "delegated", "top-level", "children"].map(parseSessionKind), ["all", "all", "delegated", "top-level", undefined]);
+	});
+
+	test("session kinds and facts: t3's delegation preamble, the first user message, fresh until a reply", () => {
+		assert.equal(isDelegatedPrompt("Act as the review sub-agent for this task.\n\nReview it."), true);
+		assert.equal(isDelegatedPrompt("  Act as the implementation sub-agent for this task."), true);
+		assert.equal(isDelegatedPrompt("Please act as the review sub-agent for this task."), false);
+		assert.equal(matchesKind("all", "x"), true);
+		assert.equal(matchesKind("delegated", "Act as the test sub-agent for this task."), true);
+		assert.equal(matchesKind("top-level", "Act as the test sub-agent for this task."), false);
+		assert.equal(matchesKind("top-level", "fix it"), true);
+		assert.deepEqual(sessionFacts([], "first"), { firstPrompt: "first", fresh: true });
+		const entries = [
+			{ type: "custom" },
+			{ type: "message", message: { role: "user", content: [{ type: "text", text: "Act as the " }, { type: "image" }, { type: "text", text: "x sub-agent" }] } },
+			{ type: "message", message: { role: "assistant", content: [] } },
+		];
+		assert.deepEqual(sessionFacts(entries.slice(0, 2), "later"), { firstPrompt: "Act as the x sub-agent", fresh: true });
+		assert.deepEqual(sessionFacts(entries, "later"), { firstPrompt: "Act as the x sub-agent", fresh: false });
+		assert.deepEqual(mergeSettings({ thinking: "low", model: "a/b" }, { thinking: "high", maxContextTokens: undefined }), { thinking: "high", model: "a/b" });
+	});
+
+	test("experiment files: settings and sessions, problems, an empty variant with settings only is valid, conflicts", () => {
+		const at = experimentFile("a-thin", "---\nsettings:\n  thinking: low\nsessions: delegated\n---\n");
+		experimentFile("b-thin", "---\nsettings:\n  thinking: minimal\n  maxContextTokens: 300000\n---\n", at);
+		experimentFile("c-top", "---\nsettings:\n  thinking: high\nsessions: top-level\n---\n", at);
+		experimentFile("d-bad", "---\nsettings:\n  thinking: lots\n---\nX", at);
+		experimentFile("e-kind", "---\nsessions: some\n---\nX", at);
+		experimentFile("f-stopped", "---\nstatus: stopped\nsettings:\n  thinking: low\n---\n", at);
+		experimentFile("g-after-conflict", "---\nsettings:\n  maxContextTokens: 200000\n---\n", at);
+		const list = listExperiments(at);
+		const by = (name: string) => list.find((e) => e.name === name)!;
+		assert.deepEqual([by("a-thin").settings, by("a-thin").sessions, by("a-thin").problem], [{ thinking: "low" }, "delegated", undefined]);
+		assert.equal(by("b-thin").problem, "sets thinking for the same sessions as running experiment a-thin");
+		assert.equal(by("c-top").problem, undefined, "delegated and top-level sessions never overlap");
+		assert.match(by("d-bad").problem!, /settings\.thinking must be one of/);
+		assert.equal(by("e-kind").problem, 'sessions must be all, delegated or top-level, got "some"');
+		assert.equal(by("f-stopped").problem, undefined);
+		assert.equal(by("g-after-conflict").problem, undefined, "an experiment with a problem blocks nothing");
+		assert.deepEqual(settingsConflict(by("a-thin"), by("c-top")), []);
+	});
+
+	test("conflicts: the experiment started first keeps running, whatever the names; a blocked one blocks nothing", () => {
+		const at = experimentFile("z-old", "---\nstarted: 2026-11-01T00:00:00.000Z\nsettings:\n  thinking: low\n---\n");
+		experimentFile("a-new", "---\nstarted: 2026-11-10T00:00:00.000Z\nsettings:\n  thinking: minimal\n  maxContextTokens: 300000\n---\n", at);
+		experimentFile("m-newer", "---\nstarted: 2026-11-12T00:00:00.000Z\nsettings:\n  maxContextTokens: 200000\n---\n", at);
+		const problems = Object.fromEntries(listExperiments(at).map((e) => [e.name, e.problem]));
+		assert.deepEqual(problems, {
+			"a-new": "sets thinking for the same sessions as running experiment z-old",
+			"m-newer": undefined,
+			"z-old": undefined,
+		});
+	});
+
+	test("enrollment: settings experiments take fresh sessions only, kinds take theirs; restricted arms are not guessed", () => {
+		const settings = experiment("thin", { settings: { thinking: "low" } });
+		const delegated = experiment("brief", { sessions: "delegated" });
+		const plain = experiment("plain");
+		const child = "Act as the review sub-agent for this task.\n\nGo.";
+		assert.deepEqual(armUpdates("s", new Map(), [settings, delegated, plain], { firstPrompt: "fix", fresh: true }).map((u) => u.experiment), ["thin", "plain"]);
+		assert.deepEqual(armUpdates("s", new Map(), [settings, delegated, plain], { firstPrompt: "fix", fresh: false }).map((u) => u.experiment), ["plain"]);
+		assert.deepEqual(armUpdates("s", new Map(), [settings, delegated, plain], { firstPrompt: child, fresh: false }).map((u) => u.experiment), ["brief", "plain"]);
+		// Ended and running again: a settings experiment does not take back a session that made requests.
+		const ended = recordedArms([armEntry({ experiment: "thin", arm: "B", forced: false }), armEntry({ experiment: "thin", ended: true })]);
+		assert.deepEqual(armUpdates("s", ended, [settings], { firstPrompt: "fix", fresh: false }), []);
+		const id = sessionIn("B", "brief");
+		assert.equal(sessionArm(delegated, id, new Map()), undefined);
+		assert.equal(sessionArm(plain, sessionIn("B", "plain"), new Map()), "B");
+		const tooled = experiment("brief", { sessions: "delegated", tools: ["x_tool"] });
+		assert.deepEqual([...toolSwitches([tooled], id, new Map())], [["x_tool", false]], "not enrolled: the tool stays off");
+		assert.deepEqual([...toolSwitches([tooled], id, recordedArms([armEntry({ experiment: "brief", arm: "B", forced: false })]))], [["x_tool", true]]);
+	});
+
+	test("the session's settings: rules for its kind, then the arms B it is in, which win", () => {
+		const rules = experimentFile("default-thin", "---\nsettings:\n  thinking: low\n  maxContextTokens: 400000\n---\n", join(dir, "rules"));
+		experimentFile("child-model", "---\nsettings:\n  model: anthropic/sonnet\nsessions: delegated\n---\n", rules);
+		const exps = [experiment("ctx", { settings: { maxContextTokens: 200000 } }), experiment("off", { status: "stopped", settings: { thinking: "off" } })];
+		const inB = recordedArms([armEntry({ experiment: "ctx", arm: "B", forced: false }), armEntry({ experiment: "off", arm: "B", forced: false })]);
+		assert.deepEqual(sessionSettings(listRules(rules), exps, inB, "fix"), { thinking: "low", maxContextTokens: 200000 });
+		assert.deepEqual(sessionSettings(listRules(rules), exps, new Map(), "Act as the review sub-agent for this task."), { thinking: "low", maxContextTokens: 400000, model: "anthropic/sonnet" });
+		const ended = recordedArms([armEntry({ experiment: "ctx", arm: "B", forced: false }), armEntry({ experiment: "ctx", ended: true })]);
+		assert.deepEqual(sessionSettings([], exps, ended, "fix"), {});
+	});
+
+	test("promotion carries settings and sessions into the rule", () => {
+		const at = experimentFile("child-model", "---\nstatus: running\nsource: dream\nsettings:\n  model: anthropic/sonnet\nsessions: delegated\n---\n");
+		const rules = join(dir, "rules");
+		writeChanges(promotedExperiment(listExperiments(at)[0]!, rules, new Date("2026-11-20T00:00:00Z")));
+		assert.equal(readFileSync(join(rules, "child-model.md"), "utf8"), "---\nsettings:\n  model: anthropic/sonnet\nsessions: delegated\npromoted: 2026-11-20\n---\n");
+		assert.deepEqual(listRules(rules).map((r) => [r.settings, r.sessions, r.problem]), [[{ model: "anthropic/sonnet" }, "delegated", undefined]]);
+	});
+});
+
+describe("prompt extension: session settings", () => {
+	function harnessOf(sessionId: string, experimentsDir: string, rulesDir = join(dir, "rules"), start: { model?: string; thinking?: string } = {}) {
+		return promptHarness(sessionId, experimentsDir, undefined, rulesDir, start);
+	}
+
+	test("arm B of a settings experiment: model and thinking on the first run, in place of the defaults only; arm A keeps them", async () => {
+		const at = experimentFile("lean", "---\nsettings:\n  model: anthropic/sonnet\n  thinking: low\n---\n");
+		const b = harnessOf(sessionIn("B", "lean"), at);
+		await b.run();
+		assert.deepEqual([b.state.model?.id, b.state.thinking], ["sonnet", "low"]);
+		assert.deepEqual(b.arms(), [{ experiment: "lean", arm: "B", forced: false }]);
+		// Changed by hand later: later runs leave it.
+		b.state.model = { provider: "anthropic", id: "opus" };
+		b.state.thinking = "high";
+		await b.run();
+		assert.deepEqual([b.state.model.id, b.state.thinking], ["opus", "high"]);
+
+		const a = harnessOf(sessionIn("A", "lean"), at);
+		await a.run();
+		assert.deepEqual([a.state.model?.id, a.state.thinking], ["opus", "medium"]);
+
+		const chosen = harnessOf(sessionIn("B", "lean", "c"), at, undefined, { model: "anthropic/sonnet", thinking: "high" });
+		await chosen.run();
+		assert.deepEqual([chosen.state.model?.id, chosen.state.thinking], ["sonnet", "high"], "a model and level chosen on purpose stay");
+		assert.deepEqual(chosen.arms(), [], "and such a session is not enrolled, so arm B holds only sessions that got its settings");
+		assert.deepEqual(chosen.notices, []);
+		const thinkingOnly = experimentFile("thin", "---\nsettings:\n  thinking: low\n---\n", join(dir, "t"));
+		const picked = harnessOf(sessionIn("B", "thin"), thinkingOnly, undefined, { model: "anthropic/sonnet" });
+		await picked.run();
+		assert.deepEqual([picked.arms().length, picked.state.thinking], [1, "low"], "a model chosen on purpose does not keep a thinking-only experiment out");
+	});
+
+	test("Pi's defaults: the project's .pi/settings.json over the agent's", () => {
+		const agent = join(dir, "agent2");
+		const project = join(dir, "project");
+		mkdirSync(agent, { recursive: true });
+		mkdirSync(join(project, ".pi"), { recursive: true });
+		writeFileSync(join(agent, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", defaultModel: "opus", defaultThinkingLevel: "high" }));
+		assert.deepEqual(piDefaults(agent), { model: "anthropic/opus", thinking: "high" });
+		writeFileSync(join(project, ".pi/settings.json"), JSON.stringify({ defaultModel: "sonnet" }));
+		assert.deepEqual(piDefaults(agent, project), { model: "anthropic/sonnet", thinking: "high" });
+		writeFileSync(join(project, ".pi/settings.json"), "{broken");
+		assert.deepEqual(piDefaults(agent, project), { model: "anthropic/opus", thinking: "high" }, "an unreadable project file sets nothing");
+		assert.deepEqual(piDefaults(join(dir, "none")), { thinking: "medium" }, "Pi's own fallback");
+	});
+
+	test("a session that made requests before the experiment started is not enrolled and keeps its settings", async () => {
+		const at = join(dir, "experiments");
+		mkdirSync(at, { recursive: true });
+		const session = harnessOf(sessionIn("B", "lean"), at);
+		await session.run();
+		experimentFile("lean", "---\nsettings:\n  thinking: low\n---\n", at);
+		await session.run();
+		assert.deepEqual([session.arms(), session.state.thinking], [[], "medium"]);
+	});
+
+	test("kind: a delegated experiment enrolls subagent sessions only", async () => {
+		const at = experimentFile("child", "---\nsettings:\n  thinking: minimal\nsessions: delegated\n---\n");
+		const id = sessionIn("B", "child");
+		const top = harnessOf(id, at);
+		await top.run("fix the bug");
+		assert.deepEqual([top.arms(), top.state.thinking], [[], "medium"]);
+		const child = harnessOf(id, at);
+		await child.run("Act as the review sub-agent for this task.\n\nReview.");
+		assert.deepEqual([child.arms(), child.state.thinking], [[{ experiment: "child", arm: "B", forced: false }], "minimal"]);
+	});
+
+	test("an unknown or keyless model is reported, and the rest still applies", async () => {
+		const at = experimentFile("bad-model", "---\nsettings:\n  model: anthropic/nope\n  thinking: low\n---\n");
+		const s = harnessOf(sessionIn("B", "bad-model"), at);
+		await s.run();
+		assert.deepEqual([s.state.model?.id, s.state.thinking], ["opus", "low"]);
+		assert.deepEqual(s.notices, ["Session settings not applied: model anthropic/nope is not in the model registry"]);
+		const keyless = experimentFile("keyless", "---\nsettings:\n  model: other/keyless\n---\n", join(dir, "k"));
+		const k = harnessOf(sessionIn("B", "keyless"), keyless);
+		await k.run();
+		assert.deepEqual(k.notices, ["Session settings not applied: model other/keyless has no credentials"]);
+	});
+
+	test("the context limit: the arm's or rule's on every run; the session's own /context-limit wins; ended arms drop it", async () => {
+		const rules = experimentFile("ctx-rule", "---\nsettings:\n  maxContextTokens: 600000\n---\n", join(dir, "rules"));
+		const at = experimentFile("ctx", "---\nsettings:\n  maxContextTokens: 300000\n---\n");
+		const b = harnessOf(sessionIn("B", "ctx"), at, rules);
+		await b.run();
+		assert.deepEqual([b.state.overrides, b.state.status], [{ maxContextTokens: 300000 }, "compact above 300k"]);
+		b.entries.push({ type: "custom", customType: LIMIT_ENTRY, data: { maxContextTokens: 150000 }, timestamp: new Date().toISOString() });
+		await b.run();
+		assert.deepEqual(b.state.overrides, { maxContextTokens: 150000 });
+		const a = harnessOf(sessionIn("A", "ctx"), at, rules);
+		await a.run();
+		assert.deepEqual(a.state.overrides, { maxContextTokens: 600000 }, "arm A: the rule's");
+		rmSync(join(at, "ctx.md"));
+		rmSync(join(rules, "ctx-rule.md"));
+		await a.run();
+		assert.deepEqual([a.state.overrides, a.state.status], [undefined, undefined]);
 	});
 });

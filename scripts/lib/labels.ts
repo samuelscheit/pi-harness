@@ -9,12 +9,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const LABELS = ["correction", "forgot_context", "process", "quality", "failure_report", "new_task", "question", "answer", "approval", "other"] as const;
-export type Label = (typeof LABELS)[number];
-
-/** Labels that mean the agent fell short: the user had to correct, remind, complain or report breakage. */
-export const NEGATIVE: readonly Label[] = ["correction", "forgot_context", "process", "quality", "failure_report"];
-export const isNegative = (label: string | undefined) => label !== undefined && (NEGATIVE as readonly string[]).includes(label);
+import { type Label, LABELS } from "../../extensions/metrics/labels.ts";
 
 /** Where a rule applies: every session (how the agent works), or one project (its code, tools, conventions). */
 export type RuleScope = "global" | "project";
