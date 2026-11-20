@@ -79,7 +79,7 @@ settings:
   model: anthropic/claude-sonnet-5-5   # provider/id
   thinking: low                        # off | minimal | low | medium | high | xhigh | max
   maxContextTokens: 400000             # compact automatically above this, at least 50000
-  decideCompactionAbove: 300000        # above this, the session decides whether to compact (tools.md#the-compaction-decider)
+  decideCompactionAbove: 400000        # above this, the session decides whether to compact (tools.md#the-compaction-decider)
 sessions: delegated                    # all (default) | delegated | top-level
 ---
 ```

@@ -6,7 +6,7 @@
 //     model: anthropic/claude-sonnet-5-5   provider/id, as the model registry knows it
 //     thinking: low                        off | minimal | low | medium | high | xhigh | max
 //     maxContextTokens: 400000             compact above this many context tokens (>= 50000)
-//     decideCompactionAbove: 300000        above this, the session decides whether to compact
+//     decideCompactionAbove: 400000        above this, the session decides whether to compact
 //                                          (extensions/context-limit/decider.ts; >= 50000)
 //   sessions: delegated                    all (default) | delegated | top-level
 //

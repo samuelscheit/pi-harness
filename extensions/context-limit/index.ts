@@ -55,7 +55,7 @@ export function applyContextLimit(pi: Pick<ExtensionAPI, "setCompactionOverrides
 }
 
 /** What the question tells the model: the context's size and cost now and after compacting, and the files the compaction would summarize. */
-export function decisionFacts(ctx: Pick<ExtensionContext, "model">, contextTokens: number, keepTokens: number, files: string[]): Facts {
+export function decisionFacts(ctx: Pick<ExtensionContext, "model">, contextTokens: number, keepTokens: number, limitTokens: number, files: string[]): Facts {
 	const cost = ctx.model?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	const perToken = (dollarsPerMillion: number) => dollarsPerMillion / 1e6;
 	// A summary is at most 3k tokens (compaction/economics.ts in vendor/pi).
@@ -64,6 +64,7 @@ export function decisionFacts(ctx: Pick<ExtensionContext, "model">, contextToken
 		contextTokens,
 		keepTokens,
 		nextTokens: contextTokens + STEP_TOKENS,
+		limitTokens,
 		requestNow: contextTokens * perToken(cost.cacheRead),
 		requestAfter: kept * perToken(cost.cacheRead),
 		compaction: contextTokens * perToken(cost.input) + 3_000 * perToken(cost.output) + kept * perToken(cost.cacheWrite),
@@ -88,11 +89,12 @@ export async function decideCompaction(
 	const window = ctx.model?.contextWindow;
 	if (decider === undefined || !settings || !window) return undefined;
 	const contextTokens = event.preparation.tokensBefore;
-	// Near the model's own limit the session could not keep for long: compact as Pi always did.
-	if (contextTokens + STEP_TOKENS >= window - settings.reserveTokens) return undefined;
+	const limitTokens = window - settings.reserveTokens;
+	// Pi's own compaction at the model's limit, not the decider's: compact as Pi always did.
+	if (decider >= limitTokens) return undefined;
 
 	const files = filesOf(event.preparation.fileOps);
-	const facts = decisionFacts(ctx, contextTokens, settings.keepRecentTokens, files);
+	const facts = decisionFacts(ctx, contextTokens, settings.keepRecentTokens, limitTokens, files);
 	const { framings, acting } = draw(random);
 	const answers: Answer[] = [];
 	for (const framing of framings) {

@@ -48,7 +48,7 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-const FACTS: Facts = { contextTokens: 312_000, keepTokens: 20_000, nextTokens: 412_000, requestNow: 0.156, requestAfter: 0.0115, compaction: 1.72, files: ["src/a.ts", "src/b.ts"] };
+const FACTS: Facts = { contextTokens: 312_000, keepTokens: 20_000, nextTokens: 412_000, limitTokens: 983_616, requestNow: 0.156, requestAfter: 0.0115, compaction: 1.72, files: ["src/a.ts", "src/b.ts"] };
 
 describe("the question", () => {
 	test("four framings: the option order and the cost line vary, nothing else", () => {
@@ -69,6 +69,9 @@ describe("the question", () => {
 		const options = (text: string) => text.split("\n").filter((l) => l.startsWith('- "')).sort();
 		assert.deepEqual(options(texts["plain-compact-first"]!), options(texts["costs-keep-first"]!));
 		assert.match(question("plain-keep-first", { ...FACTS, files: [] }), /The older part read or changed no files\./);
+		const last = question("plain-keep-first", { ...FACTS, contextTokens: 700_000, nextTokens: 1_000_000 });
+		assert.match(last, /- "keep": the full context stays\. Every request carries all of it, up to 984k tokens, where it is compacted without another question\./);
+		assert.doesNotMatch(last, /asks again/);
 	});
 
 	test("answers: JSON anywhere in the reply; anything else is no answer", () => {
@@ -110,21 +113,23 @@ describe("the question", () => {
 		assert.deepEqual(filesOf({ read: new Set(["r", "e"]), written: new Set(["w"]), edited: new Set(["e"]) }), ["e", "w", "r"]);
 	});
 
-	test("where it asks next: the setting after a compaction, 100k above each keep since", () => {
+	test("where it asks next: the setting after a compaction, 300k above each keep since", () => {
 		let n = 0;
 		const entry = (type: string, data?: Partial<DecisionData>) => ({ type, id: `e${++n}`, parentId: null, timestamp: "", ...(type === "custom" ? { customType: DECISION_ENTRY, data } : {}) }) as unknown as SessionEntry;
+		assert.equal(STEP_TOKENS, 300_000);
 		assert.equal(deciderThreshold([], undefined), undefined);
-		assert.equal(deciderThreshold([], 300_000), 300_000);
+		assert.equal(deciderThreshold([], 400_000), 400_000);
 		const keep = (contextTokens: number) => entry("custom", { contextTokens, decision: "keep" });
-		assert.equal(deciderThreshold([keep(305_000)], 300_000), 405_000);
-		assert.equal(deciderThreshold([keep(305_000), keep(410_000)], 300_000), 510_000);
-		assert.equal(deciderThreshold([keep(305_000), entry("compaction")], 300_000), 300_000, "a compaction starts over");
-		assert.equal(deciderThreshold([keep(305_000), entry("custom", { contextTokens: 420_000, decision: "compact" })], 300_000), 405_000, "a compact decision does not move it");
-		assert.equal(deciderThreshold([keep(100_000)], 300_000), 300_000, "never below the setting");
+		assert.equal(deciderThreshold([keep(405_000)], 400_000), 705_000, "400k, then 700k");
+		assert.equal(deciderThreshold([keep(405_000), keep(710_000)], 400_000), 1_010_000);
+		assert.equal(deciderThreshold([keep(405_000), entry("compaction")], 400_000), 400_000, "a compaction starts over");
+		assert.equal(deciderThreshold([keep(405_000), entry("custom", { contextTokens: 720_000, decision: "compact" })], 400_000), 705_000, "a compact decision does not move it");
+		assert.equal(deciderThreshold([keep(50_000)], 400_000), 400_000, "never below the setting");
 	});
 
 	test("facts: the context's cost per request now and after, and the compaction's own cost, from the model's prices", () => {
-		const facts = decisionFacts({ model: { cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } } as never }, 400_000, 20_000, ["a"]);
+		const facts = decisionFacts({ model: { cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } } as never }, 400_000, 20_000, 983_616, ["a"]);
+		assert.equal(facts.limitTokens, 983_616);
 		const near = (a: number, b: number) => assert.ok(Math.abs(a - b) < 1e-12, `${a} ≈ ${b}`);
 		near(facts.requestNow, 0.2);
 		near(facts.requestAfter, 23_000 * 0.5e-6);
@@ -138,7 +143,7 @@ describe("the hook with a scripted Pi", () => {
 	function scripted(replies: (string | undefined)[], entries: SessionEntry[] = []) {
 		const rulesDir = join(dir, "rules");
 		mkdirSync(rulesDir, { recursive: true });
-		writeFileSync(join(rulesDir, "decide.md"), "---\nsettings:\n  decideCompactionAbove: 300000\n---\n");
+		writeFileSync(join(rulesDir, "decide.md"), "---\nsettings:\n  decideCompactionAbove: 400000\n---\n");
 		const asked: string[] = [];
 		const state = { overrides: undefined as unknown, status: undefined as string | undefined };
 		const pi = {
@@ -170,10 +175,10 @@ describe("the hook with a scripted Pi", () => {
 	/** A random source playing back `values`. */
 	const playback = (...values: number[]) => () => values.shift() ?? 0;
 
-	test("keep: cancels, records both answers, and moves the next check 100k up", async () => {
+	test("keep: cancels, records both answers, and moves the next check 300k up", async () => {
 		const s = scripted(['{"decision":"keep","reason":"still editing"}', '{"decision":"compact","preserve":["src/e.ts"]}']);
 		// draw: first framing index 0 (plain-compact-first), second 0 of the rest (plain-keep-first), acting slot 0.
-		const result = await s.decide(310_000, playback(0, 0, 0));
+		const result = await s.decide(410_000, playback(0, 0, 0));
 		assert.deepEqual(result, { cancel: true });
 		assert.equal(s.asked.length, 2);
 		assert.match(s.asked[0]!, /^\[A question from the harness[\s\S]*\n- "compact"[\s\S]*\n- "keep"/);
@@ -182,36 +187,47 @@ describe("the hook with a scripted Pi", () => {
 		const [d] = s.decisions();
 		assert.deepEqual(
 			{ ...d, answers: d!.answers.map((a) => [a.framing, a.decision]) },
-			{ contextTokens: 310_000, threshold: 300_000, answers: [["plain-compact-first", "keep"], ["plain-keep-first", "compact"]], acting: "plain-compact-first", decision: "keep", files: ["src/e.ts", "src/r.ts"] },
+			{ contextTokens: 410_000, threshold: 400_000, answers: [["plain-compact-first", "keep"], ["plain-keep-first", "compact"]], acting: "plain-compact-first", decision: "keep", files: ["src/e.ts", "src/r.ts"] },
 		);
-		assert.deepEqual([s.state.overrides, s.state.status], [{ maxContextTokens: 410_000 }, "compaction check at 410k"]);
+		assert.deepEqual([s.state.overrides, s.state.status], [{ maxContextTokens: 710_000 }, "compaction check at 710k"]);
 	});
 
 	test("compact: lets the compaction run with what the acting answer said it still needs", async () => {
 		const s = scripted(['{"decision":"keep"}', '{"decision":"compact","preserve":["src/e.ts","the failing test"]}']);
-		const result = await s.decide(320_000, playback(0, 0, 0.9));
+		const result = await s.decide(420_000, playback(0, 0, 0.9));
 		assert.deepEqual(result, { customInstructions: "The session decided to compact and still needs these; keep them in detail in the summary:\n- src/e.ts\n- the failing test" });
 		assert.equal(s.decisions()[0]!.acting, "plain-keep-first");
 		const quiet = scripted(['{"decision":"compact"}', '{"decision":"compact"}']);
-		assert.equal(await quiet.decide(320_000, playback(0, 0, 0)), undefined, "nothing to preserve: Pi's own summary");
+		assert.equal(await quiet.decide(420_000, playback(0, 0, 0)), undefined, "nothing to preserve: Pi's own summary");
 	});
 
 	test("a failed or unreadable acting answer falls back to the other; none at all keeps", async () => {
 		const s = scripted(["throw", '{"decision":"compact"}']);
-		assert.equal(await s.decide(310_000, playback(0, 0, 0)), undefined);
+		assert.equal(await s.decide(410_000, playback(0, 0, 0)), undefined);
 		assert.deepEqual(s.decisions().map((d) => [d.acting, d.decision, d.answers.map((a) => a.decision)]), [["plain-keep-first", "compact", [null, "compact"]]]);
 		const none = scripted([undefined, "no idea"]);
-		assert.deepEqual(await none.decide(310_000, playback(0, 0, 0)), { cancel: true });
+		assert.deepEqual(await none.decide(410_000, playback(0, 0, 0)), { cancel: true });
 		assert.deepEqual(none.decisions().map((d) => [d.acting, d.decision]), [[null, "keep"]]);
 	});
 
-	test("not asked: other compactions, near the model's own limit, with a session or fixed limit", async () => {
+	test("at 700k it asks, and keeping means up to the model's limit; Pi's own compaction there is not asked about", async () => {
+		const keepAt = (contextTokens: number) => ({ type: "custom", customType: DECISION_ENTRY, data: { contextTokens, decision: "keep" }, id: `k${contextTokens}`, parentId: null, timestamp: "" }) as unknown as SessionEntry;
+		const second = scripted(['{"decision":"keep"}', '{"decision":"keep"}'], [keepAt(405_000)]);
+		assert.deepEqual(await second.decide(706_000, playback(0, 0, 0)), { cancel: true });
+		assert.match(second.asked[0]!, /The context of this session is 706k tokens\./);
+		assert.match(second.asked[0]!, /"keep": the full context stays\. Every request carries all of it, up to 984k tokens, where it is compacted without another question\./);
+		assert.deepEqual(second.state.overrides, { maxContextTokens: 1_006_000 }, "past the model's limit: Pi's own compaction applies");
+		const atLimit = scripted([], [keepAt(405_000), keepAt(706_000)]);
+		assert.equal(await atLimit.decide(984_000, Math.random), undefined, "Pi's own compaction: compacts as always");
+		assert.deepEqual(atLimit.asked, []);
+	});
+
+	test("not asked: other compactions, with a session or fixed limit", async () => {
 		const s = scripted([]);
-		assert.equal(await s.decide(310_000, Math.random, "overflow"), undefined);
-		assert.equal(await s.decide(310_000, Math.random, "manual"), undefined);
-		assert.equal(await s.decide(1_000_000 - 16_384 - STEP_TOKENS, Math.random), undefined, "keeping would run into the model's limit");
+		assert.equal(await s.decide(410_000, Math.random, "overflow"), undefined);
+		assert.equal(await s.decide(410_000, Math.random, "manual"), undefined);
 		const own = scripted([], [{ type: "custom", customType: LIMIT_ENTRY, data: { maxContextTokens: 200_000 }, id: "l", parentId: null, timestamp: "" } as unknown as SessionEntry]);
-		assert.equal(await own.decide(310_000, Math.random), undefined, "the user's /context-limit decides");
+		assert.equal(await own.decide(410_000, Math.random), undefined, "the user's /context-limit decides");
 		assert.deepEqual([s.asked, own.asked], [[], []]);
 	});
 });
@@ -323,7 +339,7 @@ describe("the decider in a real session", () => {
 		return (pi: ExtensionAPI) => contextLimit(pi, { rulesDir, experimentsDir: join(dir, "none") });
 	}
 
-	test("keep: no compaction at 50k; the next check (100k later) is near the model's limit, so Pi compacts there without asking", async () => {
+	test("keep: no compaction at 50k; the next check (300k later) is past the model's limit, so Pi compacts there without asking", async () => {
 		const { s, statuses } = await newSession([withDecider()]);
 		assert.equal(statuses.get(STATUS_KEY), "compaction check at 50k");
 		let prompts = 0;
@@ -336,8 +352,9 @@ describe("the decider in a real session", () => {
 		assert.ok(first!.decision === "keep" && first!.answers.length === 2 && first!.answers.every((a) => a.decision === "keep"));
 		assert.ok(first!.contextTokens >= 50_000 && first!.contextTokens < 70_000, `first at ${first!.contextTokens}`);
 		const compaction = entriesOf(s, "compaction")[0] as { tokensBefore: number };
-		assert.ok(compaction.tokensBefore >= first!.contextTokens + STEP_TOKENS, `compacted at ${compaction.tokensBefore}, not before the next check`);
-		assert.ok(compaction.tokensBefore + STEP_TOKENS >= 200_000 - 16_384, "there, keeping would run into the model's limit: no question");
+		assert.ok(compaction.tokensBefore >= 170_000, `compacted at ${compaction.tokensBefore}: Pi's own limit (183.6k), not earlier`);
+		const asked = requests.find((r) => r.last.startsWith("[A question from the harness"))!.last;
+		assert.match(asked, /up to 184k tokens, where it is compacted without another question/);
 		const asides = (entriesOf(s, "usage") as { kind: string }[]).filter((u) => u.kind === "aside: compaction-decision");
 		assert.equal(asides.length, decisions.length * 2);
 		assert.equal(statuses.get(STATUS_KEY), "compaction check at 50k", "after the compaction it starts over");

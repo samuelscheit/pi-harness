@@ -8,7 +8,9 @@
 //   the prompt cache, and neither the question nor the answer enters the conversation.
 // - "keep" cancels the compaction and asks again STEP_TOKENS later; "compact" lets it run, with
 //   what the model says it still needs (`preserve`) as instructions for the summary.
-// - Near the model's own limit (window minus reserve) it does not ask: Pi compacts as it always did.
+// - Pi's own compaction at the model's limit (window minus reserve) is never asked about: when the
+//   next question would come at or past it, "keep" means keeping up to that limit (the question
+//   says so), where Pi compacts as it always did.
 //
 // Framing decides answers, so the framing is measured, live. Each decision asks two of the four
 // FRAMINGS (whether the costs are spelled out × which option comes first), in random order; one
@@ -21,7 +23,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const DECISION_ENTRY = "harness-compaction-decision";
 /** After "keep", the next question comes this many tokens later. */
-export const STEP_TOKENS = 100_000;
+export const STEP_TOKENS = 300_000;
 /** Files listed in the question at most. */
 const MAX_FILES = 30;
 const MAX_PRESERVE = 20;
@@ -56,6 +58,8 @@ export interface Facts {
 	/** Tokens the compaction keeps verbatim. */
 	keepTokens: number;
 	nextTokens: number;
+	/** Where Pi compacts without asking: the model's window minus its reserve. */
+	limitTokens: number;
 	/** Dollars: one request now, one request after compacting, the compaction itself. */
 	requestNow: number;
 	requestAfter: number;
@@ -68,7 +72,10 @@ const k = (tokens: number) => `${Math.round(tokens / 1000)}k`;
 
 const OPTIONS: Record<Decision, (f: Facts) => string> = {
 	compact: (f) => `"compact": now. The older part of the context becomes a summary; the most recent ~${k(f.keepTokens)} tokens stay as they are. Anything else from the older part that the task needs again has to be read again.`,
-	keep: (f) => `"keep": the full context stays. Every request carries all of it, and the harness asks again at ${k(f.nextTokens)} tokens.`,
+	keep: (f) =>
+		f.nextTokens < f.limitTokens
+			? `"keep": the full context stays. Every request carries all of it, and the harness asks again at ${k(f.nextTokens)} tokens.`
+			: `"keep": the full context stays. Every request carries all of it, up to ${k(f.limitTokens)} tokens, where it is compacted without another question.`,
 };
 
 /** The question in one framing. The wording of both options is symmetric; only the order and the cost line vary. */
