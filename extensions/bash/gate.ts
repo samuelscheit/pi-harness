@@ -12,9 +12,10 @@
 //   in an `&&`/`||` list, in the branches of an `if` or the body of a `while` it decides, or after
 //   it in a list under `set -e`. Subshells, `{ …; }`, `x=$(…)`, `$(…)`, `eval` and `bash -c '…'`
 //   pass the status and the gate through.
-// A `;` sequence without `set -e` runs the commit regardless and is not refused; nor is a pipeline
-// elsewhere in the command. With pipefail any failing command fails the pipeline, so a filter at
-// its end (even `grep`) can only add a condition, never hide a failure.
+// A `;` sequence without `set -e` runs the commit regardless and is not refused here (checks.ts
+// refuses one after a test, lint or build); nor is a pipeline elsewhere in the command. With
+// pipefail any failing command fails the pipeline, so a filter at its end (even `grep`) can only
+// add a condition, never hide a failure.
 
 import { forEachChild, parse, type Pipeline, type Statement, type SyntaxNode } from "../../vendor/pi-lens/node_modules/unbash/dist/parser.js";
 import { clip } from "../background/jobs.ts";
@@ -29,13 +30,13 @@ const FILTERS = new Set([
 const PRINTERS = new Set([...FILTERS, "echo", "printf", "yes"]);
 
 /** The shell options a pipeline's status depends on. */
-interface Options {
+export interface Options {
 	pipefail: boolean;
 	errexit: boolean;
 }
 
 /** Applies `set`-style options (`-e`, `+e`, `-o pipefail`, `-euo pipefail`) to `options`. */
-function applyOptions(args: readonly string[], options: Options): void {
+export function applyOptions(args: readonly string[], options: Options): void {
 	for (let i = 0; i < args.length; i++) {
 		const cluster = /^([-+])([A-Za-z]+)$/.exec(args[i]!);
 		if (!cluster) break;
@@ -51,7 +52,7 @@ function applyOptions(args: readonly string[], options: Options): void {
 }
 
 /** What `command` publishes when it runs (a commit, a push, a PR, a package), or undefined. */
-function publishes(command: RunCommand): string | undefined {
+export function publishes(command: RunCommand): string | undefined {
 	const git = gitCommand(command);
 	if (git) return git.subcommand === "commit" || git.subcommand === "push" ? `git ${git.subcommand}` : undefined;
 	const [first, second] = command.args;
