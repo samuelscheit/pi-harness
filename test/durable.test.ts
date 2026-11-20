@@ -575,7 +575,8 @@ describe("resume", () => {
 		faux.setResponses(Array.from({ length: 20 }, () => (context: { messages: { role: string; content: unknown }[] }) => {
 			llmRequests++;
 			const asked = JSON.stringify(context.messages.at(-1)?.content);
-			if (failing && asked.includes("item b")) return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded" });
+			// Not transient (llm() retries those itself): a failure that lasts until someone acts, e.g. tops up the quota.
+			if (failing && asked.includes("item b")) return fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" });
 			return fauxAssistantMessage(`answer to ${asked.includes("item a") ? "a" : asked.includes("item b") ? "b" : "c"}`);
 		}));
 		const script = "const out = await map(['a', 'b', 'c'], (x) => llm(`item ${x}`, { model: 'faux/faux-1' }), { concurrency: 3 });\nreturn out.join(' | ');";
