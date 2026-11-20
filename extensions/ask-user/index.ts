@@ -15,11 +15,15 @@
 //   it does not reach the conversation a second time. Any user message counts: while the agent is
 //   blocked on its questions, a message is almost always the reply, and an unrelated instruction
 //   still reaches the agent in full, as the tool result, with a note that it was a chat reply.
-//   t3's own notifications are not replies: t3 sends them through the same RPC prompt as the
-//   user's messages and drops their origin (its Pi adapter forwards only the text), so they are
-//   told apart by their fixed text (`isT3Notification`). They are left to Pi, which queues them as
+//   t3's own notifications (a delegated task finished or asks, a watched PR changed, a
+//   continuation) are not replies: t3 sends them through the same RPC prompt as the user's
+//   messages, marked `origin: "notification"` (scripts/patch-t3.ts, notification-origin), which
+//   Pi gives extensions as input source "notification". They are left to Pi, which queues them as
 //   steers delivered after this call returns. Until 2026-11-19 they were consumed as the answer
 //   ("Delegated task … [completed]" answered a question three times and the real decision was lost).
+//   Fallback: a t3 without that patch (an update drops the patches; the new ones apply only when
+//   t3 restarts, which can wait on the user or on macOS's App Management permission) sends them
+//   as plain "rpc" input, so those are still told apart by their fixed text (`isT3Notification`).
 // - The turn is aborted: the dialog closes and the call fails.
 // When the time runs out, or with `wait_minutes: 0` at once, the call returns that no answer is
 // there yet; the dialog stays open and its answers arrive later as a message that steers the
@@ -30,7 +34,7 @@
 // in bash can call it too.
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionUIQuestion } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIQuestion, InputEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export const DEFAULT_WAIT_MINUTES = 15;
@@ -100,7 +104,8 @@ export function formatAnswers(questions: ExtensionUIQuestion[], answers: (string
 export const pendingText = (waitedMinutes: number) =>
 	`${waitedMinutes > 0 ? `No answer after ${waitedMinutes} min. ` : ""}The questions stay open. Continue with the work that does not depend on the answers, or end your turn: the answers arrive later as a message.`;
 
-// t3's server-written messages (apps/server/src/orchestration-v2: Orchestrator.ts
+// Fallback for a t3 without the notification-origin patch (see the top): t3's server-written
+// messages (apps/server/src/orchestration-v2: Orchestrator.ts
 // delegatedCompletionWakeDetail, ProviderContinuationService.ts, DelegatedTaskQuestionReactor.ts,
 // pullRequestWatch.ts, UsageLimitRecoveryWorker.ts), each matched from its first line to its exact
 // wording, so a user's reply that quotes one, mentions one or starts like one is still a reply.
@@ -117,6 +122,10 @@ const T3_NOTIFICATIONS = [
 
 /** Whether a message is a notification t3 wrote (a delegated task finished or asks, a watched PR changed, …), not the user. */
 export const isT3Notification = (text: string) => T3_NOTIFICATIONS.some((shape) => shape.test(text));
+
+/** Whether input is the user's words, which answer waiting questions: not an extension's message, not a client's notification. */
+export const isUserReply = (event: InputEvent) =>
+	event.source !== "extension" && event.source !== "notification" && !(event.source === "rpc" && isT3Notification(event.text));
 
 /** A call waiting for its answers takes a chat reply. */
 type ChatWait = (text: string, images: ImageContent[] | undefined) => void;
@@ -135,7 +144,7 @@ export default function askUser(pi: ExtensionAPI) {
 	// A user message while calls wait: it is their answer, not a new message. Messages from
 	// extensions and t3's notifications go on to the agent as usual, after the waiting call.
 	pi.on("input", (event, ctx) => {
-		if (event.source === "extension" || isT3Notification(event.text)) return;
+		if (!isUserReply(event)) return;
 		const waits = waitsOf(ctx.sessionManager.getSessionId());
 		if (waits.size === 0) return;
 		for (const answer of [...waits]) answer(event.text, event.images);

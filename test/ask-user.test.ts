@@ -16,13 +16,14 @@ import {
 	type ExtensionAPI,
 	type ExtensionUIContext,
 	type ExtensionUIQuestion,
+	type InputEvent,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
-import askUser, { formatAnswers, invalidQuestions, isT3Notification, pendingText } from "../extensions/ask-user/index.ts";
+import askUser, { formatAnswers, invalidQuestions, isT3Notification, isUserReply, pendingText } from "../extensions/ask-user/index.ts";
 import background from "../extensions/background/index.ts";
 import { sessionJobs } from "../extensions/background/jobs.ts";
 
@@ -74,12 +75,25 @@ describe("questions and answers", () => {
 			assert.equal(isT3Notification(text), false, text);
 		}
 	});
+
+	test("a reply is the user's words: a client's notification never is, whatever its text; the text fallback covers an unpatched t3's plain prompts only", () => {
+		const input = (text: string, source: InputEvent["source"]): InputEvent => ({ type: "input", text, source, streamingBehavior: "steer" });
+		for (const source of ["interactive", "rpc"] as const) assert.equal(isUserReply(input("B, please", source)), true, source);
+		assert.equal(isUserReply(input("B, please", "extension")), false);
+		assert.equal(isUserReply(input(RESTARTED, "notification")), false, "a notification the text patterns do not know");
+		assert.equal(isUserReply(input("B, please", "notification")), false);
+		assert.equal(isUserReply(input(COMPLETED, "rpc")), false, "an unpatched t3's wake");
+		assert.equal(isUserReply(input(COMPLETED, "interactive")), true, "typed in the terminal, it is the user's");
+	});
 });
 
 // t3's texts as its server writes them (apps/server/src/orchestration-v2).
 const COMPLETED = "Delegated task task-1 (Fix the parser) [completed]:\nChild task completed without an assistant result.";
 const BLOCKED =
 	"Delegated task task-2 is blocked on a question and cannot continue until it is answered. Read it with t3_pending_request action read, threadId thread-9, and requestId req-1. Answer it with action respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.";
+/** t3's restart continuation (RestartContinuation's CONTINUE_PROMPT), which the text patterns do not know. */
+const RESTARTED =
+	"Continue where you left off. Your last turn was cut short, so a command or other action it started may have finished or may still be running. Before you repeat one that changes state, confirm it did not take effect and is not still running; if you cannot tell, say so instead of repeating it.";
 const NOTIFICATIONS = [
 	COMPLETED,
 	BLOCKED,
@@ -340,8 +354,10 @@ describe("ask_user waits for the answers", () => {
 		respond(ask({ questions: [{ title: "Which option?", options: [{ label: "A" }, { label: "B" }] }] }), read, read, read, read);
 		const run = s.prompt("go");
 		await until("the dialog", () => dialogs.length === 1);
-		for (const text of [COMPLETED, BLOCKED, NOTIFICATIONS[5]!]) assert.equal(await s.steer(text, undefined, { source: "rpc" }), "queued", text);
-		await s.prompt(NOTIFICATIONS[6]!, { streamingBehavior: "steer", source: "rpc" });
+		// As a patched t3 sends them (source "notification", also a text the fallback does not know), and one as an unpatched t3 does.
+		for (const text of [COMPLETED, RESTARTED]) assert.equal(await s.steer(text, undefined, { source: "notification" }), "queued", text);
+		assert.equal(await s.steer(NOTIFICATIONS[5]!, undefined, { source: "rpc" }), "queued");
+		await s.prompt(NOTIFICATIONS[6]!, { streamingBehavior: "steer", source: "notification" });
 		await pause(50);
 		assert.equal(askResults(s).length, 0, "still waiting");
 		assert.equal(dialogs[0]!.closed, false, "the dialog stays open");
@@ -352,11 +368,11 @@ describe("ask_user waits for the answers", () => {
 		await run;
 		assert.deepEqual(askResults(s), [`The user answered your ask_user questions with a reply in the chat:\n\nWhich option?\nAnswer: ${reply}`]);
 		assert.equal(dialogs[0]!.closed, true);
-		assert.deepEqual(userTexts(s), ["go", COMPLETED, BLOCKED, NOTIFICATIONS[5]!, NOTIFICATIONS[6]!], "every notification is delivered once, in order");
+		assert.deepEqual(userTexts(s), ["go", COMPLETED, RESTARTED, NOTIFICATIONS[5]!, NOTIFICATIONS[6]!], "every notification is delivered once, in order");
 		const user = (t: string) => `user: ${t.split("\n")[0]}`;
 		assert.deepEqual(
 			reads,
-			[["user: go", "toolResult: The user answered your ask_user questions with a reply in the chat:", user(COMPLETED)], [user(BLOCKED)], [user(NOTIFICATIONS[5]!)], [user(NOTIFICATIONS[6]!)]],
+			[["user: go", "toolResult: The user answered your ask_user questions with a reply in the chat:", user(COMPLETED)], [user(RESTARTED)], [user(NOTIFICATIONS[5]!)], [user(NOTIFICATIONS[6]!)]],
 			"the model reads the answer first, then each notification once",
 		);
 	});
@@ -366,7 +382,7 @@ describe("ask_user waits for the answers", () => {
 		respond(ask({ questions: [{ title: "Go?" }] }), fauxAssistantMessage("done"));
 		const run = s.prompt("go");
 		await until("the dialog", () => dialogs.length === 1);
-		assert.equal(await s.steer(COMPLETED, undefined, { source: "rpc" }), "queued");
+		assert.equal(await s.steer(COMPLETED, undefined, { source: "notification" }), "queued");
 		dialogs[0]!.answer(["yes"]);
 		await run;
 		assert.deepEqual(askResults(s), ["The user answered your ask_user questions:\n\nGo?\nAnswer: yes"]);

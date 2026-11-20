@@ -312,6 +312,54 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	// A client's own notification (t3: a delegated task finished) must not read as its user's words.
+	it("passes a prompt's notification origin to input handlers, idle and while streaming", async () => {
+		const seen: { text: string; source: string; streamingBehavior?: string }[] = [];
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 100,
+			extensionsResult: await createTestExtensionsResult([
+				(pi) => {
+					pi.on("input", (event) => {
+						seen.push({ text: event.text, source: event.source, streamingBehavior: event.streamingBehavior });
+					});
+				},
+			]),
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "n1", type: "prompt", message: "Task done", origin: "notification" }));
+			await vi.waitFor(() => expect(getPromptResponses(rpcIo.outputLines, "n1")).toHaveLength(1));
+			lineHandler(
+				JSON.stringify({
+					id: "n2",
+					type: "prompt",
+					message: "PR changed",
+					streamingBehavior: "steer",
+					origin: "notification",
+				}),
+			);
+			lineHandler(JSON.stringify({ id: "n3", type: "prompt", message: "User reply", streamingBehavior: "steer" }));
+			// An unknown origin is not a notification: only the declared one changes the source.
+			lineHandler(
+				JSON.stringify({ id: "n4", type: "prompt", message: "Other", streamingBehavior: "steer", origin: "other" }),
+			);
+			await vi.waitFor(() => {
+				for (const id of ["n2", "n3", "n4"]) expect(getPromptResponses(rpcIo.outputLines, id)).toHaveLength(1);
+			});
+
+			expect(seen).toEqual([
+				{ text: "Task done", source: "notification", streamingBehavior: undefined },
+				{ text: "PR changed", source: "notification", streamingBehavior: "steer" },
+				{ text: "User reply", source: "rpc", streamingBehavior: "steer" },
+				{ text: "Other", source: "rpc", streamingBehavior: "steer" },
+			]);
+			await sleep(150);
+		} finally {
+			await cleanup();
+		}
+	});
+
 	// #9803: a handler can consume A while independently queueing B; report A's outcome.
 	it.each(["steer", "follow_up"] as const)(
 		"reports %s as handled even when an extension queues another message",

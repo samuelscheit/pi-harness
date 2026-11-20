@@ -1261,8 +1261,12 @@ export interface UserBashEvent {
 // Input Events
 // ============================================================================
 
-/** Source of user input */
-export type InputSource = "interactive" | "rpc" | "extension";
+/**
+ * Source of user input: typed in the TUI, sent by an RPC client, sent by an extension
+ * (`sendUserMessage`), or a notification an RPC client wrote itself rather than its user (a prompt
+ * with `origin: "notification"`, e.g. t3 reporting that a delegated task finished).
+ */
+export type InputSource = "interactive" | "rpc" | "extension" | "notification";
 
 /** Fired when user input is received, before agent processing */
 export interface InputEvent {

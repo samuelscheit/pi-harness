@@ -177,6 +177,7 @@ describe("patchBundle", () => {
 		"promoted-run-wait",
 		"thread-wait-description",
 		"bridge-long-calls",
+		"notification-origin",
 	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
@@ -238,6 +239,9 @@ describe("patchBundle", () => {
 		assert.ok(text.includes('awaited: piRecordField(item, "awaited") !== false /* releasedByItem */'));
 		assert.ok(text.includes("\tawaited: optional(Boolean$2),\n\t/** The shell command the work runs, when it is one. */"), "the contract takes false");
 		assert.ok(text.includes("task.awaited ?? backgroundWorkKindHoldsCompletion(task.kind)"));
+		// Pi learns which prompts t3 wrote itself, at a turn start and in a steer.
+		assert.ok(text.includes('kind: "turn_start",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n\t\t\t\t\t\t\t\t...piPromptOrigin(turnInput.message),\n'));
+		assert.ok(text.includes('kind: "steer",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n\t\t\t\t\t\t\t\t...piPromptOrigin(steerInput.message),\n'));
 		// A dialog shown between turns follows the last turn's items instead of ordinal 0.
 		assert.ok(text.includes("state.activeTurn = activeTurn;\n\t\t\t\t\t\tstate.lastTurn = activeTurn;"));
 		assert.ok(text.includes("ordinal: (turn ?? state?.lastTurn ?? null) === null ? 0 : itemOrdinal(turn ?? state.lastTurn, nativeRequestId)"));
@@ -944,6 +948,48 @@ describe("patchBundle", () => {
 			slot[Symbol.for("undici.globalDispatcher.1")] = legacy;
 		}
 	});
+
+	// The Pi adapter's prompt records, as bundled: a message t3 wrote itself carries Pi's notification origin.
+	test("t3's own messages reach Pi as notifications, the user's (also relayed by t3) as prompts", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const { fileOf, patched } = patchInstalled();
+		const text = patched.get(fileOf(PATCHES.find((patch) => patch.name === "notification-origin")!))!;
+		const fnStart = text.indexOf("function piPromptOrigin(");
+		const piPromptOrigin = new Function(`${text.slice(fnStart, text.indexOf("\n}\n", fnStart) + 2)}\nreturn piPromptOrigin;`)();
+		// The messages t3 dispatches (Orchestrator wakes, UsageLimitRecoveryWorker, restart continuations, async answers, typed messages).
+		const wake = { createdBy: "agent", creationSource: "server" };
+		const asyncAnswer = { createdBy: "user", creationSource: "server" };
+		const typed = { createdBy: "user", creationSource: "user" };
+		const continuation = { createdBy: "agent", creationSource: "provider" };
+		assert.deepEqual(piPromptOrigin(wake), { origin: "notification" });
+		assert.deepEqual(piPromptOrigin(asyncAnswer), {}, "the user's answer relayed by t3 is the user's");
+		assert.deepEqual(piPromptOrigin(typed), {});
+		assert.deepEqual(piPromptOrigin(continuation), {});
+
+		// steerTurn, run as bundled with recording stand-ins: the record it sends to Pi.
+		const start = text.indexOf('steerTurn: fn("PiAdapter.steerTurn")(') + 'steerTurn: fn("PiAdapter.steerTurn")('.length;
+		const steerSource = text.slice(start, text.indexOf("}, (effect, steerInput) =>", start) + 1);
+		const done = (value?: unknown) => ({ *[Symbol.iterator]() { return value; } });
+		const steer = (message: Record<string, unknown>) => {
+			const sent: unknown[] = [];
+			const turn = { providerTurn: { id: "turn-1" }, settleProbeGeneration: 0 };
+			const steerTurn = new Function("deps", `with (deps) { return ${steerSource}; }`)({
+				threadState: { activeTurn: turn },
+				protocolError: (detail: string) => done(assert.fail(detail)),
+				parsePiCompactCommand: () => null,
+				resolvePromptPayload: (text: string) => done({ message: text, images: [] }),
+				sessionEventPermit: { withPermits: () => (effect: unknown) => effect },
+				gen$1: (body: () => Generator) => ({ [Symbol.iterator]: body }),
+				sendPrompt: (prompt: { record: unknown }) => done(void sent.push(prompt.record)),
+				piPromptOrigin,
+			});
+			const run = steerTurn({ providerTurnId: "turn-1", message: { text: "Delegated task t1 [completed]:\ndone", attachments: [], ...message } });
+			while (!run.next().done);
+			assert.equal(turn.settleProbeGeneration, 1, "the steer ran to its end");
+			return sent;
+		};
+		assert.deepEqual(steer(wake), [{ type: "prompt", message: "Delegated task t1 [completed]:\ndone", origin: "notification", streamingBehavior: "steer" }]);
+		assert.deepEqual(steer(typed), [{ type: "prompt", message: "Delegated task t1 [completed]:\ndone", streamingBehavior: "steer" }], "a user who quotes a wake is still the user");
+	});
 });
 
 describe("keeping t3 patched", () => {
@@ -1051,7 +1097,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution, promoted-task-delivered, promoted-run-wait, thread-wait-description, bridge-long-calls;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution, promoted-task-delivered, promoted-run-wait, thread-wait-description, bridge-long-calls, notification-origin;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);

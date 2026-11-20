@@ -169,6 +169,15 @@
 //   `delegate_task` in `wait` mode or a question over 5 minutes failed with "fetch failed"
 //   (2026-11-19; 2026-11-14 for the workflow extension, which slices its waits since). The bridge's
 //   own requests now lift both timeouts per request; the call's abort signal still ends them.
+// - notification-origin (Pi learns which prompts t3 wrote itself): t3 sends its own messages (a
+//   delegated task's completion wake, a watched PR's update, the usage-limit and restart
+//   continuations: `createdBy: "agent"`, `creationSource: "server"`) through the same RPC prompt as
+//   the user's, and the adapter forwarded only their text. The harness's ask_user took a "Delegated
+//   task … [completed]" wake as the user's chat reply to its open questions (2026-11-19, three
+//   times; the real decision was lost). Both prompt records (turn start and steer) now carry
+//   `origin: "notification"` for such a message, and Pi (vendor/pi) gives its extensions input
+//   source "notification". A user's own server-relayed answer (`createdBy: "user"`, e.g. an async
+//   answer to a question) stays a user message.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -1218,6 +1227,30 @@ export const PATCHES: Patch[] = [
 			[
 				'    const response = await fetch(endpoint, {\n      method: "POST",\n      headers: headers(),\n      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),\n      signal,\n    });',
 				'    const response = await fetch(endpoint, {\n      method: "POST",\n      headers: headers(),\n      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),\n      signal,\n      ...bridgeDispatch(),\n    });',
+			],
+		],
+	},
+	{
+		name: "notification-origin",
+		marker: "piPromptOrigin",
+		edits: [
+			[
+				'const PI_INHERIT_MODEL_SLUG = "default";',
+				[
+					'const PI_INHERIT_MODEL_SLUG = "default";',
+					"/** A message t3 wrote itself (a delegated task's completion, a PR update, a continuation), not the user: Pi's extensions see input source \"notification\". */",
+					"function piPromptOrigin(message) {",
+					'\treturn message.createdBy === "agent" && message.creationSource === "server" ? { origin: "notification" } : {};',
+					"}",
+				].join("\n"),
+			],
+			[
+				'kind: "turn_start",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n',
+				'kind: "turn_start",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n\t\t\t\t\t\t\t\t...piPromptOrigin(turnInput.message),\n',
+			],
+			[
+				'kind: "steer",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n',
+				'kind: "steer",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n\t\t\t\t\t\t\t\t...piPromptOrigin(steerInput.message),\n',
 			],
 		],
 	},

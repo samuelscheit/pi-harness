@@ -28,6 +28,12 @@ With images:
 
 If the agent is streaming and no `streamingBehavior` is specified, the command returns an error.
 
+**Client notifications**: A message the client wrote itself rather than its user (for example a report that background work finished) can carry `"origin": "notification"`. Extensions then see it as input source `"notification"` instead of `"rpc"`, so they do not take it for the user's words:
+
+```json
+{"type": "prompt", "message": "Build finished.", "streamingBehavior": "steer", "origin": "notification"}
+```
+
 **Extension commands**: If the message is an extension command (e.g., `/mycommand`), it executes immediately even during streaming. Extension commands manage their own LLM interaction via `pi.sendMessage()`.
 
 **Input expansion**: Skill commands (`/skill:name`) and prompt templates (`/template`) are expanded before sending/queueing.
