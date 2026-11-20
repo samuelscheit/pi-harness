@@ -129,9 +129,9 @@ export function sectionText(goal: Goal): string {
 		.join("\n\n");
 }
 
-/** A background job the session's turn may wait on. */
+/** A background job the session's turn may wait on: a background call, a process, or a delegated task. */
 export interface PendingJob {
-	/** How the agent names it: `call <id>` or `pid <n>`. */
+	/** How the agent names it: `call <id>`, `pid <n>` or `task <taskId>`. */
 	key: string;
 	command: string;
 	/** Other names that match it exactly: the call id, pid or process group. */
@@ -143,6 +143,72 @@ const ago = (ms: number) => {
 	const s = Math.max(0, Math.round(ms / 1000));
 	return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min`;
 };
+
+const contentText = (content: string | readonly { type: string; text?: string }[]) => (typeof content === "string" ? content : content.map((c) => (c.type === "text" ? (c.text ?? "") : "")).join(""));
+
+/** t3's MCP tools, as its bridge registers them (also under a hidden canonical name). */
+const T3_TOOL = /^mcp__t3[-_]code__/;
+/** Run statuses of a thread that are not over: a task a `t3_thread_send` started then runs. */
+const RUN_GOING = new Set(["preparing", "queued", "starting", "running", "waiting"]);
+
+const parseObject = (text: string): Record<string, unknown> | undefined => {
+	try {
+		const value: unknown = JSON.parse(text);
+		return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	} catch {
+		return undefined;
+	}
+};
+
+const str = (value: unknown) => (typeof value === "string" && value ? value : undefined);
+
+/**
+ * The tasks the session delegated through t3 (`delegate_task`, or `t3_thread_send` to a finished
+ * child thread, which starts a fresh task) whose completion will wake it, read from the branch.
+ *
+ * t3 marks such a task in every result about it with `next` ("Completion wakes this thread, so end
+ * your turn"); a result without it (a finished task, `task_cancel`, a child waiting on a question or
+ * approval, whose answer the session owes) ends what the session may wait on. The completion reaches
+ * the session as a user message `Delegated task <taskId> (title) [status]: …`, which ends it too.
+ * Read from the branch, not process state: it survives reloads and restarts as the session does.
+ */
+export function delegatedTasks(branch: readonly SessionEntry[]): { running: PendingJob[]; ended: Set<string> } {
+	const running = new Map<string, PendingJob>();
+	const ended = new Set<string>();
+	const end = (taskId: string) => {
+		running.delete(taskId);
+		ended.add(taskId);
+	};
+	for (const entry of branch) {
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role === "toolResult") {
+			if (message.isError || !T3_TOOL.test(message.toolName)) continue;
+			const data = parseObject(contentText(message.content).trim());
+			const taskId = str(data?.taskId);
+			if (!data || !taskId) continue;
+			const wakes = str(data.next) !== undefined || (message.toolName.endsWith("t3_thread_send") && RUN_GOING.has(String(data.status)));
+			if (!wakes) {
+				end(taskId);
+				continue;
+			}
+			ended.delete(taskId);
+			const previous = running.get(taskId);
+			const title = /^\[(.+)\]\(/.exec(str(data.link) ?? "")?.[1];
+			const threads = [str(data.childThreadId), str(data.threadId)].filter((id): id is string => id !== undefined);
+			running.set(taskId, {
+				key: `task ${taskId}`,
+				command: title ? `delegated task: ${title}` : (previous?.command ?? "delegated task"),
+				ids: [...new Set([taskId, ...(previous?.ids ?? []), ...threads])],
+				startedAt: previous?.startedAt ?? message.timestamp,
+			});
+		} else if ((message.role === "user" || message.role === "custom") && running.size > 0) {
+			const text = contentText(message.content);
+			for (const taskId of [...running.keys()]) if (text.includes(`Delegated task ${taskId}`)) end(taskId);
+		}
+	}
+	return { running: [...running.values()], ended };
+}
 
 export const jobLines = (jobs: readonly PendingJob[], now: number) =>
 	jobs.map((job) => `- ${job.key}: \`${clip(job.command, 160)}\`${job.startedAt === undefined ? "" : ` (running ${ago(now - job.startedAt)})`}`);
@@ -189,6 +255,25 @@ export function pendingText(jobs: readonly PendingJob[], now: number): string {
 	].join("\n");
 }
 
+/**
+ * The message that wakes an agent which has waited on jobs for a long time without other work: the
+ * user's most repeated rule is to use waiting time ("you are waiting since 10:21 on tests, same
+ * problem all over again", 2026-11-19), and the wording of the strict continue alone did not keep
+ * agents from it.
+ */
+export function waitNudgeText(jobs: readonly PendingJob[], waitedMs: number, now: number): string {
+	return [
+		`You have been waiting ${ago(waitedMs)} on background work without doing anything else:`,
+		...jobLines(jobs, now),
+		"",
+		"Do not keep waiting idle; use the time. Do one of these now:",
+		"- Do the remaining steps of the goal that do not depend on these jobs, assuming they succeed where that is safe.",
+		"- Cut a job's run time: run only the tests or targets that matter, split it, or run its parts in parallel; restart it that way if that is faster than waiting.",
+		"- Start independent work in parallel: other checks, reviews, docs, a delegated task.",
+		"Only if every remaining step still depends on these jobs, call the `goal` tool with action `wait` again, with a `reason` saying why nothing else can be done meanwhile.",
+	].join("\n");
+}
+
 /** The message when the budget is reached: wrap up. */
 export function budgetLimitText(goal: Goal, spent: Spend): string {
 	return [
@@ -201,7 +286,7 @@ export function budgetLimitText(goal: Goal, spent: Spend): string {
 export function findJob(jobs: readonly PendingJob[], name: string): PendingJob | undefined {
 	const wanted = name.trim().replace(/^`|`$/g, "").trim().toLowerCase();
 	if (!wanted) return undefined;
-	const bare = wanted.replace(/^(call|pid|job|process group|pgid)\s+/, "");
+	const bare = wanted.replace(/^(call|pid|job|task|process group|pgid)\s+/, "");
 	const exact = jobs.find((job) => job.key.toLowerCase() === wanted || job.ids.some((id) => id.toLowerCase() === bare));
 	if (exact) return exact;
 	const partial = jobs.filter((job) => job.command.toLowerCase().includes(bare));

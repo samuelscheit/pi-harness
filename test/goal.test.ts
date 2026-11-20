@@ -2,7 +2,8 @@
 // bash) where the goal is set by command and by tool, shows in the prompt and status line, survives
 // reload, compaction and a new process, holds the run at its end, and lets it end when achieved
 // (check passing), blocked, paused, cleared, over budget, stuck (loop guard), or waiting on a
-// running background job (strict mode).
+// running background job or delegated task (strict mode); waiting idle again needs a reason, and a
+// long idle wait wakes the agent.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -12,9 +13,11 @@ import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, getApiProvider, registerApiProvider, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, type ExtensionUIContext, ModelRuntime, type SessionEntry, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import bashExtension from "../extensions/bash/index.ts";
 import {
 	continueText,
+	delegatedTasks,
 	describeGoal,
 	findJob,
 	GOAL_ENTRY,
@@ -27,8 +30,9 @@ import {
 	pendingText,
 	sectionText,
 	statusLine,
+	waitNudgeText,
 } from "../extensions/goal/goal.ts";
-import goal, { MAX_IDLE_CONTINUES, MESSAGE_TYPE } from "../extensions/goal/index.ts";
+import goal, { type GoalOptions, MAX_IDLE_CONTINUES, MESSAGE_TYPE } from "../extensions/goal/index.ts";
 import prompt from "../extensions/prompt/index.ts";
 
 const GOAL: Goal = { id: "g1", objective: "Make the tests pass.", status: "active", setBy: "user" };
@@ -85,6 +89,65 @@ describe("goal state", () => {
 		assert.equal(findJob(jobs, "npm run"), undefined, "ambiguous");
 		assert.equal(findJob(jobs, "deploy"), undefined);
 		assert.equal(findJob(jobs, "  "), undefined);
+		const task: PendingJob = { key: "task node:t%3A1", command: "delegated task: Review PR #5", ids: ["node:t%3A1", "thread:t%3A1"] };
+		assert.equal(findJob([...jobs, task], "task node:t%3A1")?.key, task.key);
+		assert.equal(findJob([...jobs, task], "node:t%3A1")?.key, task.key, "the bare task id");
+		assert.equal(findJob([...jobs, task], "thread:t%3A1")?.key, task.key, "its child thread");
+		assert.equal(findJob([...jobs, task], "review pr")?.key, task.key, "a part of its title");
+		assert.equal(findJob([...jobs, task], "task node:other"), undefined);
+	});
+
+	test("delegated tasks: running while t3 says their completion wakes the session; ended by any other word from t3 or their completion message", () => {
+		let at = 1000;
+		const result = (toolName: string, data: unknown, isError = false): SessionEntry =>
+			({ type: "message", id: `e${++n}`, parentId: null, timestamp: "", message: { role: "toolResult", toolCallId: `c${n}`, toolName, content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data) }], isError, timestamp: (at += 1000) } }) as unknown as SessionEntry;
+		const user = (text: string): SessionEntry => ({ type: "message", id: `e${++n}`, parentId: null, timestamp: "", message: { role: "user", content: [{ type: "text", text }], timestamp: 0 } }) as unknown as SessionEntry;
+		const NEXT = "Completion wakes this thread, so end your turn. Do not wait on it or poll it.";
+		const started = (taskId: string, title?: string) => ({ taskId, childThreadId: `thread:${taskId}`, ...(title ? { link: `[${title}](t3-thread://v2/x/thread:${taskId})` } : {}), status: "running", workState: "working", next: NEXT });
+
+		const a = result("mcp__t3-code__delegate_task", started("node:a", "Review [PR] #1"));
+		assert.deepEqual(delegatedTasks([a]), { running: [{ key: "task node:a", command: "delegated task: Review [PR] #1", ids: ["node:a", "thread:node:a"], startedAt: 2000 }], ended: new Set() });
+		const branch = [
+			a,
+			result("mcp__t3_code__delegate_task", started("node:b"), false),
+			result("mcp__t3-code__delegate_task", { taskId: "node:waited", status: "completed", workState: "result_available", summary: "done" }),
+			result("mcp__t3-code__delegate_task", started("node:failed-call"), true),
+			result("bash", started("node:not-t3")),
+			result("mcp__t3-code__t3_thread_read", "not json {"),
+			result("mcp__t3-code__task_status", started("node:a")),
+			result("mcp__t3-code__delegate_task", started("node:asks")),
+			result("mcp__t3-code__task_status", { taskId: "node:asks", status: "running", workState: "working", hasPendingQuestion: true }),
+			result("mcp__t3-code__delegate_task", started("node:c")),
+			result("mcp__t3-code__task_cancel", { taskId: "node:c", status: "cancel_requested" }),
+		];
+		const mid = delegatedTasks(branch);
+		assert.deepEqual(
+			mid.running.map((t) => [t.key, t.command, t.startedAt]),
+			[
+				["task node:a", "delegated task: Review [PR] #1", 2000],
+				["task node:b", "delegated task", 3000],
+			],
+			"a status read keeps the title and start; a wait-mode result that finished, an error, another tool and non-JSON add nothing",
+		);
+		assert.deepEqual([...mid.ended].sort(), ["node:asks", "node:c", "node:waited"]);
+
+		const done = delegatedTasks([
+			...branch,
+			user("Delegated task node:a (Review [PR] #1) [completed]:\nAll good; see Delegated task node:zzz.\n\nDelegated task node:b [failed]. Use task_status with taskId node:b to read the result."),
+			// A send to the finished child thread starts a fresh task under the same id.
+			result("mcp__t3-code__t3_thread_send", { threadId: "thread:node:c", link: "[Again](t3-thread://v2/x/thread:node:c)", taskId: "node:c", status: "queued", delivery: "queued" }),
+			result("mcp__t3-code__t3_thread_send", { threadId: "thread:node:d", taskId: "node:d", status: "completed", delivery: "started" }),
+		]);
+		assert.deepEqual(done.running.map((t) => [t.key, t.command, t.ids]), [["task node:c", "delegated task: Again", ["node:c", "thread:node:c"]]]);
+		assert.deepEqual([...done.ended].sort(), ["node:a", "node:asks", "node:b", "node:d", "node:waited"]);
+	});
+
+	test("the wake-up after idle waiting names the jobs, how long, and what to do instead", () => {
+		const text = waitNudgeText([{ key: "call c1", command: "npm test", ids: ["c1"], startedAt: 0 }], 16 * 60_000, 20 * 60_000);
+		assert.match(text, /^You have been waiting 16 min on background work without doing anything else:\n- call c1: `npm test` \(running 20 min\)\n\nDo not keep waiting idle; use the time\./);
+		assert.match(text, /Cut a job's run time/);
+		assert.match(text, /Start independent work in parallel/);
+		assert.match(text, /action `wait` again, with a `reason`/);
 	});
 
 	test("texts: section, status line, description, continue (plain and strict)", () => {
@@ -194,7 +257,7 @@ function recordingUi() {
 
 type Ui = ReturnType<typeof recordingUi>["ui"];
 
-async function newSession(sessionManager = SessionManager.create(join(dir, "repo"), join(dir, "sessions"))): Promise<{ s: AgentSession; ui: Ui }> {
+async function newSession(sessionManager = SessionManager.create(join(dir, "repo"), join(dir, "sessions")), setup: { goal?: GoalOptions; extensions?: ((pi: ExtensionAPI) => void)[] } = {}): Promise<{ s: AgentSession; ui: Ui }> {
 	const cwd = join(dir, "repo");
 	// Keep almost nothing at a compaction, so a short session can be compacted.
 	const settingsManager = SettingsManager.inMemory({ compaction: { keepRecentTokens: 1 } });
@@ -208,7 +271,8 @@ async function newSession(sessionManager = SessionManager.create(join(dir, "repo
 		extensionFactories: [
 			...(backgroundExtension ? [(pi: ExtensionAPI) => backgroundExtension(pi, { detachAfterMs: 30_000, logRoot: join(dir, "logs") })] : []),
 			(pi: ExtensionAPI) => bashExtension(pi, { dir: join(dir, "groups"), detachAfterMs: 30_000, pollMs: 100 }),
-			goal,
+			(pi: ExtensionAPI) => goal(pi, setup.goal),
+			...(setup.extensions ?? []),
 		],
 	});
 	await resourceLoader.reload();
@@ -512,7 +576,8 @@ describe("strict mode: background work pending", () => {
 				seen.push(lastText(context));
 				return goalCall({ action: "wait", steps: [{ step: "fix failures", job: "sleep" }, { step: "update docs", job: "the docs" }] });
 			},
-			goalCall({ action: "wait", steps: [{ step: "read the results and fix failures", job: "sleep 2" }] }),
+			// It waited on this job before and did nothing since: waiting again takes a reason.
+			goalCall({ action: "wait", steps: [{ step: "read the results and fix failures", job: "sleep 2" }], reason: "every step needs the results" }),
 			say("Every remaining step needs the tests."),
 			(context) => {
 				seen.push(lastText(context));
@@ -549,8 +614,174 @@ describe("strict mode: background work pending", () => {
 		await s.prompt("go");
 		const texts = toolTexts(s);
 		assert.equal(texts[0], "error: No goal is set.");
-		assert.match(texts[2]!, /^error: No background job is running, so nothing will wake you\./);
+		assert.match(texts[2]!, /^error: No background job or delegated task is running, so nothing will wake you\./);
 		assert.match(texts[4]!, /^error: The goal is blocked; nothing keeps your turn going/);
+	});
+});
+
+/** t3's tools as its MCP bridge registers them, answering with the JSON t3 returns: a running task (its completion wakes the caller) or a finished one. */
+function fakeT3(pi: ExtensionAPI) {
+	const NEXT = "Completion wakes this thread, so end your turn. Do not wait on it or poll it.";
+	let count = 0;
+	const finished = new Set<string>();
+	const json = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }], details: { server: "t3-code" } });
+	pi.registerTool({
+		name: "mcp__t3-code__delegate_task",
+		label: "delegate_task",
+		description: "Start a child agent.",
+		parameters: Type.Object({ task: Type.String(), title: Type.Optional(Type.String()) }),
+		execute: async (_id, params) => {
+			const taskId = `node:delegated-task:t${++count}`;
+			return json({ taskId, childThreadId: `thread:${taskId}`, link: `[${params.title ?? "Child"}](t3-thread://v2/x/thread:${taskId})`, status: "running", workState: "working", next: NEXT });
+		},
+	});
+	pi.registerTool({
+		name: "mcp__t3-code__task_status",
+		label: "task_status",
+		description: "Read a task.",
+		parameters: Type.Object({ taskId: Type.String() }),
+		execute: async (_id, { taskId }) => json(finished.has(taskId) ? { taskId, status: "completed", workState: "result_available", summary: "Done." } : { taskId, status: "running", workState: "working", next: NEXT }),
+	});
+	return { finish: (taskId: string) => finished.add(taskId) };
+}
+const t3Call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage([fauxToolCall(`mcp__t3-code__${name}`, args)], { stopReason: "toolUse" });
+const TASK1 = "node:delegated-task:t1";
+
+describe("waiting on delegated tasks", () => {
+	test("a running async task is listed and waitable; the turn ends; its completion message ends it, so waiting on it again is refused", async () => {
+		const { s } = await newSession(undefined, { extensions: [(pi) => void fakeT3(pi)] });
+		const seen: string[] = [];
+		respond(
+			goalCall({ action: "set", objective: "Land the reviewed change." }),
+			t3Call("delegate_task", { task: "Review the diff.", title: "Review the diff" }),
+			say("The review runs."),
+			(context) => {
+				seen.push(lastText(context));
+				return goalCall({ action: "wait", steps: [{ step: "apply the review", job: "task node:delegated-task:t9" }] });
+			},
+			goalCall({ action: "wait", steps: [{ step: "apply the review", job: `task ${TASK1}` }, { step: "land it", job: "review the diff" }] }),
+			say("Every remaining step needs the review; its completion wakes me."),
+		);
+		await s.prompt("keep going");
+		assert.ok(settled(s, "its completion wakes me")());
+		assert.equal(faux.getPendingResponseCount(), 0);
+		assert.equal(continues(s).length, 1);
+		assert.match(seen[0]!, new RegExp(`Background work is still running; its end wakes you with its result:\\\\n- task ${TASK1}: \`delegated task: Review the diff\` \\(running \\d+ s\\)`));
+		const texts = toolTexts(s);
+		assert.match(texts[2]!, /^error: These steps name no running job: "apply the review" \(task node:delegated-task:t9\)\.\nRunning jobs:\n- task node:delegated-task:t1: /);
+		assert.match(texts[3]!, new RegExp(`^Waiting is fine: every remaining step depends on a running job \\("apply the review" → task ${TASK1}; "land it" → task ${TASK1}\\)\\.`));
+		assert.equal(nudges(s).length, 0, "without a goal-free settle, no pending-work message");
+
+		// t3 wakes the parent with the completion as a user message.
+		respond(
+			goalCall({ action: "wait", steps: [{ step: "apply the review", job: `task ${TASK1}` }] }),
+			goalCall({ action: "achieved" }),
+			say("Landed."),
+		);
+		await s.prompt(`Delegated task ${TASK1} (Review the diff) [completed]:\nLooks good.`);
+		assert.ok(settled(s, "Landed.")());
+		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: No background job or delegated task is running, so nothing will wake you\\. Delegated task ${TASK1} ended already`));
+		assert.equal(current(s)?.status, "achieved");
+	});
+
+	test("a task_status read of a finished task ends it; a running one keeps it; a background job and a task are waited on together", async () => {
+		let t3!: ReturnType<typeof fakeT3>;
+		const { s } = await newSession(undefined, { extensions: [(pi) => void (t3 = fakeT3(pi))] });
+		respond(
+			goalCall({ action: "set", objective: "Ship." }),
+			t3Call("delegate_task", { task: "Write docs.", title: "Docs" }),
+			t3Call("task_status", { taskId: TASK1 }),
+			bash("sleep 20 > /dev/null 2>&1 &"),
+			goalCall({ action: "wait", steps: [{ step: "merge the docs", job: "docs" }, { step: "read the build", job: "sleep 20" }] }),
+			say("Waiting for the docs and the build."),
+		);
+		await s.prompt("go");
+		assert.match(toolTexts(s)[4]!, new RegExp(`^Waiting is fine: every remaining step depends on a running job \\("merge the docs" → task ${TASK1}; "read the build" → pid \\d+\\)`));
+		assert.equal(faux.getPendingResponseCount(), 0);
+
+		t3.finish(TASK1);
+		respond(t3Call("task_status", { taskId: TASK1 }), goalCall({ action: "wait", steps: [{ step: "merge the docs", job: TASK1 }] }), goalCall({ action: "blocked", reason: "stop" }), say("Stopped."));
+		await s.prompt("status?");
+		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: These steps name no running job: "merge the docs" \\(${TASK1}\\)\\.\\nDelegated task ${TASK1} ended already`));
+		assert.doesNotMatch(toolTexts(s).at(-2)!, /- task /, "only the build runs");
+	});
+});
+
+describe("waiting idle", () => {
+	test("waiting again without a tool call since needs a reason; after work it does not; an ended job is forgotten", async () => {
+		const { s } = await newSession();
+		const wait = (reason?: string) => goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep 20" }], ...(reason ? { reason } : {}) });
+		respond(goalCall({ action: "set", objective: "Test it." }), bash("sleep 20 > /dev/null 2>&1 &"), wait(), say("Waiting."));
+		await s.prompt("go");
+		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine: .*If you are still waiting idle after a while, you will be woken to use the time\.$/);
+
+		respond(wait(), wait("   "), wait("Every step needs the test results; nothing else is left."), say("Still waiting."));
+		await s.prompt("status?");
+		const [refused, blank, accepted] = toolTexts(s).slice(-3);
+		assert.match(refused!, /^error: You have been waiting on pid \d+ for \d+ s and made no tool call since your last wait: waiting again is not progress\.\nUse the time: .*cut its run time.*\nOnly if every remaining step still depends on it, call `wait` again with a `reason`/s);
+		assert.match(blank!, /^error: You have been waiting/, "a blank reason is none");
+		assert.match(accepted!, /^Waiting is fine: .*\)\. Your reason to wait again: Every step needs the test results; nothing else is left\. End your turn now/);
+
+		respond(bash("true"), wait(), say("Did a step, waiting again."));
+		await s.prompt("anything else?");
+		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine: [^]*\)\. End your turn now/, "a tool call in between: no reason needed");
+	});
+
+	test("an idle wait wakes the agent after the threshold, then after twice the time; waiting again needs a reason; a blocked goal stops it", async () => {
+		const { s } = await newSession(undefined, { goal: { waitNudgeMs: 300 } });
+		const seen: { at: number; text: string }[] = [];
+		const woken = (reply: ReturnType<typeof say>) => (context: { messages: readonly unknown[] }) => {
+			seen.push({ at: Date.now(), text: lastText(context) });
+			return reply;
+		};
+		const wait = (reason?: string) => goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep 30" }], ...(reason ? { reason } : {}) });
+		respond(
+			goalCall({ action: "set", objective: "Test it." }),
+			bash("sleep 30 > /dev/null 2>&1 &"),
+			wait(),
+			say("Waiting."),
+			woken(wait()),
+			wait("The tests gate every step."),
+			say("Still waiting."),
+			woken(goalCall({ action: "blocked", reason: "the tests take too long" })),
+			say("Blocked."),
+		);
+		const waitedAt = Date.now();
+		await s.prompt("go");
+		await until("two wake-ups", settled(s, "Blocked."), 15_000);
+		assert.equal(seen.length, 2);
+		assert.match(seen[0]!.text, /You have been waiting \d+ s on background work without doing anything else:\\n- pid \d+: `sleep 30`/);
+		assert.ok(seen[0]!.at - waitedAt >= 300, "not before the threshold");
+		// Each is seen when the model answers it, so the gap carries some latency: well above the threshold, not exactly twice it.
+		assert.ok(seen[1]!.at - seen[0]!.at >= 450, `the second after twice the time (${seen[1]!.at - seen[0]!.at} ms)`);
+		assert.match(toolTexts(s).at(-3)!, /^error: You have been waiting on pid \d+/, "woken, waiting again without work needs a reason");
+		assert.match(toolTexts(s).at(-2)!, /^Waiting is fine: .*Your reason to wait again: The tests gate every step\./);
+		assert.equal(current(s)?.status, "blocked");
+		await new Promise((r) => setTimeout(r, 1500));
+		assert.equal(seen.length, 2, "no wake-up once the goal is blocked");
+		assert.equal(faux.getPendingResponseCount(), 0);
+	});
+
+	test("a single wait on a job that ends before the threshold is never disturbed", async () => {
+		const { s } = await newSession(undefined, { goal: { waitNudgeMs: 1500 } });
+		const seen: string[] = [];
+		respond(
+			goalCall({ action: "set", objective: "Test it." }),
+			bash("sleep 0.5 > /dev/null 2>&1 &"),
+			goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep 0.5" }] }),
+			say("Waiting."),
+			(context) => {
+				seen.push(lastText(context));
+				return goalCall({ action: "achieved" });
+			},
+			say("Tested."),
+		);
+		await s.prompt("go");
+		await until("the job's end", settled(s, "Tested."));
+		assert.match(seen[0]!, /Background process pid \d+ `sleep 0\.5` ended/);
+		await new Promise((r) => setTimeout(r, 1800));
+		assert.equal(goalMessages(s).filter((t) => t.startsWith("You have been waiting")).length, 0);
+		assert.equal(faux.getPendingResponseCount(), 0);
 	});
 });
 

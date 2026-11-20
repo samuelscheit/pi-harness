@@ -28,6 +28,22 @@
 // `pendingText`: continue with the independent steps, or end with one line naming what it waits for.
 // The jobs it was told about (`memory.told`, also by the goal's strict continue and `wait`) never
 // trigger it again, so a server started on purpose costs one request, not one per turn.
+//
+// A goal may also wait on a task delegated through t3 (`delegate_task` in async mode): its
+// completion wakes the session as t3's message, like a job's end. Without it (2026-11-19) `wait`
+// refused ("No background job is running") while a child ran, and the agent wrote caffeinate and
+// `t3_thread_wait` loops, restarted about 20 times. The running tasks come from the branch
+// (goal.ts `delegatedTasks`); the goal's strict continue lists them, and a finished or unknown task
+// is refused.
+//
+// Waiting is a decision the agent must not repeat without doing anything (the user's rule, given in
+// three sessions: "do not fake being productive by waiting on long running processes"; an agent
+// waited on a landing's build and tests from 10:21 on, ending its turn again and again):
+// - a `wait` naming a job it already waited on, with no tool call since that wait, needs a `reason`;
+// - an accepted wait arms a wake-up after `WAIT_NUDGE_MS` of idle waiting (then twice as long each
+//   time): if the session is still idle and the jobs run, a message tells the agent how long it has
+//   waited and to use the time; waiting again then needs a reason. A single wait on a job that ends
+//   sooner is never disturbed.
 
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
@@ -36,6 +52,7 @@ import { runShell } from "../lib/process.ts";
 import {
 	budgetLimitText,
 	continueText,
+	delegatedTasks,
 	describeGoal,
 	findJob,
 	GOAL_ENTRY,
@@ -52,12 +69,20 @@ import {
 	sectionText,
 	spendText,
 	statusLine,
+	waitNudgeText,
 } from "./goal.ts";
 
 export const MESSAGE_TYPE = "goal";
 /** Forced continues in a row without a tool call before the guard lets the turn end. */
 export const MAX_IDLE_CONTINUES = 3;
 export const CHECK_TIMEOUT_MS = 10 * 60_000;
+/** Idle waiting on jobs after which the agent is woken to use the time; each later wake-up comes after twice the time. */
+export const WAIT_NUDGE_MS = 15 * 60_000;
+
+const minutesText = (ms: number) => {
+	const s = Math.max(0, Math.round(ms / 1000));
+	return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min`;
+};
 /** Output of a failed check shown to the agent, from its end. */
 const CHECK_TAIL = 4000;
 
@@ -97,9 +122,9 @@ const parameters = Type.Object(
 		check: Type.Optional(Type.String({ description: "set: a shell command (run in the session's directory) that must exit 0 for the goal to count as achieved, e.g. 'npm test'." })),
 		budget_usd: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "set: stop when the model spent this many USD on the goal." })),
 		budget_tokens: Type.Optional(Type.Integer({ minimum: 1, description: "set: stop when the model processed this many new tokens (input, output, cache writes) on the goal." })),
-		reason: Type.Optional(Type.String({ description: "blocked: what blocks it and what is needed to go on." })),
+		reason: Type.Optional(Type.String({ description: "blocked: what blocks it and what is needed to go on. wait: needed to wait again on a job you already waited on without doing anything since: why nothing else can be done meanwhile." })),
 		steps: Type.Optional(
-			Type.Array(Type.Object({ step: Type.String({ description: "A remaining step of the goal." }), job: Type.String({ description: "The running job it waits for: `call <id>`, `pid <n>`, or part of its command." }) }, { additionalProperties: false }), {
+			Type.Array(Type.Object({ step: Type.String({ description: "A remaining step of the goal." }), job: Type.String({ description: "The running job it waits for: `call <id>`, `pid <n>`, `task <taskId>` (a delegated task), or part of its command or task title." }) }, { additionalProperties: false }), {
 				description: "wait: every remaining step, each with the job it depends on.",
 			}),
 		),
@@ -116,14 +141,66 @@ interface SessionMemory {
 	waiting: string[] | undefined;
 	/** The keys of the pending jobs the agent was last told about; kept across runs. */
 	told: string[];
+	/** Tool calls other than `goal` so far: a wait compares it to tell whether anything was done since the last one. */
+	work: number;
+	/** The jobs the agent waited on, by key: since when it waits on each without other work, and when to wake it. */
+	waits: Map<string, WaitRecord>;
 }
 
-const freshMemory = (): SessionMemory => ({ idle: 0, notified: false, waiting: undefined, told: [] });
+interface WaitRecord {
+	/** When the idle waiting on it started. */
+	since: number;
+	/** `work` at the last accepted wait on it. */
+	work: number;
+	/** Wake-ups sent so far for this stretch of waiting. */
+	nudges: number;
+	nudgeAt: number;
+}
+
+const freshMemory = (): SessionMemory => ({ idle: 0, notified: false, waiting: undefined, told: [], work: 0, waits: new Map() });
+
+export interface GoalOptions {
+	/** Idle waiting before the first wake-up; default {@link WAIT_NUDGE_MS}. */
+	waitNudgeMs?: number;
+}
 
 const tail = (text: string, max: number) => (text.length > max ? `[…]\n${text.slice(-max)}` : text);
 
-export default function goal(pi: ExtensionAPI) {
+/** What the goal may wait on: the session's background work and the tasks it delegated whose completion wakes it. */
+const waitable = (ctx: ExtensionContext) => [...pendingJobs(ctx.sessionManager.getSessionId()), ...delegatedTasks(ctx.sessionManager.getBranch()).running];
+
+export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
+	const nudgeMs = options.waitNudgeMs ?? WAIT_NUDGE_MS;
 	let memory = freshMemory();
+	let nudgeTimer: NodeJS.Timeout | undefined;
+	const disarm = () => {
+		clearTimeout(nudgeTimer);
+		nudgeTimer = undefined;
+	};
+	/** Wake the agent at the earliest wake-up of the jobs its current wait names. */
+	const arm = (ctx: ExtensionContext) => {
+		disarm();
+		const records = (memory.waiting ?? []).flatMap((key) => memory.waits.get(key) ?? []);
+		if (records.length === 0) return;
+		const at = Math.min(...records.map((r) => r.nudgeAt));
+		nudgeTimer = setTimeout(() => nudge(ctx), Math.max(0, at - Date.now()));
+		nudgeTimer.unref();
+	};
+	const nudge = (ctx: ExtensionContext) => {
+		nudgeTimer = undefined;
+		const waiting = memory.waiting;
+		// A run since the wait (a job's end, a user message) made it decide anew: nothing to wake.
+		if (!waiting || !ctx.isIdle() || state(ctx).goal?.status !== "active") return;
+		const running = waitable(ctx).filter((job) => waiting.includes(job.key));
+		const records = running.flatMap((job) => memory.waits.get(job.key) ?? []);
+		if (records.length === 0) return;
+		const now = Date.now();
+		for (const record of records) {
+			record.nudges++;
+			record.nudgeAt = now + nudgeMs * 2 ** record.nudges;
+		}
+		pi.sendMessage({ customType: MESSAGE_TYPE, content: waitNudgeText(running, now - Math.min(...records.map((r) => r.since)), now), display: true }, { triggerTurn: true, deliverAs: "steer" });
+	};
 	const state = (ctx: ExtensionContext) => goalState(ctx.sessionManager.getBranch());
 	const refresh = (ctx: ExtensionContext) => {
 		const { goal, spent } = state(ctx);
@@ -139,11 +216,16 @@ export default function goal(pi: ExtensionAPI) {
 	const tellAgent = (content: string) => pi.sendMessage({ customType: MESSAGE_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "steer" });
 
 	const reset = (ctx: ExtensionContext) => {
+		disarm();
 		memory = freshMemory();
 		refresh(ctx);
 	};
 	pi.on("session_start", (_event, ctx) => reset(ctx));
 	pi.on("session_tree", (_event, ctx) => reset(ctx));
+	pi.on("session_shutdown", () => disarm());
+	pi.on("tool_call", (event) => {
+		if (event.toolName !== "goal") memory.work++;
+	});
 	pi.on("session_compact", (_event, ctx) => refresh(ctx));
 
 	// A user message: the guard starts over, and a goal blocked (on the user) is active again.
@@ -193,15 +275,18 @@ export default function goal(pi: ExtensionAPI) {
 			return { entries: [...event.entries, ...limited], continue: true };
 		}
 		const { goal, spent } = state(ctx);
-		const jobs = pendingJobs(ctx.sessionManager.getSessionId());
-		const keys = jobs.map((job) => job.key);
 		if (goal?.status !== "active") {
+			// Delegated tasks are not named here: t3 tells the agent their completion wakes it.
+			const jobs = pendingJobs(ctx.sessionManager.getSessionId());
+			const keys = jobs.map((job) => job.key);
 			const told = new Set(memory.told);
 			// Ended jobs drop out, so the memory holds only what still runs.
 			memory.told = keys;
 			if (keys.every((key) => told.has(key))) return;
 			return { entries: [...event.entries, message(pendingText(jobs, Date.now()))], continue: true };
 		}
+		const jobs = waitable(ctx);
+		const keys = jobs.map((job) => job.key);
 		if (memory.waiting?.every((key) => keys.includes(key))) return;
 		if (memory.idle >= MAX_IDLE_CONTINUES) {
 			if (!memory.notified && ctx.hasUI) ctx.ui.notify(`Goal: the agent stopped ${MAX_IDLE_CONTINUES + 1} times in a row without a tool call, so its turn ended. The goal stays active: send a message to go on, or /goal pause.`, "warning");
@@ -220,7 +305,7 @@ export default function goal(pi: ExtensionAPI) {
 		promptSnippet: "Set, show or finish the session's goal",
 		promptGuidelines: [
 			"Set a goal with `goal` (action set) when the user or your brief asks you to keep going until something is done (\"continue until all tests pass\", a delegated brief that says to finish X before reporting); a single task needs none. While it is active your turn cannot end: continue, mark it achieved (after auditing every requirement of the objective against evidence; with a check, only when the check exits 0) or blocked with the reason.",
-			"While a goal is active and background jobs run, do the remaining steps that do not depend on them. Only when every remaining step depends on a running job, call `goal` with action `wait`, naming each step's job, and end your turn: the job's end wakes you.",
+			"While a goal is active and background jobs or delegated tasks run, do the remaining steps that do not depend on them. Only when every remaining step depends on a running job or task, call `goal` with action `wait`, naming each step's job, and end your turn: its end wakes you. Waiting again on the same job without doing anything in between needs a `reason`.",
 		],
 		parameters,
 		async execute(_callId, params, signal, _onUpdate, ctx) {
@@ -276,24 +361,56 @@ export default function goal(pi: ExtensionAPI) {
 
 			// wait
 			if (current.status !== "active") throw new Error(`The goal is ${current.status}; nothing keeps your turn going, so there is nothing to wait for.`);
-			const jobs = pendingJobs(ctx.sessionManager.getSessionId());
-			if (jobs.length === 0) throw new Error("No background job is running, so nothing will wake you. Continue with the next step, or mark the goal achieved or blocked.");
+			const jobs = waitable(ctx);
+			const { ended } = delegatedTasks(ctx.sessionManager.getBranch());
+			/** The ended delegated tasks the steps name: their result or request reached the conversation already. */
+			const endedLine = (named: readonly { job: string }[]) => {
+				const tasks = [...ended].filter((taskId) => named.some((s) => s.job.includes(taskId)));
+				return tasks.length ? [`Delegated task ${tasks.join(", ")} ended already or no longer wakes you (it waits on a question or approval): its result or request is in the conversation or in task_status.`] : [];
+			};
 			const steps = params.steps ?? [];
+			if (jobs.length === 0) throw new Error(["No background job or delegated task is running, so nothing will wake you.", ...endedLine(steps), "Continue with the next step, or mark the goal achieved or blocked."].join(" "));
 			if (steps.length === 0) throw new Error("wait needs every remaining step, each with the running job it depends on.");
 			const resolved = steps.map((s) => ({ ...s, found: findJob(jobs, s.job) }));
 			const unknown = resolved.filter((s) => !s.found);
+			const now = Date.now();
 			if (unknown.length > 0)
 				throw new Error(
 					[
 						`These steps name no running job: ${unknown.map((s) => `"${s.step}" (${s.job})`).join(", ")}.`,
+						...endedLine(unknown),
 						"Running jobs:",
-						...jobLines(jobs, Date.now()),
-						"A step that depends on none of them can be done now: do it. Name each job as `call <id>`, `pid <n>` or a part of its command found in no other job.",
+						...jobLines(jobs, now),
+						"A step that depends on none of them can be done now: do it. Name each job as `call <id>`, `pid <n>`, `task <taskId>` or a part of its command found in no other job.",
 					].join("\n"),
 				);
-			memory.waiting = [...new Set(resolved.map((s) => s.found!.key))];
+			const keys = [...new Set(resolved.map((s) => s.found!.key))];
+			// Jobs that ended no longer count as waited on.
+			for (const key of memory.waits.keys()) if (!jobs.some((job) => job.key === key)) memory.waits.delete(key);
+			const idle = keys.filter((key) => memory.waits.get(key)?.work === memory.work);
+			const reason = params.reason?.trim();
+			if (idle.length > 0 && !reason) {
+				const since = Math.min(...idle.map((key) => memory.waits.get(key)!.since));
+				throw new Error(
+					[
+						`You have been waiting on ${idle.join(", ")} for ${minutesText(now - since)} and made no tool call since your last wait: waiting again is not progress.`,
+						"Use the time: do the steps that do not depend on it (assume it succeeds where safe), cut its run time (fewer tests or targets, split, parallel), or start independent work in parallel.",
+						"Only if every remaining step still depends on it, call `wait` again with a `reason` saying why nothing else can be done meanwhile.",
+					].join("\n"),
+				);
+			}
+			for (const key of keys) {
+				const record = memory.waits.get(key);
+				// Waiting on it again without work continues the stretch of idle waiting; after work, a new one starts.
+				if (record && idle.includes(key)) record.work = memory.work;
+				else memory.waits.set(key, { since: now, work: memory.work, nudges: 0, nudgeAt: now + nudgeMs });
+			}
+			memory.waiting = keys;
 			memory.told = jobs.map((job) => job.key);
-			return done(`Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}). End your turn now; the job's end wakes you with its result.`);
+			arm(ctx);
+			return done(
+				`Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}).${reason && idle.length ? ` Your reason to wait again: ${reason}` : ""} End your turn now; the job's end wakes you with its result. If you are still waiting idle after a while, you will be woken to use the time.`,
+			);
 		},
 	});
 
