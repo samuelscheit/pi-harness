@@ -36,7 +36,15 @@
 // A run ends when the child reports it done, not when its current turn (in t3: its t3 run) ends:
 // a child that waits for its background jobs reports `waiting`, and while its process lives the
 // parent waits on, following the turns the jobs' ends wake (in t3 new t3 runs of the thread).
-// A child that leaves no report is a harness fault (fault.ts): it is noted for the harness's backlog.
+// Until then the run is in flight: a workflow that ends meanwhile (a sibling failed) cancels the
+// child, and its missing report is the workflow's end, not a fault. A child that leaves no report
+// is a harness fault (fault.ts): it is noted for the harness's backlog.
+//
+// Every request to t3 has its own clientRequestId, recorded in the journal before it is sent: a
+// reattach repeats the recorded one (t3 dedupes it to the run it started), a run that a resume runs
+// again after a failure gets a new one. Reusing the failed execution's id got t3's answer to it, a
+// run long over, so the child never saw the message, and a sibling that waited for its jobs when
+// the workflow failed was reported as a fault (workflow 20261119-151815-eac9a7).
 
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -188,6 +196,20 @@ interface RunMeta {
 	threadId?: string;
 	link?: string;
 	runId?: string;
+	/** The clientRequestId of the request in flight (requestIdOf). */
+	requestId?: string;
+}
+
+/** A new clientRequestId: t3 answers a repeated one with the run it started for it, so each request that must reach the child has its own. */
+const newRequestId = (base: string) => `${base}-${randomUUID().slice(0, 8)}`;
+
+/** A durable call's clientRequestId: a reattach repeats the recorded one; anything else gets a new one, recorded before it is sent. */
+function requestIdOf(call: CallContext, base: string, reattach: boolean): string {
+	const recorded = (call.recorded as RunMeta).requestId;
+	if (reattach && recorded) return recorded;
+	const id = newRequestId(base);
+	call.meta({ requestId: id });
+	return id;
 }
 
 /** delegate()'s parameters, checked; throws with what is wrong. */
@@ -612,8 +634,10 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		};
 		signal.addEventListener("abort", cancel, { once: true });
 		running = true;
-		const requestId = `${current.id}-run-${n}`;
+		const requestId = requestIdOf(call, `${current.id}-run-${n}`, reattach);
 		const remember = (meta: RunMeta) => call.meta({ ...meta });
+		// The run is in flight until the child reports its end: also while it waits for its background jobs.
+		let state: DelegationState | undefined;
 		try {
 			env.progress(`${label} · ${reattach ? "reattaching" : "running"}`);
 			const continuation = delegationMessage(current, n, CONTINUE_MESSAGE);
@@ -632,9 +656,10 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 					await transport.reattach(runMessage, continuation, requestId, recorded, remember, signal);
 					// The child's own run was cut off too (its process ended, or it was stopped): ask it to go on.
 					const after = await settledState(n, signal, 2000);
-					if (!after || stoppedRun(after, n)) await transport.run(continuation, `${requestId}-continue`, remember, signal);
+					if (!after || stoppedRun(after, n)) await transport.run(continuation, newRequestId(`${current.id}-run-${n}-continue`), remember, signal);
 				}
 			}
+			state = await settledState(n, signal);
 		} catch (error) {
 			// The parent's side failed (t3, or onAsk threw): the child would wait for an answer or a reader forever.
 			// Not when the run is interrupted (t3 unreachable): the child runs on and a resume reattaches.
@@ -646,8 +671,8 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 			signal.removeEventListener("abort", cancel);
 			env.ran();
 		}
+		// Aborted while it ran or waited for the child's report: the child was cancelled (or runs on for a resume); no report is no fault.
 		if (signal.aborted) throw signal.reason;
-		const state = await settledState(n, signal);
 		const changed = await changedSince(before);
 		if (!state || state.run !== n) throw env.fault(`${label}: the child reported no end of run ${n} (${reported()}); ${transport.describe()}`);
 		if (state.error) throw new Error(`${label}: ${state.error}`);
@@ -695,11 +720,11 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 	const operate = (op: string, text: string | undefined, act: (requestId: string, signal: AbortSignal) => Promise<void>) => {
 		usable();
 		if (!firstKey) return Promise.reject(new Error(`${label} has not run yet: ${op} needs a running or finished child`));
-		const live = async (call: CallContext) => {
-			await act(`${spec!.id}-${op}-${call.key}`, call.signal);
+		const execute = (reattach: boolean) => async (call: CallContext) => {
+			await act(requestIdOf(call, `${spec!.id}-${op}`, reattach), call.signal);
 			return { value: null };
 		};
-		return env.durable.call({ kind: "delegate", args: { delegate: firstKey, op, ...(text === undefined ? {} : { text }) }, label: `${tag} ${op}${text ? `: ${headline(text).slice(0, 80)}` : ""}` }, live, live).then(() => undefined);
+		return env.durable.call({ kind: "delegate", args: { delegate: firstKey, op, ...(text === undefined ? {} : { text }) }, label: `${tag} ${op}${text ? `: ${headline(text).slice(0, 80)}` : ""}` }, execute(false), execute(true)).then(() => undefined);
 	};
 
 	env.track({

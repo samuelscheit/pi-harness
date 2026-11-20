@@ -223,6 +223,42 @@ describe("replay", () => {
 		assert.deepEqual(retryableFailures(resume.entries()), [], "the journal of the resume has none left");
 	});
 
+	test("a failed agent run that runs again is a new execution: the failed one's meta is not its recorded, nor a later reattach's (workflow 20261119-151815-eac9a7)", async () => {
+		const first = durable();
+		await assert.rejects(
+			first.d.call(spec("delegate", { m: "run 2" }), async (call) => {
+				call.meta({ title: "t", requestId: "req-a", runId: "run-old" });
+				throw new Error("the request failed: 429");
+			}),
+		);
+		const key = starts(first.entries())[0]!;
+		assert.deepEqual(foldJournal(first.entries()).metas.get(key), { title: "t", requestId: "req-a", runId: "run-old" }, "kept while it is the latest execution");
+
+		// The resume runs it again; this execution records only its request before its process dies.
+		const retry = durable(first.entries());
+		let seen: Record<string, unknown> | undefined;
+		const cut = new Promise<void>((resolve) => {
+			void retry.d.call(spec("delegate", { m: "run 2" }), async (call) => {
+				seen = call.recorded;
+				call.meta({ requestId: "req-b" });
+				resolve();
+				return new Promise<never>(() => undefined);
+			});
+		});
+		await cut;
+		assert.deepEqual(seen, {}, "nothing of the failed execution");
+		const entries = [...first.entries(), ...retry.entries()];
+		assert.deepEqual(foldJournal(entries).metas.get(key), { requestId: "req-b" }, "no stale run id to wait for");
+
+		// A reattach of the in-flight execution sees its meta, and a second reattach still does.
+		let reattached: Record<string, unknown> | undefined;
+		const again = durable(entries);
+		assert.equal(await again.d.call(spec("delegate", { m: "run 2" }), never, async (call) => ((reattached = call.recorded), { value: "ok" })), "ok");
+		assert.deepEqual(reattached, { requestId: "req-b" });
+		const restarted: JournalEntry = { t: "start", key, kind: "delegate", label: "again", at: 2 };
+		assert.deepEqual(foldJournal([...entries, restarted]).metas.get(key), { requestId: "req-b" }, "a start without an outcome before it is a reattach: its meta stays");
+	});
+
 	test("a call that ran again and succeeds may take another path: the resume takes over there instead of stopping", async () => {
 		const first = durable();
 		// The script caught the failure and took its fallback.

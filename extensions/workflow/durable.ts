@@ -14,7 +14,9 @@
 // - the first call without an entry runs live;
 // - a failed agent run, llm() call or nested workflow (`retryable`) runs again: its failure was the
 //   child's work failing (a request failed, a harness fault), and a resume that replayed it would
-//   fail at the same place again. What the failed attempt spent still counts. A failure from a
+//   fail at the same place again. What the failed attempt spent still counts. It runs as a new
+//   execution: the failed one's meta (an agent's run id, its request id) is not its `recorded`,
+//   nor a later reattach's. A failure from a
 //   budget (the run's or a phase's) is replayed: running again would only spend into it again.
 //   Shell and tools.* failures are replayed: running them again could repeat their effects. Once
 //   a call ran again, the script may take another path than the journal (the call now succeeds):
@@ -165,6 +167,8 @@ export function foldJournal(entries: readonly JournalEntry[]): Folded {
 		switch (entry.t) {
 			case "start":
 				if (!folded.starts.has(entry.key)) folded.order.push(entry.key);
+				// A failed call that runs again is a new execution: what the failed one learned is not its own.
+				if (folded.outcomes.has(entry.key)) folded.metas.delete(entry.key);
 				if (!folded.startAt.has(entry.key)) folded.startAt.set(entry.key, at);
 				folded.starts.set(entry.key, entry);
 				folded.outcomes.delete(entry.key);
@@ -375,6 +379,7 @@ export class Durable {
 			// Its nested calls stay recorded: the workflow asks for them again (its finished ones replay).
 			this.retried = true;
 			this.retriedCalls++;
+			this.folded.metas.delete(key);
 			this.onRetried?.(spec.kind, outcome.cost ?? 0);
 			this.notify();
 			return this.guard(this.run(key, spec, live));

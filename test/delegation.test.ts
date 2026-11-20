@@ -793,6 +793,80 @@ describe("a child's run that waits for its background jobs (workflow 20261116-07
 	});
 });
 
+describe("a workflow that fails while children work, and its resume (workflow 20261119-151815-eac9a7)", () => {
+	const JOB = "job-1";
+	const backlog = () => join(dir, "harness-backlog.md");
+	afterEach(() => {
+		for (const thread of fx.threads.values()) sessionJobs(thread.session.sessionId).jobs.delete(JOB);
+	});
+
+	test("a sibling fails while a child waits for its background jobs: the child is cancelled and its missing report is no harness fault", async () => {
+		const code = [
+			"const waiting = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('test it');",
+			"waiting.catch(() => undefined);",
+			"await new Promise((r) => setTimeout(r, 600));",
+			"throw new Error('a sibling failed');",
+		].join("\n");
+		const { details } = await runInT3(code, () => {
+			// Its turn ends while its job runs on: the run waits for the job, which outlasts the workflow.
+			sessionJobs(fx.threads.get("thread-1")!.session.sessionId).jobs.set(JOB, { callId: JOB, toolName: "bash", input: { command: "pytest tests" }, startedAt: Date.now(), log: join(dir, "job.log"), controller: new AbortController() });
+			return say("I'm waiting for the study re-run (pid 57256).");
+		});
+		assert.equal(details.status, "failed");
+		assert.match(details.error ?? "", /a sibling failed/);
+		// What the aborted run does after the workflow's end (the fault was noted after a git snapshot).
+		await new Promise((r) => setTimeout(r, 500));
+		assert.equal(existsSync(backlog()), false, "no harness fault");
+		assert.deepEqual([...new Set(callsOf("task_cancel").map((c) => c.args.taskId))], ["task-thread-1"], "the waiting child was cancelled with its workflow");
+		const journal = readJournal(join(runDir(fx.agentDir, details.id), "journal.jsonl"));
+		assert.equal(journal.filter((e) => e.t === "failed").length, 0, "the run stays in flight for a resume");
+	});
+
+	test("a resume runs a failed run again with a new request: the child gets the message, not t3's answer to the failed request", async () => {
+		const parent = await newSession([workflowExtension(runtime), fakeT3(runtime)]);
+		parent.setActiveToolsByName([...parent.getActiveToolNames(), "workflow"]);
+		const code = "const a = delegate({ target: { model: 'faux/faux-1' }, tools: ['read'], schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } });\nawait a.run('first');\nreturn JSON.stringify((await a.run('second')).result);";
+		let failing = true;
+		let resumeId = "";
+		const dispatch: FauxResponseStep = (context) => {
+			const last = lastMessage(context);
+			if (!isChild(context)) {
+				if (last.role === "toolResult") return say("parent done");
+				return textOf(last.content).includes("resume") ? call("workflow", { resume: resumeId }) : call("workflow", { code, budget: 5 });
+			}
+			if (last.role === "toolResult") return say("done");
+			const text = textOf(last.content);
+			if (text.endsWith("first")) return call(SUBMIT_TOOL, { n: 1 });
+			// Run 2 fails (as the 429 did): no result, through both reminders.
+			return failing ? say("no result") : call(SUBMIT_TOOL, { n: 2 });
+		};
+		faux.setResponses(Array.from({ length: 30 }, () => dispatch));
+		await parent.prompt("go");
+		const results = () => parent.messages.flatMap((m) => (m.role === "toolResult" && m.toolName === "workflow" ? [m] : []));
+		const failed = results()[0]!.details as unknown as WorkflowDetails;
+		assert.equal(failed.status, "failed");
+		assert.match(failed.error ?? "", /delegate 1: it finished without calling submit_result/);
+
+		failing = false;
+		resumeId = failed.id;
+		await parent.prompt("resume it");
+		const second = results().at(-1)!;
+		const resumed = second.details as unknown as WorkflowDetails;
+		assert.equal(resumed.status, "completed", resumed.error);
+		assert.deepEqual(value(textOf(second.content)), { n: 2 });
+		assert.equal(resumed.retriedCalls, 1);
+		const sends = callsOf("t3_thread_send").map((c) => String(c.args.clientRequestId));
+		assert.equal(sends.length, 2, "run 2, then run 2 again");
+		assert.notEqual(sends[0], sends[1], "a new request, which t3 does not answer with the failed run");
+		const seen = fx.threads.get("thread-1")!.session.messages.filter((m) => m.role === "user" && textOf(m.content).endsWith("second"));
+		assert.equal(seen.length, 2, "the child got run 2's message again");
+		assert.equal(existsSync(backlog()), false, "no harness fault");
+		const journal = readJournal(join(runDir(fx.agentDir, failed.id), "journal.jsonl"));
+		const requests = journal.flatMap((e) => (e.t === "meta" && typeof e.data.requestId === "string" ? [e.data.requestId] : []));
+		assert.deepEqual(requests.slice(-2), sends, "each request was recorded before it was sent");
+	});
+});
+
 describe("t3's delegate_task as the harness extends it", () => {
 	const schema = { type: "object", properties: { verdict: { type: "string", enum: ["ok", "bad"] } }, required: ["verdict"], additionalProperties: false };
 

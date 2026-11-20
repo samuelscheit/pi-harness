@@ -6,8 +6,9 @@
 // The first run is `delegate_task` in wait mode, waiting only START_WAIT_MS, so the task, thread
 // and run ids reach the workflow's journal within seconds (a resume after a crash reattaches with
 // them); later runs go to the same thread with `t3_thread_send` (a resume: the child's context and
-// prompt cache are warm). Both carry a `clientRequestId` per run, which t3 dedupes within one MCP
-// session (one Pi process; a new process gets a new task for the same id, seen 2026-11-14). A wait
+// prompt cache are warm). Both carry the caller's `clientRequestId` (one per request, delegate.ts),
+// which t3 dedupes within one MCP session (one Pi process; a new process gets a new task for the
+// same id, seen 2026-11-14): a repeated id gets the run t3 started for it, even one long over. A wait
 // that times out does not end the run: it continues with `t3_thread_wait` until the run is over. A
 // question the child waits for does not end a thread wait (t3 reports it to the calling thread), so
 // with a `waiting` hook (the workflow's onAsk) the code waits in short slices and the hook looks
