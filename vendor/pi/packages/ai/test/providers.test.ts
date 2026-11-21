@@ -114,6 +114,9 @@ describe("builtin providers", () => {
 			supportsOpenAIGrammarTools: true,
 		});
 		expect(getBuiltinModel("anthropic", "claude-haiku-4-5").compat?.supportsStrictTools).toBe(true);
+		const copilotClaude = getBuiltinModels("github-copilot").filter((model) => model.api === "anthropic-messages");
+		expect(copilotClaude.length).toBeGreaterThan(0);
+		for (const model of copilotClaude) expect(model.compat).toMatchObject({ supportsStrictTools: true });
 	});
 
 	it("gives Claude vision models their API resolution tier and every other vision model the conservative profile", () => {

@@ -40,13 +40,12 @@ export async function readImageContent(
 	{ autoResizeImages, resizeOptions, model }: ReadImageSettings,
 ): Promise<ReadImageResult> {
 	const view = imageViewFor(request, model);
-	const nonVisionNote = getNonVisionImageNote(model);
 	if (view.kind === "whole" && !autoResizeImages) {
 		const processed = await processImage(buffer, mimeType, { autoResizeImages });
-		if (!processed.ok) return { content: [textBlock(mimeType, [], [processed.message, nonVisionNote])] };
+		if (!processed.ok) return { content: [textBlock(mimeType, [], [processed.message])] };
 		return {
 			content: [
-				textBlock(processed.mimeType, [], [...processed.hints, nonVisionNote]),
+				textBlock(processed.mimeType, [], [...processed.hints]),
 				{ type: "image", data: processed.data, mimeType: processed.mimeType },
 			],
 		};
@@ -57,7 +56,7 @@ export async function readImageContent(
 		// An explicit region or tile request that fails (such as a region outside the image) is an error
 		// the model must act on; a plain read keeps its text-only result, as for any unreadable image.
 		if (view.kind !== "whole") throw new Error(processed.message);
-		return { content: [textBlock(mimeType, [], [`[Image omitted: ${processed.message}]`, nonVisionNote])] };
+		return { content: [textBlock(mimeType, [], [`[Image omitted: ${processed.message}]`])] };
 	}
 	const outputMimeType = processed.images[0].mimeType;
 	const imageBlock = (image: ResizedImage): ImageContent => ({
@@ -82,7 +81,6 @@ export async function readImageContent(
 				header,
 				clampNote(processed.clamped, request.region),
 				...processed.hints,
-				nonVisionNote,
 			]),
 		];
 		images.forEach((image, index) => {
@@ -110,7 +108,6 @@ export async function readImageContent(
 				regionLine,
 				clampNote(processed.clamped, request.region),
 				...processed.hints,
-				nonVisionNote,
 			]),
 			imageBlock(image),
 		],
@@ -156,11 +153,6 @@ function downscaleNotice(image: ResizedImage): string {
 
 function clampNote(clamped: boolean, region: ImageBox | undefined): string | undefined {
 	return clamped && region ? `[Requested region ${formatBox(region)} was clamped to the image bounds.]` : undefined;
-}
-
-function getNonVisionImageNote(model: Model<Api> | undefined): string | undefined {
-	if (!model || model.input.includes("image")) return undefined;
-	return "[Current model does not support images. The image will be omitted from this request.]";
 }
 
 /**

@@ -61,6 +61,11 @@ export interface ReadToolDetails {
 	truncation?: TruncationResult;
 	/** Loss of resolution or omitted area of an image read, shown to the user as well as the model. */
 	imageNotice?: string;
+	/**
+	 * Id of the model that was selected when the image was read, if it has no image input. Shown to the user only:
+	 * the model gets pi-ai's placeholder per request, so the stored result stays right after a model switch.
+	 */
+	imageUnsupportedByModel?: string;
 }
 
 /**
@@ -313,7 +318,11 @@ export function createReadToolDefinition(
 									},
 								);
 								content = image.content;
-								if (image.notice) details = { imageNotice: image.notice };
+								const imageUnsupportedByModel =
+									ctx?.model && !ctx.model.input.includes("image") && image.content.some((block) => block.type === "image")
+										? ctx.model.id
+										: undefined;
+								if (image.notice || imageUnsupportedByModel) details = { imageNotice: image.notice, imageUnsupportedByModel };
 							} else {
 								if (tiles || region) {
 									throw new Error("tiles and region apply only to image files.");

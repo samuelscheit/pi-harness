@@ -1037,7 +1037,9 @@ describe("durable length recovery", () => {
 		);
 	});
 
-	it("keeps omissions and does not retry when recovery compaction fails", async () => {
+	// The summary request fails, so recovery compacts without a summary (compactsWithoutSummary):
+	// the omissions stay, and the session can go on instead of failing the same way again.
+	it("keeps omissions, compacts without a summary and continues when recovery's summary fails", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
 			settings: {
@@ -1049,14 +1051,16 @@ describe("durable length recovery", () => {
 		harness.setResponses([
 			fauxAssistantMessage("partial response", { stopReason: "length" }),
 			fauxAssistantMessage("summary failed", { stopReason: "error", errorMessage: "summary failed" }),
-			fauxAssistantMessage("must not retry"),
+			fauxAssistantMessage("continued after compaction"),
 		]);
 
 		await harness.session.prompt("x".repeat(5000));
 
 		const entries = harness.sessionManager.getEntries();
 		expect(entries.some((entry) => entry.type === "context_edit")).toBe(true);
-		expect(entries.some((entry) => entry.type === "compaction")).toBe(false);
+		expect(entries.find((entry) => entry.type === "compaction")).toMatchObject({
+			summary: expect.stringContaining("summary failed"),
+		});
 		expect(
 			entries.some((entry) => entry.type === "message" && getMessageText(entry.message) === "partial response"),
 		).toBe(true);
@@ -1065,6 +1069,7 @@ describe("durable length recovery", () => {
 				.buildSessionProjection()
 				.messages.some((message) => getMessageText(message) === "partial response"),
 		).toBe(false);
-		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.session.getLastAssistantText()).toBe("continued after compaction");
 	});
 });
