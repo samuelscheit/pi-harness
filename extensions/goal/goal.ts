@@ -6,6 +6,7 @@
 // restarts, reloads and compaction, and branch navigation shows the goal of that branch.
 
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { ago, contentText, parseObject, str, T3_TOOL } from "../lib/t3-result.ts";
 
 export const GOAL_ENTRY = "harness-goal";
 export const GOAL_SECTION = "goal";
@@ -139,28 +140,8 @@ export interface PendingJob {
 	startedAt?: number;
 }
 
-const ago = (ms: number) => {
-	const s = Math.max(0, Math.round(ms / 1000));
-	return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min`;
-};
-
-const contentText = (content: string | readonly { type: string; text?: string }[]) => (typeof content === "string" ? content : content.map((c) => (c.type === "text" ? (c.text ?? "") : "")).join(""));
-
-/** t3's MCP tools, as its bridge registers them (also under a hidden canonical name). */
-const T3_TOOL = /^mcp__t3[-_]code__/;
 /** Run statuses of a thread that are not over: a task a `t3_thread_send` started then runs. */
 const RUN_GOING = new Set(["preparing", "queued", "starting", "running", "waiting"]);
-
-const parseObject = (text: string): Record<string, unknown> | undefined => {
-	try {
-		const value: unknown = JSON.parse(text);
-		return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-	} catch {
-		return undefined;
-	}
-};
-
-const str = (value: unknown) => (typeof value === "string" && value ? value : undefined);
 
 /**
  * The tasks the session delegated through t3 (`delegate_task`, or `t3_thread_send` to a finished
