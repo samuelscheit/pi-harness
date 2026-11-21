@@ -128,6 +128,8 @@ export interface DelegateEnv {
 	ran: () => void;
 	progress: (line: string) => void;
 	warn: (line: string) => void;
+	/** The files a child's own tool calls changed (absolute), for the workflow's report. */
+	wrote: (paths: string[]) => void;
 	/** How long a child's report may lag behind the end of its turn; default STATE_WAIT_MS. */
 	stateWaitMs?: number;
 	/** A broken invariant of the harness (fault.ts): noted for the harness's backlog, returned as the error to throw. */
@@ -676,6 +678,7 @@ export function createDelegate(raw: unknown, env: DelegateEnv, source?: ForkSour
 		const changed = await changedSince(before);
 		if (!state || state.run !== n) throw env.fault(`${label}: the child reported no end of run ${n} (${reported()}); ${transport.describe()}`);
 		if (state.error) throw new Error(`${label}: ${state.error}`);
+		env.wrote(state.wrote ?? []);
 		const run: DelegateRun = {
 			text: state.text ?? "",
 			...(current.schema ? { result: state.result } : {}),

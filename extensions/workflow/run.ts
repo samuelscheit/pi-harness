@@ -26,6 +26,7 @@ import { type ExtensionUIQuestion, type ModelRuntime, SettingsManager, truncateH
 import { stringify } from "yaml";
 import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
+import { ownWrites } from "./own-writes.ts";
 import { canonical, changedPaths, diffSince, type FileState, gitRoot, type Snapshot, snapshot } from "../lib/workspace.ts";
 import { createDelegate, type SteerTarget } from "./delegate.ts";
 import { harnessFault } from "./fault.ts";
@@ -126,8 +127,10 @@ export interface WorkflowDetails {
 	childSessions: string[];
 	/** The t3 threads of child agents (links). */
 	childThreads: string[];
-	/** Files changed during the run (absolute; details.changedFiles for the metrics index). */
+	/** Files this run wrote: its delegates' own tool calls, its write/edit tool calls and the files its shell and bash calls changed and named (absolute; details.changedFiles for the metrics index). */
 	changedFiles: string[];
+	/** Files the working tree changed during the run that the run did not write: someone else's work (absolute). */
+	othersChangedFiles: string[];
 	warnings: string[];
 	/** The last progress lines. */
 	log: string[];
@@ -417,6 +420,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 		childSessions: [],
 		childThreads: [],
 		changedFiles: [],
+		othersChangedFiles: [],
 		warnings: [],
 		log: [],
 	};
@@ -483,6 +487,37 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	const root = await gitRoot(env.cwd);
 	const snapshotFile = join(dir, SNAPSHOT_FILE);
 	let start: Snapshot | undefined = root ? loadSnapshot(snapshotFile) : undefined;
+	// What the run itself wrote (own-writes.ts), apart from the files others change in the tree meanwhile.
+	const written = new Set<string>();
+	const bookkeeping: Promise<void>[] = [];
+	const writes = ownWrites();
+	let callIds = 0;
+	/** Runs a session tool or shell command (one aborted by `signal` returns at once, the report waits for its bookkeeping), adding the files it changed to `written`. */
+	const recording = async <T extends object>(name: string, args: unknown, at: string, signal: AbortSignal, fn: () => Promise<T>): Promise<T> => {
+		const id = `call-${++callIds}`;
+		// The snapshot before a command must not delay an abort: a call aborted meanwhile never runs.
+		const aborted = new Promise<never>((_resolve, reject) => {
+			if (signal.aborted) reject(signal.reason);
+			else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+		});
+		aborted.catch(() => undefined);
+		await Promise.race([writes.started(id, name, (args ?? {}) as Record<string, unknown>, at), aborted]);
+		const record = async (failed: boolean) => {
+			for (const path of await writes.ended(id, failed)) written.add(path);
+		};
+		let outcome: T;
+		try {
+			outcome = await fn();
+		} catch (error) {
+			// A call that fails or is aborted rejects at once (its journal entry must not wait for a snapshot); the report waits for the bookkeeping.
+			bookkeeping.push(record(true).catch(() => undefined));
+			throw error;
+		}
+		const bookkept = record("isError" in outcome && outcome.isError === true);
+		if (signal.aborted) bookkeeping.push(bookkept.catch(() => undefined));
+		else await bookkept;
+		return outcome;
+	};
 	if (root && !start) {
 		start = await snapshot(root);
 		saveSnapshot(snapshotFile, start);
@@ -547,7 +582,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 								const idempotent = asking || idempotentOption(options, `tools.${name}()`);
 								return durable.call({ kind: "tool", args: { name, args }, label: `${name} ${firstLine(JSON.stringify(args) ?? "", 100)}`, idempotent }, async (call) => {
 									if (asking) return { value: await askUser(((args ?? {}) as { questions?: ExtensionUIQuestion[] }).questions ?? [], call.signal) };
-									const outcome = await executeTool(name, args, call.signal);
+									const outcome = await recording(name, args, env.cwd, call.signal, () => executeTool(name, args, call.signal));
 									live();
 									if (outcome.isError && !outcome.structured) throw new Error(outcome.text || `tool ${name} failed`);
 									return { value: outcome.value };
@@ -565,7 +600,8 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 			const idempotent = idempotentOption(options, "shell()");
 			return durable.call({ kind: "shell", args: { command, cwd: cwd ?? null, timeoutSeconds: timeoutSeconds ?? null }, label: firstLine(command), idempotent }, async (call) => {
 				progress(`shell ${firstLine(command)}`);
-				const result = await runShell(command, { cwd: resolve(env.cwd, cwd ?? "."), signal: call.signal, timeoutMs: timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000 });
+				const where = resolve(env.cwd, cwd ?? ".");
+				const result = await recording("bash", { command }, where, call.signal, () => runShell(command, { cwd: where, signal: call.signal, timeoutMs: timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000 }));
 				live();
 				return { value: { exitCode: result.exitCode, output: result.output, timedOut: result.timedOut } };
 			});
@@ -617,6 +653,7 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 				ran: () => details.delegateRuns++,
 				progress,
 				warn: (line) => details.warnings.push(line),
+				wrote: (paths) => paths.forEach((p) => written.add(p)),
 				...(env.stateWaitMs ? { stateWaitMs: env.stateWaitMs } : {}),
 				fault: (message) =>
 					harnessFault(message, { ...(env.harnessBacklog ? { backlog: env.harnessBacklog } : {}), cwd: env.cwd, ...(env.sessionId ? { sessionId: env.sessionId } : {}), runId: header.id, journal: journal.path }),
@@ -693,7 +730,9 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 	if (!keep) for (const work of unsettled.values()) work.cancel(reason);
 	const lingering = keep ? [...unsettled].filter(([, work]) => work.kind === "delegate").map(([key]) => key) : [];
 	if (diverged) failure = reason;
-	if (root && start) details.changedFiles = await changedPaths(start, await snapshot(root));
+	await Promise.all(bookkeeping);
+	details.changedFiles = [...written].sort();
+	if (root && start) details.othersChangedFiles = (await changedPaths(start, await snapshot(root))).filter((f) => !written.has(f));
 	details.durationMs = performance.now() - started;
 	details.replayedCalls = durable.replayedCalls;
 	details.retriedCalls = durable.retriedCalls;
@@ -747,7 +786,9 @@ function report(details: WorkflowDetails, value: unknown, failed: boolean, lines
 		);
 	}
 	if (calls.unused.length) out.push(`${calls.unused.length} recorded call${calls.unused.length === 1 ? "" : "s"} not used by the new code: ${calls.unused.slice(0, 10).join("; ")}${calls.unused.length > 10 ? "; …" : ""}`);
-	if (details.changedFiles.length) out.push(`Changed files: ${details.changedFiles.map((f) => relative(canonical(cwd), f)).join(", ")}`);
+	const shownPaths = (files: string[]) => files.map((f) => relative(canonical(cwd), f)).join(", ");
+	if (details.changedFiles.length) out.push(`Written by this run: ${shownPaths(details.changedFiles)}`);
+	if (details.othersChangedFiles.length) out.push(`Changed by others meanwhile (not this run; do not restore or revert): ${shownPaths(details.othersChangedFiles)}`);
 	for (const warning of details.warnings) out.push(`Warning: ${warning}`);
 	if (details.childThreads.length) out.push(`Child threads: ${details.childThreads.join(", ")}`);
 	if (details.childSessions.length) out.push(`Child sessions: ${details.childSessions.join(", ")}`);

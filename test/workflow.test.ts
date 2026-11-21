@@ -184,6 +184,58 @@ describe("scripts", () => {
 		assert.deepEqual(started.sort(), [0, 1], "only the first two started");
 	});
 
+	describe("the report tells what the run wrote from what others changed meanwhile", () => {
+		// `rm "$f"ME.md` changes README.md without naming it, as another agent's edit would.
+		const OTHERS_DELETE_README = "await shell('f=READ; rm \"$f\"ME.md');\n";
+
+		test("a read-only delegate is not blamed for a deletion that is not its work", async () => {
+			respond(say("nothing to change"));
+			const { text, details } = await run(`${OTHERS_DELETE_README}const r = await delegate({ target: { model: 'faux/faux-1' }, tools: ['read'] }).run('look');\nreturn JSON.stringify(r.wrote);`);
+			assert.equal(details.status, "completed", details.error);
+			assert.deepEqual(details.changedFiles, []);
+			assert.deepEqual(details.othersChangedFiles, [join(real(), "README.md")]);
+			assert.doesNotMatch(text, /Written by this run/);
+			assert.match(text, /\nChanged by others meanwhile \(not this run; do not restore or revert\): README\.md\n/);
+			assert.equal(text.split("\n\n").at(-1), "[]", "the child's own wrote is empty");
+		});
+
+		test("own writes and other changes are listed apart; a file both touched counts as written", async () => {
+			const { text, details } = await run(`${OTHERS_DELETE_README}await shell('echo new > notes.txt && echo mine > src/calc.mjs');\nreturn 'ok';`);
+			assert.equal(details.status, "completed", details.error);
+			assert.deepEqual(details.changedFiles, [join(real(), "notes.txt"), join(real(), "src", "calc.mjs")]);
+			assert.deepEqual(details.othersChangedFiles, [join(real(), "README.md")]);
+			assert.match(text, /\nWritten by this run: notes\.txt, src\/calc\.mjs\nChanged by others meanwhile \(not this run; do not restore or revert\): README\.md\n/);
+			// Someone else also changed a file the run wrote: it stays the run's, never in the others list.
+			writeFileSync(join(repo, "notes.txt"), "someone else first\n");
+			const both = await run("await shell('echo mine >> notes.txt');\nreturn 'ok';");
+			assert.deepEqual(both.details.changedFiles, [join(real(), "notes.txt")]);
+			assert.deepEqual(both.details.othersChangedFiles, []);
+		});
+
+		test("a failing command's writes count; a command that names nothing leaves the change to others; no change, no lines", async () => {
+			const failing = await run("const r = await shell('echo x > failed.txt; exit 3');\nreturn r.exitCode;");
+			assert.deepEqual(failing.details.changedFiles, [join(real(), "failed.txt")]);
+			const unnamed = await run("await shell('f=fail; echo y > \"$f\"ed.txt');\nreturn 'ok';");
+			assert.deepEqual(unnamed.details.changedFiles, []);
+			assert.deepEqual(unnamed.details.othersChangedFiles, [join(real(), "failed.txt")]);
+			rmSync(join(repo, "failed.txt"));
+			const quiet = await run("await shell('echo nothing');\nreturn 'ok';");
+			assert.deepEqual([quiet.details.changedFiles, quiet.details.othersChangedFiles], [[], []]);
+			assert.doesNotMatch(quiet.text, /Written by|Changed by others/);
+		});
+
+		test("a delegate's own writes (also outside the tree, as in a worktree) are the run's, never the others'", async () => {
+			const away = join(dir, "other-checkout");
+			mkdirSync(away);
+			respond(tool("write", { path: join(away, "made.txt"), content: "x\n" }), tool("write", { path: "src/calc.mjs", content: FIXED }), say("done"));
+			const { text, details } = await run(`${OTHERS_DELETE_README}await delegate({ target: { model: 'faux/faux-1' } }).run('write');\nreturn 'ok';`);
+			assert.equal(details.status, "completed", details.error);
+			assert.deepEqual(details.changedFiles, [join(realpathSync(away), "made.txt"), join(real(), "src", "calc.mjs")].sort());
+			assert.deepEqual(details.othersChangedFiles, [join(real(), "README.md")]);
+			assert.match(text, /Written by this run: \.\.\/other-checkout\/made\.txt, src\/calc\.mjs\nChanged by others meanwhile .*: README\.md\n/);
+		});
+	});
+
 	test("abort stops a running command at once and reports aborted", async () => {
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 100);
@@ -202,7 +254,9 @@ describe("scripts", () => {
 		assert.match(text, /\+\+\+ b\/src\/calc\.mjs\n@@ -1,1 \+1,1 @@\n-export const add = \(a, b\) => a - b;\n\+changed/);
 		assert.doesNotMatch(text, /README/, "changes before the run are not the run's");
 		assert.deepEqual(details.changedFiles, [join(real(), "notes.txt"), join(real(), "src", "calc.mjs")]);
-		assert.match(text, /Changed files: notes\.txt, src\/calc\.mjs/);
+		assert.match(text, /\nWritten by this run: notes\.txt, src\/calc\.mjs\n/);
+		assert.deepEqual(details.othersChangedFiles, []);
+		assert.doesNotMatch(text, /Changed by others/);
 		const outside = mkdtempSync(join(tmpdir(), "no-git-"));
 		const noGit = await run("return await changes();", 1, { cwd: outside });
 		assert.match(noGit.details.error!, /changes\(\) needs a git repository/);
