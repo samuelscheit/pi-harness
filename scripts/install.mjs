@@ -35,6 +35,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fetchGatewayListing, GATEWAY_PROVIDER, gatewayModels, readModelsJson, writeModelsJson } from "../extensions/lib/gateway.ts";
 import { piLink } from "../extensions/lib/pi-build.ts";
 import { currentLink, deploy, harnessDir } from "../extensions/lib/release.ts";
 import { LAUNCH_AGENT, launchAgent } from "./patch-t3.ts";
@@ -59,19 +60,8 @@ if (!base || !token) throw new Error("set ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_
 const v1 = base.endsWith("/v1") ? base : `${base}/v1`;
 const origin = v1.slice(0, -"/v1".length);
 
-const response = await fetch(`${v1}/models`, { headers: { Authorization: `Bearer ${token}` } });
-if (!response.ok) throw new Error(`gateway /v1/models: HTTP ${response.status}`);
-const { data } = await response.json();
-
-const gatewayModels = data
-	.filter((m) => !m.id.startsWith("claude-"))
-	.map((m) => ({
-		id: m.id,
-		reasoning: true,
-		input: m.input_modalities ?? ["text"],
-		...(m.context_window ? { contextWindow: m.context_window } : {}),
-		...(m.max_tokens ? { maxTokens: m.max_tokens } : {}),
-	}));
+// The first list; the gateway extension keeps it current from then on (extensions/gateway).
+const gatewayList = gatewayModels(await fetchGatewayListing(v1, token));
 
 const npm = (cwd, ...args) => execFileSync("npm", args, { cwd, stdio: "inherit" });
 // The dependencies every Pi build links to (extensions/lib/pi-build.ts), and the model data builds copy.
@@ -106,16 +96,16 @@ const writeJson = (file, value) => writeFileSync(file, `${JSON.stringify(value, 
 mkdirSync(agentDir, { recursive: true });
 
 const modelsFile = join(agentDir, "models.json");
-const models = readJson(modelsFile);
+const models = readModelsJson(modelsFile);
 models.providers = {
 	...models.providers,
 	anthropic: { baseUrl: origin, compat: { supportsMessageThreads: true } },
 	// Prompt edits go out as developer messages appended to the conversation, so the cached
 	// prefix stays (test/prompt-cache.test.ts); without this flag Pi folds them into the
 	// instructions and the whole conversation is written again.
-	gateway: { baseUrl: v1, api: "openai-responses", compat: { supportsMidConvoSystemMessages: true }, models: gatewayModels },
+	[GATEWAY_PROVIDER]: { baseUrl: v1, api: "openai-responses", compat: { supportsMidConvoSystemMessages: true }, models: gatewayList },
 };
-writeJson(modelsFile, models);
+writeModelsJson(modelsFile, models);
 
 // -U replaces an existing item; the token travels as an argument only to the local `security` tool.
 execFileSync("security", ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", "gateway", "-w", token]);
@@ -161,4 +151,4 @@ writeJson(settingsFile, {
 	},
 });
 
-console.log(`${agentDir}: harness ${root} (${branch} at ${deployed.commit.slice(0, 9)}, ${currentLink(agentDir)}), gateway ${origin} (${gatewayModels.length} non-Claude models), default anthropic/claude-opus-5-5`);
+console.log(`${agentDir}: harness ${root} (${branch} at ${deployed.commit.slice(0, 9)}, ${currentLink(agentDir)}), gateway ${origin} (${gatewayList.length} non-Claude models), default anthropic/claude-opus-5-5`);
