@@ -31,6 +31,7 @@ import {
 	sessionHost,
 	unsafe,
 } from "@p2/app/v1";
+import type { RoutedSend } from "../chat/contract.ts";
 
 /** A view's ID: a lowercase slug, unique in its session. */
 export const VIEW_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -301,6 +302,7 @@ export const VIEWS_ACCEPTS: AcceptsTable<typeof Views> = {
 
 /** An older page's open: a Markdown file or the changes (saved views are gone). */
 function openOfV2(old: Static<typeof OpenSchemaV2>): OpenInput {
+	// Version 2's wire schema is frozen: its saved-view form has no `kind` to tell it apart by.
 	if ("saved" in old) throw new Error("Saved views are gone");
 	return {
 		kind: old.kind,
@@ -323,6 +325,9 @@ export type MessageContext = {
 	readonly carried: (ctx: Ctx) => Promise<void>;
 };
 
-/** Worker registry of message contexts, by plugin: each says what is new for the next message (undefined: nothing). */
+/**
+ * Worker registry of message contexts, by plugin: each says what goes with the message being sent (undefined:
+ * nothing), what is new since the last one or what was staged for that message (its `requestId`).
+ */
 export const MessageContexts =
-	keyedRegistry<(ctx: Ctx) => Promise<MessageContext | undefined>>("p2.views-message-contexts");
+	keyedRegistry<(input: RoutedSend, ctx: Ctx) => Promise<MessageContext | undefined>>("p2.views-message-contexts");
