@@ -16,7 +16,7 @@ import { type Candidate, parseDeltas } from "../scripts/dream/curate.ts";
 import { type LedgerRecord, readLedger, readSince, recurrences, report } from "../scripts/dream/ledger.ts";
 import { globalRules, instructionFile, type KnownRule, projectRules } from "../scripts/dream/rules.ts";
 import { dream } from "../scripts/dream/run.ts";
-import { type Ask, isHuman, labelMessages, parseLabels } from "../scripts/lib/labels.ts";
+import { type Ask, askUntilValid, type ChatMessage, isHuman, labelMessages, parseLabels } from "../scripts/lib/labels.ts";
 
 let dir: string;
 beforeEach(() => {
@@ -227,6 +227,86 @@ describe("curator validation", () => {
 		];
 		for (const [deltas, error] of bad) assert.throws(() => parse(deltas), error, JSON.stringify(deltas));
 		assert.throws(() => parseDeltas([], candidates, rules), /expected \{deltas/);
+	});
+
+	test("names why a delta is invalid", () => {
+		const reasons: [Record<string, unknown>, RegExp][] = [
+			[{ op: "update", rule: "AGENTS.md:3", text: "z" }, /AGENTS\.md:3 is not editable/],
+			[{ op: "recur", rule: "rules/nope" }, /no rule has the id "rules\/nope"/],
+			[{ op: "add", scope: "global", name: "Bad Name", text: "t" }, /name "Bad Name" is not kebab-case/],
+			[{ op: "add", scope: "project", repo: "/elsewhere", text: "t" }, /repo "\/elsewhere" is no candidate's repository/],
+			[{ op: "add", scope: "team", text: "t" }, /scope "team" is neither/],
+			[{ op: "add", scope: "global", name: "long", text: "x".repeat(601) }, /text has 601 characters, the limit is 600/],
+			[{ op: "add", scope: "global", name: "empty", text: "- …" }, /text has no words/],
+			[{ op: "add", scope: "global", name: "num", text: 5 }, /text is not a string/],
+			[{ op: "rewrite", rule: "rules/batch" }, /op "rewrite" is unknown/],
+		];
+		for (const [delta, reason] of reasons) assert.throws(() => parse([{ ...delta, evidence: ["c1", "c2"] }]), reason, JSON.stringify(delta));
+	});
+
+	test("an update may lengthen a rule past the cap for new rules, by a bounded margin", () => {
+		const long: KnownRule = { id: "rules/visual", text: "v".repeat(646), editable: true };
+		const update = (text: string) => parseDeltas({ deltas: [{ op: "update", rule: long.id, text, reason: "", evidence: ["c1", "c2"] }] }, candidates, [long]);
+		assert.equal((update("w".repeat(730))[0] as { text: string }).text.length, 730, "the run of 2026-11-20 failed on this");
+		assert.equal((update("w".repeat(946))[0] as { text: string }).text.length, 946, "old length plus the margin");
+		assert.throws(() => update("w".repeat(947)), /text has 947 characters, the limit is 946/);
+		assert.equal((parse([{ op: "update", rule: "rules/batch", text: "y".repeat(600), reason: "", evidence: ["c1", "c2"] }])[0] as { text: string }).text.length, 600, "a short rule may grow to the cap");
+		assert.throws(() => parse([{ op: "update", rule: "rules/batch", text: "y".repeat(601), reason: "", evidence: ["c1", "c2"] }]), /limit is 600/);
+	});
+});
+
+describe("askUntilValid", () => {
+	const positive = (value: unknown) => {
+		if (typeof (value as { n?: unknown }).n !== "number" || (value as { n: number }).n <= 0) throw new Error("n must be positive");
+		return (value as { n: number }).n;
+	};
+	const scripted = (replies: (string | Error)[]) => {
+		const sent: ChatMessage[][] = [];
+		const send = async (messages: ChatMessage[]) => {
+			sent.push(structuredClone(messages));
+			const reply = replies.shift();
+			if (reply === undefined) throw new Error("no more replies");
+			if (reply instanceof Error) throw reply;
+			return reply;
+		};
+		return { sent, send };
+	};
+
+	test("returns the first valid answer, with JSON inside prose", async () => {
+		const { sent, send } = scripted(['Here: {"n": 3} done']);
+		assert.equal(await askUntilValid("q", positive, send, { pauseMs: 0 }), 3);
+		assert.deepEqual(sent, [[{ role: "user", content: "q" }]]);
+	});
+
+	test("sends an invalid answer back with the error, so the model corrects it", async () => {
+		const { sent, send } = scripted(['{"n": -1}', "no json at all", '{"n": 2,}']);
+		await assert.rejects(askUntilValid("q", positive, send, { pauseMs: 0, attempts: 3 }), SyntaxError);
+		assert.equal(sent.length, 3);
+		assert.deepEqual(sent[1], [
+			{ role: "user", content: "q" },
+			{ role: "assistant", content: '{"n": -1}' },
+			{ role: "user", content: "Your reply is invalid: n must be positive\nReply again with only the corrected JSON." },
+		]);
+		assert.match(sent[2]![4]!.content, /the reply holds no JSON value/);
+	});
+
+	test("a corrected answer after feedback wins", async () => {
+		const { sent, send } = scripted(['{"n": 0}', '{"n": 5}']);
+		assert.equal(await askUntilValid("q", positive, send, { pauseMs: 0 }), 5);
+		assert.equal(sent[1]!.length, 3);
+	});
+
+	test("a failed request is sent again unchanged, keeping earlier feedback", async () => {
+		const { sent, send } = scripted(['{"n": 0}', new Error("529: overloaded"), '{"n": 1}']);
+		assert.equal(await askUntilValid("q", positive, send, { pauseMs: 0 }), 1);
+		assert.deepEqual(sent[2], sent[1], "the transport retry repeats the same conversation");
+		assert.equal(sent[1]!.length, 3);
+	});
+
+	test("gives up after the attempts with the last error", async () => {
+		const { sent, send } = scripted([new Error("a"), new Error("b"), new Error("c"), new Error("d"), '{"n": 1}']);
+		await assert.rejects(askUntilValid("q", positive, send, { pauseMs: 0 }), /^Error: d$/);
+		assert.equal(sent.length, 4);
 	});
 });
 

@@ -37,41 +37,68 @@ let credentials: { apiKey: string; baseUrl: string } | undefined;
 
 /**
  * Ask an Anthropic model through the user's gateway (Pi's anthropic provider) and parse the JSON
- * value in its reply. `validate` throws on a malformed answer; the call is retried up to 3 times.
- * The reply is streamed, so a long answer keeps the connection busy past the gateway's idle timeout.
+ * value in its reply (see `askUntilValid` for the retries). The reply is streamed, so a long answer
+ * keeps the connection busy past the gateway's idle timeout.
  */
 export async function askJson<T>(model: string, system: string, user: string, validate: (value: unknown) => T, maxTokens = 8000): Promise<T> {
 	credentials ??= {
 		apiKey: execFileSync("pi", ["auth", "print-api-key", "--provider", "anthropic"], { encoding: "utf8" }).trim(),
 		baseUrl: (JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "models.json"), "utf8")) as { providers: { anthropic: { baseUrl: string } } }).providers.anthropic.baseUrl.replace(/\/$/, ""),
 	};
-	for (let attempt = 0; ; attempt++) {
-		try {
-			const response = await fetch(`${credentials.baseUrl}/v1/messages`, {
-				method: "POST",
-				headers: { "x-api-key": credentials.apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-				body: JSON.stringify({ model, max_tokens: maxTokens, stream: true, system, messages: [{ role: "user", content: user }] }),
-			});
-			if (!response.ok || !response.body) throw new Error(`${response.status}: ${(await response.text()).slice(0, 200)}`);
-			let text = "";
-			let buffer = "";
-			for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
-				buffer += chunk;
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
-				for (const line of lines) {
-					if (!line.startsWith("data:")) continue;
-					const event = JSON.parse(line.slice(5)) as { type: string; delta?: { type: string; text?: string }; error?: { message: string } };
-					if (event.type === "error") throw new Error(event.error?.message);
-					if (event.type === "content_block_delta" && event.delta?.type === "text_delta") text += event.delta.text ?? "";
-				}
+	const { apiKey, baseUrl } = credentials;
+	return askUntilValid(user, validate, async (messages) => {
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+			body: JSON.stringify({ model, max_tokens: maxTokens, stream: true, system, messages }),
+		});
+		if (!response.ok || !response.body) throw new Error(`${response.status}: ${(await response.text()).slice(0, 200)}`);
+		let text = "";
+		let buffer = "";
+		for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
+			buffer += chunk;
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line.startsWith("data:")) continue;
+				const event = JSON.parse(line.slice(5)) as { type: string; delta?: { type: string; text?: string }; error?: { message: string } };
+				if (event.type === "error") throw new Error(event.error?.message);
+				if (event.type === "content_block_delta" && event.delta?.type === "text_delta") text += event.delta.text ?? "";
 			}
-			const start = text.search(/[[{]/);
-			const end = Math.max(text.lastIndexOf("]"), text.lastIndexOf("}"));
-			return validate(JSON.parse(text.slice(start, end + 1)));
+		}
+		return text;
+	});
+}
+
+export interface ChatMessage {
+	role: "user" | "assistant";
+	content: string;
+}
+
+/**
+ * Ask through `send` until the JSON value in the reply passes `validate`, at most 4 attempts. A
+ * failed request is sent again after a pause. A reply that is no JSON or that `validate` rejects
+ * goes back to the model with the error, so it corrects that answer instead of repeating it.
+ */
+export async function askUntilValid<T>(
+	user: string,
+	validate: (value: unknown) => T,
+	send: (messages: ChatMessage[]) => Promise<string>,
+	{ attempts = 4, pauseMs = 2000 }: { attempts?: number; pauseMs?: number } = {},
+): Promise<T> {
+	const messages: ChatMessage[] = [{ role: "user", content: user }];
+	for (let attempt = 1; ; attempt++) {
+		let reply: string | undefined;
+		try {
+			reply = await send(messages);
+			const start = reply.search(/[[{]/);
+			const end = Math.max(reply.lastIndexOf("]"), reply.lastIndexOf("}"));
+			if (start < 0 || end < start) throw new Error("the reply holds no JSON value");
+			return validate(JSON.parse(reply.slice(start, end + 1)));
 		} catch (error) {
-			if (attempt >= 3) throw error;
-			await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)));
+			if (attempt >= attempts) throw error;
+			if (reply === undefined) await new Promise((resolve) => setTimeout(resolve, pauseMs * attempt));
+			else messages.push({ role: "assistant", content: reply }, { role: "user", content: `Your reply is invalid: ${(error as Error).message}\nReply again with only the corrected JSON.` });
 		}
 	}
 }

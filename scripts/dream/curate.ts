@@ -28,6 +28,8 @@ export type Delta =
 	| { op: "skip"; reason: string; evidence: string[] };
 
 const MAX_RULE_CHARS = 600;
+/** How much an update may lengthen a rule: it sharpens or widens the rule, it does not rewrite it. */
+const MAX_UPDATE_GROWTH = 300;
 
 const INSTRUCTIONS = `You curate the working rules of an AI coding agent from the corrections its user made. You receive the rules the agent already reads (each with an id) and new candidates: a message the user typed mid-session (with the agent's message before it when known), its label, and a rule a classifier derived from it, with a scope.
 
@@ -38,7 +40,7 @@ Decide for every candidate exactly one of these deltas; several candidates can s
 - {"op":"add","scope":"project","repo":"<repository path from the candidate>","text":"…","evidence":[…]}: a new rule that depends on that repository's code, tools, infrastructure or conventions.
 - {"op":"skip","reason":"…","evidence":[…]}: a one-off decision about one task, a preference that does not generalize, unclear, or conflicting with other candidates without a clear winner.
 
-Writing rules: one rule per delta, an imperative sentence or two, and the reason when it is not obvious. Write it for any future session, not about this conversation. Match the existing rules' style. Never restate a rule that exists. A global rule must make sense in every project; anything naming a project's paths, commands, services or people is a project rule.
+Writing rules: one rule per delta, an imperative sentence or two, and the reason when it is not obvious. A new rule has at most ${MAX_RULE_CHARS} characters; an update makes a rule at most ${MAX_UPDATE_GROWTH} characters longer. Write it for any future session, not about this conversation. Match the existing rules' style. Never restate a rule that exists. A global rule must make sense in every project; anything naming a project's paths, commands, services or people is a project rule.
 Reply with only JSON: {"deltas":[…]} covering every candidate ref exactly once.`;
 
 function render(candidates: readonly Candidate[], rules: { global: readonly KnownRule[]; projects: ReadonlyMap<string, readonly KnownRule[]> }): string {
@@ -54,13 +56,49 @@ function render(candidates: readonly Candidate[], rules: { global: readonly Know
 /**
  * A rule's text as the model wrote it, trimmed and without the list markers it may start with
  * ("- ", "* ", "1. "; apply writes a project rule as a list item itself). A project rule is one
- * line: its id is its line. Undefined when nothing is left or it is too long.
+ * line: its id is its line. Throws the reason when nothing is left or it is longer than `max`.
  */
-function ruleText(value: unknown, oneLine: boolean): string | undefined {
-	if (typeof value !== "string") return undefined;
+function ruleText(value: unknown, oneLine: boolean, max: number): string {
+	if (typeof value !== "string") throw new Error("text is not a string");
 	let text = value.trim().replace(/^(?:(?:[-*+]|\d+[.)])(?:\s+|$))+/, "");
 	if (oneLine) text = text.replace(/\s+/g, " ");
-	return /[\p{L}\p{N}]/u.test(text) && text.length <= MAX_RULE_CHARS ? text : undefined;
+	if (!/[\p{L}\p{N}]/u.test(text)) throw new Error("text has no words");
+	if (text.length > max) throw new Error(`text has ${text.length} characters, the limit is ${max}`);
+	return text;
+}
+
+/** One delta of the model's answer; throws why it is invalid. */
+function parseDelta(raw: Record<string, unknown>, evidence: string[], rules: ReadonlyMap<string, KnownRule>, repos: ReadonlySet<string>): Delta {
+	const known = (id: unknown): KnownRule => {
+		const rule = typeof id === "string" ? rules.get(id) : undefined;
+		if (!rule) throw new Error(`no rule has the id ${JSON.stringify(id)}`);
+		return rule;
+	};
+	const reason = String(raw.reason ?? "");
+	switch (raw.op) {
+		case "recur":
+			return { op: "recur", rule: known(raw.rule).id, evidence };
+		case "update": {
+			const rule = known(raw.rule);
+			if (!rule.editable) throw new Error(`${rule.id} is not editable`);
+			const max = Math.max(MAX_RULE_CHARS, rule.text.length + MAX_UPDATE_GROWTH);
+			return { op: "update", rule: rule.id, text: ruleText(raw.text, !rule.id.startsWith("rules/"), max), reason, evidence };
+		}
+		case "add":
+			if (raw.scope === "global") {
+				if (typeof raw.name !== "string" || !NAME.test(raw.name)) throw new Error(`name ${JSON.stringify(raw.name)} is not kebab-case`);
+				return { op: "add", scope: "global", name: raw.name, text: ruleText(raw.text, false, MAX_RULE_CHARS), evidence };
+			}
+			if (raw.scope === "project") {
+				if (typeof raw.repo !== "string" || !repos.has(raw.repo)) throw new Error(`repo ${JSON.stringify(raw.repo)} is no candidate's repository`);
+				return { op: "add", scope: "project", repo: raw.repo, text: ruleText(raw.text, true, MAX_RULE_CHARS), evidence };
+			}
+			throw new Error(`scope ${JSON.stringify(raw.scope)} is neither global nor project`);
+		case "skip":
+			return { op: "skip", reason, evidence };
+		default:
+			throw new Error(`op ${JSON.stringify(raw.op)} is unknown`);
+	}
 }
 
 /** The model's deltas, validated against the candidates and rules; throws on anything malformed. */
@@ -79,15 +117,11 @@ export function parseDeltas(value: unknown, candidates: readonly Candidate[], ru
 			if (seen.has(ref)) throw new Error(`${ref} is in two deltas`);
 			seen.add(ref);
 		}
-		const ev = evidence as string[];
-		const rule = typeof raw.rule === "string" ? byId.get(raw.rule) : undefined;
-		const text = ruleText(raw.text, raw.op === "add" ? raw.scope === "project" : !rule?.id.startsWith("rules/"));
-		if (raw.op === "recur" && rule) result.push({ op: "recur", rule: rule.id, evidence: ev });
-		else if (raw.op === "update" && rule?.editable && text) result.push({ op: "update", rule: rule.id, text, reason: String(raw.reason ?? ""), evidence: ev });
-		else if (raw.op === "add" && raw.scope === "global" && typeof raw.name === "string" && NAME.test(raw.name) && text) result.push({ op: "add", scope: "global", name: raw.name, text, evidence: ev });
-		else if (raw.op === "add" && raw.scope === "project" && typeof raw.repo === "string" && repos.has(raw.repo) && text) result.push({ op: "add", scope: "project", repo: raw.repo, text, evidence: ev });
-		else if (raw.op === "skip") result.push({ op: "skip", reason: String(raw.reason ?? ""), evidence: ev });
-		else throw new Error(`invalid delta ${JSON.stringify(raw)}`);
+		try {
+			result.push(parseDelta(raw, evidence as string[], byId, repos));
+		} catch (error) {
+			throw new Error(`invalid delta (${(error as Error).message}): ${JSON.stringify(raw)}`);
+		}
 	}
 	const missing = [...refs].filter((ref) => !seen.has(ref));
 	if (missing.length) throw new Error(`no delta for ${missing.join(", ")}`);
