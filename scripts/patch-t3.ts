@@ -162,6 +162,18 @@
 // - thread-wait-description (the tool says how to wait for a sent message): without `runId` the wait
 //   takes the latest run, also one that had already ended, which read as "no way to wait for the
 //   next run" (2026-11-19); the description names `t3_thread_send`'s `runId`.
+// - thread-wait-report (a `t3_thread_wait` that times out says why, and what changed): the server
+//   silently clamps `timeoutMs` to 60 minutes (a coordinator asked for 6 h, every wait ended after 60
+//   min and was restarted), and a timed-out result carried only the selected run's status, so a wait on
+//   a child whose run had long completed read "completed, timedOut" with no reason: with
+//   `untilDelegatedWorkSettled` the wait also holds on the thread's tasks, their undelivered
+//   completions and its awaited background jobs (a git fsmonitor daemon, a dead wait loop). The coordinator
+//   restarted such waits for hours without checking (2026-11-19/20; the user's rule "do not fake being
+//   productive by iteratively waiting" recurred in 4 sessions). A timed-out result now carries
+//   `timeout` (requested, effective, maximum, capped), `thread` (its status, latest run, the work state
+//   and what `holding` the wait) and a `note` saying what to do; the description names the cap.
+//   A wait whose run (or, with `untilDelegatedWorkSettled`, whose work) is over returns at once, as
+//   t3's `waitForThread` always did (checked: it evaluates before it subscribes).
 // - bridge-long-calls (a t3 tool call may take longer than Pi's HTTP idle timeout): t3's Pi
 //   extension (`PI_T3_MCP_EXTENSION_SOURCE`) sends each MCP call as one HTTP request that t3 answers
 //   when the tool ends, through Pi's global undici dispatcher, whose headers and body timeouts are
@@ -1197,6 +1209,110 @@ export const PATCHES: Patch[] = [
 			[
 				'description: "Wait for a thread\'s run to finish. No `runId`: latest. Idle: at once.',
 				'description: "Wait for a thread\'s run to finish. No `runId`: the latest, also one that already ended; for a message you sent, pass the `runId` t3_thread_send returned (a queued message moved into the running turn waits for that turn). Idle: at once.',
+			],
+		],
+	},
+	{
+		name: "thread-wait-report-contract",
+		file: "const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT = ",
+		marker: "holding: ArraySchema(String$2)",
+		edits: [
+			[
+				"\tresultRun: optional(Struct({\n\t\trunId: RunId,\n\t\tstatus: OrchestrationV2RunStatus\n\t}))\n});\nconst OrchestratorMcpThreadInterruptInput = ",
+				[
+					"\tresultRun: optional(Struct({",
+					"\t\trunId: RunId,",
+					"\t\tstatus: OrchestrationV2RunStatus",
+					"\t})),",
+					"\t/** On timeout: the timeout asked for, the one applied and the server's maximum. */",
+					"\ttimeout: optional(Struct({",
+					"\t\trequestedMs: Finite,",
+					"\t\teffectiveMs: Finite,",
+					"\t\tmaxMs: Finite,",
+					"\t\tcapped: Boolean$2",
+					"\t})),",
+					"\t/** On timeout: the thread's current state and what holds the wait. */",
+					"\tthread: optional(Struct({",
+					"\t\tstatus: OrchestratorMcpThreadStatus,",
+					"\t\tlatestRun: NullOr(Struct({",
+					"\t\t\trunId: RunId,",
+					"\t\t\tstatus: OrchestratorMcpThreadStatus",
+					"\t\t})),",
+					'\t\twork: Literals(["working", "waiting_for_children", "result_available"]),',
+					"\t\tholding: ArraySchema(String$2)",
+					"\t})),",
+					"\tnote: optional(String$2)",
+					"});",
+					"const OrchestratorMcpThreadInterruptInput = ",
+				].join("\n"),
+			],
+		],
+	},
+	{
+		name: "thread-wait-report",
+		file: 'fn("OrchestratorMcpService.delegateTask")',
+		marker: "function threadWaitReport(",
+		edits: [
+			[
+				"const MAX_WAIT_TIMEOUT_MS = 36e5;",
+				[
+					"/** The timeout a wait asked for and the one the server applies: it never waits longer than `maxMs`. */",
+					"function waitTimeoutReport(requestedMs, defaultMs, maxMs) {",
+					"\tconst requested = requestedMs ?? defaultMs;",
+					"\treturn { requestedMs: requested, effectiveMs: Math.min(maxMs, Math.max(1, requested)), maxMs, capped: requested > maxMs };",
+					"}",
+					"/** What a timed-out wait tells: the thread's state now and everything its settling is held by. */",
+					"function threadWaitReport(timeout, records, helpers) {",
+					"\tconst latest = helpers.latestRun(records);",
+					"\tconst latestRun = latest === void 0 ? null : { runId: latest.id, status: helpers.runOutcome(latest) };",
+					"\tconst holding = [];",
+					"\tfor (const task of records.subagents) {",
+					'\t\tconst active = task.status === "pending" || task.status === "running" || task.status === "waiting";',
+					'\t\tconst undelivered = task.status !== "idle" && (task.completionDelivery?.state === "pending" || task.completionDelivery?.state === "claimed");',
+					'\t\tif (active || undelivered) holding.push(`task ${task.id}${task.title ? ` (${task.title})` : ""}: ${active ? task.status : "its result is not delivered yet"}`);',
+					"\t}",
+					"\tfor (const providerThread of records.providerThreads) {",
+					"\t\tfor (const task of providerThread.pendingBackgroundTasks ?? []) {",
+					'\t\t\tif (task.awaited ?? (task.kind === "subagent" || task.kind === "background_task")) holding.push(`${task.kind} ${task.taskId}${task.description ? `: ${task.description}` : ""}`);',
+					"\t\t}",
+					"\t}",
+					"\tconst shown = holding.length > 20 ? [...holding.slice(0, 20), `and ${holding.length - 20} more`] : holding;",
+					'\tconst over = latestRun !== null && ["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(latestRun.status);',
+					"\tconst notes = [];",
+					"\tif (timeout.capped) notes.push(`timeoutMs ${timeout.requestedMs} is above the server maximum of ${timeout.maxMs} ms: this wait ended after ${timeout.effectiveMs} ms. No single wait lasts longer, so waiting again is not a longer wait.`);",
+					'\tif (latestRun === null) notes.push("The thread has no run.");',
+					"\telse if (over && holding.length > 0) notes.push(`The latest run ${latestRun.runId} is already ${latestRun.status}; the wait was held by what the holding list names (tasks, their undelivered results, awaited background jobs). Read the result with t3_thread_read instead of waiting again.`);",
+					"\telse if (over) notes.push(`The latest run ${latestRun.runId} is already ${latestRun.status}: read its result with t3_thread_read.`);",
+					'\telse notes.push(`The latest run ${latestRun.runId} is still ${latestRun.status} and nothing settled within ${timeout.effectiveMs} ms: do independent work or end your turn instead of waiting again.`);',
+					'\treturn { timeout, thread: { status: latestRun === null ? "idle" : latestRun.status, latestRun, work: helpers.delegatedTaskProgress(records).state, holding: shown }, note: notes.join(" ") };',
+					"}",
+					"const MAX_WAIT_TIMEOUT_MS = 36e5;",
+				].join("\n"),
+			],
+			[
+				'const status = result.run === null ? "idle" : runOutcome(result.run);\n\t\t\tconst taskId = result.run?.delegatedTaskId;',
+				[
+					'const status = result.run === null ? "idle" : runOutcome(result.run);',
+					"\t\t\tconst timeoutReport = result.timedOut ? threadWaitReport(waitTimeoutReport(input.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS), yield* threadManagement.getThreadRecords(input.threadId, [",
+					'\t\t\t\t"runs",',
+					'\t\t\t\t"messages",',
+					'\t\t\t\t"subagents",',
+					'\t\t\t\t"providerThreads"',
+					"\t\t\t], {",
+					'\t\t\t\tmessageRoles: ["user"],',
+					"\t\t\t\tmonitorNotificationsOnly: true",
+					"\t\t\t}).pipe(mapError(threadManagementFailure)), {",
+					"\t\t\t\tlatestRun,",
+					"\t\t\t\trunOutcome,",
+					"\t\t\t\tdelegatedTaskProgress",
+					"\t\t\t}) : void 0;",
+					"\t\t\tconst taskId = result.run?.delegatedTaskId;",
+				].join("\n"),
+			],
+			["\t\t\t\ttimedOut: result.timedOut,\n\t\t\t\t...wakesCaller ?", "\t\t\t\ttimedOut: result.timedOut,\n\t\t\t\t...timeoutReport,\n\t\t\t\t...wakesCaller ?"],
+			[
+				"On timeout, with `next` end your turn; without, call again.",
+				"The server waits at most 60 minutes per call, whatever `timeoutMs` asks (the result then says `capped`). On timeout the result carries `thread` (its status, latest run, what `holding` the wait) and `note`: with `next`, end your turn (completion wakes you); otherwise do other work or read the thread. An immediate re-wait with nothing changed gains nothing.",
 			],
 		],
 	},

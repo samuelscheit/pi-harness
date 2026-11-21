@@ -176,6 +176,8 @@ describe("patchBundle", () => {
 		"promoted-task-delivered",
 		"promoted-run-wait",
 		"thread-wait-description",
+		"thread-wait-report-contract",
+		"thread-wait-report",
 		"bridge-long-calls",
 		"notification-origin",
 	];
@@ -950,6 +952,176 @@ describe("patchBundle", () => {
 	});
 
 	// The Pi adapter's prompt records, as bundled: a message t3 wrote itself carries Pi's notification origin.
+	// t3_thread_wait's timeout result, the handler run as bundled (2026-11-19/20: a coordinator asked 6 h, t3 ended every
+	// wait after 60 min without saying so, and re-waited children whose runs had long completed).
+	describe("t3_thread_wait reports a timeout", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const HOUR = 60 * 60_000;
+		const { fileOf, patched } = patchInstalled();
+		const server = patched.get(fileOf(PATCHES.find((patch) => patch.name === "thread-wait-report")!))!;
+		const contracts = patched.get(fileOf(PATCHES.find((patch) => patch.name === "thread-wait-report-contract")!))!;
+		/** What `yield*` returns inside the bundled generators: Effect stand-ins that finish with a value at once. */
+		const done = (value?: unknown) => {
+			const stub = { *[Symbol.iterator]() { return value; }, pipe: () => stub };
+			return stub;
+		};
+		const fnSource = (name: string) => {
+			const start = server.indexOf(`function ${name}(`);
+			return server.slice(start, server.indexOf("\n}\n", start) + 2);
+		};
+		const handlerStart = server.indexOf('waitForThread: fn("OrchestratorMcpService.waitForThread")(') + 'waitForThread: fn("OrchestratorMcpService.waitForThread")('.length;
+		const handlerSource = server.slice(handlerStart, server.indexOf(",\n\t\tinterruptThread:", handlerStart) - 1);
+		const run = (id: string, ordinal: number, status: string) => ({ id, ordinal, status });
+		type Waited = { run: unknown; timedOut: boolean; resultRun?: unknown };
+		/** Calls t3_thread_wait with `input`: t3's wait ends as `waited`, the thread's records are `records`. */
+		const callWait = (waited: Waited, records: Record<string, unknown> = {}, input: Record<string, unknown> = {}, state = "working") => {
+			const calls = { waited: [] as Record<string, any>[], records: [] as unknown[][] };
+			const handler = new Function("deps", `with (deps) { return ${handlerSource}; }`)({
+				fn: () => (body: unknown) => body,
+				loadScopedThread: () => done({ parent: undefined, target: { thread: { projectId: "project:1" } } }),
+				threadManagement: {
+					waitForThread: (arg: Record<string, any>) => (calls.waited.push(arg), done(waited)),
+					getThreadRecords: (...arg: unknown[]) => (calls.records.push(arg), done({ runs: [], subagents: [], providerThreads: [], messages: [], ...records })),
+				},
+				mapError: () => undefined,
+				threadManagementFailure: undefined,
+				loadTasks: () => done([]),
+				latestRun: (projection: { runs: { ordinal: number }[] }) => projection.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0],
+				runOutcome: (r: { status: string }) => r.status,
+				delegatedTaskProgress: () => ({ state }),
+				DEFAULT_WAIT_TIMEOUT_MS: 10 * 60_000,
+				MAX_WAIT_TIMEOUT_MS: HOUR,
+				ORCHESTRATOR_MCP_RUNNING_TASK_NEXT: "end your turn",
+				waitTimeoutReport: new Function(`${fnSource("waitTimeoutReport")}\nreturn waitTimeoutReport;`)(),
+				threadWaitReport: new Function(`${fnSource("threadWaitReport")}\nreturn threadWaitReport;`)(),
+			});
+			const step = handler({}, { threadId: "thread:child", ...input }).next();
+			assert.ok(step.done, "the handler yields only to effects");
+			return { calls, result: step.value as Record<string, any> };
+		};
+		const completed = run("run:1", 1, "completed");
+		const running = run("run:2", 2, "running");
+
+		test("the contract and the tool description carry the report and the cap", () => {
+			assert.ok(contracts.includes("holding: ArraySchema(String$2)"));
+			assert.ok(contracts.includes("\ttimeout: optional(Struct({\n\t\trequestedMs: Finite,\n\t\teffectiveMs: Finite,\n\t\tmaxMs: Finite,\n\t\tcapped: Boolean$2\n\t})),"));
+			assert.ok(contracts.includes("\tnote: optional(String$2)\n});\nconst OrchestratorMcpThreadInterruptInput = "));
+			assert.ok(server.includes("The server waits at most 60 minutes per call, whatever `timeoutMs` asks (the result then says `capped`)."));
+			assert.ok(!server.includes("On timeout, with `next` end your turn; without, call again."), "the old sentence is replaced");
+			assert.ok(server.includes("An immediate re-wait with nothing changed gains nothing."));
+		});
+
+		test("a settled wait returns at once with its result: no timeout report, no extra reads", () => {
+			for (const input of [{}, { runId: "run:1" }, { untilDelegatedWorkSettled: true }, { timeoutMs: 6 * HOUR }]) {
+				const { calls, result } = callWait({ run: completed, timedOut: false, resultRun: completed }, { subagents: [{ id: "task:1", status: "running" }] }, input);
+				assert.equal(result.timedOut, false);
+				assert.equal(result.status, "completed");
+				assert.equal(result.runId, "run:1");
+				assert.deepEqual(Object.keys(result).sort(), ["resultRun", "runId", "status", "threadId", "timedOut"]);
+				assert.equal(calls.records.length, 0, "nothing is read for a result");
+			}
+			const { result } = callWait({ run: null, timedOut: false }, {}, { timeoutMs: 6 * HOUR });
+			assert.deepEqual(result, { threadId: "thread:child", runId: null, status: "idle", timedOut: false });
+		});
+
+		test("the timeout applied is the requested one up to the maximum, and a timeout says so", () => {
+			const cases: [number | undefined, number, boolean][] = [
+				[undefined, 10 * 60_000, false],
+				[5_000, 5_000, false],
+				[HOUR, HOUR, false],
+				[HOUR + 1, HOUR, true],
+				[6 * HOUR, HOUR, true],
+				[0, 1, false],
+				[-5, 1, false],
+			];
+			for (const [requested, effective, capped] of cases) {
+				const { calls, result } = callWait({ run: running, timedOut: true }, { runs: [running] }, requested === undefined ? {} : { timeoutMs: requested });
+				assert.equal(calls.waited[0]!.timeoutMs, effective, `asked ${requested}`);
+				assert.deepEqual(result.timeout, { requestedMs: requested ?? 10 * 60_000, effectiveMs: effective, maxMs: HOUR, capped });
+				assert.equal(/above the server maximum of 3600000 ms: this wait ended after 3600000 ms/.test(result.note), capped, `asked ${requested}`);
+			}
+		});
+
+		test("a timeout carries the thread's status, its latest run and the work state", () => {
+			const { calls, result } = callWait({ run: running, timedOut: true }, { runs: [completed, running] }, { untilDelegatedWorkSettled: true }, "working");
+			assert.equal(result.timedOut, true);
+			assert.equal(result.status, "running");
+			assert.deepEqual(result.thread, { status: "running", latestRun: { runId: "run:2", status: "running" }, work: "working", holding: [] });
+			assert.match(result.note, /^The latest run run:2 is still running and nothing settled within 600000 ms: do independent work or end your turn instead of waiting again\.$/);
+			assert.deepEqual(calls.records[0], ["thread:child", ["runs", "messages", "subagents", "providerThreads"], { messageRoles: ["user"], monitorNotificationsOnly: true }]);
+
+			// The selected run is an older one: the thread's status is the latest run's, the result's `status` the selected run's.
+			const older = callWait({ run: running, timedOut: true }, { runs: [running, run("run:3", 3, "completed")] }, { runId: "run:2" });
+			assert.equal(older.result.status, "running");
+			assert.equal(older.result.thread.status, "completed");
+			assert.match(older.result.note, /^The latest run run:3 is already completed: read its result with t3_thread_read\.$/);
+
+			// No run: idle.
+			const none = callWait({ run: null, timedOut: true }, {});
+			assert.deepEqual(none.result.thread, { status: "idle", latestRun: null, work: "working", holding: [] });
+			assert.equal(none.result.note, "The thread has no run.");
+		});
+
+		test("a wait on a completed run that times out names what holds it (the 2026-11-20 children that 'long completed')", () => {
+			const subagents = [
+				{ id: "task:running", title: "N6", status: "running" },
+				{ id: "task:waiting", title: null, status: "waiting" },
+				{ id: "task:pending", title: "P", status: "pending" },
+				{ id: "task:undelivered", title: "L2-Review", status: "completed", completionDelivery: { state: "pending" } },
+				{ id: "task:claimed", title: "C", status: "failed", completionDelivery: { state: "claimed" } },
+				{ id: "task:delivered", title: "D", status: "completed", completionDelivery: { state: "delivered" } },
+				{ id: "task:idle", title: "I", status: "idle", completionDelivery: { state: "pending" } },
+				{ id: "task:disposed", title: "X", status: "cancelled", completionDelivery: { state: "disposed" } },
+			];
+			const providerThreads = [
+				{
+					pendingBackgroundTasks: [
+						{ taskId: "bg:daemon", kind: "background_task", description: "git fsmonitor--daemon" },
+						{ taskId: "bg:loop", kind: "subagent" },
+						{ taskId: "bg:command", kind: "command", description: "npm test" },
+						{ taskId: "bg:monitor", kind: "monitor" },
+						{ taskId: "bg:released", kind: "background_task", awaited: false },
+						{ taskId: "bg:awaited-command", kind: "command", awaited: true, description: "build" },
+					],
+				},
+				{},
+			];
+			const { result } = callWait({ run: completed, timedOut: true }, { runs: [completed], subagents, providerThreads }, { untilDelegatedWorkSettled: true }, "waiting_for_children");
+			assert.equal(result.status, "completed");
+			assert.equal(result.thread.work, "waiting_for_children");
+			assert.deepEqual(result.thread.holding, [
+				"task task:running (N6): running",
+				"task task:waiting: waiting",
+				"task task:pending (P): pending",
+				"task task:undelivered (L2-Review): its result is not delivered yet",
+				"task task:claimed (C): its result is not delivered yet",
+				"background_task bg:daemon: git fsmonitor--daemon",
+				"subagent bg:loop",
+				"command bg:awaited-command: build",
+			]);
+			assert.match(result.note, /^The latest run run:1 is already completed; the wait was held by what the holding list names .* Read the result with t3_thread_read instead of waiting again\.$/);
+
+			// Nothing holds a completed run: the plain case never times out, but a run completed after the wait began is read, not waited for.
+			const none = callWait({ run: completed, timedOut: true }, { runs: [completed] });
+			assert.deepEqual(none.result.thread.holding, []);
+			assert.match(none.result.note, /is already completed: read its result/);
+		});
+
+		test("a long holding list is cut and the cap note comes first", () => {
+			const subagents = Array.from({ length: 25 }, (_, i) => ({ id: `task:${i}`, title: `T${i}`, status: "running" }));
+			const { result } = callWait({ run: completed, timedOut: true }, { runs: [completed], subagents }, { timeoutMs: 6 * HOUR });
+			assert.equal(result.thread.holding.length, 21);
+			assert.equal(result.thread.holding[19], "task task:19 (T19): running");
+			assert.equal(result.thread.holding[20], "and 5 more");
+			assert.match(result.note, /^timeoutMs 21600000 is above the server maximum of 3600000 ms: this wait ended after 3600000 ms\. No single wait lasts longer, so waiting again is not a longer wait\. The latest run/);
+		});
+
+		test("a timed-out wait on a thread no task owns has no `next`, but the report", () => {
+			const { result } = callWait({ run: running, timedOut: true }, { runs: [running] });
+			assert.equal(result.next, undefined, "no owned task: no next");
+			assert.ok(result.thread && result.timeout && result.note);
+		});
+	});
+
 	test("t3's own messages reach Pi as notifications, the user's (also relayed by t3) as prompts", { skip: !existsSync(original) && "t3 not installed" }, () => {
 		const { fileOf, patched } = patchInstalled();
 		const text = patched.get(fileOf(PATCHES.find((patch) => patch.name === "notification-origin")!))!;
@@ -1097,7 +1269,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution, promoted-task-delivered, promoted-run-wait, thread-wait-description, bridge-long-calls, notification-origin;/,
+				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution, promoted-task-delivered, promoted-run-wait, thread-wait-description, thread-wait-report-contract, thread-wait-report, bridge-long-calls, notification-origin;/,
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
@@ -1122,7 +1294,7 @@ describe("keeping t3 patched", () => {
 			const earlier = patchBundle(chunks[adapterChunk]!, chunkPatches[adapterChunk]!.filter((patch) => !fork(patch))).text;
 			writeArchive(archive, { ...chunks, [adapterChunk]: earlier });
 			const original = readFileSync(archive);
-			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi, task-id-resolution, thread-wait-description;/);
+			assert.match(await keepPatched(app, tell), /\(delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, background-items, background-items-contract, background-items-caller, thread-identity-search, background-released, background-released-contract, keyed-lock-contended, background-tasks-from-pi, task-id-resolution, thread-wait-description, thread-wait-report-contract, thread-wait-report;/);
 			assert.ok(!existsSync(`${archive}.pre-pi-harness`), "an already patched archive is not t3's own");
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);
 
