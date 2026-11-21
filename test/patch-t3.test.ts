@@ -140,47 +140,50 @@ describe("asar rewrite", () => {
 	});
 });
 
+/** Every patch by name, in the order a bundle gets them. */
+const ALL = [
+	"cache-warming",
+	"dialogs",
+	"background-work",
+	"questions",
+	"questions-capability",
+	"background-caller",
+	"delegate-fork-runtime",
+	"delegate-fork-schema",
+	"delegate-fork-tool",
+	"delegate-template-schema",
+	"delegate-template-tool",
+	"delegate-template-runtime",
+	"session-questions",
+	"background-items",
+	"background-items-contract",
+	"background-items-caller",
+	"handoff-waits-for-run",
+	"handoff-ends-turn",
+	"thread-identity-search",
+	"connection-failure-resumable",
+	"background-released",
+	"background-released-contract",
+	"between-turns-ordinal",
+	"effect-slot-wait",
+	"effect-slot-handback",
+	"keyed-lock-contended",
+	"background-tasks-from-pi",
+	"followup-after-disposed-delivery",
+	"question-descriptions",
+	"task-id-resolution",
+	"promoted-task-delivered",
+	"promoted-run-wait",
+	"thread-wait-description",
+	"thread-wait-report-contract",
+	"thread-wait-report",
+	"bridge-long-calls",
+	"notification-origin",
+	"rollback-registers-thread",
+];
+
 describe("patchBundle", () => {
 	const [cacheWarming, dialogs] = PATCHES as [(typeof PATCHES)[0], (typeof PATCHES)[0]];
-	const ALL = [
-		"cache-warming",
-		"dialogs",
-		"background-work",
-		"questions",
-		"questions-capability",
-		"background-caller",
-		"delegate-fork-runtime",
-		"delegate-fork-schema",
-		"delegate-fork-tool",
-		"delegate-template-schema",
-		"delegate-template-tool",
-		"delegate-template-runtime",
-		"session-questions",
-		"background-items",
-		"background-items-contract",
-		"background-items-caller",
-		"handoff-waits-for-run",
-		"handoff-ends-turn",
-		"thread-identity-search",
-		"connection-failure-resumable",
-		"background-released",
-		"background-released-contract",
-		"between-turns-ordinal",
-		"effect-slot-wait",
-		"effect-slot-handback",
-		"keyed-lock-contended",
-		"background-tasks-from-pi",
-		"followup-after-disposed-delivery",
-		"question-descriptions",
-		"task-id-resolution",
-		"promoted-task-delivered",
-		"promoted-run-wait",
-		"thread-wait-description",
-		"thread-wait-report-contract",
-		"thread-wait-report",
-		"bridge-long-calls",
-		"notification-origin",
-	];
 
 	test("applies every patch in order, each edit once, and is idempotent", () => {
 		const { text, applied } = patchBundle(bundle);
@@ -1162,6 +1165,55 @@ describe("patchBundle", () => {
 		assert.deepEqual(steer(wake), [{ type: "prompt", message: "Delegated task t1 [completed]:\ndone", origin: "notification", streamingBehavior: "steer" }]);
 		assert.deepEqual(steer(typed), [{ type: "prompt", message: "Delegated task t1 [completed]:\ndone", streamingBehavior: "steer" }], "a user who quotes a wake is still the user");
 	});
+
+	test("a rollback on a fresh Pi runtime loads the thread's session first; one without a session still fails", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const { texts, fileOf, patched } = patchInstalled();
+		const file = fileOf(PATCHES.find((patch) => patch.name === "rollback-registers-thread")!);
+		const head = 'rollbackThread: fn("PiAdapter.rollbackThread")(';
+		// rollbackThread, run as bundled up to its fork boundary with recording stand-ins.
+		const rollbackOf = (text: string) => {
+			const start = text.indexOf(head) + head.length;
+			return text.slice(start, text.indexOf("}, (effect, rollbackInput) =>", start) + 1);
+		};
+		const done = (value?: unknown) => ({ *[Symbol.iterator]() { return value; } });
+		const sessionFile = "/Users/u/.pi/agent/sessions/--repo--/2026-11-21_01a1.jsonl";
+		const providerThread = (nativeId: string | undefined) => ({ id: "provider-thread:pi:1", appThreadId: "mcp:f67b3905", nativeThreadRef: nativeId === undefined ? null : { driver: "pi", nativeId } });
+		const rollback = (source: string, thread: ReturnType<typeof providerThread>, loaded: ReturnType<typeof providerThread> | null) => {
+			const registered: unknown[][] = [];
+			const deps = {
+				threadState: loaded === null ? null : { providerThread: loaded, activeTurn: null },
+				pendingWake: null,
+				input: { threadId: "session-thread", modelSelection: { model: "m" }, runtimePolicy: { mode: "auto" } },
+				registerThread: (threadInput: { existingProviderThread: unknown }, publish: boolean) =>
+					done(void (registered.push([threadInput, publish]), (deps.threadState = { providerThread: threadInput.existingProviderThread as typeof thread, activeTurn: null }))),
+				protocolError: (detail: string) => ({
+					*[Symbol.iterator]() {
+						throw new Error(detail);
+					},
+				}),
+				piForkBoundary: () => ({ type: "nothing" }),
+				piThreadSnapshot: (snapshotThread: unknown) => ({ snapshot: snapshotThread }),
+			};
+			const run = new Function("deps", `with (deps) { return ${source}; }`)(deps)({ providerThread: thread, target: { checkpointId: "c1" } });
+			let step = run.next();
+			while (!step.done) step = run.next();
+			return { result: step.value, registered };
+		};
+		const fixed = rollbackOf(patched.get(file)!);
+		const thread = providerThread(sessionFile);
+
+		assert.throws(() => rollback(rollbackOf(texts.get(file)!), thread, null), /Pi session has no registered thread/, "unpatched, a fresh runtime refuses (2026-11-21)");
+		const fresh = rollback(fixed, thread, null);
+		assert.deepEqual(fresh.registered, [[{ threadId: "mcp:f67b3905", modelSelection: { model: "m" }, runtimePolicy: { mode: "auto" }, existingProviderThread: thread }, false]], "switches to the session, unpublished");
+		assert.deepEqual(fresh.result, { snapshot: thread });
+
+		const loaded = rollback(fixed, thread, thread);
+		assert.deepEqual(loaded.registered, [], "a runtime that hosts the thread is not switched again");
+		assert.deepEqual(loaded.result, { snapshot: thread });
+
+		assert.throws(() => rollback(fixed, providerThread(undefined), null), /Pi session has no registered thread/, "a thread without a session file has nothing to load");
+		assert.throws(() => rollback(fixed, thread, { ...thread, id: "provider-thread:pi:2" }), /does not host/, "a runtime hosting another thread is not taken over");
+	});
 });
 
 describe("keeping t3 patched", () => {
@@ -1269,7 +1321,7 @@ describe("keeping t3 patched", () => {
 			const original = readFileSync(archive);
 			assert.match(
 				await keepPatched(app, tell),
-				/^patched apps\/server\/dist\/chunk0\.mjs, apps\/server\/dist\/chunk1\.mjs, apps\/server\/dist\/chunk2\.mjs, apps\/server\/dist\/chunk3\.mjs \(cache-warming, dialogs, background-work, questions, questions-capability, background-caller, delegate-fork-runtime, delegate-fork-schema, delegate-fork-tool, delegate-template-schema, delegate-template-tool, delegate-template-runtime, session-questions, background-items, background-items-contract, background-items-caller, handoff-waits-for-run, handoff-ends-turn, thread-identity-search, connection-failure-resumable, background-released, background-released-contract, between-turns-ordinal, effect-slot-wait, effect-slot-handback, keyed-lock-contended, background-tasks-from-pi, followup-after-disposed-delivery, question-descriptions, task-id-resolution, promoted-task-delivered, promoted-run-wait, thread-wait-description, thread-wait-report-contract, thread-wait-report, bridge-long-calls, notification-origin;/,
+				new RegExp(`^patched apps/server/dist/chunk0\\.mjs, apps/server/dist/chunk1\\.mjs, apps/server/dist/chunk2\\.mjs, apps/server/dist/chunk3\\.mjs \\(${ALL.join(", ")};`),
 			);
 			assert.deepEqual(readFileSync(`${archive}.pre-pi-harness`), original);
 			for (const path of Object.keys(chunks)) assert.equal(readFile(archive, path).toString(), patchedChunk(path), path);

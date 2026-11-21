@@ -190,6 +190,12 @@
 //   `origin: "notification"` for such a message, and Pi (vendor/pi) gives its extensions input
 //   source "notification". A user's own server-relayed answer (`createdBy: "user"`, e.g. an async
 //   answer to a question) stays a user message.
+// - rollback-registers-thread (backports t3code main: a rollback on a fresh Pi runtime loads the
+//   thread's session first): rolling back a message started a new Pi runtime for a thread whose
+//   session had been released (idle unload, t3 restart), and the adapter refused at once with "Pi
+//   session has no registered thread", so every rollback of such a thread failed (2026-11-21, thread
+//   mcp:f67b3905). It now switches the runtime to the thread's persisted session file (unpublished:
+//   the rollback service persists the snapshot it returns) and forks from there.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -1367,6 +1373,28 @@ export const PATCHES: Patch[] = [
 			[
 				'kind: "steer",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n',
 				'kind: "steer",\n\t\t\t\t\t\t\trecord: {\n\t\t\t\t\t\t\t\ttype: "prompt",\n\t\t\t\t\t\t\t\tmessage: payload.message,\n\t\t\t\t\t\t\t\t...piPromptOrigin(steerInput.message),\n',
+			],
+		],
+	},
+	{
+		name: "rollback-registers-thread",
+		marker: "A fresh runtime (restart or idle release) loads the thread's session before forking.",
+		edits: [
+			[
+				'rollbackThread: fn("PiAdapter.rollbackThread")(function* (rollbackInput) {\n\t\t\t\t\tconst state = threadState;\n',
+				[
+					'rollbackThread: fn("PiAdapter.rollbackThread")(function* (rollbackInput) {',
+					"\t\t\t\t\t// A fresh runtime (restart or idle release) loads the thread's session before forking.",
+					"\t\t\t\t\t// Unpublished: the rollback service persists the returned snapshot.",
+					"\t\t\t\t\tif (threadState === null && rollbackInput.providerThread.nativeThreadRef?.nativeId != null) yield* registerThread({",
+					"\t\t\t\t\t\tthreadId: rollbackInput.providerThread.appThreadId ?? input.threadId,",
+					"\t\t\t\t\t\tmodelSelection: input.modelSelection,",
+					"\t\t\t\t\t\truntimePolicy: input.runtimePolicy,",
+					"\t\t\t\t\t\texistingProviderThread: rollbackInput.providerThread",
+					"\t\t\t\t\t}, false);",
+					"\t\t\t\t\tconst state = threadState;",
+					"",
+				].join("\n"),
 			],
 		],
 	},
