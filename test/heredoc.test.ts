@@ -68,19 +68,16 @@ describe("the refusal", () => {
 	});
 });
 
-describe("refused: a double-quoted tool argument with a command substitution", () => {
+describe("refused: a double-quoted tool argument with a backtick substitution", () => {
 	for (const [command, expansions] of [
 		// The incident: a backtick span in a message.
 		['tool mcp__t3-code__t3_thread_send --threadId t1 --message "bitte `uebernehmen ns` und weiter"', ["`uebernehmen ns`"]],
-		['tool send --message "result: $(git rev-parse HEAD)"', ["$(git rev-parse HEAD)"]],
-		['tool send --message "a `b` and $(c) and `b`"', ["`b`", "$(c)"]],
+		['tool send --message "a `b` and $(c) and `b`"', ["`b`"]],
 		['tool send --message="x `y`"', ["`y`"]],
 		['tool send "`y`"', ["`y`"]],
-		['tool read "$(pwd)/a.ts"', ["$(pwd)"]],
 		['tool send --message "multi\nline `x`\nmore"', ["`x`"]],
 		['tool send --a "ok" --b "bad `x`"', ["`x`"]],
 		['tool send --message "a \\`esc\\` and `real`"', ["`real`"]],
-		['tool send --message "nested $(echo "$(inner)")"', ["$(echo \"$(inner)\")"]],
 		// Behind wrappers, in chains, loops, functions, background, pipelines.
 		['timeout 60 tool send --message "x `y`"', ["`y`"]],
 		['cd x && tool send --message "x `y`" && echo ok', ["`y`"]],
@@ -88,12 +85,12 @@ describe("refused: a double-quoted tool argument with a command substitution", (
 		['tool send --message "x `y`" > out.log 2>&1 &', ["`y`"]],
 		['echo hi | tool send --message "x `y`"', ["`y`"]],
 		['f() { tool send --message "x `y`"; }; f', ["`y`"]],
-		['if tool send --message "x $(y)"; then :; fi', ["$(y)"]],
+		['if tool send --message "x `y`"; then :; fi', ["`y`"]],
 	] as const) {
 		test(command, () => {
 			assert.deepEqual(quotedToolSubstitutions(command).flatMap((f) => f.expansions), expansions);
 			const text = toolQuotedArgumentRefusal(command)!;
-			assert.match(text, /^Not run: this command passes `tool` a double-quoted argument with a command substitution/);
+			assert.match(text, /^Not run: this command passes `tool` a double-quoted argument with a backtick substitution/);
 			assert.match(text, /single quotes/);
 			assert.match(text, /--message - <<'EOF'/);
 		});
@@ -109,8 +106,10 @@ describe("allowed: tool arguments", () => {
 		'tool send --message "plain text"',
 		"tool send --message - <<'EOF'\nbitte `uebernehmen ns` $(x)\nEOF",
 		"tool edit - <<'EOF'\n`x` $(y)\nEOF",
-		// Substitution outside quotes is deliberate (a tool path from a command).
+		// Substitution outside quotes, and `$(…)` inside them, is deliberate (a tool path from a command).
 		"tool read $(pwd)/a.ts",
+		'tool read "$(pwd)/a.ts"',
+		'tool send --message "result: $(git rev-parse HEAD)"',
 		"tool send --message `cat msg.txt`",
 		// The command substitution is another command's argument.
 		'echo "`date`" && tool read a.ts',

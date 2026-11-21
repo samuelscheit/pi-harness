@@ -61,21 +61,22 @@ export function toolHeredocRefusal(source: string): string | undefined {
 
 // A double-quoted argument of a `tool` command still runs the command substitutions in it:
 // `tool … --message "… `uebernehmen ns` …"` ran `uebernehmen ns` ("command not found") and sent the
-// message without that text, and the tool reported success. Backticks and `$(…)` are common in
-// free text (code spans, Markdown). A single-quoted argument (or a `-` read from a quoted heredoc)
-// passes them verbatim. `\`` and `\$(` are escaped, so literal, and not refused; `$x` is a variable
-// the caller may mean (`tool read "$DIR/a.ts"`) and is not refused either.
+// message without that text, and the tool reported success. Backticks are Markdown code spans in
+// free text, so a backtick substitution in double quotes is almost always an accident and refused.
+// A `$(…)` in double quotes is usually meant (`tool read "$(pwd)/a.ts"`), as is `$x`, so neither is
+// refused. A single-quoted argument (or a `-` read from a quoted heredoc) passes text verbatim;
+// an escaped `\`` is literal and not refused.
 
 const SUBSTITUTION = "CommandExpansion";
 
-/** The command substitutions (as written) directly inside the double quotes of `part`'s tree. */
+/** The backtick substitutions (as written) directly inside the double quotes of `part`'s tree. */
 const quotedSubstitutions = (part: WordPart, quoted: boolean): string[] => {
-	if (part.type === SUBSTITUTION) return quoted ? [part.text] : [];
+	if (part.type === SUBSTITUTION) return quoted && part.text.startsWith("`") ? [part.text] : [];
 	if (part.type === "DoubleQuoted") return part.parts.flatMap((p) => quotedSubstitutions(p, true));
 	return [];
 };
 
-/** For each `tool` command in `source` with a double-quoted argument that holds a command substitution: the command and the substitutions. */
+/** For each `tool` command in `source` with a double-quoted argument that holds a backtick substitution: the command and the substitutions. */
 export function quotedToolSubstitutions(source: string): { command: string; expansions: string[] }[] {
 	const found: { command: string; expansions: string[] }[] = [];
 	const visit = (node: SyntaxNode) => {
@@ -89,15 +90,15 @@ export function quotedToolSubstitutions(source: string): { command: string; expa
 	return found;
 }
 
-/** Why `source` is refused, when a `tool` command has a double-quoted argument with a backtick or `$(…)` substitution; undefined otherwise. */
+/** Why `source` is refused, when a `tool` command has a double-quoted argument with a backtick substitution; undefined otherwise. */
 export function toolQuotedArgumentRefusal(source: string): string | undefined {
 	const found = quotedToolSubstitutions(source);
 	if (found.length === 0) return undefined;
 	return refusalText(
-		`passes \`${TOOL_COMMAND}\` a double-quoted argument with a command substitution, which the shell runs first`,
+		`passes \`${TOOL_COMMAND}\` a double-quoted argument with a backtick substitution, which the shell runs first`,
 		found.map((f) => f.command),
 		`Substituted: ${[...new Set(found.flatMap((f) => f.expansions))].map((e) => `\`${e}\``).join(", ")}.`,
-		"Inside double quotes the shell still runs backticks and `$(…)` and puts their output (usually nothing, plus a \"command not found\" on stderr) into the argument, so the tool receives the text without them and still succeeds (a `tool … --message \"… `word` …\"` lost the span silently).",
+		"Inside double quotes the shell still runs backticks and puts their output (usually nothing, plus a \"command not found\" on stderr) into the argument, so the tool receives the text without them and still succeeds (a `tool … --message \"… `word` …\"` lost the span silently).",
 		`Pass the text verbatim: single quotes (\`--message 'text with \\\`code\\\`'\`, no single quote inside), or for longer or mixed text read the value from stdin with \`-\` and a quoted heredoc: \`${TOOL_COMMAND} <name> --message - <<'EOF'\` … \`EOF\` (works for any string argument; one per command). Variables you want expanded stay outside the single quotes.`,
 	);
 }
