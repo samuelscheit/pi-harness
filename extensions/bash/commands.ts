@@ -23,10 +23,12 @@ export interface RunCommand {
 	background?: boolean;
 	/** The innermost loop (`while`, `until`, `for`, `select`) it runs in, clause or body; one node per loop. */
 	loop?: SyntaxNode;
+	/** Every loop it runs in, outermost first (`loop` is the last). */
+	loops?: SyntaxNode[];
 }
 
 /** Where a command runs: in a background job, in a loop. */
-type Context = Pick<RunCommand, "background" | "loop">;
+type Context = Pick<RunCommand, "background" | "loop" | "loops">;
 const LOOPS = new Set(["While", "For", "ArithmeticFor", "Select"]);
 
 /** Commands that run their arguments as a command. */
@@ -77,10 +79,10 @@ export function commandsIn(source: string, context: Context = {}): RunCommand[] 
 	const found: RunCommand[] = [];
 	const visit = (node: SyntaxNode, context: Context) => {
 		if ((node.type === "Statement" && node.background) || node.type === "Coproc") context = { ...context, background: true };
-		if (LOOPS.has(node.type)) context = { ...context, loop: node };
+		if (LOOPS.has(node.type)) context = { ...context, loop: node, loops: [...(context.loops ?? []), node] };
 		if (node.type === "Command") {
 			for (const command of unwrap(node, source.slice(node.pos, node.end))) {
-				const located = { ...command, ...(context.background ? { background: true } : {}), ...(context.loop ? { loop: context.loop } : {}) };
+				const located = { ...command, ...(context.background ? { background: true } : {}), ...(context.loop ? { loop: context.loop, loops: context.loops } : {}) };
 				found.push(located);
 				const script = scriptOf(command);
 				if (script !== undefined) found.push(...commandsIn(script, context));

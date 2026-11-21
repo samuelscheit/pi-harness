@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { commandsIn } from "../extensions/bash/commands.ts";
-import { foregroundWaits, sleepSeconds, waitRefusal } from "../extensions/bash/wait.ts";
+import { fastGhPolls, foregroundWaits, sleepSeconds, waitRefusal } from "../extensions/bash/wait.ts";
 
 describe("refused: a foreground wait", () => {
 	for (const [command, waits] of [
@@ -156,4 +156,64 @@ describe("message", () => {
 		assert.match(text, /\(sleep 20; gh run watch "\$\(gh run list/);
 		assert.match(text, /until curl -s localhost:3000; do sleep 1; done/);
 	});
+});
+
+describe("refused: a loop polling gh faster than once a minute", () => {
+	const pollNote = /^Not run: this command polls GitHub in a loop that sleeps under 60s per iteration:/;
+	for (const [command, gh] of [
+		// The incident: a background loop on a run's status.
+		['while [ "$(gh run view 123 --json status -q .status)" != completed ]; do sleep 9; done > ci.log 2>&1 &', ['gh run view 123 --json status -q .status']],
+		['(while [ "$(gh run view 123 --json status -q .status)" != completed ]; do sleep 9; done; echo done) > ci.log 2>&1 &', ['gh run view 123 --json status -q .status']],
+		["nohup bash -c 'until gh run list --limit 1 | grep -q completed; do sleep 5; done' > ci.log 2>&1 &", ["gh run list --limit 1"]],
+		// Foreground, below the 10 s foreground limit too.
+		["until gh pr checks 12 | grep -qv pending; do sleep 5; done", ["gh pr checks 12"]],
+		["while true; do gh api repos/a/b/actions/runs; sleep 30; done &", ["gh api repos/a/b/actions/runs"]],
+		["for i in $(seq 50); do gh pr view 1 --json state; sleep 59; done &", ["gh pr view 1 --json state"]],
+		["while gh run view 1 --exit-status >/dev/null; do sleep 0.5; done", ["gh run view 1 --exit-status >/dev/null"]],
+		["until timeout 20 gh api rate_limit; do sleep 2; sleep 3; done &", ["timeout 20 gh api rate_limit"]],
+		["env GH_REPO=a/b gh run view 1; while true; do /opt/homebrew/bin/gh run view 1; sleep 20; done &", ["/opt/homebrew/bin/gh run view 1"]],
+		// gh in an inner loop, the sleep in the outer one.
+		["while true; do for r in 1 2; do gh run view $r; done; sleep 10; done &", ["gh run view $r"]],
+		["while sleep 30; do gh api user; done &", ["gh api user"]],
+	] as const) {
+		test(command, () => {
+			const polls = fastGhPolls(command);
+			assert.deepEqual(polls.flatMap((p) => p.gh), gh);
+			assert.match(waitRefusal(command)!, pollNote);
+			assert.match(waitRefusal(command)!, /gh run watch <id> --exit-status > ci\.log 2>&1 &/);
+		});
+	}
+
+	test("a loop over several gh commands lists each once; a foreground long wait is reported beside it", () => {
+		const text = waitRefusal("while true; do gh run view 1; gh run list; gh run view 1; sleep 20; done &\nsleep 30")!;
+		assert.match(text, /- `gh run view 1`\n- `gh run list`\n/);
+		assert.match(text, /^Not run: this command waits idly in the foreground[^]*\n\nNot run: this command polls GitHub/);
+	});
+});
+
+describe("allowed: gh in loops", () => {
+	for (const command of [
+		"while true; do gh run view 1; sleep 60; done > poll.log 2>&1 &",
+		"while true; do gh run view 1; sleep 1m; done &",
+		"while true; do gh run view 1; sleep 30; sleep 30; done &",
+		"while true; do gh run view 1; sleep 120; done &",
+		// Not a loop, or no sleep, or a sleep that is not in the gh loop.
+		"gh run view 1; sleep 5; gh run view 1",
+		"for r in 1 2 3; do gh run view $r --log-failed | tail -5; done",
+		"while read id; do gh run view $id; done < ids",
+		"until curl -s localhost:3000; do sleep 1; done; gh run view 1",
+		"for i in 1 2; do sleep 1; done; gh run list",
+		"gh run view 1 & while true; do sleep 1; done",
+		// A sleep that is not literal is not counted.
+		"while true; do gh run view 1; sleep $n; done &",
+		// Text, not commands.
+		"while true; do echo 'gh run view 1'; sleep 5; done",
+		"while true; do grep gh notes; sleep 5; done",
+		"git commit -m 'refuse while gh api; do sleep 5; done'",
+		"cat <<'EOF'\nwhile true; do gh api x; sleep 5; done\nEOF",
+		"# while true; do gh api x; sleep 5; done",
+		"until nc -z localhost 80; do sleep 2; done; gh run watch 1 --exit-status > ci.log 2>&1 &",
+	]) {
+		test(command, () => assert.equal(fastGhPolls(command).length, 0));
+	}
 });
