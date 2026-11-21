@@ -342,6 +342,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 
 	/**
+	 * Resolves a tool the model called that the context does not declare, such as a deferred tool it
+	 * knows by name from the prompt. The call then runs like any other: validated against the tool's
+	 * schema, through `beforeToolCall` and `afterToolCall`. Undefined: the call fails as not found.
+	 */
+	resolveTool?: (name: string) => AgentTool<any> | undefined;
+
+	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.
 	 *
 	 * Return an `AfterToolCallResult` to override parts of the executed tool result:

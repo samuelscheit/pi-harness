@@ -2283,6 +2283,37 @@ describe("runToolCall", () => {
 		expect(hookCalls).toEqual(["before a", "after a", "before c", "before e", "after e"]);
 	});
 
+	it("runs an undeclared tool resolveTool finds like a declared one, and only one not declared", async () => {
+		const hookCalls: string[] = [];
+		const resolved: string[] = [];
+		const options = {
+			tools: [failing],
+			assistantMessage,
+			context: { messages: [] },
+			resolveTool: (name: string) => {
+				resolved.push(name);
+				return name === "echo" ? echo : undefined;
+			},
+			beforeToolCall: async ({ toolCall }: { toolCall: { id: string } }) =>
+				void hookCalls.push(`before ${toolCall.id}`),
+			afterToolCall: async ({ toolCall }: { toolCall: { id: string } }) =>
+				void hookCalls.push(`after ${toolCall.id}`),
+		};
+
+		expect(await runToolCall(call("a", "echo", { value: "a" }), options)).toMatchObject({
+			result: { structuredContent: { value: "a" } },
+			isError: false,
+		});
+		expect(await runToolCall(call("b", "echo", {}), options)).toMatchObject({ isError: true });
+		expect(await runToolCall(call("c", "missing", {}), options)).toMatchObject({
+			result: { content: [{ type: "text", text: "Tool missing not found" }] },
+			isError: true,
+		});
+		await runToolCall(call("d", "failing", {}), options);
+		expect(resolved, "a declared tool is not resolved").toEqual(["echo", "echo", "missing"]);
+		expect(hookCalls).toEqual(["before a", "after a", "before d", "after d"]);
+	});
+
 	it("lets afterToolCall replace structured content and drops it when only content is replaced", async () => {
 		const redacted = [{ type: "text" as const, text: "redacted" }];
 		const results = [

@@ -826,8 +826,19 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
+		this.agent.resolveTool = (name) => this._resolveDeferredTool(name);
 		this.agent.afterToolCall = (context) => this._afterToolCall(context);
 		this.agent.executeToolCall = (context) => this._extensionRunner.executeToolCall(context);
+	}
+
+	/**
+	 * A deferred tool the model calls by name (a prompt or a script's declarations name it) runs as
+	 * if tool_search had loaded it, instead of failing as not found; it stays undeclared, so the
+	 * request's tools and their prompt cache are unchanged. Codemode-only tools stay script-only.
+	 */
+	private _resolveDeferredTool(name: string): AgentTool | undefined {
+		const tool = this._toolRegistry.get(name);
+		return tool && this._getToolExposure(name) === "deferred" && this._isActivatable(name) ? tool : undefined;
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -1863,7 +1874,10 @@ export class AgentSession {
 	}
 
 	/** Ask the session's model on its current context without adding to the session (see ExtensionAPI.askAside). */
-	async askAside(question: string, { kind, signal }: { kind: string; signal?: AbortSignal }): Promise<AsideResult | undefined> {
+	async askAside(
+		question: string,
+		{ kind, signal }: { kind: string; signal?: AbortSignal },
+	): Promise<AsideResult | undefined> {
 		const model = this.model;
 		if (!model || isVirtualModel(model)) return undefined;
 		const projection = this.sessionManager.buildSessionProjection();
@@ -3362,7 +3376,9 @@ export class AgentSession {
 					fromExtension = true;
 				}
 				if (result?.customInstructions) {
-					customInstructions = customInstructions ? `${customInstructions}\n\n${result.customInstructions}` : result.customInstructions;
+					customInstructions = customInstructions
+						? `${customInstructions}\n\n${result.customInstructions}`
+						: result.customInstructions;
 				}
 			}
 
@@ -3714,12 +3730,16 @@ export class AgentSession {
 			const signal = abortController.signal;
 			const compacted =
 				extensionCompaction ??
-				(await this._runDefaultCompaction(preparation!, summaryModel ?? model, extensionInstructions, signal, reason).catch(
-					(error: unknown) => {
-						if (signal.aborted || !compactsWithoutSummary(reason, error)) throw error;
-						return compactWithoutSummary(preparation!, error instanceof Error ? error.message : String(error));
-					},
-				));
+				(await this._runDefaultCompaction(
+					preparation!,
+					summaryModel ?? model,
+					extensionInstructions,
+					signal,
+					reason,
+				).catch((error: unknown) => {
+					if (signal.aborted || !compactsWithoutSummary(reason, error)) throw error;
+					return compactWithoutSummary(preparation!, error instanceof Error ? error.message : String(error));
+				}));
 			const { summary, firstKeptEntryId, tokensBefore, usage, details, generatedBy } = compacted;
 			abortController.signal.throwIfAborted();
 

@@ -124,6 +124,7 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+	resolveTool?: (name: string) => AgentTool<any> | undefined;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	executeToolCall?: (context: ExecuteToolCallContext) => Promise<AgentToolResult<any>>;
 	finishTurn?: FinishTurn;
@@ -215,6 +216,8 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	/** See {@link AgentLoopConfig.resolveTool}. */
+	public resolveTool?: (name: string) => AgentTool<any> | undefined;
 	/** See {@link AgentLoopConfig.executeToolCall}. */
 	public executeToolCall?: (context: ExecuteToolCallContext) => Promise<AgentToolResult<any>>;
 	public finishTurn?: FinishTurn;
@@ -252,6 +255,7 @@ export class Agent {
 		this.onResponse = runtimeOptions.onResponse;
 		this.onProviderStreamEvent = runtimeOptions.onProviderStreamEvent;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
+		this.resolveTool = runtimeOptions.resolveTool;
 		this.afterToolCall = runtimeOptions.afterToolCall;
 		this.executeToolCall = runtimeOptions.executeToolCall;
 		this.finishTurn = runtimeOptions.finishTurn;
@@ -494,6 +498,7 @@ export class Agent {
 			identity: this.identity,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
+			resolveTool: this.resolveTool,
 			afterToolCall: this.afterToolCall,
 			executeToolCall: this.executeToolCall,
 			finishTurn: this.finishTurn,

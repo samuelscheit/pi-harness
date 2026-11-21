@@ -440,8 +440,38 @@ describe("AgentSession MCP integration", () => {
 		expect(calls).toEqual(["read-file:{}", "read_file:{}"]);
 	});
 
-	it("rejects direct model calls to codemode-only MCP tools", async () => {
-		const { harness, calls } = await setup("codemode");
+	it("runs an undeclared MCP tool the model calls by name, validated, without declaring it", async () => {
+		// The model knows such names from prompts and script declarations (2026-11-21: 86 "Tool
+		// mcp__t3-code__… not found" results across sessions).
+		for (const exposure of ["codemode", "deferred"] as const) {
+			const { harness, calls } = await setup(exposure);
+			const searchName = createMcpToolName("docs", "search");
+			harness.setResponses([
+				fauxAssistantMessage([fauxToolCall(searchName, { query: "x" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage([fauxToolCall(searchName, {})], { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+
+			await harness.session.prompt("go");
+
+			const [ran, invalid] = harness.session.messages.filter(
+				(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === searchName,
+			);
+			expect(ran?.isError, exposure).toBe(false);
+			expect(invalid?.isError, "still validated against the tool's schema").toBe(true);
+			expect(getMessageText(invalid!)).toContain("query");
+			expect(calls).toEqual(['search:{"query":"x"}']);
+			// The request's tools are unchanged: the call did not declare it.
+			expect(harness.session.getActiveToolNames()).not.toContain(searchName);
+			expect(declaredToolNames(harness)).not.toContain(searchName);
+		}
+	});
+
+	it("leaves a deferred MCP tool --tools keeps out of reach not found", async () => {
+		const { harness, calls } = await setup("deferred", undefined, {
+			allowedToolNames: ["read"],
+			withoutToolSearch: true,
+		});
 		harness.setResponses([
 			fauxAssistantMessage([fauxToolCall(createMcpToolName("docs", "search"), { query: "x" })], {
 				stopReason: "toolUse",
@@ -451,9 +481,7 @@ describe("AgentSession MCP integration", () => {
 
 		await harness.session.prompt("go");
 
-		const result = toolResult(harness, "mcp__docs__search");
-		expect(result.isError).toBe(true);
-		expect(getMessageText(result)).toBe("Tool mcp__docs__search not found");
+		expect(getMessageText(toolResult(harness, "mcp__docs__search"))).toBe("Tool mcp__docs__search not found");
 		expect(calls).toEqual([]);
 	});
 
