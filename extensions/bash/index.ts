@@ -44,6 +44,7 @@ import { changeEnds, changeStarts, commitRefusal, dropSessionFiles, sessionFiles
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
 import { gateRefusal } from "./gate.ts";
 import { gitRefusal } from "./git.ts";
+import { headRefusal } from "./head.ts";
 import { killRefusal } from "./kill.ts";
 import { toolHeredocRefusal } from "./heredoc.ts";
 import { messageFileRefusal } from "./message.ts";
@@ -110,7 +111,7 @@ export function readGroup(file: string): number | undefined {
 const POLL_MS = 1000;
 
 /** What the tool refuses to run, for its description. */
-const REFUSED = "Refused before they run: `setsid`, a foreground wait (`gh run watch`, `gh pr checks --watch`, `sleep` of 10 s or more outside a background job; per iteration in a loop), `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), kill by name (`pkill`, `killall`: they hit other agents' processes; use `kill <pid>`), a `git commit` of changes your edit and write tools did not make, a commit or tag message read from a file (`-F <file>`; use `-F -` with a heredoc), a commit or push gated (`&&`, `||`, `if`, `set -e`) on a pipeline ending in a filter (`tests | grep … && git commit`) without `set -o pipefail`, a commit, push, PR or publish that runs even when a test, lint or build before it fails (`tests; git commit`), and a `tool` command fed a heredoc with an unquoted delimiter whose body the shell expands (use `<<'EOF'`).";
+const REFUSED = "Refused before they run: `setsid`, a foreground wait (`gh run watch`, `gh pr checks --watch`, `sleep` of 10 s or more outside a background job; per iteration in a loop), `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f`, whole-tree discards (`git checkout -- .`, `git restore .`), a `git push <remote> <branch>` while HEAD is detached or on another branch (it pushes the old branch, not your commit; push `HEAD:<branch>`), a `git commit` on a detached HEAD (unless `PI_DETACHED_COMMIT=1`), kill by name (`pkill`, `killall`: they hit other agents' processes; use `kill <pid>`), a `git commit` of changes your edit and write tools did not make, a commit or tag message read from a file (`-F <file>`; use `-F -` with a heredoc), a commit or push gated (`&&`, `||`, `if`, `set -e`) on a pipeline ending in a filter (`tests | grep … && git commit`) without `set -o pipefail`, a commit, push, PR or publish that runs even when a test, lint or build before it fails (`tests; git commit`), and a `tool` command fed a heredoc with an unquoted delimiter whose body the shell expands (use `<<'EOF'`).";
 /** How to work beside other agents, for the tool's guidelines. */
 const SHARED_CHECKOUT_GUIDELINE =
 	"Other agents may work in the same checkout or worktrees of the same repository, so `git stash` (except `list`/`show`), `git reset --hard`, `git clean -f` and whole-tree discards (`git checkout -- .`, `git restore .`) are refused: for a clean state use `git worktree add /tmp/<name> HEAD`, and restore or commit only your own paths. A `git commit` that would take changes your edit and write tools did not make is refused with the paths; after `git diff` shows they are yours, run it as `PI_COMMIT_CHECKED=1 git commit …`. Pass a commit message on stdin from a quoted heredoc in the same command (`git commit --only <paths> -F - <<'EOF'`), never through a message file: parallel agents overwrite each other's files in /tmp. For the same reason scratch work goes in a directory of your own, `D=$(mktemp -d) && cd \"$D\" && …`, never a fixed name in /tmp: such a name is often taken (2026-11-16: `mkdir -p /tmp/mm` met another agent's binary, the commands after `;` ran in /tmp itself, and `wc -c *` hung on its FIFOs until the timeout). Join a `cd` to the commands that depend on it with `&&`.";
@@ -157,7 +158,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 		const { command } = event.input;
 		const setsid = setsidCommands(command);
 		const id = ctx.sessionManager.getSessionId();
-		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, waitRefusal(command), gitRefusal(command), killRefusal(command), messageFileRefusal(command), gateRefusal(command) ?? ungatedRefusal(command), toolHeredocRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
+		const reasons = [setsid.length > 0 ? refusal(setsid) : undefined, waitRefusal(command), gitRefusal(command), headRefusal(command, ctx.cwd), killRefusal(command), messageFileRefusal(command), gateRefusal(command) ?? ungatedRefusal(command), toolHeredocRefusal(command), commitRefusal(sessionFiles(id), command, ctx.cwd)].filter((r) => r !== undefined);
 		if (reasons.length > 0) return { block: true, reason: reasons.join("\n\n") };
 		mkdirSync(sessionDir(id), { recursive: true });
 		event.input.command = recordLine(groupFile(id, event.toolCallId)) + event.input.command;

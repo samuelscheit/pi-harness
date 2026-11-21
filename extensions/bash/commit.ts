@@ -91,7 +91,7 @@ export function canonical(path: string): string {
 }
 
 /** Runs git; undefined when it fails. */
-function git(dir: string, args: string[]): string | undefined {
+export function git(dir: string, args: string[]): string | undefined {
 	try {
 		return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 });
 	} catch {
@@ -211,7 +211,7 @@ export function commitProblems(files: SessionFiles, dir: string, commit: GitComm
 	return problems;
 }
 
-const expandHome = (path: string) => (path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
+export const expandHome = (path: string) => (path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
 /** The file an edit or write call's `path` names, as Pi's tools resolve it (a leading `@` dropped, `~` expanded). */
 export const toolPath = (path: string, cwd: string) => resolve(cwd, expandHome(path.replace(/^@/, "")));
 
