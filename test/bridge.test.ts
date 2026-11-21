@@ -36,6 +36,16 @@ describe("parseArguments", () => {
 		assert.deepEqual(parse(["--", "--path"]).args, { path: "--path" }, "after -- everything is positional");
 	});
 
+	test("`-` as the value of a string argument reads stdin, minus one final newline; other types and a missing stdin keep it literal", () => {
+		assert.deepEqual(parse(["--path", "-"], "text with `ticks` and $(x)\n").args, { path: "text with `ticks` and $(x)" });
+		assert.deepEqual(parse(["-"], "a.txt\n").args, { path: "a.txt" }, "a positional too");
+		assert.deepEqual(parse(["--path=-"], "x\n\n").args, { path: "x\n" }, "only one newline is dropped");
+		assert.deepEqual(parse(["--path", "-"], "line 1\nline 2").args, { path: "line 1\nline 2" });
+		assert.deepEqual(parse(["--path", "-"], "").args, { path: "" });
+		assert.deepEqual(parse(["--path", "-"]).args, { path: "-" }, "no stdin: literal");
+		assert.deepEqual(parse(["--path", "a", "--tags", "-"], "x").args, { path: "a", tags: ["-"] }, "only string arguments");
+	});
+
 	test("option names match ignoring case, - and _", () => {
 		assert.deepEqual(parse(["a", "--follow-links"]).args, { path: "a", follow_links: true });
 		assert.deepEqual(parse(["a", "--followLinks"]).args, { path: "a", follow_links: true });

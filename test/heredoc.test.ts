@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { expandedToolInputs, toolHeredocRefusal } from "../extensions/bash/heredoc.ts";
+import { expandedToolInputs, quotedToolSubstitutions, toolHeredocRefusal, toolQuotedArgumentRefusal } from "../extensions/bash/heredoc.ts";
 
 const BLOCK = "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE";
 const INCIDENT = `V=Zpo/Fiktion.lean\ntool edit - <<EOF && lake build\n$V\n<<<<<<< SEARCH\n/-- see \`zpo.p130e_1_fiktion\` -/\n=======\n/-- see \`zpo.p130e_1\` -/\n>>>>>>> REPLACE\nEOF\n`;
@@ -66,4 +66,63 @@ describe("the refusal", () => {
 		assert.match(text, /backtick spans in Lean doc comments ran as commands/);
 		assert.match(text, /`tool edit - <<'EOF'`/);
 	});
+});
+
+describe("refused: a double-quoted tool argument with a command substitution", () => {
+	for (const [command, expansions] of [
+		// The incident: a backtick span in a message.
+		['tool mcp__t3-code__t3_thread_send --threadId t1 --message "bitte `uebernehmen ns` und weiter"', ["`uebernehmen ns`"]],
+		['tool send --message "result: $(git rev-parse HEAD)"', ["$(git rev-parse HEAD)"]],
+		['tool send --message "a `b` and $(c) and `b`"', ["`b`", "$(c)"]],
+		['tool send --message="x `y`"', ["`y`"]],
+		['tool send "`y`"', ["`y`"]],
+		['tool read "$(pwd)/a.ts"', ["$(pwd)"]],
+		['tool send --message "multi\nline `x`\nmore"', ["`x`"]],
+		['tool send --a "ok" --b "bad `x`"', ["`x`"]],
+		['tool send --message "a \\`esc\\` and `real`"', ["`real`"]],
+		['tool send --message "nested $(echo "$(inner)")"', ["$(echo \"$(inner)\")"]],
+		// Behind wrappers, in chains, loops, functions, background, pipelines.
+		['timeout 60 tool send --message "x `y`"', ["`y`"]],
+		['cd x && tool send --message "x `y`" && echo ok', ["`y`"]],
+		['for t in a b; do tool send --threadId $t --message "x `y`"; done', ["`y`"]],
+		['tool send --message "x `y`" > out.log 2>&1 &', ["`y`"]],
+		['echo hi | tool send --message "x `y`"', ["`y`"]],
+		['f() { tool send --message "x `y`"; }; f', ["`y`"]],
+		['if tool send --message "x $(y)"; then :; fi', ["$(y)"]],
+	] as const) {
+		test(command, () => {
+			assert.deepEqual(quotedToolSubstitutions(command).flatMap((f) => f.expansions), expansions);
+			const text = toolQuotedArgumentRefusal(command)!;
+			assert.match(text, /^Not run: this command passes `tool` a double-quoted argument with a command substitution/);
+			assert.match(text, /single quotes/);
+			assert.match(text, /--message - <<'EOF'/);
+		});
+	}
+});
+
+describe("allowed: tool arguments", () => {
+	for (const command of [
+		// Single quotes, escapes, variables, plain text.
+		"tool send --message 'bitte `uebernehmen ns` und $(x)'",
+		'tool send --message "bitte \\`uebernehmen ns\\` und \\$(x)"',
+		'tool send --message "path $HOME/a and ${X}"',
+		'tool send --message "plain text"',
+		"tool send --message - <<'EOF'\nbitte `uebernehmen ns` $(x)\nEOF",
+		"tool edit - <<'EOF'\n`x` $(y)\nEOF",
+		// Substitution outside quotes is deliberate (a tool path from a command).
+		"tool read $(pwd)/a.ts",
+		"tool send --message `cat msg.txt`",
+		// The command substitution is another command's argument.
+		'echo "`date`" && tool read a.ts',
+		'tool read a.ts; git commit -m "fix `x` and $(y)"',
+		'git commit -m "tool send --message \\"`x`\\""',
+		'x="$(tool read a.ts)"',
+		'echo "tool send --message \\"`x`\\""',
+		"# tool send --message \"`x`\"",
+		"cat <<'EOF'\ntool send --message \"`x`\"\nEOF",
+		'grep "`x`" notes',
+		"",
+	]) {
+		test(JSON.stringify(command), () => assert.equal(toolQuotedArgumentRefusal(command), undefined));
+	}
 });

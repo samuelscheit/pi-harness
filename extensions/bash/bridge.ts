@@ -116,7 +116,7 @@ export function coerce(schema: Schema | undefined, raw: string, name: string): u
  * A tool's arguments from the command line: `--name value`, `--name=value`, a bare `--flag` or
  * `--no-flag` for booleans, a repeated option for arrays (or one JSON array), JSON for objects,
  * positional values for the required properties in order, and `--args <json>` (`-` reads stdin)
- * as the base the options override. Option names match properties ignoring case, `-` and `_`.
+ * as the base the options override; `-` as the value of a string argument (`--message -`) reads it from stdin too. Option names match properties ignoring case, `-` and `_`.
  * `--json` and `--help` are the command's own unless the tool has a property of that name.
  */
 export function parseArguments(schema: Schema, argv: readonly string[], stdin?: string): ParsedArguments {
@@ -129,8 +129,10 @@ export function parseArguments(schema: Schema, argv: readonly string[], stdin?: 
 	let json = false;
 	let help = false;
 
-	const set = (name: string, raw: string) => {
+	const set = (name: string, text: string) => {
 		const property = properties[name];
+		// `-` as the value of a string argument reads it from stdin (a quoted heredoc), minus the heredoc's final newline.
+		const raw = text === "-" && typesOf(property).has("string") && stdin !== undefined ? stdin.replace(/\n$/, "") : text;
 		const value = coerce(property, raw, name);
 		if (typesOf(property).has("array") && Array.isArray(args[name]) && !raw.trimStart().startsWith("[")) {
 			(args[name] as unknown[]).push(...(value as unknown[]));
