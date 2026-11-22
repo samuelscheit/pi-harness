@@ -1,5 +1,5 @@
 ---
-status: running
+status: stopped
 started: 2026-11-21T07:36:22.260Z
 source: dream
 hypothesis: Filtering and capping bash output before it enters context shrinks
@@ -7,6 +7,7 @@ hypothesis: Filtering and capping bash output before it enters context shrinks
   requests, and no information is lost since full logs stay in a file to grep.
 expectedWeeklySaving: 1100
 qualityRisk: low
+stopped: 2026-11-22T09:08:12.109Z
 ---
 
 ## Bash output budget
