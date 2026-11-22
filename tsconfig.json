@@ -12,6 +12,6 @@
 		"skipLibCheck": true,
 		"types": ["node"]
 	},
-	"include": ["extensions", "scripts", "test", "dashboard/server"],
+	"include": ["extensions", "scripts", "test", "dashboard/server", "agy"],
 	"exclude": ["extensions/workflow/api.d.ts"]
 }

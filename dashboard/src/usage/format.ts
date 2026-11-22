@@ -81,4 +81,4 @@ export function projectName(cwd: string): string {
 	return parts.length > 1 ? parts.slice(-2).join("/") : cwd || "—";
 }
 
-export const SOURCE_LABELS: Record<string, string> = { pi: "Pi", "claude-code": "Claude Code", all: "All" };
+export const SOURCE_LABELS: Record<string, string> = { pi: "Pi", agy: "Antigravity", "claude-code": "Claude Code", all: "All" };

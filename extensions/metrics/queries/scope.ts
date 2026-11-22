@@ -7,8 +7,8 @@
 
 import type { DatabaseSync, SQLInputValue, StatementSync } from "node:sqlite";
 
-export type Source = "pi" | "claude-code" | "all";
-export const SOURCES: readonly Source[] = ["pi", "claude-code", "all"];
+export type Source = "pi" | "agy" | "claude-code" | "all";
+export const SOURCES: readonly Source[] = ["pi", "agy", "claude-code", "all"];
 
 export interface Filters {
 	/** Window start in ms (inclusive); all time when undefined. */
@@ -17,7 +17,7 @@ export interface Filters {
 	end?: number;
 	/** Only sessions started in this directory. */
 	project?: string;
-	/** Pi's sessions (default), imported Claude Code ones (analysis only), or all. */
+	/** Pi's sessions (default), Antigravity (`agy`), imported Claude Code ones (analysis only), or all. */
 	source?: Source;
 	/** Only requests of this model; tables without a model keep the sessions that used it. */
 	model?: string;

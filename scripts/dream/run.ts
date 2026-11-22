@@ -164,7 +164,7 @@ async function main(): Promise<void> {
 	if (since !== undefined && Number.isNaN(since)) throw new Error(`--since: not a date: ${values.since}`);
 	const db = openStore(metricsPath());
 	try {
-		indexAll(db);
+		indexAll(db, { agy: true });
 		const result = await dream({ source: SOURCE_ROOT, db, ...(since === undefined ? {} : { since }), dryRun: values["dry-run"] === true, log: (line) => console.error(line) });
 		if (values["dry-run"]) console.log(JSON.stringify(result.deltas, null, 2));
 		console.log(result.text);

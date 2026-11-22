@@ -30,7 +30,9 @@ const KINDS = ["follow-up", "steer", "after error", "after interrupt"];
 
 interface SessionEntry {
 	id?: string;
+	step_index?: number;
 	type?: string;
+	content?: unknown;
 	message?: { role?: string; content?: unknown };
 }
 
@@ -52,7 +54,8 @@ export function precedingAgentText(sessionFile: string): Map<string, string> {
 	} catch {
 		return before;
 	}
-	for (const line of lines) {
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i]!;
 		if (!line.trim()) continue;
 		let entry: SessionEntry;
 		try {
@@ -61,17 +64,21 @@ export function precedingAgentText(sessionFile: string): Map<string, string> {
 			continue;
 		}
 		if (entry.id) before.set(entry.id, last);
+		else if (typeof entry.step_index === "number") before.set(`step-${entry.step_index}`, last);
 		if (entry.type === "message" && entry.message?.role === "assistant") {
 			const text = assistantText(entry.message.content).trim();
+			if (text) last = text;
+		} else if (entry.type === "PLANNER_RESPONSE" && typeof entry.content === "string") {
+			const text = entry.content.trim();
 			if (text) last = text;
 		}
 	}
 	return before;
 }
 
-/** Every repository a Pi session ever worked in, distinct and sorted. */
+/** Every repository a Pi or Antigravity session ever worked in, distinct and sorted. */
 export function repositories(db: DatabaseSync): string[] {
-	const rows = db.prepare("SELECT DISTINCT cwd FROM sessions WHERE source = 'pi'").all() as { cwd: string }[];
+	const rows = db.prepare("SELECT DISTINCT cwd FROM sessions WHERE source IN ('pi', 'agy') AND cwd != ''").all() as { cwd: string }[];
 	return [...new Set(rows.map((row) => repositoryRoot(row.cwd)))].sort();
 }
 
@@ -80,7 +87,7 @@ export function collect(db: DatabaseSync, since: number): Observation[] {
 	const rows = db
 		.prepare(
 			`SELECT u.session_id, u.entry_id, u.ts, u.text, s.cwd, s.file FROM user_messages u JOIN sessions s ON s.id = u.session_id
-			WHERE s.source = 'pi' AND s.prompt_digest IS NULL AND s.parent_session IS NULL AND u.ts > ? AND u.kind IN (${KINDS.map(() => "?").join(", ")})
+			WHERE s.source IN ('pi', 'agy') AND s.prompt_digest IS NULL AND s.parent_session IS NULL AND u.ts > ? AND u.kind IN (${KINDS.map(() => "?").join(", ")})
 			ORDER BY u.ts`,
 		)
 		.all(since, ...KINDS) as { session_id: string; entry_id: string; ts: number; text: string; cwd: string; file: string }[];

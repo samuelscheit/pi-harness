@@ -35,6 +35,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AGY_PLUGINS_DIRNAME, buildAgyPlugin, installPostCommitHook, installToolSymlink, registerAgyPlugin } from "../agy/build.ts";
 import { fetchGatewayListing, GATEWAY_PROVIDER, gatewayModels, readModelsJson, writeModelsJson } from "../extensions/lib/gateway.ts";
 import { piLink } from "../extensions/lib/pi-build.ts";
 import { currentLink, deploy, harnessDir } from "../extensions/lib/release.ts";
@@ -150,5 +151,17 @@ writeJson(settingsFile, {
 		economic: { model: "anthropic/claude-haiku-5-5", minSaving: COMPACTION_MIN_SAVING },
 	},
 });
+
+// Antigravity (agy) plugin, standalone `tool` CLI, and post-commit sync hook.
+const agyRoot = currentLink(agentDir);
+const agyPluginsParent = join(agyRoot, AGY_PLUGINS_DIRNAME);
+if (!existsSync(join(agyPluginsParent, "pi-harness", "plugin.json")) && existsSync(join(agyRoot, "agy", "hooks", "dispatch.ts"))) {
+	buildAgyPlugin({ harnessRoot: agyRoot, pluginsParentDir: agyPluginsParent, runtimeRoot: agyRoot });
+}
+if (existsSync(join(agyPluginsParent, "pi-harness", "plugin.json"))) {
+	registerAgyPlugin({ pluginsParentDir: agyPluginsParent });
+	installToolSymlink(agyRoot);
+	installPostCommitHook(root);
+}
 
 console.log(`${agentDir}: harness ${root} (${branch} at ${deployed.commit.slice(0, 9)}, ${currentLink(agentDir)}), gateway ${origin} (${gatewayList.length} non-Claude models), default anthropic/claude-opus-5-5`);

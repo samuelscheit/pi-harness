@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { SOURCES, type Source } from "../../extensions/metrics/queries/index.ts";
-import { CLAUDE_PROJECTS, metricsPath, needsClaude } from "../../extensions/metrics/stats.ts";
+import { CLAUDE_PROJECTS, metricsPath, needsAgy, needsClaude } from "../../extensions/metrics/stats.ts";
 import { RELEASE } from "../../extensions/lib/repository.ts";
 import { openStore } from "../../extensions/metrics/store.ts";
 import { ApiError, route } from "./api.ts";
@@ -53,6 +53,8 @@ export interface IndexStatus {
 	indexing: boolean;
 	/** Whether Claude Code transcripts were imported since the server started. */
 	claudeIndexed: boolean;
+	/** Whether Antigravity (agy) transcripts were imported since the server started. */
+	agyIndexed: boolean;
 	/** When the last index finished (ms), and what it found. */
 	lastIndexed: number | null;
 	indexed: number;
@@ -67,36 +69,38 @@ export interface IndexStatus {
 
 /** Runs index passes one at a time in a worker; a request during a pass queues one more. */
 export class Indexer {
-	readonly status: IndexStatus = { app: APP, indexing: false, claudeIndexed: false, lastIndexed: null, indexed: 0, failed: [], error: null, generation: 0, release: RELEASE?.commit ?? null, pid: process.pid };
+	readonly status: IndexStatus = { app: APP, indexing: false, claudeIndexed: false, agyIndexed: false, lastIndexed: null, indexed: 0, failed: [], error: null, generation: 0, release: RELEASE?.commit ?? null, pid: process.pid };
 	private running: Promise<void> | undefined;
-	private queued: { claude: boolean } | undefined;
-	private readonly options: { path: string; agentDir: string; claudeDir: string; onDone: () => void };
+	private queued: { claude: boolean; agy: boolean } | undefined;
+	private readonly options: { path: string; agentDir: string; claudeDir: string; agyRoots?: string[]; onDone: () => void };
 
-	constructor(options: { path: string; agentDir: string; claudeDir: string; onDone: () => void }) {
+	constructor(options: { path: string; agentDir: string; claudeDir: string; agyRoots?: string[]; onDone: () => void }) {
 		this.options = options;
 	}
 
 	/** Start a pass (or queue one after the current pass); resolves when the data includes it. */
-	refresh(claude: boolean): Promise<void> {
+	refresh(request: boolean | { claude?: boolean; agy?: boolean }): Promise<void> {
+		const claude = typeof request === "boolean" ? request : Boolean(request.claude);
+		const agy = typeof request === "boolean" ? false : Boolean(request.agy);
 		if (this.running) {
-			this.queued = { claude: claude || (this.queued?.claude ?? false) };
+			this.queued = { claude: claude || (this.queued?.claude ?? false), agy: agy || (this.queued?.agy ?? false) };
 			return this.running.then(() => this.running ?? undefined);
 		}
 		this.status.indexing = true;
-		this.running = this.pass(claude).finally(() => {
+		this.running = this.pass(claude, agy).finally(() => {
 			this.running = undefined;
 			const next = this.queued;
 			this.queued = undefined;
-			if (next) void this.refresh(next.claude);
+			if (next) void this.refresh(next);
 			else this.status.indexing = false;
 		});
 		return this.running;
 	}
 
-	private pass(claude: boolean): Promise<void> {
-		const { path, agentDir, claudeDir } = this.options;
+	private pass(claude: boolean, agy: boolean): Promise<void> {
+		const { path, agentDir, claudeDir, agyRoots } = this.options;
 		return new Promise((done) => {
-			const worker = new Worker(new URL("./index-worker.ts", import.meta.url), { workerData: { path, agentDir, claudeDir, claude } });
+			const worker = new Worker(new URL("./index-worker.ts", import.meta.url), { workerData: { path, agentDir, claudeDir, claude, agy, agyRoots } });
 			let result: { indexed: number; failed: IndexStatus["failed"] } | undefined;
 			worker.once("message", (message) => (result = message));
 			worker.once("error", (error) => (this.status.error = error.message));
@@ -106,6 +110,7 @@ export class Indexer {
 					this.status.failed = result.failed;
 					this.status.error = null;
 					if (claude) this.status.claudeIndexed = true;
+					if (agy) this.status.agyIndexed = true;
 				}
 				this.status.lastIndexed = Date.now();
 				this.status.generation += 1;
@@ -158,6 +163,7 @@ export interface DashboardOptions {
 	port?: number;
 	agentDir?: string;
 	claudeDir?: string;
+	agyRoots?: string[];
 	dist?: string;
 	/** Index on start (tests turn it off and index themselves). */
 	indexOnStart?: boolean;
@@ -173,11 +179,11 @@ export interface Dashboard {
 	close: () => Promise<void>;
 }
 
-export async function startDashboard({ port = DEFAULT_PORT, agentDir = getAgentDir(), claudeDir = CLAUDE_PROJECTS, dist = DIST, indexOnStart = true }: DashboardOptions = {}): Promise<Dashboard> {
+export async function startDashboard({ port = DEFAULT_PORT, agentDir = getAgentDir(), claudeDir = CLAUDE_PROJECTS, agyRoots, dist = DIST, indexOnStart = true }: DashboardOptions = {}): Promise<Dashboard> {
 	const path = metricsPath(agentDir);
 	const db = openStore(path);
 	const cache = new Map<string, string>();
-	const indexer = new Indexer({ path, agentDir, claudeDir, onDone: () => cache.clear() });
+	const indexer = new Indexer({ path, agentDir, claudeDir, agyRoots, onDone: () => cache.clear() });
 
 	const handle = async (req: IncomingMessage, res: ServerResponse) => {
 		const host = req.headers.host ?? "";
@@ -195,7 +201,7 @@ export async function startDashboard({ port = DEFAULT_PORT, agentDir = getAgentD
 				if (req.method !== "POST") return sendJson(res, 405, { error: "POST to refresh" });
 				const source = url.searchParams.get("source") ?? "pi";
 				if (!SOURCES.includes(source as Source)) throw new ApiError(400, `source: one of ${SOURCES.join(", ")}`);
-				const done = indexer.refresh(needsClaude(source as Source));
+				const done = indexer.refresh({ claude: needsClaude(source as Source), agy: needsAgy(source as Source) });
 				if (url.searchParams.get("wait") === "1") await done;
 				return sendJson(res, 202, indexer.status);
 			}

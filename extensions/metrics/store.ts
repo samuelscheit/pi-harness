@@ -13,6 +13,8 @@ export const SCHEMA_VERSION = 14;
 
 /** Meta key set once Claude Code transcripts were imported; it survives schema rebuilds. */
 const CLAUDE_IMPORTED = "claude_imported";
+/** Meta key set once Antigravity (agy) transcripts were imported; it survives schema rebuilds. */
+const AGY_IMPORTED = "agy_imported";
 
 const TABLES = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -22,7 +24,7 @@ CREATE TABLE sessions (
 	-- name: the session's own title when it has one (Pi's session name, Claude Code's custom title).
 	-- parent_session: the id of the session this one was forked from or started by (Pi records a path; resolved to the id).
 	id TEXT PRIMARY KEY, file TEXT NOT NULL, cwd TEXT NOT NULL, parent_session TEXT, name TEXT,
-	-- 'pi', or 'claude-code' for sessions imported for analysis only (see claude.ts).
+	-- 'pi', 'agy' (Antigravity CLI / T3 Code), or 'claude-code' for sessions imported for analysis only (see claude.ts, agy.ts).
 	source TEXT NOT NULL DEFAULT 'pi',
 	-- The cost the client itself reported for the session, when it does (Claude Code), to check ours.
 	reported_cost REAL,
@@ -164,11 +166,13 @@ export function openStore(path: string): DatabaseSync {
 	}
 	if (current !== String(SCHEMA_VERSION)) {
 		const claude = current !== undefined && heldClaude(db);
-		const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+		const agy = current !== undefined && heldAgy(db);
+		const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'sqlite_sequence'").all() as { name: string }[];
 		for (const { name } of tables) db.exec(`DROP TABLE IF EXISTS "${name}"`);
 		db.exec(TABLES);
 		db.prepare("INSERT INTO meta (key, value) VALUES ('schema', ?)").run(String(SCHEMA_VERSION));
 		if (claude) markClaudeImported(db);
+		if (agy) markAgyImported(db);
 	}
 	return db;
 }
@@ -185,10 +189,26 @@ function heldClaude(db: DatabaseSync): boolean {
 	}
 }
 
+/** Whether a store of any earlier schema held Antigravity (agy) sessions. */
+function heldAgy(db: DatabaseSync): boolean {
+	const flag = db.prepare("SELECT value FROM meta WHERE key = ?").get(AGY_IMPORTED);
+	if (flag) return true;
+	try {
+		return db.prepare("SELECT 1 FROM sessions WHERE source = 'agy' LIMIT 1").get() !== undefined;
+	} catch {
+		return false;
+	}
+}
+
 export const markClaudeImported = (db: DatabaseSync) => db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')").run(CLAUDE_IMPORTED);
 
 /** Whether Claude Code transcripts were imported into this store (also before its last rebuild). */
 export const importedClaude = (db: DatabaseSync) => db.prepare("SELECT 1 FROM meta WHERE key = ?").get(CLAUDE_IMPORTED) !== undefined;
+
+export const markAgyImported = (db: DatabaseSync) => db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')").run(AGY_IMPORTED);
+
+/** Whether Antigravity (agy) transcripts were imported into this store (also before its last rebuild). */
+export const importedAgy = (db: DatabaseSync) => db.prepare("SELECT 1 FROM meta WHERE key = ?").get(AGY_IMPORTED) !== undefined;
 
 export function deleteSession(db: DatabaseSync, sessionId: string): void {
 	for (const table of SESSION_TABLES) {

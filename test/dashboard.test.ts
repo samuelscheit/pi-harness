@@ -43,11 +43,12 @@ before(async () => {
 	dir = mkdtempSync(join(tmpdir(), "pi-dashboard-"));
 	mkdirSync(join(dir, "agent", "sessions"), { recursive: true });
 	mkdirSync(join(dir, "claude"), { recursive: true });
+	mkdirSync(join(dir, "agy"), { recursive: true });
 	mkdirSync(join(dir, "dist", "assets"), { recursive: true });
 	writeFileSync(join(dir, "dist", "index.html"), "<!doctype html><title>app</title>");
 	writeFileSync(join(dir, "dist", "assets", "app.js"), "console.log(1)");
 	writeFileSync(join(dir, "secret.txt"), "outside dist");
-	dashboard = await startDashboard({ port: 0, agentDir: join(dir, "agent"), claudeDir: join(dir, "claude"), dist: join(dir, "dist"), indexOnStart: false });
+	dashboard = await startDashboard({ port: 0, agentDir: join(dir, "agent"), claudeDir: join(dir, "claude"), agyRoots: [join(dir, "agy")], dist: join(dir, "dist"), indexOnStart: false });
 	base = dashboard.url;
 	seed(dashboard.db);
 });

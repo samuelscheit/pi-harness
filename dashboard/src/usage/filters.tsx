@@ -18,7 +18,7 @@ export const RANGES = {
 } as const;
 export type RangeKey = keyof typeof RANGES | "custom";
 export const DEFAULT_RANGE = "7d";
-const SOURCES: Source[] = ["pi", "claude-code", "all"];
+const SOURCES: Source[] = ["pi", "agy", "claude-code", "all"];
 /** Search params every link inside the dashboard carries along, so drilling down keeps the filters. */
 const SHARED_PARAMS = ["range", "start", "end", "source", "project", "model", "session"];
 // Relative ranges end "now", rounded so the query key stays stable for a minute.
@@ -170,16 +170,20 @@ export function FilterBar({ withSession = true }: { withSession?: boolean }) {
 		staleTime: 60_000,
 		placeholderData: (previous) => previous,
 	});
-	const needsClaude = filters.source !== "pi";
+	const needsClaude = filters.source === "claude-code" || filters.source === "all";
+	const needsAgy = filters.source === "agy" || filters.source === "all";
 	const claudeMissing = needsClaude && status.data && !status.data.claudeIndexed;
-	// Claude Code transcripts are imported when a view first asks for them.
-	const requested = useRef(false);
+	const agyMissing = needsAgy && status.data && !status.data.agyIndexed;
+	const sourceMissing = Boolean(claudeMissing || agyMissing);
+	// Claude Code and Antigravity transcripts are imported when a view first asks for them.
+	const requested = useRef<string | null>(null);
 	useEffect(() => {
-		if (claudeMissing && !status.data?.indexing && !requested.current) {
-			requested.current = true;
+		const key = `${claudeMissing ? "c" : ""}${agyMissing ? "a" : ""}`;
+		if (sourceMissing && !status.data?.indexing && requested.current !== key) {
+			requested.current = key;
 			void refresh(filters.source);
 		}
-	}, [claudeMissing, status.data?.indexing, refresh, filters.source]);
+	}, [sourceMissing, claudeMissing, agyMissing, status.data?.indexing, refresh, filters.source]);
 	const keys: ("project" | "model" | "session")[] = withSession ? ["project", "model", "session"] : ["project", "model"];
 	const active = keys.filter((key) => filters[key]);
 
@@ -237,7 +241,7 @@ export function FilterBar({ withSession = true }: { withSession?: boolean }) {
 				<div className="flex items-center gap-2 text-xs text-slate-500">
 					{status.data?.indexing ? (
 						<span className="inline-flex items-center gap-1.5 text-sky-300" role="status">
-							<LoaderCircle className="size-3.5 animate-spin" /> {claudeMissing ? "Importing Claude Code sessions…" : "Indexing sessions…"}
+							<LoaderCircle className="size-3.5 animate-spin" /> {agyMissing && !claudeMissing ? "Importing Antigravity sessions…" : claudeMissing ? "Importing Claude Code sessions…" : "Indexing sessions…"}
 						</span>
 					) : status.data?.lastIndexed ? (
 						<span title={status.data.failed.map((f) => `${f.path}: ${f.error}`).join("\n") || undefined}>

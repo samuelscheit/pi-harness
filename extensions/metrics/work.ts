@@ -9,9 +9,9 @@ import { type Effect, shellEffect } from "./shell.ts";
 
 export type { Effect } from "./shell.ts";
 
-const PATH_KEYS = ["path", "file_path", "filePath", "notebook_path", "file", "directory", "cwd"];
-/** Tools whose path arguments are files they write (Pi's and Claude Code's built-ins). */
-const WRITE_TOOLS = new Set(["edit", "write", "multiedit", "notebookedit"]);
+const PATH_KEYS = ["path", "file_path", "filePath", "notebook_path", "file", "directory", "cwd", "TargetFile", "AbsolutePath", "DirectoryPath", "SearchPath", "Cwd"];
+/** Tools whose path arguments are files they write (Pi's, Claude Code's, and Antigravity's built-ins). */
+const WRITE_TOOLS = new Set(["edit", "write", "multiedit", "notebookedit", "replace_file_content", "multi_replace_file_content", "write_to_file", "edit_blocks"]);
 
 const expand = (path: string, cwd: string) =>
 	resolve(cwd, path === "~" || path.startsWith("~/") ? `${homedir()}${path.slice(1)}` : path);
@@ -27,7 +27,14 @@ export function toolEffect(tool: string, args: unknown, cwd: string): Effect {
 	if (!args || typeof args !== "object") return none;
 	const record = args as Record<string, unknown>;
 	const name = tool.toLowerCase();
-	if (name === "bash") return typeof record.command === "string" ? shellEffect(record.command, cwd) : none;
+	if (name === "call_mcp_tool" && typeof record.ToolName === "string") {
+		return toolEffect(record.ToolName, record.Arguments, cwd);
+	}
+	if (name === "bash" || name === "run_command") {
+		const cmd = typeof record.command === "string" ? record.command : typeof record.CommandLine === "string" ? record.CommandLine : undefined;
+		const effectiveCwd = typeof record.Cwd === "string" && record.Cwd.trim() ? record.Cwd.trim() : cwd;
+		return cmd ? shellEffect(cmd, effectiveCwd) : none;
+	}
 	const files = PATH_KEYS.map((key) => record[key]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => expand(v.trim(), cwd));
 	if (WRITE_TOOLS.has(name)) return { files, writes: files, mutates: true };
 	// pi-lens: rewrites the given paths (or the project) only when applied, otherwise a preview.
@@ -121,6 +128,9 @@ const isTool = (name: string, tool: string) => name === tool || name.endsWith(`_
 /** A subagent start (`delegate_task`) or a message to an existing thread (`t3_thread_send`), from a tool call and its result. */
 export function delegation(tool: string, args: unknown, resultText: string): Delegation | undefined {
 	const record = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+	if (tool === "call_mcp_tool" && typeof record.ToolName === "string") {
+		return delegation(record.ToolName, record.Arguments, resultText);
+	}
 	const str = (value: unknown) => (typeof value === "string" && value ? value : undefined);
 	if (isTool(tool, "delegate_task")) {
 		const task = str(record.task);

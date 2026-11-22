@@ -4,12 +4,13 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { indexAgySessions } from "./agy.ts";
 import { indexClaudeSessions } from "./claude.ts";
 import { type IndexResult, indexSessions } from "./indexer.ts";
 import { indexLabels, LABELS_FILE } from "./labels.ts";
 import type { Filters, Source } from "./queries/index.ts";
 import { report } from "./report.ts";
-import { importedClaude, openStore } from "./store.ts";
+import { importedAgy, importedClaude, openStore } from "./store.ts";
 
 export const CLAUDE_PROJECTS = join(homedir(), ".claude", "projects");
 
@@ -18,13 +19,39 @@ export const metricsPath = (agentDir = getAgentDir()) => join(agentDir, "metrics
 /** Whether a source filter needs the Claude Code transcripts imported. */
 export const needsClaude = (source: Source | undefined) => source === "claude-code" || source === "all";
 
+/** Whether a source filter needs the Antigravity (`agy`) transcripts imported. */
+export const needsAgy = (source: Source | undefined) => source === "agy" || source === "all";
+
 /**
- * Index changed Pi sessions, and Claude Code transcripts (imported for analysis only) when asked
+ * Index changed Pi sessions, and Claude Code / Antigravity (`agy`) transcripts when asked
  * or when the store imported them before a rebuild dropped them (see store.ts), and dreaming's
  * message labels (labels.ts).
  */
-export function indexAll(db: DatabaseSync, { claude = false, agentDir = getAgentDir(), claudeDir = CLAUDE_PROJECTS, labelsFile = LABELS_FILE } = {}): IndexResult[] {
-	const results = [indexSessions(db, join(agentDir, "sessions")), ...(claude || claudeDropped(db) ? [indexClaudeSessions(db, claudeDir)] : [])];
+export function indexAll(
+	db: DatabaseSync,
+	{
+		claude = false,
+		agy = false,
+		agentDir = getAgentDir(),
+		claudeDir = CLAUDE_PROJECTS,
+		agyRoots,
+		agyDataDir,
+		labelsFile = LABELS_FILE,
+	}: {
+		claude?: boolean;
+		agy?: boolean;
+		agentDir?: string;
+		claudeDir?: string;
+		agyRoots?: readonly string[];
+		agyDataDir?: string;
+		labelsFile?: string;
+	} = {},
+): IndexResult[] {
+	const results = [
+		indexSessions(db, join(agentDir, "sessions")),
+		...(claude || claudeDropped(db) ? [indexClaudeSessions(db, claudeDir)] : []),
+		...(agy || agyDropped(db) ? [indexAgySessions(db, { roots: agyRoots, dataDir: agyDataDir })] : []),
+	];
 	indexLabels(db, labelsFile);
 	// Planner statistics: without them a time window scans every source's requests by time instead
 	// of the few sessions in scope (2 s instead of 60 ms for Pi's sessions next to Claude Code's).
@@ -37,10 +64,14 @@ export function indexAll(db: DatabaseSync, { claude = false, agentDir = getAgent
 const claudeDropped = (db: DatabaseSync) =>
 	importedClaude(db) && db.prepare("SELECT 1 FROM sessions WHERE source = 'claude-code' LIMIT 1").get() === undefined;
 
+/** Whether Antigravity transcripts were imported but none are in the store: a schema rebuild dropped them. */
+const agyDropped = (db: DatabaseSync) =>
+	importedAgy(db) && db.prepare("SELECT 1 FROM sessions WHERE source = 'agy' LIMIT 1").get() === undefined;
+
 export function stats(filters: Filters, agentDir = getAgentDir()): string {
 	const db = openStore(metricsPath(agentDir));
 	try {
-		const indexed = indexAll(db, { claude: needsClaude(filters.source), agentDir });
+		const indexed = indexAll(db, { claude: needsClaude(filters.source), agy: needsAgy(filters.source), agentDir });
 		const failures = indexed.flatMap((i) => i.failed).map((f) => `could not index ${f.path}: ${f.error}`);
 		return [report(db, filters), ...failures].join("\n\n");
 	} finally {

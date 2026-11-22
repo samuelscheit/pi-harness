@@ -217,7 +217,10 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { AGY_PLUGINS_DIRNAME, registerAgyPlugin } from "../agy/build.ts";
+import { currentLink } from "../extensions/lib/release.ts";
 import { packedFiles, readFile, readHeader, replaceFiles } from "./lib/asar.ts";
 
 export interface Patch {
@@ -1616,4 +1619,9 @@ export function launchAgent(options: { node: string; script: string; app: string
 if (import.meta.url === `file://${process.argv[1]}`) {
 	const app = process.argv[2] ?? "/Applications/T3 Code (Nightly).app";
 	console.log(`${new Date().toISOString()} ${await keepPatched(app)}`);
+	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent");
+	const agyPluginsParent = join(currentLink(agentDir), AGY_PLUGINS_DIRNAME);
+	if (existsSync(join(agyPluginsParent, "pi-harness", "plugin.json"))) {
+		registerAgyPlugin({ pluginsParentDir: agyPluginsParent });
+	}
 }

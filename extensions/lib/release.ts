@@ -32,6 +32,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { AGY_PLUGIN_NAME, AGY_PLUGINS_DIRNAME, buildAgyPlugin, validateAgyPlugin } from "../../agy/build.ts";
 import { acquireLock, pidAlive } from "./lock.ts";
 import { buildPi, builtPi as builtPiIn, ensurePiBuild, prunePiBuilds, releasePi, switchPi } from "./pi-build.ts";
 import { RELEASE_MARKER, type ReleaseMarker } from "./repository.ts";
@@ -122,17 +123,28 @@ export async function refFiles(source: string, branch: string): Promise<string[]
 	return paths.map((path) => join(source, path));
 }
 
-/** Every extension entry point imports in a fresh Node process; throws with its output otherwise. */
+/** Every extension (and agy) entry point imports in a fresh Node process; throws with its output otherwise. */
 export async function importCheck(root: string): Promise<void> {
 	const entries = readdirSync(join(root, "extensions"))
 		.map((name) => join(root, "extensions", name, "index.ts"))
 		.filter((path) => existsSync(path));
+	for (const rel of ["agy/hooks/dispatch.ts", "agy/mcp/server.ts", "agy/mcp/protocol.ts", "agy/build.ts"]) {
+		const path = join(root, rel);
+		if (existsSync(path)) entries.push(path);
+	}
 	const script = `for (const f of ${JSON.stringify(entries)}) { try { await import(f); } catch (e) { console.error(f + ": " + (e && e.stack || e)); process.exitCode = 1; } }`;
 	try {
 		await exec(process.execPath, ["--input-type=module", "-e", script], { cwd: root, timeout: VALIDATE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
 	} catch (error) {
 		const e = error as { stderr?: string; message: string };
 		throw new Error((e.stderr || e.message).trim().split("\n").slice(0, 20).join("\n"));
+	}
+	const agyPluginDir = join(root, AGY_PLUGINS_DIRNAME, AGY_PLUGIN_NAME);
+	if (existsSync(agyPluginDir)) {
+		const validation = validateAgyPlugin(agyPluginDir);
+		if (validation.status === "failed") {
+			throw new Error(`agy plugin validation failed:\n${validation.output}`);
+		}
 	}
 }
 
@@ -224,7 +236,7 @@ export async function deploy({ source, branch, agentDir, validate = importCheck,
 			if (!existsSync(target)) {
 				rmSync(temporary, { recursive: true, force: true });
 				mkdirSync(temporary, { recursive: true });
-				await extract(source, branch, commit, temporary, pi);
+				await extract(source, branch, commit, temporary, pi, agentDir);
 				await validate(temporary);
 				try {
 					renameSync(temporary, target);
@@ -262,9 +274,10 @@ async function untar(archive: Buffer, dir: string): Promise<void> {
 
 /**
  * Extract `commit` (without vendor/) into `dir`, link the unversioned parts (node_modules to the Pi
- * build `pi`, whose workspace packages are the commit's Pi) and write the marker.
+ * build `pi`, whose workspace packages are the commit's Pi), build the native agy plugin if present,
+ * and write the marker.
  */
-async function extract(source: string, branch: string, commit: string, dir: string, pi: string): Promise<void> {
+async function extract(source: string, branch: string, commit: string, dir: string, pi: string, agentDir: string): Promise<void> {
 	await untar(await git(source, "archive", "--format=tar", commit, "--", ".", ":(exclude)vendor"), dir);
 	const links: [string, string][] = [...LINKS.map((path): [string, string] => [path, join(source, path)]), ["node_modules", join(pi, "node_modules")]];
 	for (const [path, target] of links) {
@@ -272,6 +285,13 @@ async function extract(source: string, branch: string, commit: string, dir: stri
 		rmSync(join(dir, path), { recursive: true, force: true });
 		mkdirSync(join(dir, path, ".."), { recursive: true });
 		symlinkSync(target, join(dir, path));
+	}
+	if (existsSync(join(dir, "agy", "hooks", "dispatch.ts")) && existsSync(join(dir, "prompt"))) {
+		buildAgyPlugin({
+			harnessRoot: dir,
+			pluginsParentDir: join(dir, AGY_PLUGINS_DIRNAME),
+			runtimeRoot: currentLink(agentDir),
+		});
 	}
 	const subject = (await git(source, "log", "-1", "--format=%s", commit)).toString("utf8").trim();
 	const marker: ReleaseMarker = { commit, source, branch, subject, deployedAt: new Date().toISOString() };
