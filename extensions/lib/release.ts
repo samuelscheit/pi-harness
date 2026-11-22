@@ -31,6 +31,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { AGY_PLUGIN_NAME, AGY_PLUGINS_DIRNAME, buildAgyPlugin, validateAgyPlugin } from "../../agy/build.ts";
 import { acquireLock, pidAlive } from "./lock.ts";
@@ -287,7 +288,9 @@ async function extract(source: string, branch: string, commit: string, dir: stri
 		symlinkSync(target, join(dir, path));
 	}
 	if (existsSync(join(dir, "agy", "hooks", "dispatch.ts")) && existsSync(join(dir, "prompt"))) {
-		buildAgyPlugin({
+		const targetBuild = join(dir, "agy", "build.ts");
+		const mod = existsSync(targetBuild) ? ((await import(pathToFileURL(targetBuild).href)) as { buildAgyPlugin?: typeof buildAgyPlugin }) : undefined;
+		(mod?.buildAgyPlugin ?? buildAgyPlugin)({
 			harnessRoot: dir,
 			pluginsParentDir: join(dir, AGY_PLUGINS_DIRNAME),
 			runtimeRoot: currentLink(agentDir),
