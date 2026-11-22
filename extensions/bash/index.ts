@@ -30,6 +30,9 @@
 // pipeline) to `<file>.jobs` when the shell exits and before a `disown`. A command's own EXIT trap
 // runs as well (`trap` is wrapped to chain it, with the exit status in `$?`). The transcript keeps
 // the original command (Pi hands tool_call handlers a copy).
+//
+// Git in the tool's shells runs without fsmonitor (git-env.ts), and the `index.lock` a killed
+// call's git left is removed (locks.ts).
 
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,7 +46,9 @@ import { ungatedRefusal } from "./checks.ts";
 import { changeEnds, changeStarts, commitRefusal, dropSessionFiles, sessionFiles, toolPath } from "./commit.ts";
 import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
 import { gateRefusal } from "./gate.ts";
+import { withGitConfig } from "./git-env.ts";
 import { gitRefusal } from "./git.ts";
+import { locksText, removeStaleLocks, wasKilled, workDirs } from "./locks.ts";
 import { headRefusal } from "./head.ts";
 import { killRefusal } from "./kill.ts";
 import { toolHeredocRefusal, toolQuotedArgumentRefusal } from "./heredoc.ts";
@@ -134,7 +139,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 	const groupFile = (id: string, callId: string) => join(sessionDir(id), encodeURIComponent(callId));
 	const ps = options.ps ?? defaultPs;
 	const pollMs = options.pollMs ?? POLL_MS;
-	const builtin = createBashToolDefinition(process.cwd());
+	const builtin = createBashToolDefinition(process.cwd(), { spawnHook: (spawn) => ({ ...spawn, env: withGitConfig(spawn.env) }) });
 	const binDir = toolBinDir();
 
 	setProcessGroupOf("bash", (sessionId, callId) => readGroup(groupFile(sessionId, callId)));
@@ -206,6 +211,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 			const line = recordLine(groupFile(sessionId, callId));
 			if (!params.command.startsWith(line)) return builtin.execute(callId, params, signal, onUpdate, ctx);
 			const command = params.command.slice(line.length);
+			const startedAt = Date.now();
 			const bridge = await openBridge(ctx as ExtensionToolContext, signal, binDir, sessionJobs(sessionId), pollMs);
 			let outcome: { result: Awaited<ReturnType<typeof builtin.execute>> } | { error: unknown };
 			try {
@@ -219,7 +225,8 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 				untracked = adopted.untracked;
 				return adopted;
 			});
-			const notes = [...(left.length ? [leftText(left)] : []), ...(untracked.length ? [untrackedText(untracked)] : [])];
+			const locks = "error" in outcome && wasKilled(outcome.error, signal) ? await removeStaleLocks(workDirs(command, ctx.cwd), startedAt).catch(() => []) : [];
+			const notes = [...(left.length ? [leftText(left)] : []), ...(untracked.length ? [untrackedText(untracked)] : []), ...(locks.length ? [locksText(locks)] : [])];
 			const note = notes.length ? notes.join("\n\n") : undefined;
 			if ("error" in outcome) {
 				if (!note) throw outcome.error;

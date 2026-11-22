@@ -29,6 +29,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { commandsIn, type GitCommand, gitCommand, gitOptions, refusalText } from "./commands.ts";
+import { withGitConfig } from "./git-env.ts";
 
 /** The variable that runs a refused commit after its changes were checked. */
 export const COMMIT_CHECKED = "PI_COMMIT_CHECKED";
@@ -90,10 +91,10 @@ export function canonical(path: string): string {
 	}
 }
 
-/** Runs git; undefined when it fails. */
+/** Runs git (without fsmonitor, as the tool's shells: git-env.ts); undefined when it fails. */
 export function git(dir: string, args: string[]): string | undefined {
 	try {
-		return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 });
+		return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: withGitConfig(process.env), stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 * 1024 });
 	} catch {
 		return undefined;
 	}

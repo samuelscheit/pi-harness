@@ -4,8 +4,8 @@
 // long command moves to the background and its end wakes the session.
 
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
@@ -491,6 +491,63 @@ describe("shared checkouts", () => {
 		assert.match(texts[1]!, /^Not run: this command reads a commit or tag message from a file:\n- `GIT_AUTHOR_NAME=t [^`]* git commit -qF '/);
 		assert.equal(repoGit("diff", "--cached", "--name-only"), "", "the refused command's git add did not run");
 		assert.equal(texts[2], "feat: mine\n\n## Why\nbody\n\n");
+	});
+
+	test("git in the tool's shells runs without fsmonitor, the user's GIT_CONFIG_COUNT entries kept: a repository with core.fsmonitor=true shows the edit and starts no daemon", async () => {
+		initRepo();
+		repoGit("config", "core.fsmonitor", "true");
+		const user = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "from-user" };
+		const saved = Object.fromEntries(Object.keys(user).map((key) => [key, process.env[key]]));
+		Object.assign(process.env, user);
+		try {
+			const s = await newSession(FOREGROUND_MS);
+			respond(bash("printf 'edited\\n' > a.ts && git config --get core.fsmonitor && git config --get user.name && GIT_TRACE_FSMONITOR=1 git status --short 2>&1; git fsmonitor--daemon status || echo no-daemon"), fauxAssistantMessage("ok"));
+			await s.prompt("status");
+			assert.match(toolTexts(s)[0]!, /^false\nfrom-user\n M a\.ts\nfsmonitor-daemon is not watching '[^']+'\nno-daemon\n$/, "no fsmonitor trace, no daemon left running (it would be named in the result)");
+			// Without the tool's environment the same status starts the daemon: the repository does use fsmonitor.
+			repoGit("status", "--short");
+			assert.match(repoGit("fsmonitor--daemon", "status"), /is watching/);
+		} finally {
+			for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : (process.env[key] = value);
+			spawnSync("git", ["-C", join(dir, "repo"), "fsmonitor--daemon", "stop"]);
+		}
+	});
+
+	test("a call killed by its timeout removes the index.lock its git left (a worktree's too) and names it; a held lock, an older one, and one of a call that was not killed stay", async () => {
+		initRepo();
+		const wt = join(dir, "wt");
+		repoGit("worktree", "add", "-q", wt, "-b", "wt");
+		const [mainLock, wtLock] = [repoFile(".git/index.lock"), repoFile(".git/worktrees/wt/index.lock")];
+		const s = await newSession(FOREGROUND_MS);
+		const run = async (command: string, timeout?: number) => {
+			respond(bash(command, timeout), fauxAssistantMessage("ok"));
+			await s.prompt("go");
+			return toolTexts(s).at(-1)!;
+		};
+
+		const own = await run(`cd '${wt}' && touch "$(git rev-parse --absolute-git-dir)/index.lock" && sleep 9`, 1);
+		assert.match(own, /Command timed out after 1 seconds\n\nRemoved the git index lock this killed command's git left behind [^\n]*:\n- `([^`]+)`$/);
+		assert.equal(/- `([^`]+)`$/.exec(own)![1], realpathSync(join(dir, "repo", ".git", "worktrees", "wt")) + "/index.lock");
+		assert.ok(!existsSync(wtLock));
+
+		const holder = spawn("sh", ["-c", 'exec 3>>"$1"; echo ready; exec sleep 60', "sh", mainLock], { stdio: ["ignore", "pipe", "ignore"] });
+		try {
+			await new Promise((ready) => holder.stdout.once("data", ready));
+			const held = await run("touch .git/index.lock; sleep 9", 1);
+			assert.match(held, /Command timed out after 1 seconds$/, "a lock another process holds is not removed");
+			assert.ok(existsSync(mainLock));
+		} finally {
+			holder.kill("SIGKILL");
+		}
+
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(mainLock, old, old);
+		assert.match(await run("git status --short; sleep 9", 1), /Command timed out after 1 seconds$/, "a lock from before the call is not removed");
+		assert.ok(existsSync(mainLock));
+		rmSync(mainLock);
+
+		assert.match(await run("touch .git/index.lock; exit 1"), /Command exited with code 1$/, "a call that was not killed removes nothing");
+		assert.ok(existsSync(mainLock));
 	});
 });
 
