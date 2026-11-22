@@ -21,9 +21,14 @@ describe("compileAgyRules", () => {
 		assert.ok(compiled.bytes > 1000, "should include real prompt content");
 		assert.ok(compiled.bytes <= MAX_AGY_RULE_BYTES, `expected <= ${MAX_AGY_RULE_BYTES} bytes, got ${compiled.bytes}`);
 		assert.equal(compiled.truncated.length, 0, "real harness rules should fit without truncation");
+		assert.ok(compiled.sections.some((s) => s.name === "base"));
 		assert.ok(compiled.sections.some((s) => s.name === "working-rules"));
 		assert.ok(compiled.sections.some((s) => s.name === "pi-harness-tools"));
 		assert.match(compiled.content, /pi-harness/i);
+		assert.ok(compiled.content.includes("`ask_question`"), "prompt/base.md should adapt ask_user to ask_question");
+		assert.ok(!compiled.content.includes("`ask_user`"), "Pi-only ask_user name should not leak into agy rules");
+		assert.ok(!compiled.content.includes("wait_minutes: 0"), "Pi-only wait_minutes hint should be removed");
+		assert.ok(!compiled.content.includes("no `file://`"), "conflicting file:// link rule should be removed");
 	});
 
 	test("honors targets/harnesses frontmatter and skips pi-only rules", () => {

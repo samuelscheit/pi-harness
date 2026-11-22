@@ -47,6 +47,17 @@ function targetsAllowAgy(file: string): boolean {
 }
 
 /**
+ * Lightly adapt Pi-only tool names or conflicting link syntax in `prompt/base.md` so the
+ * core behavioral instructions stay accurate inside `agy`.
+ */
+function adaptBaseForAgy(body: string): string {
+	return body
+		.replaceAll("`ask_user`", "`ask_question`")
+		.replace(" The call waits for the answer; pass `wait_minutes: 0` when you have other work that does not depend on it.", "")
+		.replace(" Link local files as [name](/abs/path/file.ts:12): absolute path, optional single line number, no backticks, no `file://`.", "");
+}
+
+/**
  * Lightly adapt Pi-only tool names in rule bodies so instructions stay accurate inside `agy`
  * without altering the meaning of the rule.
  */
@@ -78,11 +89,20 @@ The following tools and safety guards from \`pi-harness\` are active in this ses
 - **\`pi-lens\`** (MCP): LSP diagnostics, symbol navigation, and structural search configured with the harness's layered \`config/pi-lens.json\` + \`.pi/pi-lens.json\`.
 - **Git & shell guards (\`PreToolUse\`)**: Destructive whole-tree git commands (\`git stash\`, \`git reset --hard\`, \`git clean -f\`, whole-tree \`checkout\`/\`restore\`), commit message files (\`git commit -F <file>\`, use \`-F - <<'EOF'\`), \`setsid\`, commits containing edits your tools did not make (override after \`git diff\` with \`PI_COMMIT_CHECKED=1 git commit …\`), and idle \`t3_thread_wait\` loops are refused automatically.`;
 
-/** Compile `prompt/AGENTS.md` + `prompt/rules/*.md` into Antigravity's consolidated `rules/AGENTS.md`. */
+/** Compile `prompt/base.md` + `prompt/AGENTS.md` + `prompt/rules/*.md` into Antigravity's consolidated `rules/AGENTS.md`. */
 export function compileAgyRules(harnessRoot = HARNESS_ROOT, maxBytes = MAX_AGY_RULE_BYTES): CompiledRules {
 	const sections: CompiledRuleSection[] = [];
 	const skipped: { name: string; reason: string }[] = [];
 	const truncated: string[] = [];
+
+	const baseFile = join(harnessRoot, "prompt", "base.md");
+	if (existsSync(baseFile)) {
+		const raw = readFileSync(baseFile, "utf8").trim();
+		if (raw) {
+			const text = adaptBaseForAgy(raw);
+			sections.push({ name: "base", text, hash: sha(text) });
+		}
+	}
 
 	const agentsFile = join(harnessRoot, "prompt", "AGENTS.md");
 	if (existsSync(agentsFile)) {
@@ -111,7 +131,7 @@ export function compileAgyRules(harnessRoot = HARNESS_ROOT, maxBytes = MAX_AGY_R
 		sections.push({ name: rule.name, text, hash: sha(text) });
 	}
 
-	const header = "# pi-harness Rules\n\n<!-- Generated from pi-harness prompt/AGENTS.md and prompt/rules/*.md. Edit in pi-harness and commit to sync. -->\n";
+	const header = "# pi-harness Rules\n\n<!-- Generated from pi-harness prompt/base.md, prompt/AGENTS.md, and prompt/rules/*.md. Edit in pi-harness and commit to sync. -->\n";
 	const kept: CompiledRuleSection[] = [];
 	let content = header;
 	for (const section of sections) {
