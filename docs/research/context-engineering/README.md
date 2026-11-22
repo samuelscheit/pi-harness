@@ -12,6 +12,8 @@ Researched 2026-11-12. This file condenses six detailed reports, which together 
 | 06 | [Harness implementations](06-harness-implementations.md) | source-level comparison of Pi, Codex, Claude Code, Gemini CLI, opencode, OpenHands, Aider, Cline/Roo, Goose, Continue, Amp, Cursor, Factory, (mini-)SWE-agent, smolagents |
 | 07 | [Evidence from our sessions](07-evidence-from-our-sessions.md) | each candidate measured on 1,616 of our own sessions ($21k): simulations, labelled corrections, recurring rules. **Overrides the ranking below where they disagree.** |
 | 08 | [Thinking and cache-loss events](08-thinking-and-cache-loss.md) | replayed thinking is 8–11% of Pi spend (the metrics overstate it ~2×); 77% of cache-loss waste came from pi-lens's in-memory injection ledger (fixed) |
+| 09 | [Turn reduction techniques](09-turn-reduction-techniques.md) | parallel calls, script/programmatic tool calling, CodeAct, plan-then-execute, edit formats, tool design, turn budgets, wasted-step studies, exploration subagents |
+| 10 | [Turns in our sessions](10-turns-in-our-sessions.md) | 176k Pi turns: 85% of a turn's cost is re-reading context, 95% of tool turns make one call despite the batching rule, 57% of serial explore turns judged avoidable (~15% of spend), goal `wait` wastes a closing turn (2.3%) |
 
 ## The model in one paragraph
 
