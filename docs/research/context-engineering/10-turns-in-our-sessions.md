@@ -14,6 +14,7 @@ A **turn** is one model request in the tool loop, not one user prompt. A **packa
 - **The "next slice of the same file" pattern is 15% of serial-explore pairs.** The agent reads a file through `sed -n` in small ranges, one turn per slice. 87% of these were judged "wider": one larger read would have done.
 - **Goal `wait` costs a model turn just to stop.** After 3,879 `wait` calls the model wrote only a closing line, a ~410-token text-only turn ($414, 2.3% of spend). The tool could end the run itself.
 - **The redundancy the literature reports is small here.** Identical read-only calls with nothing changed since are 1.1% of turns. Rereads of unchanged files are 0.5%. Check runs repeated with no change are 156 of 4,814. Edits fail 1.8% of the time with `edit` and 2.7% with `tool edit -`. The Purdue study's prompt rules and a "test unchanged" detector would buy little here.
+- **A Haiku explorer subagent could be the largest lever.** If every explore run of 2+ turns became one call to a Haiku subagent, Opus would skip ~64k turns. That saves $4.9k (27% of spend) for about $60 of Haiku. 80% of the saving is in mid-task runs, not the opening orientation. Carrying raw explore results costs a further $5.8k, which a digest could partly save. This is an upper bound, assuming full adoption and no re-checking (§8).
 - **The batching tools are rarely used.** 8.9% of bash calls use `tool <name>`, `workflow` appears in 0.2% of turns, and `fix_loop` and `codemode` in under 0.1%.
 
 ## Data and method
@@ -167,6 +168,42 @@ Typical cases:
 
 Scaled to the 63,994 serial-explore turns, 57% (52–63%) is about 36,700 turns, 21% of all turns. Their re-read cost is about $2,840, 15.6% of spend, and about 92 hours of model time at 9.1 s per turn. This is an upper bound on the saving. Batched calls return their results together, so the merged turn's context grows by the same amount. Wider reads add lines the agent would not have read, and those lines are re-read by every later turn. The judge also sees only truncated results, and it cannot tell whether the agent's plan really existed before the first result came back.
 
+## 8. Exploration handed to a cheap subagent (simulation)
+
+The idea: when the main model needs context, it asks a clean Haiku 5.5 subagent once. The subagent explores in its own small context and returns the context itself (a digest), or paths and line ranges that the harness reads and returns as one tool result. The main model pays for one turn instead of the whole run.
+
+The simulation replaces every explore run of a package (consecutive explore-only turns) with one subagent call. The main model keeps one turn per run and saves the re-read of the others. Haiku pays at its own rates for each turn of the run: a 15k-token prompt plus the results gathered so far, at $0.01/M cache read, $0.13/M write and $0.50/M output (Opus 5.5: $0.20, $7.07 and $20). "Opening" runs come before the package's first file change. "Mid-task" runs come after it.
+
+| position | run length | runs | turns | main-model saving | Haiku cost | net | median result tokens | cost of carrying results |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| opening | 1 | 1,341 | 1,341 | $0 | $0.65 | −$0.65 | 0k | $68 |
+| opening | 2–3 | 1,206 | 2,887 | $131 | $1.80 | $129 | 3k | $241 |
+| opening | 4–7 | 745 | 3,833 | $212 | $2.89 | $209 | 10k | $321 |
+| opening | 8+ | 783 | 13,472 | $711 | $15.40 | $696 | 39k | $1,195 |
+| mid-task | 1 | 13,000 | 13,000 | $0 | $5.70 | −$5.70 | 1k | $561 |
+| mid-task | 2–3 | 8,567 | 19,957 | $1,056 | $9.24 | $1,047 | 2k | $998 |
+| mid-task | 4–7 | 4,040 | 19,977 | $1,454 | $10.14 | $1,444 | 5k | $1,169 |
+| mid-task | 8+ | 1,588 | 21,280 | $1,435 | $15.61 | $1,420 | 16k | $1,921 |
+
+Runs of 2+ turns: net $4,944 (27.0% of spend). That is the whole serial-explore re-read from §4, including the 43% of turns the judge called dependent: the subagent follows those references itself. Haiku's share is about 1% of the saving. Carrying the raw results in the main context costs another $5,845 over their lifetime. This overlaps the turn saving, because a saved turn's re-read also covers those results. Single-turn runs gain nothing. Calling the subagent for them only adds a turn's latency.
+
+**Three points matter more than the price:**
+
+- **Mid-task, not orientation.** 80% of the saving comes from runs after the first edit, which ask a question the main model formed while working ("where else is this called", "what does this return"). A single context-gathering pass at the start cannot capture that. The subagent has to be cheap to call again and again, best as one explorer per session that is resumed so its cache stays warm and it remembers what it has already read.
+- **Digest vs paths.**
+  - A digest saves the carrying cost too, but it is lossy. Haiku's mistakes become the main model's beliefs, and the main model still needs the exact text before an `edit`.
+  - Paths that the harness reads keep the content exact. Haiku can then only select badly, not misstate, but the results are as large as today's.
+  - The Purdue study ([09](09-turn-reduction-techniques.md) §8) is the warning here: richer pushed context cut Claude Code's tool calls 27–31% but *raised* cost 8–28%, because the injected output was verbose.
+  - The hybrid limits both risks: a short answer plus ranked ranges, which the harness reads under a token budget and dedupes against ranges already in context.
+- **Adoption.** A prompt rule alone has not changed how the model explores (§2: batching fell after the rule; `workflow` and `codemode` appear in under 0.2% of turns). An explorer tool needs either a strong rule tested as an experiment, or a harness nudge. For example, the result of a second consecutive explore-only turn could carry a one-line hint to ask the explorer.
+
+**Evidence from elsewhere:**
+
+- Claude Code's built-in Explore subagent (Haiku by default) is this design. Our imported transcripts cannot test it: of 38 Explore calls, 35 ran async, and the 3 synchronous ones ran on Opus.
+- SWE-grep ([09](09-turn-reduction-techniques.md) §8) shows a fast, RL-trained retriever doing in 4 turns what serial search does in 10–20, but its quality numbers are internal.
+
+So the 27% is an upper bound that assumes the main model calls the explorer for every multi-turn run and never re-explores what it got back. Rereads of returned ranges in arm B are the metric that shows how far the bound falls.
+
 ## 7. What this means: ranked recommendations
 
 | # | change | turns saved | spend saved | certainty | effort |
@@ -176,6 +213,7 @@ Scaled to the 63,994 serial-explore turns, 57% (52–63%) is about 36,700 turns,
 | 3 | Rewrite the batching rule the way Anthropic words its nudge ("err on the side of maximizing parallel calls", with read-only examples), and A/B test it, judged by calls per tool turn and the §6 independent share | ≤ 21.8k (≤ 12%) | ≤ $1.7k | the current wording measurably failed; the new wording is untested | small + experiment |
 | 4 | Make scripted exploration the default path for multi-step reading (Factory Script mode: 10 → 5 model calls on a coding task, [09](09-turn-reduction-techniques.md) §2): the prompt should name concrete exploration scripts (`for f in …; do sed -n …; done`, `tool read` chains) rather than only edit+check | overlaps 2–3 | – | vendor evidence only | small |
 | 5 | Child sessions: give delegated tasks the context they need (paths, entry points) in the brief, so a child does not spend its first explore run rediscovering what the parent knew; measure child turns per package before and after | unknown | most spend is here | untested | small |
+| 5b | Explorer subagent (§8): an `explore(question)` tool backed by a resumed Haiku 5.5 child per session, returning a short answer plus ranges that the harness reads under a token budget, deduped against the context; available to delegated children too; A/B tested | ≤ 64k (≤ 36%) | ≤ $4.9k (27%), minus re-exploration | simulated upper bound; Haiku recall untested | medium |
 | 6 | Do not build: a "test unchanged" detector, prompt rules against rereads, edit-error recovery, or turn caps. Each targets ≤ 1% of turns here, or has no evidence ([09](09-turn-reduction-techniques.md) §6–7) | – | – | measured small | – |
 
 Do 1 now: it is certain and needs no experiment. Run 2 and 3 as one experiment, since both act on explore turns and will interact. Judge it by turns per package and cost per package, with the children's turns included, and use the judge script on arm B's serial-explore pairs to see whether the independent share falls. Re-run `turns.ts` a week after any change to see whether the 95% single-call share moves at all.

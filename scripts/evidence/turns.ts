@@ -53,6 +53,8 @@ interface Call {
 	mutates: boolean;
 	kind: Kind;
 	durationMs: number | null;
+	tokens: number;
+	lifetime: number; // what the result cost while it stayed in context (tool_results.lifetime_cost)
 }
 
 const CHECK = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|check|typecheck|tsc|verify|ci)\b|npx\s+(?:tsc|vitest|jest|eslint|biome|playwright)|vitest|jest\b|pytest|python3?\s+-m\s+(?:pytest|unittest|mypy)|\btsc\b|cargo\s+(?:test|build|check|clippy)|go\s+(?:test|build|vet)|\bmake\b|eslint|biome\s+(?:check|lint|ci)|ruff\s+check|mypy|node\s+--test|swift\s+(?:build|test)|xcodebuild|gradlew?|flutter\s+(?:test|analyze)|dart\s+analyze|lake\s+build|tox\b)/;
@@ -109,7 +111,7 @@ for (const r of db
 
 let assigned = 0;
 for (const c of db
-	.prepare("SELECT session_id, call_id, ts, tool, summary, is_error, mutates, duration_ms FROM tool_results WHERE session_id IN (SELECT id FROM sessions WHERE source = 'pi') ORDER BY session_id, ts")
+	.prepare("SELECT session_id, call_id, ts, tool, summary, is_error, mutates, duration_ms, tokens, lifetime_cost FROM tool_results WHERE session_id IN (SELECT id FROM sessions WHERE source = 'pi') ORDER BY session_id, ts")
 	.iterate() as Iterable<Record<string, any>>) {
 	const turns = bySession.get(c.session_id);
 	if (!turns) continue;
@@ -120,7 +122,7 @@ for (const c of db
 		else hi = mid - 1;
 	}
 	if (at < 0) continue;
-	turns[at].calls.push({ id: c.call_id, ts: c.ts, tool: c.tool, summary: c.summary, error: !!c.is_error, mutates: !!c.mutates, kind: callKind(c.tool, c.summary, !!c.mutates), durationMs: c.duration_ms });
+	turns[at].calls.push({ id: c.call_id, ts: c.ts, tool: c.tool, summary: c.summary, error: !!c.is_error, mutates: !!c.mutates, kind: callKind(c.tool, c.summary, !!c.mutates), durationMs: c.duration_ms, tokens: c.tokens, lifetime: c.lifetime_cost });
 	assigned++;
 }
 
@@ -361,6 +363,54 @@ table(["mechanism", "calls", "share"], [
 	["fix_loop calls", int(toolCalls.filter((c) => c.tool === "fix_loop").length), pct(all.filter((t) => t.calls.some((c) => c.tool === "fix_loop")).length, all.length) + " of turns"],
 	["codemode calls", int(toolCalls.filter((c) => c.tool === "codemode").length), pct(all.filter((t) => t.calls.some((c) => c.tool === "codemode")).length, all.length) + " of turns"],
 ]);
+
+// ---------- 6. explore runs handed to a cheap subagent ----------
+
+// Simulation: every explore run of a package (consecutive explore-only turns) becomes one call to a
+// fresh Haiku subagent. The main model keeps one turn per run (the call) and saves the re-read of
+// the others. Haiku pays per turn for its own small context: a fixed prompt plus the results it has
+// gathered so far, at Haiku 5.5's cache rates, plus ~300 output tokens per turn. "Opening" runs come
+// before the package's first file change (orientation, the part a brief can name up front); "mid-task"
+// runs come after one. Carrying the results costs the main model what tool_results.lifetime_cost
+// says; returning a digest instead of raw results saves part of that.
+{
+	const HAIKU = { read: 0.01e-6, write: 0.13e-6, output: 0.5e-6, prompt: 15_000, outputTokens: 300 };
+	console.log(`## 6. Explore runs as subagent candidates\n`);
+	type Run = { opening: boolean; turns: Turn[] };
+	const runs: Run[] = [];
+	for (const p of packages) {
+		let edited = false, cur: Run | undefined;
+		for (const t of p.turns) {
+			const k = turnKind(t);
+			if (k === "explore") (cur ??= (runs.push({ opening: !edited, turns: [] }), runs[runs.length - 1])).turns.push(t);
+			else cur = undefined;
+			if (t.calls.some((c) => c.mutates)) edited = true;
+		}
+	}
+	const haikuCost = (r: Run) => {
+		let gathered = 0, cost = 0;
+		for (const t of r.turns) {
+			const got = sum(t.calls.map((c) => c.tokens));
+			cost += (HAIKU.prompt + gathered) * HAIKU.read + got * HAIKU.write + HAIKU.outputTokens * HAIKU.output;
+			gathered += got;
+		}
+		return cost;
+	};
+	const rows: (string | number)[][] = [];
+	for (const opening of [true, false])
+		for (const [label, lo, hi] of [["1", 1, 1], ["2–3", 2, 3], ["4–7", 4, 7], ["8+", 8, Infinity]] as const) {
+			const rs = runs.filter((r) => r.opening === opening && r.turns.length >= lo && r.turns.length <= hi);
+			const saved = sum(rs.map((r) => sum(r.turns.slice(1).map((t) => t.overhead))));
+			const haiku = sum(rs.map(haikuCost));
+			const carry = sum(rs.flatMap((r) => r.turns.flatMap((t) => t.calls.map((c) => c.lifetime))));
+			const tokens = rs.map((r) => sum(r.turns.flatMap((t) => t.calls.map((c) => c.tokens))));
+			rows.push([opening ? "opening" : "mid-task", label, int(rs.length), int(sum(rs.map((r) => r.turns.length))), usd(saved), usd(haiku), usd(saved - haiku), `${int(quantile(tokens, 0.5) / 1000)}k`, usd(carry)]);
+		}
+	table(["position", "run length", "runs", "turns", "main-model saving", "Haiku cost", "net", "median result tokens", "cost of carrying results"], rows);
+	const all2 = runs.filter((r) => r.turns.length >= 2);
+	const net = sum(all2.map((r) => sum(r.turns.slice(1).map((t) => t.overhead)) - haikuCost(r)));
+	console.log(`Runs of 2+ turns: net ${usd(net)} (${pct(net, totalCost)} of spend) before any digest; carrying their raw results costs ${usd(sum(all2.flatMap((r) => r.turns.flatMap((t) => t.calls.map((c) => c.lifetime)))))}.\n`);
+}
 
 // ---------- samples for the judge ----------
 
