@@ -1,5 +1,5 @@
 ---
-status: running
+status: stopped
 started: 2026-11-21T07:36:22.260Z
 source: dream
 hypothesis: Running delegated subagent sessions on claude-sonnet-5-5 instead of
@@ -10,4 +10,5 @@ qualityRisk: medium
 settings:
   model: anthropic/claude-sonnet-5-5
 sessions: delegated
+stopped: 2026-11-22T09:08:12.109Z
 ---
