@@ -17,28 +17,56 @@ export interface GatewayListing {
 	input_modalities?: ("text" | "image")[];
 	context_window?: number;
 	max_tokens?: number;
+	supported_reasoning_efforts?: string[];
 }
+
+export type GatewayThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type GatewayThinkingLevelMap = Partial<Record<GatewayThinkingLevel, string | null>>;
 
 /** A model entry of models.json. */
 export interface GatewayModel {
 	id: string;
 	reasoning: boolean;
+	thinkingLevelMap?: GatewayThinkingLevelMap;
 	input: ("text" | "image")[];
 	contextWindow?: number;
 	maxTokens?: number;
+}
+
+const PI_EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Turn the gateway's `supported_reasoning_efforts` into Pi's `thinkingLevelMap`.
+ * Matches `@earendil-works/pi-ai`'s `getEffortThinkingLevelMap`: Pi only exposes `xhigh`/`max`
+ * when explicitly mapped and hides levels mapped to `null`, so models only offer levels the
+ * gateway actually serves. Returns undefined when the listing advertises no known effort levels.
+ */
+export function gatewayThinkingLevelMap(efforts?: readonly string[]): GatewayThinkingLevelMap | undefined {
+	if (!efforts?.length) return undefined;
+	const supported = new Set(efforts.map((effort) => effort.trim().toLowerCase()));
+	if (!PI_EFFORT_LEVELS.some((level) => supported.has(level)) && !supported.has("none")) return undefined;
+	const map: GatewayThinkingLevelMap = { off: supported.has("none") ? "none" : null };
+	for (const level of PI_EFFORT_LEVELS) {
+		map[level] = supported.has(level) ? level : null;
+	}
+	return map;
 }
 
 /** The models.json entries of the listing's non-Claude models, sorted by id. */
 export function gatewayModels(listing: readonly GatewayListing[]): GatewayModel[] {
 	return listing
 		.filter((m) => !m.id.startsWith("claude-"))
-		.map((m) => ({
-			id: m.id,
-			reasoning: true,
-			input: m.input_modalities ?? ["text"],
-			...(m.context_window ? { contextWindow: m.context_window } : {}),
-			...(m.max_tokens ? { maxTokens: m.max_tokens } : {}),
-		}))
+		.map((m) => {
+			const thinkingLevelMap = gatewayThinkingLevelMap(m.supported_reasoning_efforts);
+			return {
+				id: m.id,
+				reasoning: true,
+				...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+				input: m.input_modalities ?? ["text"],
+				...(m.context_window ? { contextWindow: m.context_window } : {}),
+				...(m.max_tokens ? { maxTokens: m.max_tokens } : {}),
+			};
+		})
 		.sort((a, b) => a.id.localeCompare(b.id));
 }
 

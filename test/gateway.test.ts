@@ -7,12 +7,24 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { syncGateway } from "../extensions/gateway/index.ts";
-import { fetchGatewayListing, gatewayModels, syncGatewayModels } from "../extensions/lib/gateway.ts";
+import { fetchGatewayListing, gatewayModels, gatewayThinkingLevelMap, syncGatewayModels } from "../extensions/lib/gateway.ts";
 
 const listing = [
-	{ id: "gpt-5.6", input_modalities: ["text", "image"] as ("text" | "image")[], context_window: 400_000, max_tokens: 128_000 },
+	{
+		id: "gpt-5.6",
+		input_modalities: ["text", "image"] as ("text" | "image")[],
+		context_window: 400_000,
+		max_tokens: 128_000,
+		supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+	},
 	{ id: "claude-opus-5-5", context_window: 1_000_000 },
-	{ id: "gemini-4-neon", input_modalities: ["text", "image"] as ("text" | "image")[], context_window: 1_000_000, max_tokens: 262_144 },
+	{
+		id: "gemini-4-neon",
+		input_modalities: ["text", "image"] as ("text" | "image")[],
+		context_window: 1_000_000,
+		max_tokens: 262_144,
+		supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
+	},
 	{ id: "gpt-oss-120b" },
 ];
 
@@ -23,12 +35,41 @@ const tempModels = (config: unknown) => {
 };
 
 describe("gatewayModels", () => {
-	test("non-Claude models only, sorted, with their limits and text input by default", () => {
+	test("non-Claude models only, sorted, with limits, thinkingLevelMap, and text input by default", () => {
 		assert.deepEqual(gatewayModels(listing), [
-			{ id: "gemini-4-neon", reasoning: true, input: ["text", "image"], contextWindow: 1_000_000, maxTokens: 262_144 },
-			{ id: "gpt-5.6", reasoning: true, input: ["text", "image"], contextWindow: 400_000, maxTokens: 128_000 },
+			{
+				id: "gemini-4-neon",
+				reasoning: true,
+				thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null },
+				input: ["text", "image"],
+				contextWindow: 1_000_000,
+				maxTokens: 262_144,
+			},
+			{
+				id: "gpt-5.6",
+				reasoning: true,
+				thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+				input: ["text", "image"],
+				contextWindow: 400_000,
+				maxTokens: 128_000,
+			},
 			{ id: "gpt-oss-120b", reasoning: true, input: ["text"] },
 		]);
+	});
+
+	test("gatewayThinkingLevelMap maps none -> off and ignores unknown/empty efforts", () => {
+		assert.equal(gatewayThinkingLevelMap(undefined), undefined);
+		assert.equal(gatewayThinkingLevelMap([]), undefined);
+		assert.equal(gatewayThinkingLevelMap(["ultra"]), undefined);
+		assert.deepEqual(gatewayThinkingLevelMap(["none", "minimal", "high"]), {
+			off: "none",
+			minimal: "minimal",
+			low: null,
+			medium: null,
+			high: "high",
+			xhigh: null,
+			max: null,
+		});
 	});
 });
 
