@@ -24,10 +24,13 @@
 // Their nested calls (a script's, or `tool workflow …` in bash) stay in the foreground of their
 // caller, which needs the result; `tool workflow … &` in bash makes one a job of its own.
 //
-// Some tools (`WAITING_TOOLS`: `ask_user`) never move: a call of one waits for the person directing
-// the agent, up to its own `wait_minutes`, and a user message arriving meanwhile is its answer.
-// Moved after 2 minutes, every question would get 2 minutes; moved by the user's message, the
-// message could no longer answer it. The wrapper runs them untouched.
+// Some tools (`WAITING_TOOLS`) never move. A call of `ask_user` waits for the person directing the
+// agent, up to its own `wait_minutes`, and a user message arriving meanwhile is its answer. Moved
+// after 2 minutes, every question would get 2 minutes; moved by the user's message, the message
+// could no longer answer it. A call of `explore` is short (its explorer is stopped after a bounded
+// number of turns), its result is what the caller needs next, and only a result recorded as the
+// call's own keeps its ranges deduplicated and its explorer's session linked. The wrapper runs them
+// untouched; the turn's abort still stops them.
 //
 // The turn's abort stops a call in the foreground, not one in the background. A background call
 // stops at the session's end (its AbortSignal), not on a harness reload: its end reaches the
@@ -63,7 +66,7 @@ export const START_GRACE_MS = 5_000;
 export const BACKGROUND_TOOLS: readonly string[] = ["workflow"];
 
 /** Tools whose calls stay in the foreground however long they run; see the header. */
-export const WAITING_TOOLS: readonly string[] = ["ask_user"];
+export const WAITING_TOOLS: readonly string[] = ["ask_user", "explore"];
 
 /** Calls of a background tool that answer at once and stay in the foreground: `workflow { show }` renders a page, `workflow { stop }` stops a run. */
 export const foregroundCall = (toolName: string, input: Record<string, unknown>) => toolName === "workflow" && (input.show !== undefined || input.stop !== undefined);

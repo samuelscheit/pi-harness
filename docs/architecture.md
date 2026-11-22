@@ -54,6 +54,7 @@ flowchart TB
 | [`extensions/ask-user`](../extensions/ask-user/index.ts) | `ask_user` on Pi dialogs: waits for the answers or a chat reply; unanswered in time, they arrive later as a message. |
 | [`extensions/web`](../extensions/web/index.ts) | `web_search` and `web_fetch` through Anthropic server tools. |
 | [`extensions/improvements`](../extensions/improvements/index.ts) | `note_improvement`, the agent's friction log. |
+| [`extensions/explore`](../extensions/explore/index.ts) | The `explore` tool: a resumed Haiku explorer per session answers questions about the code with an answer plus exact ranges, under a token budget ([tools.md](tools.md#explore)). |
 | [`extensions/goal`](../extensions/goal/index.ts) | `/goal` and the `goal` tool: a session goal that holds the run at its end until it is achieved, blocked or out of budget ([goal.md](goal.md)). |
 | [`extensions/template`](../extensions/template/index.ts) | Session templates: recipes in `.pi/templates/`, deterministic builds, staleness and rebuilds, `/template` ([templates.md](templates.md)). |
 | [`extensions/warm`](../extensions/warm/index.ts) | `/warm` and the `keep_warm` tool: hold the prompt cache warm until a time, with a budget ([tools.md](tools.md#warm-and-keep_warm)). |

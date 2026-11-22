@@ -49,7 +49,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { relative } from "node:path";
-import { type AgentSession, createAgentSession, DefaultResourceLoader, type ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, type ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { canonical, changedPaths, type Snapshot, snapshot } from "../lib/workspace.ts";
 import askUser from "../ask-user/index.ts";
 import { modelFinder } from "../template/index.ts";
@@ -59,7 +59,8 @@ import { type Ask, answerPending, answersInOrder, type Question, questionsUi } f
 import { delegatedChild, RUN_STOPPED } from "./child.ts";
 import { type DelegationSpec, type DelegationState, delegateProblem, type TemplateUse, delegationMessage, delegationsDir, HARNESS_KEYS, templateArgs, prepareDelegation, readSpec, readState, removeDelegation, SUBMIT_TOOL, touchSpec, writeSpec } from "./delegation.ts";
 import { type CallContext, type Durable, isInterruption } from "./durable.ts";
-import { CACHE_RETENTION, resolveModel, servedModel, THINKING, type Thinking } from "./models.ts";
+import { childSessionManager, createChildSession } from "./child-session.ts";
+import { resolveModel, THINKING, type Thinking } from "./models.ts";
 import { type T3, T3Child, type T3ChildIds } from "./t3.ts";
 
 /** The model of an in-process child without `target.model` when the caller's is unknown. */
@@ -297,40 +298,24 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 	let child: Promise<AgentSession> | undefined;
 	let sessionFile: string | undefined;
 	const create = async (manager: SessionManager) => {
-		const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true, maxRetries: 3 }, cacheRetention: CACHE_RETENTION });
-		const resourceLoader = new DefaultResourceLoader({
+		const { model, thinking } = inProcessModel(options, env, template());
+		const tools = options.tools ?? fork?.spec.tools;
+		const session = await createChildSession({
 			cwd: env.cwd,
 			agentDir: env.agentDir,
-			settingsManager,
-			noExtensions: true,
-			noSkills: true,
-			noPromptTemplates: true,
-			noThemes: true,
-			noContextFiles: true,
-			// ask_user, whose questions the workflow answers (questionsUi below).
+			runtime: env.runtime,
+			model,
+			thinking,
+			sessionManager: manager,
+			// ask_user, whose questions the workflow answers (questionsUi below); h.warm's /warm.
 			extensionFactories: [
 				{ name: "workflow-delegate", factory: (pi) => void delegatedChild(pi, dir) },
 				{ name: "ask-user", factory: askUser },
-				// h.warm's /warm.
 				{ name: "warm", factory: warm },
 			],
-		});
-		await resourceLoader.reload();
-		const { model, thinking } = inProcessModel(options, env, template());
-		const tools = options.tools ?? fork?.spec.tools;
-		const { session } = await createAgentSession({
-			cwd: env.cwd,
-			agentDir: env.agentDir,
-			// Checked against what its endpoint serves before the child's first request.
-			model: await servedModel(env.runtime, model),
-			thinkingLevel: thinking,
-			modelRuntime: env.runtime,
-			resourceLoader,
 			...(tools ? { tools: [...new Set([...tools, ...(options.schema || fork?.spec.schema ? [SUBMIT_TOOL] : [])])] } : {}),
-			sessionManager: manager,
-			settingsManager,
+			uiContext: questionsUi(ask),
 		});
-		await session.bindExtensions({ uiContext: questionsUi(ask) });
 		session.subscribe((event) => {
 			if (event.type === "tool_execution_start") env.progress(`${label} · ${callLine(event.toolName, event.args)}`);
 		});
@@ -343,7 +328,7 @@ function inProcess(options: DelegateOptions, dir: string, label: string, env: De
 			if (!fork.sessionFile || !existsSync(fork.sessionFile)) throw new Error(`${label}: the source of the fork has no session file (in-process children need a session directory to fork)`);
 			return SessionManager.forkFrom(fork.sessionFile, env.cwd, env.sessionDir);
 		}
-		return env.sessionDir ? SessionManager.create(env.cwd, env.sessionDir, { parentSession: env.parentSessionFile }) : SessionManager.inMemory(env.cwd);
+		return childSessionManager(env.cwd, env.sessionDir, env.parentSessionFile);
 	};
 	const recorded = () => (sessionFile && existsSync(sessionFile) ? SessionManager.open(sessionFile) : fresh());
 	const session = async (remember: (meta: RunMeta) => void = () => undefined) => {
