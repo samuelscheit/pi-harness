@@ -1,5 +1,5 @@
-// The explorer: a cheap model (Haiku 5.5) in an in-process Pi session of its own, with read-only
-// tools, that answers one question about the code at a time and reports the answer plus the line
+// The explorer: a cheap model (Haiku 5.5) in an in-process Pi session of its own, with full tools,
+// that answers one question about the code at a time and reports the answer plus the line
 // ranges the caller must see. Each calling session (and working directory) keeps a small pool: an
 // idle explorer is reused, so it remembers what it read for earlier questions and its prompt cache
 // stays warm; parallel calls get one explorer each, and a call beyond the pool's size waits for one.
@@ -9,16 +9,20 @@
 // explorer links its session (details.childSessions): the metrics index counts a linked session's
 // whole cost once per link, so follow-ups to the same explorer do not link it again.
 //
-// Read-only: read, grep, find, ls and bash; a bash command that would change files
-// (extensions/metrics/shell.ts) is refused, and bash gets a timeout. The explorer ends its run with
+// Tools: read, grep, find, ls, bash (with a default timeout), edit, write, web_search, web_fetch and,
+// below MAX_DEPTH, `explore` itself: an explorer can ask sub-explorers of its own pool. The files a
+// run changes (edit, write, and the writes of bash commands per extensions/metrics/shell.ts) are
+// reported to the caller. The explorer ends its run with
 // `report`, whose result terminates the loop, so no closing turn is paid. An explorer that ends
 // with text instead (Haiku wrote its report as a `<report>` text block, 2026-11-22) is asked once to
 // call `report`. After `maxTurns` turns it is told to report; after `maxTurns + HARD_EXTRA` it is
 // stopped. Without a report, its last text is the answer.
 
-import type { AgentSession, ExtensionAPI, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { relative, resolve } from "node:path";
+import type { AgentSession, ExtensionAPI, ExtensionFactory, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { shellEffect } from "../metrics/shell.ts";
+import web from "../web/index.ts";
 import { childSessionManager, createChildSession } from "../workflow/child-session.ts";
 import { parseRangeLines, type Range } from "./ranges.ts";
 
@@ -35,13 +39,16 @@ export interface Report {
 	ranges: Range[];
 	/** The explorer was stopped before it reported. */
 	truncated?: boolean;
+	/** Files the run changed, relative to the working directory; a bash command whose writes are unknown is listed as `bash: <command>`. */
+	changed: string[];
 }
 
-export const SYSTEM = `You are a code explorer. Another agent (the caller) is working on a task in this repository and asks you one question at a time. You find the answer with read-only tools and report it; you never change files.
+export const SYSTEM = `You are a code explorer. Another agent (the caller) is working on a task in this repository and asks you one question at a time. You find the answer and report it.
 
 How to work:
-- Search broadly and fast: issue several independent tool calls (grep, find, ls, read, read-only bash) in one response; follow references until you can answer.
+- Search broadly and fast: issue several independent tool calls (grep, find, ls, read, bash) in one response; follow references until you can answer.
 - Prefer grep with context and reading whole small files over many small slices.
+- You may run commands (tests, builds, scripts), search and fetch the web, change files when the question asks for a change, and ask \`explore\` (when you have it) to hand independent sub-questions to explorers of your own, in parallel. Other agents may work in the same checkout: change only what the question needs. The caller is told which files you changed.
 - Answer only what was asked. Later questions may build on earlier ones: you remember what you read.
 
 Then call \`report\` once, as the only call of its response:
@@ -54,7 +61,9 @@ interface Explorer {
 	/** Whether a call already linked its session (details.childSessions). */
 	linked: boolean;
 	/** The report of the run in progress (the first `report` call's). */
-	report?: Report;
+	report?: Omit<Report, "changed">;
+	/** Files the run in progress changed. */
+	changed: Set<string>;
 }
 
 interface Pool {
@@ -72,6 +81,8 @@ export interface ExplorerEnv {
 	sessionDir?: string;
 	parentSessionFile?: string;
 	maxTurns?: number;
+	/** The `explore` extension for the explorer's own sub-explorers; none at the depth limit. */
+	nested?: ExtensionFactory;
 }
 
 const state = globalThis as { __harnessExplorers?: Map<string, Pool> };
@@ -89,7 +100,18 @@ export function reportArguments(answer: string, ranges: string | undefined): { a
 	return { answer: answer.slice(0, leak.index).replace(/\s*<\/answer>\s*$/, "").trimEnd(), ranges: ranges?.trim() ? ranges : leak[1]!.replace(/<\/?(?:answer|parameter)[^>]*>/g, "").trim() };
 }
 
-/** The explorer extension inside the child session: the report tool, the read-only guard, the bash timeout. */
+/** A run's changes from one successful tool call: edit and write paths, the writes of a bash command, a sub-explorer's changes. */
+function changesOf(toolName: string, input: Record<string, unknown>, details: unknown, cwd: string): string[] {
+	const shown = (path: string) => relative(cwd, path) || ".";
+	if (toolName === "explore") return (details as { changed?: string[] } | undefined)?.changed ?? [];
+	if ((toolName === "edit" || toolName === "write") && typeof input.path === "string") return [shown(resolve(cwd, input.path))];
+	if (toolName !== "bash" || typeof input.command !== "string") return [];
+	const effect = shellEffect(input.command, cwd);
+	if (!effect.mutates) return [];
+	return effect.writes.length ? effect.writes.map(shown) : [`bash: ${input.command.length > 120 ? `${input.command.slice(0, 120)}…` : input.command}`];
+}
+
+/** The explorer extension inside the child session: the report tool, change tracking, the bash timeout. */
 function explorerExtension(slot: () => Explorer) {
 	return (pi: ExtensionAPI) => {
 		pi.registerTool({
@@ -113,11 +135,14 @@ function explorerExtension(slot: () => Explorer) {
 				return done;
 			},
 		});
-		pi.on("tool_call", (event, ctx) => {
+		pi.on("tool_call", (event) => {
 			if (event.toolName !== "bash") return;
-			const input = event.input as { command?: unknown; timeout?: unknown };
-			if (shellEffect(String(input.command ?? ""), ctx.cwd).mutates) return { block: true, reason: "You are read-only: this command would change files. Use read, grep, find, ls or a read-only command." };
+			const input = event.input as { timeout?: unknown };
 			if (typeof input.timeout !== "number") input.timeout = BASH_TIMEOUT_S;
+		});
+		pi.on("tool_result", (event, ctx) => {
+			if (event.isError) return;
+			for (const path of changesOf(event.toolName, event.input, event.details, ctx.cwd)) slot().changed.add(path);
 		});
 	};
 }
@@ -131,8 +156,12 @@ function createExplorer(env: ExplorerEnv, slot: () => Explorer): Promise<AgentSe
 		thinking: "low",
 		systemPrompt: SYSTEM,
 		sessionManager: childSessionManager(env.cwd, env.sessionDir, env.parentSessionFile),
-		extensionFactories: [{ name: "explorer", factory: explorerExtension(slot) }],
-		tools: ["read", "grep", "find", "ls", "bash", "report"],
+		extensionFactories: [
+			{ name: "explorer", factory: explorerExtension(slot) },
+			{ name: "web", factory: web },
+			...(env.nested ? [{ name: "explore", factory: env.nested }] : []),
+		],
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write", "web_search", "web_fetch", "report", ...(env.nested ? ["explore"] : [])],
 	});
 }
 
@@ -151,7 +180,7 @@ async function acquire(pool: Pool, env: ExplorerEnv, signal?: AbortSignal): Prom
 			return idle;
 		}
 		if (pool.explorers.length < POOL_SIZE) {
-			const explorer: Explorer = { busy: true, linked: false, session: undefined as unknown as Promise<AgentSession> };
+			const explorer: Explorer = { busy: true, linked: false, changed: new Set(), session: undefined as unknown as Promise<AgentSession> };
 			explorer.session = createExplorer(env, () => explorer);
 			// A session that failed to start is not kept.
 			explorer.session.catch(() => {
@@ -177,6 +206,7 @@ export async function ask(sessionId: string, env: ExplorerEnv, question: string,
 	const pool = pools.get(key) ?? pools.set(key, { explorers: [], waiting: [] }).get(key)!;
 	const explorer = await acquire(pool, env, signal);
 	explorer.report = undefined;
+	explorer.changed = new Set();
 	try {
 		const session = await explorer.session;
 		signal?.throwIfAborted();
@@ -197,10 +227,10 @@ export async function ask(sessionId: string, env: ExplorerEnv, question: string,
 		signal?.addEventListener("abort", abort, { once: true });
 		const before = session.messages.length;
 		/** The result; the first successful call links the explorer's session. */
-		const result = (report: Report) => {
+		const result = (report: Omit<Report, "changed">) => {
 			const link = !explorer.linked;
 			explorer.linked = true;
-			return { report, sessionId: session.sessionId, link, turns };
+			return { report: { ...report, changed: [...explorer.changed] }, sessionId: session.sessionId, link, turns };
 		};
 		type Last = { content: unknown; stopReason?: string; errorMessage?: string } | undefined;
 		const lastReply = () => session.messages.slice(before).findLast((m) => m.role === "assistant") as Last;
@@ -230,11 +260,18 @@ export async function ask(sessionId: string, env: ExplorerEnv, question: string,
 	}
 }
 
-/** Stop and drop the calling session's explorers (its session ended). */
+/** Stop and drop the calling session's explorers (its session ended), and their sub-explorers: dispose() emits no session_shutdown. */
 export function disposeExplorers(sessionId: string): void {
 	for (const [key, pool] of pools) {
 		if (!key.startsWith(`${sessionId}\0`)) continue;
-		for (const e of pool.explorers) void e.session.then((s) => s.abort().finally(() => s.dispose()), () => undefined);
 		pools.delete(key);
+		for (const e of pool.explorers)
+			void e.session.then(
+				(s) => {
+					disposeExplorers(s.sessionId);
+					return s.abort().finally(() => s.dispose());
+				},
+				() => undefined,
+			);
 	}
 }

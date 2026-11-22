@@ -1,5 +1,6 @@
 // `explore`: the caller asks a cheap explorer model (explorer.ts) one question about the code; the
-// explorer searches in its own small context and reports an answer plus the line ranges the caller
+// explorer works in its own small context (with full tools, sub-explorers included, up to
+// MAX_DEPTH levels) and reports an answer plus the line ranges the caller
 // must see, which the harness reads and returns verbatim under a token budget (ranges.ts). The
 // caller pays one turn for what was a run of read-only turns, each re-reading its whole context.
 // Motivation and simulation: docs/research/context-engineering/10-turns-in-our-sessions.md §7.
@@ -23,6 +24,8 @@ import { renderSelection, type Shown, selectRanges } from "./ranges.ts";
 
 export const EXPLORE_TOOL = "explore";
 export const DEFAULT_BUDGET = 12_000;
+/** Explorer levels below the calling agent: an explorer at this depth has no `explore` of its own. */
+export const MAX_DEPTH = 3;
 export const HINT = `Hint: this is another turn reading code right after one. If more reading follows, ask \`${EXPLORE_TOOL}\` one question instead: a cheap model searches in its own context and returns the answer with the exact code ranges, for one turn of yours.`;
 
 export interface ExploreOptions {
@@ -31,6 +34,8 @@ export interface ExploreOptions {
 	model?: string;
 	/** Explorer turns before it is told to report (tests). */
 	maxTurns?: number;
+	/** Explorer levels above the session this extension runs in: 0 in the calling agent. */
+	depth?: number;
 }
 
 export interface ExploreDetails {
@@ -39,6 +44,8 @@ export interface ExploreDetails {
 	childSessions: string[];
 	explorer: string;
 	turns: number;
+	/** Files the explorer changed. */
+	changed: string[];
 }
 
 // Process state, so a reload (which evaluates the extension anew) keeps the runtime.
@@ -72,6 +79,8 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 	const runtime = options.modelRuntime ?? (() => (processState.__harnessExploreRuntime ??= ModelRuntime.create()));
 	const agentDir = options.agentDir ?? getAgentDir();
 	const model = options.model ?? EXPLORER_MODEL;
+	const depth = options.depth ?? 0;
+	const nested = depth + 1 < MAX_DEPTH ? (child: ExtensionAPI) => explore(child, { ...options, depth: depth + 1 }) : undefined;
 
 	pi.registerTool({
 		name: EXPLORE_TOOL,
@@ -79,7 +88,8 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 		defaultActive: false,
 		description: [
 			"Ask a cheap explorer model one question about the code (where something is, how it works, what a change must touch).",
-			"It searches with read-only tools in its own context and returns a concise answer plus the exact code ranges you need, read verbatim from the files, under a token budget.",
+			"It works in its own context and returns a concise answer plus the exact code ranges you need, read verbatim from the files, under a token budget.",
+			"It has full tools: it can run commands (tests, builds), search the web, change files when you ask for a change (the result lists the files it changed), and ask sub-explorers.",
 			"It remembers earlier questions of this session, so follow-ups are cheap; independent questions can run in parallel.",
 		].join(" "),
 		promptSnippet: "Ask a cheap explorer model a question about the code; get the answer and the exact code ranges",
@@ -106,14 +116,19 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 					runtime: modelRuntime,
 					model,
 					...(options.maxTurns ? { maxTurns: options.maxTurns } : {}),
+					...(nested ? { nested } : {}),
 					...(parentSessionFile ? { sessionDir: session.getSessionDir(), parentSessionFile } : {}),
 				},
 				question,
 				signal,
 			);
 			const selection = selectRanges(ctx.cwd, report.ranges, params.budget_tokens ?? DEFAULT_BUDGET, seenRanges(ctx));
-			const details: ExploreDetails = { shown: selection.shown.map(({ path, start, end, hash }) => ({ path, start, end, hash })), childSessions: link ? [sessionId] : [], explorer: sessionId, turns };
-			const answer = report.truncated ? `[The explorer was stopped after ${turns} turns without a report; its last words:]\n${report.answer}` : report.answer;
+			const details: ExploreDetails = { shown: selection.shown.map(({ path, start, end, hash }) => ({ path, start, end, hash })), childSessions: link ? [sessionId] : [], explorer: sessionId, turns, changed: report.changed };
+			const answer = [
+				...(report.truncated ? [`[The explorer was stopped after ${turns} turns without a report; its last words:]`] : []),
+				report.answer,
+				...(report.changed.length ? [`\n[The explorer changed: ${report.changed.join(", ")}]`] : []),
+			].join("\n");
 			return { content: [{ type: "text", text: renderSelection(answer, selection) }], details };
 		},
 	});
@@ -123,7 +138,8 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 	const stretches = new Map<string, { previous: boolean; hinted: boolean }>();
 	const stretchOf = (id: string) => stretches.get(id) ?? stretches.set(id, { previous: false, hinted: false }).get(id)!;
 	pi.on("tool_result", (event, ctx) => {
-		if (event.parentToolCallId !== undefined || event.isError || event.toolName === EXPLORE_TOOL) return;
+		// Explorers get no hint: delegating their reading again costs more than reading.
+		if (depth > 0 || event.parentToolCallId !== undefined || event.isError || event.toolName === EXPLORE_TOOL) return;
 		if (!pi.getActiveTools().includes(EXPLORE_TOOL)) return;
 		const stretch = stretchOf(ctx.sessionManager.getSessionId());
 		if (!stretch.previous || stretch.hinted || !readingCode(event.toolName, event.input, ctx.cwd)) return;

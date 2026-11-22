@@ -3,7 +3,7 @@
 // same scripted model with real read-only tools.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
@@ -11,7 +11,7 @@ import type { JsonObject } from "@earendil-works/pi-ai";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { ask, disposeExplorers, reportArguments } from "../extensions/explore/explorer.ts";
-import explore, { type ExploreDetails, HINT } from "../extensions/explore/index.ts";
+import explore, { type ExploreDetails, HINT, MAX_DEPTH } from "../extensions/explore/index.ts";
 import { MAX_FILE_BYTES, mergeRanges, parseRangeLines, renderSelection, selectRanges } from "../extensions/explore/ranges.ts";
 import { callKind } from "../extensions/lib/call-kind.ts";
 
@@ -162,7 +162,7 @@ describe("explore runs", () => {
 		const seen: string[] = [];
 		respond(
 			call("explore", { question: "Where is cost defined?" }),
-			// The explorer: a refused write, a search, then its report.
+			// The explorer: a write, a search, then its report.
 			call("bash", { command: "echo x > src/new.ts" }),
 			call("grep", { pattern: "cost", path: "src" }),
 			call("report", { answer: "x", ranges: "src/b.ts the file" }),
@@ -179,7 +179,9 @@ describe("explore runs", () => {
 		assert.equal(faux.getPendingResponseCount(), 0);
 		const [first, second] = results(s);
 		assert.equal(first!.name, "explore");
-		assert.equal(first!.text, "cost() is defined in src/b.ts:1.\n\nsrc/b.ts:1-3 (definition)\n```\nexport function cost() {\n\treturn 1;\n}\n```");
+		assert.equal(first!.text, "cost() is defined in src/b.ts:1.\n\n[The explorer changed: src/new.ts]\n\nsrc/b.ts:1-3 (definition)\n```\nexport function cost() {\n\treturn 1;\n}\n```");
+		assert.deepEqual(first!.details!.changed, ["src/new.ts"]);
+		assert.deepEqual(second!.details!.changed, [], "changes are per call");
 		assert.equal(first!.details!.shown.length, 1);
 		assert.equal(first!.details!.turns, 4, "a malformed report is sent back once");
 		assert.match(second!.text, /^It returns 1 \(src\/b\.ts:2\)\.\n\nAlready returned by an earlier explore call and unchanged, not repeated: src\/b\.ts:1-3$/);
@@ -187,11 +189,40 @@ describe("explore runs", () => {
 		assert.deepEqual(second!.details!.childSessions, [], "its session is linked once, by the call that created it");
 		assert.match(seen[0]!, /And what does it return\?/, "the follow-up reached the explorer as a new message");
 		const explorer = SessionManager.open(join(dir, "sessions", (await import("node:fs")).readdirSync(join(dir, "sessions")).find((f) => f.includes(first!.details!.childSessions[0]!))!));
-		const refused = explorer.getBranch().flatMap((e) => (e.type === "message" && e.message.role === "toolResult" && e.message.toolName === "bash" ? [textOf(e.message.content)] : []));
-		assert.match(refused[0]!, /You are read-only/);
+		assert.equal(readFileSync(join(repo, "src/new.ts"), "utf8"), "x\n", "the explorer may change files");
+		rmSync(join(repo, "src/new.ts"));
 		const reports = explorer.getBranch().flatMap((e) => (e.type === "message" && e.message.role === "toolResult" && e.message.toolName === "report" ? [textOf(e.message.content)] : []));
 		assert.match(reports[0]!, /These lines are not ranges .*"src\/b\.ts the file"/);
 		assert.equal(explorer.getHeader()?.parentSession, s.sessionManager.getSessionFile(), "the explorer's session names the caller as parent");
+	});
+
+	test("an explorer asks sub-explorers down to MAX_DEPTH; their changes reach the caller", async () => {
+		const s = await newSession();
+		const deepest: string[] = [];
+		respond(
+			call("explore", { question: "level 1" }),
+			call("explore", { question: "level 2" }),
+			call("explore", { question: "level 3" }),
+			// Level 3 has no explore of its own.
+			call("explore", { question: "level 4" }),
+			(context) => {
+				deepest.push(JSON.stringify(context.messages.at(-1)));
+				return call("write", { path: "src/deep.ts", content: "deep\n" });
+			},
+			call("report", { answer: "level 3 wrote src/deep.ts", ranges: "" }),
+			call("report", { answer: "level 2 relayed", ranges: "" }),
+			call("report", { answer: "level 1 relayed", ranges: "" }),
+			say("done"),
+		);
+		await s.prompt("go deep");
+		assert.equal(faux.getPendingResponseCount(), 0);
+		assert.equal(MAX_DEPTH, 3);
+		assert.match(deepest[0]!, /Tool explore not found/);
+		const [result] = results(s);
+		assert.equal(result!.text, "level 1 relayed\n\n[The explorer changed: src/deep.ts]");
+		assert.deepEqual(result!.details!.changed, ["src/deep.ts"]);
+		assert.equal(readFileSync(join(repo, "src/deep.ts"), "utf8"), "deep\n");
+		rmSync(join(repo, "src/deep.ts"));
 	});
 
 	test("an explorer that answers in text is asked once to call report; answering in text again, its text is the answer", async () => {
