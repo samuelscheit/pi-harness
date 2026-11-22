@@ -48,7 +48,7 @@ import { refusal, setsidCommands, systemGuideline } from "./detach.ts";
 import { gateRefusal } from "./gate.ts";
 import { withGitConfig } from "./git-env.ts";
 import { gitRefusal } from "./git.ts";
-import { locksText, removeStaleLocks, wasKilled, workDirs } from "./locks.ts";
+import { groupRunsGit, locksText, removeStaleLocks, wasKilled, workDirs } from "./locks.ts";
 import { headRefusal } from "./head.ts";
 import { killRefusal } from "./kill.ts";
 import { toolHeredocRefusal, toolQuotedArgumentRefusal } from "./heredoc.ts";
@@ -213,11 +213,23 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 			const command = params.command.slice(line.length);
 			const startedAt = Date.now();
 			const bridge = await openBridge(ctx as ExtensionToolContext, signal, binDir, sessionJobs(sessionId), pollMs);
+			// Whether git ran in the call's group when it was killed (locks.ts): this timer and abort
+			// listener, made before the built-in tool's, run right before its kill.
+			let killedGit: number | undefined;
+			const beforeKill = () => {
+				const pgid = readGroup(groupFile(sessionId, callId));
+				if (pgid !== undefined && groupRunsGit(pgid)) killedGit = pgid;
+			};
+			signal?.addEventListener("abort", beforeKill, { once: true });
+			const deadline = typeof params.timeout === "number" && params.timeout > 0 && Number.isFinite(params.timeout) ? setTimeout(beforeKill, params.timeout * 1000) : undefined;
 			let outcome: { result: Awaited<ReturnType<typeof builtin.execute>> } | { error: unknown };
 			try {
 				outcome = { result: await builtin.execute(callId, { ...params, command: bridge.line + params.command }, signal, onUpdate, ctx) };
 			} catch (error) {
 				outcome = { error };
+			} finally {
+				clearTimeout(deadline);
+				signal?.removeEventListener("abort", beforeKill);
 			}
 			let untracked: Untracked[] = [];
 			const { images, left } = await bridge.ended(async () => {
@@ -225,7 +237,7 @@ export default function bash(pi: ExtensionAPI, options: BashOptions = {}) {
 				untracked = adopted.untracked;
 				return adopted;
 			});
-			const locks = "error" in outcome && wasKilled(outcome.error, signal) ? await removeStaleLocks(workDirs(command, ctx.cwd), startedAt).catch(() => []) : [];
+			const locks = killedGit !== undefined && "error" in outcome && wasKilled(outcome.error, signal) ? await removeStaleLocks(workDirs(command, ctx.cwd), startedAt, { ignoreGroup: killedGit }).catch(() => []) : [];
 			const notes = [...(left.length ? [leftText(left)] : []), ...(untracked.length ? [untrackedText(untracked)] : []), ...(locks.length ? [locksText(locks)] : [])];
 			const note = notes.length ? notes.join("\n\n") : undefined;
 			if ("error" in outcome) {

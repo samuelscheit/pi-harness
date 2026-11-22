@@ -2,17 +2,18 @@
 // call's stale index.lock is removed (extensions/bash/locks.ts). Through the tool: test/bash.test.ts.
 
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { withGitConfig } from "../extensions/bash/git-env.ts";
-import { isHeld, locksText, removeStaleLocks, wasKilled, workDirs } from "../extensions/bash/locks.ts";
+import { gitWorksIn, groupRunsGit, isHeld, locksText, type Repository, removeStaleLocks, wasKilled, workDirs } from "../extensions/bash/locks.ts";
 
 const ENV: NodeJS.ProcessEnv = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 for (const key of Object.keys(ENV)) if (/^GIT_CONFIG_(?:COUNT|KEY_|VALUE_|PARAMETERS)/.test(key)) delete ENV[key];
 const git = (dir: string, args: string[], env: NodeJS.ProcessEnv = ENV) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env }).trim();
+const lockOf = (dir: string) => join(git(dir, ["rev-parse", "--absolute-git-dir"]), "index.lock");
 
 let root: string;
 let repo: string;
@@ -68,6 +69,70 @@ describe("withGitConfig", () => {
 	});
 });
 
+describe("git at work", () => {
+	/** A git that runs until its stdin closes (`git cat-file --batch`), in its own process group; git changes to the work tree's top. */
+	const startGit = async (cwd: string) => {
+		const child = spawn("git", ["cat-file", "--batch"], { cwd, detached: true, stdio: ["pipe", "ignore", "ignore"] });
+		await new Promise((started) => child.once("spawn", started));
+		return child;
+	};
+	const stop = async (child: ChildProcess) => {
+		child.kill("SIGKILL");
+		await new Promise((ended) => child.once("exit", ended));
+	};
+	const main: Repository = { gitDir: "", root: "" };
+	before(() => Object.assign(main, { gitDir: join(repo, ".git"), root: repo }));
+
+	test("groupRunsGit: a group running git (behind a pipe) counts; a group without git, or a gone one, does not", async () => {
+		const piped = spawn("sh", ["-c", "sleep 9 | git cat-file --batch"], { detached: true, stdio: "ignore" });
+		const plain = spawn("sleep", ["9"], { detached: true, stdio: "ignore" });
+		try {
+			const start = Date.now();
+			while (!groupRunsGit(piped.pid!) && Date.now() - start < 5000) await new Promise((r) => setTimeout(r, 50));
+			assert.equal(groupRunsGit(piped.pid!), true);
+			assert.equal(groupRunsGit(plain.pid!), false);
+		} finally {
+			process.kill(-piped.pid!, "SIGKILL");
+			await stop(plain);
+		}
+		assert.equal(groupRunsGit(piped.pid!), false);
+	});
+
+	test("gitWorksIn: a git in the work tree (started in a subdirectory too) counts, unless it is the killed call's group; one in another worktree does not; an unknown work tree counts", async () => {
+		mkdirSync(join(repo, "sub"), { recursive: true });
+		assert.equal(await gitWorksIn(main), false, "no git running");
+		const git = await startGit(join(repo, "sub"));
+		try {
+			const start = Date.now();
+			while (!(await gitWorksIn(main)) && Date.now() - start < 5000) await new Promise((r) => setTimeout(r, 50));
+			assert.equal(await gitWorksIn(main), true);
+			assert.equal(await gitWorksIn(main, git.pid), false, "the killed call's own git does not count");
+			assert.equal(await gitWorksIn({ gitDir: join(repo, ".git", "worktrees", "wt"), root: worktree }), false, "another worktree's lock is not this git's");
+		} finally {
+			await stop(git);
+		}
+		assert.equal(await gitWorksIn(main), false);
+		assert.equal(await gitWorksIn({ gitDir: join(repo, ".git"), root: undefined }), true);
+	});
+
+	test("removeStaleLocks keeps an unheld lock made during the call while another git works in the repository", async () => {
+		const lock = lockOf(repo);
+		const since = Date.now() - 1000;
+		const git = await startGit(repo);
+		try {
+			writeFileSync(lock, "");
+			const start = Date.now();
+			while (!(await gitWorksIn(main)) && Date.now() - start < 5000) await new Promise((r) => setTimeout(r, 50));
+			assert.deepEqual(await removeStaleLocks([repo], since), []);
+			assert.ok(existsSync(lock));
+			assert.deepEqual(await removeStaleLocks([repo], since, { ignoreGroup: git.pid }), [lock], "the same git as the killed call's own");
+		} finally {
+			await stop(git);
+			rmSync(lock, { force: true });
+		}
+	});
+});
+
 describe("wasKilled", () => {
 	test("a timeout or an abort, by the tool's status line or the signal; other failures are not", () => {
 		const aborted = new AbortController();
@@ -97,8 +162,8 @@ describe("workDirs", () => {
 });
 
 describe("removeStaleLocks", () => {
-	const lockOf = (dir: string) => join(git(dir, ["rev-parse", "--absolute-git-dir"]), "index.lock");
-	const free = async () => false;
+	const no = async () => false;
+	const free = { held: no, busy: no };
 
 	test("the lock the call made is removed, in a worktree's own git dir too; dirs of one repo count once; dirs outside a repository and missing ones are skipped", async () => {
 		const since = Date.now() - 1000;
@@ -145,6 +210,23 @@ describe("removeStaleLocks", () => {
 		assert.equal(await isHeld(lock), false);
 		assert.deepEqual(await removeStaleLocks([repo], since), [lock]);
 		assert.equal(await isHeld(lock), false, "a missing file is held by no one");
+	});
+
+	test("the repository each dir is in: its git dir and work tree, also from inside the git dir or a worktree's git dir", async () => {
+		const seen: Repository[] = [];
+		const since = Date.now() - 1000;
+		const [main, wt] = [lockOf(repo), lockOf(worktree)];
+		writeFileSync(main, "");
+		writeFileSync(wt, "");
+		const busy = async (r: Repository) => (seen.push(r), true);
+		assert.deepEqual(await removeStaleLocks([join(repo, ".git"), join(repo, ".git", "worktrees", "wt")], since, { held: no, busy }), [], "a busy repository keeps its lock");
+		assert.deepEqual(seen, [
+			{ gitDir: join(repo, ".git"), root: repo },
+			{ gitDir: join(repo, ".git", "worktrees", "wt"), root: worktree },
+		]);
+		assert.ok(existsSync(main) && existsSync(wt));
+		rmSync(main);
+		rmSync(wt);
 	});
 
 	test("the note names each removal", () => {

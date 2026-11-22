@@ -513,7 +513,10 @@ describe("shared checkouts", () => {
 		}
 	});
 
-	test("a call killed by its timeout removes the index.lock its git left (a worktree's too) and names it; a held lock, an older one, and one of a call that was not killed stay", async () => {
+	/** A git that runs until the call is killed. */
+	const GIT_RUNNING = "sleep 9 | git cat-file --batch";
+
+	test("a call killed by its timeout while its git ran removes the index.lock it left (a worktree's too) and names it; a held lock, an older one, one of a call without git, and one of a call that was not killed stay", async () => {
 		initRepo();
 		const wt = join(dir, "wt");
 		repoGit("worktree", "add", "-q", wt, "-b", "wt");
@@ -525,7 +528,7 @@ describe("shared checkouts", () => {
 			return toolTexts(s).at(-1)!;
 		};
 
-		const own = await run(`cd '${wt}' && touch "$(git rev-parse --absolute-git-dir)/index.lock" && sleep 9`, 1);
+		const own = await run(`cd '${wt}' && touch "$(git rev-parse --absolute-git-dir)/index.lock" && ${GIT_RUNNING}`, 1);
 		assert.match(own, /Command timed out after 1 seconds\n\nRemoved the git index lock this killed command's git left behind [^\n]*:\n- `([^`]+)`$/);
 		assert.equal(/- `([^`]+)`$/.exec(own)![1], realpathSync(join(dir, "repo", ".git", "worktrees", "wt")) + "/index.lock");
 		assert.ok(!existsSync(wtLock));
@@ -533,7 +536,7 @@ describe("shared checkouts", () => {
 		const holder = spawn("sh", ["-c", 'exec 3>>"$1"; echo ready; exec sleep 60', "sh", mainLock], { stdio: ["ignore", "pipe", "ignore"] });
 		try {
 			await new Promise((ready) => holder.stdout.once("data", ready));
-			const held = await run("touch .git/index.lock; sleep 9", 1);
+			const held = await run(`touch .git/index.lock; ${GIT_RUNNING}`, 1);
 			assert.match(held, /Command timed out after 1 seconds$/, "a lock another process holds is not removed");
 			assert.ok(existsSync(mainLock));
 		} finally {
@@ -542,12 +545,45 @@ describe("shared checkouts", () => {
 
 		const old = new Date(Date.now() - 60_000);
 		utimesSync(mainLock, old, old);
-		assert.match(await run("git status --short; sleep 9", 1), /Command timed out after 1 seconds$/, "a lock from before the call is not removed");
+		assert.match(await run(`git status --short; ${GIT_RUNNING}`, 1), /Command timed out after 1 seconds$/, "a lock from before the call is not removed");
+		assert.ok(existsSync(mainLock));
+		rmSync(mainLock);
+
+		assert.match(await run("git status --short; touch .git/index.lock; sleep 9", 1), /Command timed out after 1 seconds$/, "no git ran in the call when it was killed: the lock is not its git's");
 		assert.ok(existsSync(mainLock));
 		rmSync(mainLock);
 
 		assert.match(await run("touch .git/index.lock; exit 1"), /Command exited with code 1$/, "a call that was not killed removes nothing");
 		assert.ok(existsSync(mainLock));
+	});
+
+	test("a live `git commit` whose slow pre-commit hook runs (its lock closed, held by no process) keeps its lock when a parallel call in the same worktree is killed with its own git", async () => {
+		initRepo();
+		const [started, release] = [marker(), marker()];
+		const mainLock = repoFile(".git/index.lock");
+		writeFileSync(repoFile(".git/hooks/pre-commit"), `#!/bin/sh\nuntil [ -e '${release}' ]; do sleep 0.05; done\n`, { mode: 0o755 });
+		writeFileSync(repoFile("a.ts"), "another agent's commit\n");
+		const s = await newSession(FOREGROUND_MS);
+		respond(bash(`touch '${started}'; ${GIT_RUNNING}`, 2), fauxAssistantMessage("ok"));
+		const prompt = s.prompt("go");
+		await until("the call runs", () => existsSync(started));
+		// Another agent's commit starts after the call: its lock is newer than the call's start.
+		const commit = spawn("git", ["-C", join(dir, "repo"), "commit", "-qam", "another agent"], { env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" }, stdio: "ignore" });
+		const committed = new Promise<number | null>((done) => commit.once("exit", done));
+		let exitCode: number | null;
+		try {
+			await until("the commit's hook runs with the index locked", () => existsSync(mainLock));
+			await prompt;
+			assert.match(toolTexts(s).at(-1)!, /Command timed out after 2 seconds$/, "nothing removed");
+			assert.ok(existsSync(mainLock), "the live commit's lock stays");
+		} finally {
+			// Also on a failure: the hook must see the release before afterEach removes the scratch dir.
+			writeFileSync(release, "");
+			exitCode = await committed;
+		}
+		assert.equal(exitCode, 0, "the commit completes");
+		assert.equal(repoGit("log", "-1", "--format=%s").trim(), "another agent");
+		assert.ok(!existsSync(mainLock));
 	});
 });
 
