@@ -309,7 +309,7 @@ export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
 		promptSnippet: "Set, show or finish the session's goal",
 		promptGuidelines: [
 			"Set a goal with `goal` (action set) when the user or your brief asks you to keep going until something is done (\"continue until all tests pass\", a delegated brief that says to finish X before reporting); a single task needs none. While it is active your turn cannot end: continue, mark it achieved (after auditing every requirement of the objective against evidence; with a check, only when the check exits 0) or blocked with the reason.",
-			"While a goal is active and background jobs or delegated tasks run, do the remaining steps that do not depend on them. Only when every remaining step depends on a running job or task, call `goal` with action `wait`, naming each step's job, and end your turn: its end wakes you. Waiting again on the same job without doing anything in between needs a `reason`.",
+			"While a goal is active and background jobs or delegated tasks run, do the remaining steps that do not depend on them. Only when every remaining step depends on a running job or task, call `goal` with action `wait`, naming each step's job, as the only call of its response: it ends your turn, and the job's end wakes you. Waiting again on the same job without doing anything in between needs a `reason`.",
 		],
 		parameters,
 		async execute(_callId, params, signal, _onUpdate, ctx) {
@@ -412,9 +412,14 @@ export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
 			memory.waiting = keys;
 			memory.told = jobs.map((job) => job.key);
 			arm(ctx);
-			return done(
-				`Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}).${reason && idle.length ? ` Your reason to wait again: ${reason}` : ""} End your turn now; the job's end wakes you with its result. If you are still waiting idle after a while, you will be woken to use the time.`,
-			);
+			// An accepted wait ends the run here: without `terminate` the model was called once more only to
+			// write a closing line (3,879 such turns, 2.3% of Pi spend; docs/research/context-engineering/10 §5).
+			return {
+				...done(
+					`Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}).${reason && idle.length ? ` Your reason to wait again: ${reason}` : ""} Your turn ends here; the job's end wakes you with its result. If you are still waiting idle after a while, you will be woken to use the time.`,
+				),
+				terminate: true,
+			};
 		},
 	});
 

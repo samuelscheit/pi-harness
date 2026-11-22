@@ -577,7 +577,6 @@ describe("strict mode: background work pending", () => {
 			goalCall({ action: "set", objective: "Run the kernel tests and fix what fails." }),
 			bash("sleep 2 > /dev/null 2>&1 &\necho started"),
 			goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep" }] }),
-			say("I wait for the kernel tests; their end wakes me."),
 			say("Still waiting for the tests."),
 			(context) => {
 				seen.push(lastText(context));
@@ -585,7 +584,6 @@ describe("strict mode: background work pending", () => {
 			},
 			// It waited on this job before and did nothing since: waiting again takes a reason.
 			goalCall({ action: "wait", steps: [{ step: "read the results and fix failures", job: "sleep 2" }], reason: "every step needs the results" }),
-			say("Every remaining step needs the tests."),
 			(context) => {
 				seen.push(lastText(context));
 				return goalCall({ action: "achieved" });
@@ -598,8 +596,8 @@ describe("strict mode: background work pending", () => {
 		assert.match(texts[2]!, /^Waiting is fine: every remaining step depends on a running job \("read the results" → pid \d+\)/, "a wait before any continue is accepted too");
 		// It waited, then did more work: its reply needs no new wait while the job runs.
 		assert.equal(continues(s).length, 0);
-		assert.ok(settled(s, "I wait for the kernel tests")());
-		assert.equal(faux.getPendingResponseCount(), 6, "the turn ended after the wait");
+		assert.equal(s.messages.at(-1)?.role, "toolResult", "the run ends on the wait's result");
+		assert.equal(faux.getPendingResponseCount(), 5, "the turn ended after the wait");
 
 		// The next prompt is a new run: the old wait no longer counts.
 		await s.prompt("status?");
@@ -608,7 +606,8 @@ describe("strict mode: background work pending", () => {
 		assert.match(seen[0]!, /List the remaining steps of the goal that do not depend on these jobs, and do them now\./);
 		assert.match(toolTexts(s)[3]!, /^error: These steps name no running job: "update docs" \(the docs\)\.\nRunning jobs:\n- pid \d+: `sleep 2`/);
 		assert.match(toolTexts(s)[4]!, /^Waiting is fine/);
-		assert.ok(settled(s, "Every remaining step needs the tests.")());
+		assert.equal(s.messages.at(-1)?.role, "toolResult", "the accepted wait ended the run without another request");
+		assert.equal(faux.getPendingResponseCount(), 2, "no model request follows an accepted wait");
 
 		await until("the job's end wakes the session", settled(s, "Kernel tests pass."));
 		assert.match(seen[1]!, /Background process pid \d+ `sleep 2` ended/);
@@ -667,10 +666,9 @@ describe("waiting on delegated tasks", () => {
 				return goalCall({ action: "wait", steps: [{ step: "apply the review", job: "task node:delegated-task:t9" }] });
 			},
 			goalCall({ action: "wait", steps: [{ step: "apply the review", job: `task ${TASK1}` }, { step: "land it", job: "review the diff" }] }),
-			say("Every remaining step needs the review; its completion wakes me."),
 		);
 		await s.prompt("keep going");
-		assert.ok(settled(s, "its completion wakes me")());
+		assert.equal(s.messages.at(-1)?.role, "toolResult", "the run ends on the accepted wait");
 		assert.equal(faux.getPendingResponseCount(), 0);
 		assert.equal(continues(s).length, 1);
 		assert.match(seen[0]!, new RegExp(`Background work is still running; its end wakes you with its result:\\\\n- task ${TASK1}: \`delegated task: Review the diff\` \\(running \\d+ s\\)`));
@@ -700,7 +698,6 @@ describe("waiting on delegated tasks", () => {
 			t3Call("task_status", { taskId: TASK1 }),
 			bash("sleep 20 > /dev/null 2>&1 &"),
 			goalCall({ action: "wait", steps: [{ step: "merge the docs", job: "docs" }, { step: "read the build", job: "sleep 20" }] }),
-			say("Waiting for the docs and the build."),
 		);
 		await s.prompt("go");
 		assert.match(toolTexts(s)[4]!, new RegExp(`^Waiting is fine: every remaining step depends on a running job \\("merge the docs" → task ${TASK1}; "read the build" → pid \\d+\\)`));
@@ -718,20 +715,20 @@ describe("waiting idle", () => {
 	test("waiting again without a tool call since needs a reason; after work it does not; an ended job is forgotten", async () => {
 		const { s } = await newSession();
 		const wait = (reason?: string) => goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep 20" }], ...(reason ? { reason } : {}) });
-		respond(goalCall({ action: "set", objective: "Test it." }), bash("sleep 20 > /dev/null 2>&1 &"), wait(), say("Waiting."));
+		respond(goalCall({ action: "set", objective: "Test it." }), bash("sleep 20 > /dev/null 2>&1 &"), wait());
 		await s.prompt("go");
 		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine: .*If you are still waiting idle after a while, you will be woken to use the time\.$/);
 
-		respond(wait(), wait("   "), wait("Every step needs the test results; nothing else is left."), say("Still waiting."));
+		respond(wait(), wait("   "), wait("Every step needs the test results; nothing else is left."));
 		await s.prompt("status?");
 		const [refused, blank, accepted] = toolTexts(s).slice(-3);
 		assert.match(refused!, /^error: You have been waiting on pid \d+ for \d+ s and made no tool call since your last wait: waiting again is not progress\.\nUse the time: .*cut its run time.*\nOnly if every remaining step still depends on it, call `wait` again with a `reason`/s);
 		assert.match(blank!, /^error: You have been waiting/, "a blank reason is none");
-		assert.match(accepted!, /^Waiting is fine: .*\)\. Your reason to wait again: Every step needs the test results; nothing else is left\. End your turn now/);
+		assert.match(accepted!, /^Waiting is fine: .*\)\. Your reason to wait again: Every step needs the test results; nothing else is left\. Your turn ends here/);
 
-		respond(bash("true"), wait(), say("Did a step, waiting again."));
+		respond(bash("true"), wait());
 		await s.prompt("anything else?");
-		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine: [^]*\)\. End your turn now/, "a tool call in between: no reason needed");
+		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine: [^]*\)\. Your turn ends here/, "a tool call in between: no reason needed");
 	});
 
 	test("an idle wait wakes the agent after the threshold, then after twice the time; waiting again needs a reason; a blocked goal stops it", async () => {
@@ -746,10 +743,8 @@ describe("waiting idle", () => {
 			goalCall({ action: "set", objective: "Test it." }),
 			bash("sleep 30 > /dev/null 2>&1 &"),
 			wait(),
-			say("Waiting."),
 			woken(wait()),
 			wait("The tests gate every step."),
-			say("Still waiting."),
 			woken(goalCall({ action: "blocked", reason: "the tests take too long" })),
 			say("Blocked."),
 		);
@@ -776,7 +771,6 @@ describe("waiting idle", () => {
 			goalCall({ action: "set", objective: "Test it." }),
 			bash("sleep 0.5 > /dev/null 2>&1 &"),
 			goalCall({ action: "wait", steps: [{ step: "read the results", job: "sleep 0.5" }] }),
-			say("Waiting."),
 			(context) => {
 				seen.push(lastText(context));
 				return goalCall({ action: "achieved" });
