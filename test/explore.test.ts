@@ -258,6 +258,26 @@ describe("explore runs", () => {
 		disposeExplorers("direct");
 	});
 
+	test("parallel calls get one explorer each, on an empty pool and with an idle explorer", async () => {
+		const env = { cwd: repo, agentDir: dir, runtime, model: "faux/faux-1" };
+		const report = (answer: string) => call("report", { answer, ranges: "" });
+		respond(report("a"), report("b"));
+		const [a, b] = await Promise.all([ask("parallel", env, "qa"), ask("parallel", env, "qb")]);
+		assert.notEqual(a.sessionId, b.sessionId, "empty pool: two explorers");
+		assert.deepEqual([a.report.answer, b.report.answer].sort(), ["a", "b"]);
+		disposeExplorers("parallel");
+
+		respond(report("warm"));
+		const warm = await ask("parallel", env, "q1");
+		respond(report("c"), report("d"));
+		const [c, d] = await Promise.all([ask("parallel", env, "qc"), ask("parallel", env, "qd")]);
+		assert.notEqual(c.sessionId, d.sessionId, "one idle explorer: the second call gets a new one");
+		assert.ok([c.sessionId, d.sessionId].includes(warm.sessionId), "the idle explorer is reused");
+		assert.deepEqual([c.report.answer, d.report.answer].sort(), ["c", "d"]);
+		assert.equal(faux.getPendingResponseCount(), 0);
+		disposeExplorers("parallel");
+	});
+
 	test("a read-only call right after a read-only turn gets the hint once per stretch; not without the tool", async () => {
 		const s = await newSession();
 		respond(

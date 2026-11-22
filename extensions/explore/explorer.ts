@@ -136,14 +136,22 @@ function createExplorer(env: ExplorerEnv, slot: () => Explorer): Promise<AgentSe
 	});
 }
 
-/** An idle explorer of the pool, a new one while the pool has room, else the next one to become idle. */
+/**
+ * Claims an idle explorer of the pool, a new one while the pool has room, else the next one to
+ * become idle. The claim (busy) is set here, before the caller's `await` of this function resumes:
+ * set after it, a parallel call ran in between, found the same explorer idle, and its prompt failed
+ * with "Agent is already processing a prompt" (2026-11-22, two parallel explore calls).
+ */
 async function acquire(pool: Pool, env: ExplorerEnv, signal?: AbortSignal): Promise<Explorer> {
 	for (;;) {
 		signal?.throwIfAborted();
 		const idle = pool.explorers.find((e) => !e.busy);
-		if (idle) return idle;
+		if (idle) {
+			idle.busy = true;
+			return idle;
+		}
 		if (pool.explorers.length < POOL_SIZE) {
-			const explorer: Explorer = { busy: false, linked: false, session: undefined as unknown as Promise<AgentSession> };
+			const explorer: Explorer = { busy: true, linked: false, session: undefined as unknown as Promise<AgentSession> };
 			explorer.session = createExplorer(env, () => explorer);
 			// A session that failed to start is not kept.
 			explorer.session.catch(() => {
@@ -168,7 +176,6 @@ export async function ask(sessionId: string, env: ExplorerEnv, question: string,
 	const key = poolKey(sessionId, env.cwd);
 	const pool = pools.get(key) ?? pools.set(key, { explorers: [], waiting: [] }).get(key)!;
 	const explorer = await acquire(pool, env, signal);
-	explorer.busy = true;
 	explorer.report = undefined;
 	try {
 		const session = await explorer.session;
