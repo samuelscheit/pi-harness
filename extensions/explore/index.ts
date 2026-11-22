@@ -19,8 +19,11 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir, ModelRuntime } f
 import { Type } from "typebox";
 import { callKind } from "../lib/call-kind.ts";
 import { shellEffect } from "../metrics/shell.ts";
+import { delegationsDir, parseMarker, readSpec } from "../workflow/delegation.ts";
+import { contextT3 } from "../workflow/t3.ts";
 import { ask, disposeExplorers, EXPLORER_MODEL } from "./explorer.ts";
 import { renderSelection, type Shown, selectRanges } from "./ranges.ts";
+import { askT3, disposeT3Explorers } from "./t3-explorer.ts";
 
 export const EXPLORE_TOOL = "explore";
 export const DEFAULT_BUDGET = 12_000;
@@ -34,7 +37,7 @@ export interface ExploreOptions {
 	model?: string;
 	/** Explorer turns before it is told to report (tests). */
 	maxTurns?: number;
-	/** Explorer levels above the session this extension runs in: 0 in the calling agent. */
+	/** Explorer levels above the session this extension runs in: 0 in the calling agent; without, a t3 explorer child's spec says. */
 	depth?: number;
 }
 
@@ -42,7 +45,9 @@ export interface ExploreDetails {
 	shown: Shown[];
 	/** The explorer's session, on the first call it answered only: the index counts a linked session's whole cost per link. */
 	childSessions: string[];
+	/** The explorer's session id, or in t3 its thread's link. */
 	explorer: string;
+	/** Its tool-loop turns; in t3 the runs (messages) of its thread. */
 	turns: number;
 	/** Files the explorer changed. */
 	changed: string[];
@@ -79,8 +84,24 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 	const runtime = options.modelRuntime ?? (() => (processState.__harnessExploreRuntime ??= ModelRuntime.create()));
 	const agentDir = options.agentDir ?? getAgentDir();
 	const model = options.model ?? EXPLORER_MODEL;
-	const depth = options.depth ?? 0;
-	const nested = depth + 1 < MAX_DEPTH ? (child: ExtensionAPI) => explore(child, { ...options, depth: depth + 1 }) : undefined;
+	/** The session's level: the option (in-process explorers), else the delegation spec of a t3 explorer child (its first-run marker). */
+	const depths = new Map<string, number>();
+	const depthOf = (ctx: ExtensionContext): number => {
+		if (options.depth !== undefined) return options.depth;
+		const id = ctx.sessionManager.getSessionId();
+		const known = depths.get(id);
+		if (known !== undefined) return known;
+		let depth = 0;
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "message" || entry.message.role !== "user") continue;
+			const content = entry.message.content;
+			const text = typeof content === "string" ? content : content.flatMap((c) => (c.type === "text" ? [c.text] : [])).join("\n");
+			const marker = parseMarker(text);
+			if (marker?.run === 1) depth = readSpec(delegationsDir(agentDir), marker.id)?.exploreDepth ?? depth;
+		}
+		depths.set(id, depth);
+		return depth;
+	};
 
 	pi.registerTool({
 		name: EXPLORE_TOOL,
@@ -106,24 +127,35 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 			const session = ctx.sessionManager;
 			const parentSessionFile = session.getSessionFile();
 			const question = params.paths?.length ? `${params.question}\n\nStart from: ${params.paths.join(", ")}` : params.question;
-			const modelRuntime = await runtime();
-			signal?.throwIfAborted();
-			const { report, sessionId, link, turns } = await ask(
-				session.getSessionId(),
-				{
-					cwd: ctx.cwd,
-					agentDir,
-					runtime: modelRuntime,
-					model,
-					...(options.maxTurns ? { maxTurns: options.maxTurns } : {}),
-					...(nested ? { nested } : {}),
-					...(parentSessionFile ? { sessionDir: session.getSessionDir(), parentSessionFile } : {}),
-				},
-				question,
-				signal,
-			);
+			const depth = depthOf(ctx);
+			const nestedAllowed = depth + 1 < MAX_DEPTH;
+			// Inside t3 the explorer is a t3 child thread the user can watch; else an in-process session.
+			const t3 = contextT3(ctx, agentDir);
+			const asked = t3
+				? await askT3(session.getSessionId(), { t3, cwd: ctx.cwd, agentDir, depth, nested: nestedAllowed, ...(options.model ? { model } : {}) }, question, signal)
+				: await (async () => {
+						const modelRuntime = await runtime();
+						signal?.throwIfAborted();
+						const nested = nestedAllowed ? (child: ExtensionAPI) => explore(child, { ...options, depth: depth + 1 }) : undefined;
+						const result = await ask(
+							session.getSessionId(),
+							{
+								cwd: ctx.cwd,
+								agentDir,
+								runtime: modelRuntime,
+								model,
+								...(options.maxTurns ? { maxTurns: options.maxTurns } : {}),
+								...(nested ? { nested } : {}),
+								...(parentSessionFile ? { sessionDir: session.getSessionDir(), parentSessionFile } : {}),
+							},
+							question,
+							signal,
+						);
+						return { ...result, explorer: result.sessionId };
+					})();
+			const { report, sessionId, link, turns } = asked;
 			const selection = selectRanges(ctx.cwd, report.ranges, params.budget_tokens ?? DEFAULT_BUDGET, seenRanges(ctx));
-			const details: ExploreDetails = { shown: selection.shown.map(({ path, start, end, hash }) => ({ path, start, end, hash })), childSessions: link ? [sessionId] : [], explorer: sessionId, turns, changed: report.changed };
+			const details: ExploreDetails = { shown: selection.shown.map(({ path, start, end, hash }) => ({ path, start, end, hash })), childSessions: link ? [sessionId] : [], explorer: asked.explorer, turns, changed: report.changed };
 			const answer = [
 				...(report.truncated ? [`[The explorer was stopped after ${turns} turns without a report; its last words:]`] : []),
 				report.answer,
@@ -139,7 +171,7 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 	const stretchOf = (id: string) => stretches.get(id) ?? stretches.set(id, { previous: false, hinted: false }).get(id)!;
 	pi.on("tool_result", (event, ctx) => {
 		// Explorers get no hint: delegating their reading again costs more than reading.
-		if (depth > 0 || event.parentToolCallId !== undefined || event.isError || event.toolName === EXPLORE_TOOL) return;
+		if (depthOf(ctx) > 0 || event.parentToolCallId !== undefined || event.isError || event.toolName === EXPLORE_TOOL) return;
 		if (!pi.getActiveTools().includes(EXPLORE_TOOL)) return;
 		const stretch = stretchOf(ctx.sessionManager.getSessionId());
 		if (!stretch.previous || stretch.hinted || !readingCode(event.toolName, event.input, ctx.cwd)) return;
@@ -156,6 +188,8 @@ export default function explore(pi: ExtensionAPI, options: ExploreOptions = {}) 
 		if (event.reason === "reload") return;
 		const id = ctx.sessionManager.getSessionId();
 		stretches.delete(id);
+		depths.delete(id);
 		disposeExplorers(id);
+		disposeT3Explorers(id, agentDir);
 	});
 }

@@ -29,6 +29,7 @@
 // `parent_not_active` (the agent ended its turn while the workflow runs) waits for one, waking the
 // session, and is repeated (parent-turn.ts). The other calls need no active run.
 
+import { type ExtensionToolContext, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { ParentTurn } from "./parent-turn.ts";
 
 export const T3_PREFIX = "mcp__t3-code__";
@@ -103,6 +104,36 @@ export function t3Data(name: string, value: unknown, text: string): T3Data {
 		// Not JSON.
 	}
 	throw new Error(`t3 ${name} returned no data: ${text.slice(0, 300)}`);
+}
+
+/** A session tool's outcome as the t3 caller reads it: its text, and the value that may hold `structuredContent`. */
+export type ToolExecute = (name: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<{ isError: boolean; text: string; value: unknown }>;
+
+/** The t3 tools reached through a session's tools (`mcp__t3-code__<name>`): errors reject, data is t3's. */
+export const t3CallVia =
+	(execute: ToolExecute): T3Call =>
+	async (name, args, signal) => {
+		const outcome = await execute(`${T3_PREFIX}${name}`, args, signal);
+		if (outcome.isError) throw new Error(`t3 ${name}: ${outcome.text || "failed"}`);
+		return t3Data(name, outcome.value, outcome.text);
+	};
+
+/** Whether a session with these tools runs inside t3 (its MCP bridge registered delegate_task). */
+export const inT3 = (toolNames: readonly string[]) => toolNames.includes(T3_DELEGATE);
+
+/** The wait slice for this working directory's Pi settings: t3's bridge fetches with Pi's dispatcher, whose idle timeout would cut a longer wait. */
+export const t3WaitMs = (cwd: string, agentDir: string) => waitSliceMs(SettingsManager.create(cwd, agentDir).getHttpIdleTimeoutMs());
+
+/** t3 for a tool's own calls (explore): through the tool context's executeTool; undefined outside t3. */
+export function contextT3(ctx: Pick<ExtensionToolContext, "tools" | "executeTool" | "cwd">, agentDir: string, options: T3Options = {}): T3 | undefined {
+	if (!inT3(ctx.tools.map((t) => t.name))) return undefined;
+	const execute: ToolExecute = async (name, args, signal) => {
+		const outcome = await ctx.executeTool(name, args, { signal });
+		const result = outcome.result as { content?: { type: string; text?: string }[] };
+		const text = (result.content ?? []).flatMap((block) => (block.type === "text" && block.text ? [block.text] : [])).join("\n");
+		return { isError: outcome.isError, text, value: result };
+	};
+	return new T3(t3CallVia(execute), { waitMs: t3WaitMs(ctx.cwd, agentDir), ...options });
 }
 
 /** t3 for one workflow run: its tools, called by their bare names; transport failures are repeated. */

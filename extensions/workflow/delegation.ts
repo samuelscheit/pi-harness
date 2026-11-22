@@ -38,6 +38,8 @@ export interface DelegationSpec {
 	schema?: Record<string, unknown>;
 	/** The session that delegated. */
 	callerSessionId?: string;
+	/** An explorer child (extensions/explore): its level below the agent that first called `explore`. */
+	exploreDepth?: number;
 	/** The template the child was forked from, and when it was built. */
 	template?: { name: string; builtAt: string; note?: string };
 }

@@ -24,6 +24,7 @@ import { Type } from "typebox";
 import { shellEffect } from "../metrics/shell.ts";
 import web from "../web/index.ts";
 import { childSessionManager, createChildSession } from "../workflow/child-session.ts";
+import { acquire, type Pool, poolKey, poolOf, release, remove, takePools } from "./pool.ts";
 import { parseRangeLines, type Range } from "./ranges.ts";
 
 export const EXPLORER_MODEL = "anthropic/claude-haiku-5-5";
@@ -31,8 +32,9 @@ export const EXPLORER_MODEL = "anthropic/claude-haiku-5-5";
 export const MAX_TURNS = 24;
 /** Turns past MAX_TURNS after which the explorer is stopped. */
 const HARD_EXTRA = 6;
-const POOL_SIZE = 4;
 const BASH_TIMEOUT_S = 60;
+/** The explorer's tools besides `report` (in-process) or `submit_result` (t3) and `explore`. */
+export const EXPLORER_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write", "web_search", "web_fetch"];
 
 export interface Report {
 	answer: string;
@@ -43,7 +45,8 @@ export interface Report {
 	changed: string[];
 }
 
-export const SYSTEM = `You are a code explorer. Another agent (the caller) is working on a task in this repository and asks you one question at a time. You find the answer and report it.
+/** The explorer's system prompt; `reporting` says how it reports (the in-process `report` tool, or t3's `submit_result`). */
+export const systemPrompt = (reporting: string) => `You are a code explorer. Another agent (the caller) is working on a task in this repository and asks you one question at a time. You find the answer and report it.
 
 How to work:
 - Search broadly and fast: issue several independent tool calls (grep, find, ls, read, bash) in one response; follow references until you can answer.
@@ -51,9 +54,11 @@ How to work:
 - You may run commands (tests, builds, scripts), search and fetch the web, change files when the question asks for a change, and ask \`explore\` (when you have it) to hand independent sub-questions to explorers of your own, in parallel. Other agents may work in the same checkout: change only what the question needs. The caller is told which files you changed.
 - Answer only what was asked. Later questions may build on earlier ones: you remember what you read.
 
-Then call \`report\` once, as the only call of its response:
+${reporting}
 - answer: the facts the caller needs, concise (at most about 15 lines), with path:line references. Say plainly what you did not find.
 - ranges: the code the caller must see verbatim to act (the lines it will change, the definitions and call sites its change depends on), one per line as \`path:start-end why\`, most important first. Tight ranges (a function, a block, 5 to 80 lines; a whole file only when small). The harness reads them and shows them to the caller, so do not copy code into the answer.`;
+
+export const SYSTEM = systemPrompt("Then call `report` once, as the only call of its response:");
 
 interface Explorer {
 	session: Promise<AgentSession>;
@@ -64,12 +69,6 @@ interface Explorer {
 	report?: Omit<Report, "changed">;
 	/** Files the run in progress changed. */
 	changed: Set<string>;
-}
-
-interface Pool {
-	explorers: Explorer[];
-	/** Calls waiting for an explorer to become idle. */
-	waiting: (() => void)[];
 }
 
 export interface ExplorerEnv {
@@ -85,9 +84,8 @@ export interface ExplorerEnv {
 	nested?: ExtensionFactory;
 }
 
-const state = globalThis as { __harnessExplorers?: Map<string, Pool> };
-const pools: Map<string, Pool> = (state.__harnessExplorers ??= new Map());
-const poolKey = (sessionId: string, cwd: string) => `${sessionId}\0${cwd}`;
+const state = globalThis as { __harnessExplorers?: Map<string, Pool<Explorer>> };
+const pools: Map<string, Pool<Explorer>> = (state.__harnessExplorers ??= new Map());
 
 /**
  * The report's arguments as they arrive. Haiku sometimes writes the `ranges` parameter into the
@@ -161,40 +159,16 @@ function createExplorer(env: ExplorerEnv, slot: () => Explorer): Promise<AgentSe
 			{ name: "web", factory: web },
 			...(env.nested ? [{ name: "explore", factory: env.nested }] : []),
 		],
-		tools: ["read", "grep", "find", "ls", "bash", "edit", "write", "web_search", "web_fetch", "report", ...(env.nested ? ["explore"] : [])],
+		tools: [...EXPLORER_TOOLS, "report", ...(env.nested ? ["explore"] : [])],
 	});
 }
 
-/**
- * Claims an idle explorer of the pool, a new one while the pool has room, else the next one to
- * become idle. The claim (busy) is set here, before the caller's `await` of this function resumes:
- * set after it, a parallel call ran in between, found the same explorer idle, and its prompt failed
- * with "Agent is already processing a prompt" (2026-11-22, two parallel explore calls).
- */
-async function acquire(pool: Pool, env: ExplorerEnv, signal?: AbortSignal): Promise<Explorer> {
-	for (;;) {
-		signal?.throwIfAborted();
-		const idle = pool.explorers.find((e) => !e.busy);
-		if (idle) {
-			idle.busy = true;
-			return idle;
-		}
-		if (pool.explorers.length < POOL_SIZE) {
-			const explorer: Explorer = { busy: true, linked: false, changed: new Set(), session: undefined as unknown as Promise<AgentSession> };
-			explorer.session = createExplorer(env, () => explorer);
-			// A session that failed to start is not kept.
-			explorer.session.catch(() => {
-				const i = pool.explorers.indexOf(explorer);
-				if (i >= 0) pool.explorers.splice(i, 1);
-			});
-			pool.explorers.push(explorer);
-			return explorer;
-		}
-		await new Promise<void>((resolve, reject) => {
-			pool.waiting.push(resolve);
-			signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-		});
-	}
+function newExplorer(pool: Pool<Explorer>, env: ExplorerEnv): Explorer {
+	const explorer: Explorer = { busy: true, linked: false, changed: new Set(), session: undefined as unknown as Promise<AgentSession> };
+	explorer.session = createExplorer(env, () => explorer);
+	// A session that failed to start is not kept.
+	explorer.session.catch(() => remove(pool, explorer));
+	return explorer;
 }
 
 const textOf = (message: { content: unknown }) =>
@@ -202,9 +176,8 @@ const textOf = (message: { content: unknown }) =>
 
 /** Ask an explorer of the calling session one question; resolves with its report, its session id and whether this call links it. */
 export async function ask(sessionId: string, env: ExplorerEnv, question: string, signal?: AbortSignal): Promise<{ report: Report; sessionId: string; link: boolean; turns: number }> {
-	const key = poolKey(sessionId, env.cwd);
-	const pool = pools.get(key) ?? pools.set(key, { explorers: [], waiting: [] }).get(key)!;
-	const explorer = await acquire(pool, env, signal);
+	const pool = poolOf(pools, poolKey(sessionId, env.cwd));
+	const explorer = await acquire(pool, () => newExplorer(pool, env), signal);
 	explorer.report = undefined;
 	explorer.changed = new Set();
 	try {
@@ -255,17 +228,14 @@ export async function ask(sessionId: string, env: ExplorerEnv, question: string,
 			session.clearQueue();
 		}
 	} finally {
-		explorer.busy = false;
-		pool.waiting.shift()?.();
+		release(pool, explorer);
 	}
 }
 
 /** Stop and drop the calling session's explorers (its session ended), and their sub-explorers: dispose() emits no session_shutdown. */
 export function disposeExplorers(sessionId: string): void {
-	for (const [key, pool] of pools) {
-		if (!key.startsWith(`${sessionId}\0`)) continue;
-		pools.delete(key);
-		for (const e of pool.explorers)
+	for (const pool of takePools(pools, sessionId)) {
+		for (const e of pool.members)
 			void e.session.then(
 				(s) => {
 					disposeExplorers(s.sessionId);

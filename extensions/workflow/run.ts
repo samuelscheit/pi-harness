@@ -22,7 +22,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { type ToolCall, type Usage, validateToolArguments } from "@earendil-works/pi-ai";
-import { type ExtensionUIQuestion, type ModelRuntime, SettingsManager, truncateHead } from "@earendil-works/pi-coding-agent";
+import { type ExtensionUIQuestion, type ModelRuntime, truncateHead } from "@earendil-works/pi-coding-agent";
 import { stringify } from "yaml";
 import { acquireLock } from "../lib/lock.ts";
 import { runShell } from "../lib/process.ts";
@@ -40,7 +40,7 @@ import { sh } from "./sh.ts";
 import { watchSteer } from "./steer.ts";
 import { clearStopRequest, linger, lockPath, takeLingering, watchStop } from "./stop.ts";
 import type { ParentTurn } from "./parent-turn.ts";
-import { cancelTask, T3, T3_DELEGATE, T3_PREFIX, type T3Options, t3Data, waitSliceMs } from "./t3.ts";
+import { cancelTask, inT3, T3, T3_DELEGATE, type T3Options, t3CallVia, t3WaitMs } from "./t3.ts";
 
 const DEFAULT_CONCURRENCY = 4;
 const MAX_LLM_IN_FLIGHT = 8;
@@ -543,16 +543,8 @@ async function execute(header: RunHeader, recorded: readonly JournalEntry[], jou
 			}
 		: undefined;
 	t3 =
-		executeTool && env.toolNames?.includes(T3_DELEGATE)
-			? new T3(
-					async (name, args, callSignal) => {
-						const outcome = await executeTool(`${T3_PREFIX}${name}`, args, callSignal);
-						if (outcome.isError) throw new Error(`t3 ${name}: ${outcome.text || "failed"}`);
-						return t3Data(name, outcome.value, outcome.text);
-					},
-					// t3's bridge fetches with Pi's dispatcher, whose idle timeout would cut a longer wait.
-					{ waitMs: waitSliceMs(SettingsManager.create(env.cwd, env.agentDir).getHttpIdleTimeoutMs()), ...env.t3Retry, unreachable: interrupt, ...(env.parent ? { parent: env.parent } : {}) },
-				)
+		executeTool && inT3(env.toolNames ?? [])
+			? new T3(t3CallVia(executeTool), { waitMs: t3WaitMs(env.cwd, env.agentDir), ...env.t3Retry, unreachable: interrupt, ...(env.parent ? { parent: env.parent } : {}) })
 			: undefined;
 	let delegates = 0;
 	/** Ask whoever runs the workflow with its session's ask_user; resolves to the answers in order. */
