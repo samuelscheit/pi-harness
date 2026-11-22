@@ -144,6 +144,29 @@ export interface PendingJob {
 const RUN_GOING = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 
 /**
+ * A delegated task the goal's `wait` found running through t3 (`task_status`) although the branch
+ * holds no result about it: a continuation of a child (t3 starts a new task when the child runs again
+ * after its result, e.g. woken by its own job, a usage-limit continuation or a follow-up a script
+ * sent). The wait's result stores them in its `details`, so they are read from the branch like the rest.
+ */
+export interface ResolvedTask {
+	taskId: string;
+	/** The task's child thread, and the names the agent used for it (an earlier task of that child). */
+	ids: string[];
+	title?: string;
+}
+
+/** The `details` of an accepted `wait` that resolved tasks through t3. */
+export interface WaitDetails {
+	tasks: ResolvedTask[];
+}
+
+const resolvedTasks = (details: unknown): ResolvedTask[] => {
+	const tasks = details && typeof details === "object" ? (details as Partial<WaitDetails>).tasks : undefined;
+	return Array.isArray(tasks) ? tasks.filter((task): task is ResolvedTask => typeof task?.taskId === "string" && Array.isArray(task.ids)) : [];
+};
+
+/**
  * The tasks the session delegated through t3 (`delegate_task`, or `t3_thread_send` to a finished
  * child thread, which starts a fresh task) whose completion will wake it, read from the branch.
  *
@@ -151,44 +174,70 @@ const RUN_GOING = new Set(["preparing", "queued", "starting", "running", "waitin
  * your turn"); a result without it (a finished task, `task_cancel`, a child waiting on a question or
  * approval, whose answer the session owes) ends what the session may wait on. The completion reaches
  * the session as a user message `Delegated task <taskId> (title) [status]: …`, which ends it too.
+ * Tasks a `goal` wait resolved through t3 (`details.tasks`) run until their completion message.
+ * `known` holds every delegated task seen, ended ones too, with its child thread: the session's own
+ * children (the thread-wait guard refuses waiting on them; a wait naming one is resolved through t3).
  * Read from the branch, not process state: it survives reloads and restarts as the session does.
  */
-export function delegatedTasks(branch: readonly SessionEntry[]): { running: PendingJob[]; ended: Set<string> } {
-	const running = new Map<string, PendingJob>();
+export function delegatedTasks(branch: readonly SessionEntry[]): { running: PendingJob[]; ended: Set<string>; known: PendingJob[] } {
+	const known = new Map<string, PendingJob>();
+	const running = new Set<string>();
 	const ended = new Set<string>();
 	const end = (taskId: string) => {
 		running.delete(taskId);
 		ended.add(taskId);
 	};
+	const learn = (taskId: string, ids: readonly string[], title: string | undefined, at: number) => {
+		const previous = known.get(taskId);
+		// A later task of a child (a follow-up, a continuation) keeps the child's title.
+		const sibling = previous ? undefined : [...known.values()].filter((job) => job.command !== "delegated task" && ids.some((id) => job.ids.includes(id))).at(-1);
+		known.set(taskId, {
+			key: `task ${taskId}`,
+			command: title ? `delegated task: ${title}` : (previous?.command ?? sibling?.command ?? "delegated task"),
+			ids: [...new Set([taskId, ...(previous?.ids ?? []), ...ids])],
+			startedAt: previous?.startedAt ?? at,
+		});
+	};
+	const start = (taskId: string) => {
+		ended.delete(taskId);
+		running.add(taskId);
+	};
 	for (const entry of branch) {
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message.role === "toolResult") {
-			if (message.isError || !T3_TOOL.test(message.toolName)) continue;
+			if (message.isError) continue;
+			if (message.toolName === "goal") {
+				for (const task of resolvedTasks(message.details)) {
+					learn(task.taskId, task.ids, task.title, message.timestamp);
+					start(task.taskId);
+				}
+				continue;
+			}
+			if (!T3_TOOL.test(message.toolName)) continue;
 			const data = parseObject(contentText(message.content).trim());
 			const taskId = str(data?.taskId);
 			if (!data || !taskId) continue;
-			const wakes = str(data.next) !== undefined || (message.toolName.endsWith("t3_thread_send") && RUN_GOING.has(String(data.status)));
-			if (!wakes) {
-				end(taskId);
-				continue;
-			}
-			ended.delete(taskId);
-			const previous = running.get(taskId);
-			const title = /^\[(.+)\]\(/.exec(str(data.link) ?? "")?.[1];
 			const threads = [str(data.childThreadId), str(data.threadId)].filter((id): id is string => id !== undefined);
-			running.set(taskId, {
-				key: `task ${taskId}`,
-				command: title ? `delegated task: ${title}` : (previous?.command ?? "delegated task"),
-				ids: [...new Set([taskId, ...(previous?.ids ?? []), ...threads])],
-				startedAt: previous?.startedAt ?? message.timestamp,
-			});
+			learn(taskId, threads, /^\[(.+)\]\(/.exec(str(data.link) ?? "")?.[1], message.timestamp);
+			const wakes = str(data.next) !== undefined || (message.toolName.endsWith("t3_thread_send") && RUN_GOING.has(String(data.status)));
+			if (wakes) start(taskId);
+			else end(taskId);
 		} else if ((message.role === "user" || message.role === "custom") && running.size > 0) {
 			const text = contentText(message.content);
-			for (const taskId of [...running.keys()]) if (text.includes(`Delegated task ${taskId}`)) end(taskId);
+			for (const taskId of [...running]) if (text.includes(`Delegated task ${taskId}`)) end(taskId);
 		}
 	}
-	return { running: [...running.values()], ended };
+	return { running: [...known.values()].filter((task) => running.has(task.key.slice(5))), ended, known: [...known.values()] };
+}
+
+/** The session's own delegated task a thread belongs to (the newest one of that child), if any. */
+export function ownChild(branch: readonly SessionEntry[], threadId: string): PendingJob | undefined {
+	const { running, known } = delegatedTasks(branch);
+	// t3's waits take threads: a task id names no child thread.
+	if (known.some((job) => job.key === `task ${threadId}`)) return undefined;
+	const of = (jobs: readonly PendingJob[]) => jobs.filter((job) => job.ids.includes(threadId)).at(-1);
+	return of(running) ?? of(known);
 }
 
 export const jobLines = (jobs: readonly PendingJob[], now: number) =>

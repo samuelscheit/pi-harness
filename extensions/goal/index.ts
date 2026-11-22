@@ -33,8 +33,11 @@
 // completion wakes the session as t3's message, like a job's end. Without it (2026-11-19) `wait`
 // refused ("No background job is running") while a child ran, and the agent wrote caffeinate and
 // `t3_thread_wait` loops, restarted about 20 times. The running tasks come from the branch
-// (goal.ts `delegatedTasks`); the goal's strict continue lists them, and a finished or unknown task
-// is refused.
+// (goal.ts `delegatedTasks`); the goal's strict continue lists them. A step naming a delegated child
+// whose task ended (or any id-like name) is asked about through t3's `task_status`: a child that
+// runs again under a task the session never saw (a continuation) is accepted under that task, stored
+// with the wait's result, and its completion message is the wake; otherwise the wait is refused with
+// what t3 said (`lookUpChild`).
 //
 // Waiting is a decision the agent must not repeat without doing anything (the user's rule, given in
 // three sessions: "do not fake being productive by waiting on long running processes"; an agent
@@ -46,9 +49,10 @@
 //   sooner is never disturbed.
 
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { runShell } from "../lib/process.ts";
+import { contentText, parseObject, str, T3_TOOL } from "../lib/t3-result.ts";
 import { isUserInput } from "../lib/user-input.ts";
 import {
 	budgetLimitText,
@@ -67,10 +71,12 @@ import {
 	type PendingJob,
 	parseFlags,
 	pendingText,
+	type ResolvedTask,
 	sectionText,
 	spendText,
 	statusLine,
 	waitNudgeText,
+	type WaitDetails,
 } from "./goal.ts";
 
 export const MESSAGE_TYPE = "goal";
@@ -125,7 +131,7 @@ const parameters = Type.Object(
 		budget_tokens: Type.Optional(Type.Integer({ minimum: 1, description: "set: stop when the model processed this many new tokens (input, output, cache writes) on the goal." })),
 		reason: Type.Optional(Type.String({ description: "blocked: what blocks it and what is needed to go on. wait: needed to wait again on a job you already waited on without doing anything since: why nothing else can be done meanwhile." })),
 		steps: Type.Optional(
-			Type.Array(Type.Object({ step: Type.String({ description: "A remaining step of the goal." }), job: Type.String({ description: "The running job it waits for: `call <id>`, `pid <n>`, `task <taskId>` (a delegated task), or part of its command or task title." }) }, { additionalProperties: false }), {
+			Type.Array(Type.Object({ step: Type.String({ description: "A remaining step of the goal." }), job: Type.String({ description: "The running job it waits for: `call <id>`, `pid <n>`, `task <taskId>` (a delegated task; also an earlier task or the thread id of a child that runs again), or part of its command or task title." }) }, { additionalProperties: false }), {
 				description: "wait: every remaining step, each with the job it depends on.",
 			}),
 		),
@@ -166,6 +172,70 @@ export interface GoalOptions {
 }
 
 const tail = (text: string, max: number) => (text.length > max ? `[…]\n${text.slice(-max)}` : text);
+
+/** What t3 says of a delegated child a `wait` step names: a task that runs again and wakes the session, or why it does not. */
+interface ChildLookup {
+	task?: ResolvedTask;
+	job?: PendingJob;
+	line?: string;
+}
+
+type ToolOutcome = Awaited<ReturnType<ExtensionToolContext["executeTool"]>>;
+
+/** The name a step gives a job, without backticks and a `task`/`thread` prefix. */
+const bareName = (name: string) =>
+	name
+		.trim()
+		.replace(/^`|`$/g, "")
+		.trim()
+		.replace(/^(task|thread|child)\s+/i, "");
+
+/**
+ * Asks t3 about a delegated child a step names (a task id or a child thread id) that the branch
+ * shows no running task for. t3 starts a new task when a child runs again after its result (woken by
+ * its own job, a usage-limit continuation, a follow-up a script sent), and its end wakes the session,
+ * but no result in the branch names it: the session saw the first task end and nothing since
+ * (2026-11-21: `wait` refused such children with "ended already", and agents waited with
+ * `t3_thread_wait` instead, which t3 ends after 60 min). `task_status` resolves a child's thread id
+ * to its newest task; `next` says it runs and its completion wakes the caller. A name t3 does not
+ * know as a task of this thread is no child: undefined. Reading a finished task delivers its result,
+ * so the line carries it.
+ */
+async function lookUpChild(ctx: ExtensionToolContext, name: string, known: readonly PendingJob[], signal: AbortSignal | undefined, asked: Map<string, Promise<ToolOutcome | undefined>>): Promise<ChildLookup | undefined> {
+	const bare = bareName(name);
+	if (bare.length < 6 || /\s/.test(bare)) return undefined;
+	const tool = ctx.tools
+		.map((t) => t.name)
+		.filter((n) => T3_TOOL.test(n) && n.endsWith("__task_status"))
+		.sort()[0];
+	if (!tool) return undefined;
+	const lower = bare.toLowerCase();
+	const task = known.filter((job) => job.ids.some((id) => id.toLowerCase() === lower)).at(-1);
+	const taskId = task?.key.slice("task ".length);
+	// The child's thread, so t3 answers with its newest task, not the one the step names.
+	const query = task?.ids.find((id) => id !== taskId && !known.some((other) => other.key === `task ${id}`)) ?? bare;
+	// Two names of one child (its task id and its thread) are one question to t3.
+	if (!asked.has(query)) asked.set(query, ctx.executeTool(tool, { taskId: query }, signal ? { signal } : {}).catch(() => undefined));
+	const outcome = await asked.get(query)!;
+	if (!outcome) return undefined;
+	const result = outcome.result as { content?: { type: string; text?: string }[]; structuredContent?: unknown };
+	const text = contentText(result.content ?? []).trim();
+	if (outcome.isError) return task ? { line: `Delegated task ${taskId}: t3 found no task of its child now (${text.slice(0, 300)}).` } : undefined;
+	const data = (result.structuredContent && typeof result.structuredContent === "object" ? (result.structuredContent as Record<string, unknown>) : undefined) ?? parseObject(text);
+	const newest = str(data?.taskId);
+	if (!data || !newest) return undefined;
+	const title = /^\[(.+)\]\(/.exec(str(data.link) ?? "")?.[1] ?? task?.command.replace(/^delegated task: /, "");
+	if (str(data.next) !== undefined) {
+		const ids = [...new Set([str(data.childThreadId), ...(task?.ids ?? []), bare].filter((id): id is string => id !== undefined && id !== newest))];
+		return {
+			task: { taskId: newest, ids, ...(title ? { title } : {}) },
+			job: { key: `task ${newest}`, command: title && title !== "delegated task" ? `delegated task: ${title}` : "delegated task", ids: [newest, ...ids], startedAt: Date.now() },
+		};
+	}
+	const why = data.hasPendingQuestion === true ? "it waits on your answer to its question (t3_pending_request)" : data.pendingApproval ? "it waits on an approval" : `its status is ${str(data.status) ?? "unknown"}${str(data.workState) ? ` (${data.workState})` : ""}`;
+	const summary = str(data.summary);
+	return { line: `Delegated task ${newest}${newest === taskId || !taskId ? "" : ` (the newest of the child of ${taskId})`} does not run, so it will not wake you: ${why}.${summary ? ` Its result: ${summary.length > 1500 ? `${summary.slice(0, 1499)}…` : summary}` : ""}` };
+}
 
 /** What the goal may wait on: the session's background work and the tasks it delegated whose completion wakes it. */
 const waitable = (ctx: ExtensionContext) => [...pendingJobs(ctx.sessionManager.getSessionId()), ...delegatedTasks(ctx.sessionManager.getBranch()).running];
@@ -225,7 +295,8 @@ export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
 	pi.on("session_tree", (_event, ctx) => reset(ctx));
 	pi.on("session_shutdown", () => disarm());
 	pi.on("tool_call", (event) => {
-		if (event.toolName !== "goal") memory.work++;
+		// A call a tool makes itself (the wait's own task_status, a script's) is part of that call.
+		if (event.toolName !== "goal" && event.parentToolCallId === undefined) memory.work++;
 	});
 	pi.on("session_compact", (_event, ctx) => refresh(ctx));
 
@@ -365,14 +436,36 @@ export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
 
 			// wait
 			if (current.status !== "active") throw new Error(`The goal is ${current.status}; nothing keeps your turn going, so there is nothing to wait for.`);
-			const jobs = waitable(ctx);
-			const { ended } = delegatedTasks(ctx.sessionManager.getBranch());
-			/** The ended delegated tasks the steps name: their result or request reached the conversation already. */
-			const endedLine = (named: readonly { job: string }[]) => {
-				const tasks = [...ended].filter((taskId) => named.some((s) => s.job.includes(taskId)));
-				return tasks.length ? [`Delegated task ${tasks.join(", ")} ended already or no longer wakes you (it waits on a question or approval): its result or request is in the conversation or in task_status.`] : [];
-			};
 			const steps = params.steps ?? [];
+			const { ended, known } = delegatedTasks(ctx.sessionManager.getBranch());
+			const pending = waitable(ctx);
+			// Steps that name no running job may name a delegated child that runs again: t3 knows.
+			const lookups = new Map<string, ChildLookup | undefined>();
+			const asked = new Map<string, Promise<ToolOutcome | undefined>>();
+			for (const s of steps) {
+				const bare = bareName(s.job).toLowerCase();
+				if (!findJob(pending, s.job) && !lookups.has(bare)) lookups.set(bare, await lookUpChild(ctx, s.job, known, signal, asked));
+			}
+			const found = [...lookups.values()].flatMap((lookup) => (lookup?.job && lookup.task ? [{ job: lookup.job, task: lookup.task }] : []));
+			const jobs = [...pending];
+			const resolvedTasks: ResolvedTask[] = [];
+			for (const { job, task } of found) {
+				const same = jobs.find((other) => other.key === job.key);
+				if (same) same.ids.push(...job.ids.filter((id) => !same.ids.includes(id)));
+				else jobs.push(job);
+				if (!resolvedTasks.some((other) => other.taskId === task.taskId)) resolvedTasks.push(task);
+			}
+			/** What is known of the steps' jobs that do not run: what t3 said of a child, or that a delegated task ended. */
+			const endedLine = (named: readonly { job: string }[]) => {
+				const lines = new Set<string>();
+				for (const s of named) {
+					const line = lookups.get(bareName(s.job).toLowerCase())?.line;
+					if (line) lines.add(line);
+				}
+				const tasks = [...ended].filter((taskId) => named.some((s) => s.job.includes(taskId) && !lookups.get(bareName(s.job).toLowerCase())?.line));
+				if (tasks.length) lines.add(`Delegated task ${tasks.join(", ")} ended already or no longer wakes you (it waits on a question or approval): its result or request is in the conversation or in task_status.`);
+				return [...lines];
+			};
 			if (jobs.length === 0) throw new Error(["No background job or delegated task is running, so nothing will wake you.", ...endedLine(steps), "Continue with the next step, or mark the goal achieved or blocked."].join(" "));
 			if (steps.length === 0) throw new Error("wait needs every remaining step, each with the running job it depends on.");
 			const resolved = steps.map((s) => ({ ...s, found: findJob(jobs, s.job) }));
@@ -412,12 +505,19 @@ export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {
 			memory.waiting = keys;
 			memory.told = jobs.map((job) => job.key);
 			arm(ctx);
+			// The tasks found through t3 are stored with the result, so the branch lists them as running
+			// (this run's settle, the nudges, later waits) until their completion message.
+			const tasks = resolvedTasks.filter((task) => keys.includes(`task ${task.taskId}`));
 			// An accepted wait ends the run here: without `terminate` the model was called once more only to
 			// write a closing line (3,879 such turns, 2.3% of Pi spend; docs/research/context-engineering/10 §5).
 			return {
-				...done(
-					`Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}).${reason && idle.length ? ` Your reason to wait again: ${reason}` : ""} Your turn ends here; the job's end wakes you with its result. If you are still waiting idle after a while, you will be woken to use the time.`,
-				),
+				content: [
+					{
+						type: "text" as const,
+						text: `Waiting is fine: every remaining step depends on a running job (${resolved.map((s) => `"${s.step}" → ${s.found!.key}`).join("; ")}).${tasks.length ? ` t3 says ${tasks.map((task) => `task ${task.taskId}`).join(", ")} runs now; its completion wakes you.` : ""}${reason && idle.length ? ` Your reason to wait again: ${reason}` : ""} Your turn ends here; the job's end wakes you with its result. If you are still waiting idle after a while, you will be woken to use the time.`,
+					},
+				],
+				details: tasks.length ? ({ tasks } satisfies WaitDetails) : undefined,
 				terminate: true,
 			};
 		},

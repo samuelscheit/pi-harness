@@ -12,7 +12,7 @@ import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall, registerFaux
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, ModelRuntime, type SessionEntry, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import threadWait from "../extensions/thread-wait/index.ts";
-import { idleRewait, isThreadWait, timedOutWaits } from "../extensions/thread-wait/wait.ts";
+import { idleRewait, isThreadWait, ownChildWait, timedOutWaits } from "../extensions/thread-wait/wait.ts";
 
 const WAIT = "mcp__t3-code__t3_thread_wait";
 const TIMED_OUT = { threadId: "thread:a", runId: "run:1", status: "completed", timedOut: true };
@@ -36,6 +36,39 @@ describe("isThreadWait", () => {
 		assert.equal(isThreadWait("t3_thread_wait"), false);
 		assert.equal(isThreadWait("mcp__other__t3_thread_wait"), false);
 		assert.equal(isThreadWait("mcp__t3-code__task_status"), false);
+	});
+});
+
+describe("ownChildWait", () => {
+	const DELEGATED = { taskId: "node:t1", childThreadId: "thread:child", link: "[Port the kernel](t3-thread://v2/x/thread:child)", status: "running", next: "Completion wakes this thread." };
+	const delegated = (data: unknown = DELEGATED, tool = "mcp__t3-code__delegate_task") => [assistant({ id: `d${++n}`, name: tool }), result(`d${n}`, tool, data)];
+
+	test("refuses a wait on the session's own delegated child, naming the task, why, and `goal wait`", () => {
+		const reason = ownChildWait(delegated(), { threadId: "thread:child", timeoutMs: 3_600_000 })!;
+		assert.match(reason, /^Refused: thread thread:child is your own delegated child \(task node:t1, delegated task: Port the kernel\)\. Its run's end wakes you .* t3 ends a t3_thread_wait after 60 minutes at most/);
+		assert.match(reason, /call `goal` with action `wait` naming `task node:t1` \(or the child's thread id/);
+		assert.match(reason, /without a goal, end your turn with one line/);
+		assert.match(reason, /task_status with taskId thread:child\.$/);
+	});
+
+	test("the child stays the session's after its task ended, and after a follow-up started a new task; the newest running task is named", () => {
+		const branch = [...delegated(), message("user", "Delegated task node:t1 (Port the kernel) [completed]: half")];
+		assert.match(ownChildWait(branch, { threadId: "thread:child" })!, /\(task node:t1, /, "an ended task: its child's runs still wake the session");
+		const followUp = [...branch, ...delegated({ threadId: "thread:child", taskId: "node:t2", status: "running", delivery: "started" }, "mcp__t3-code__t3_thread_send")];
+		assert.match(ownChildWait(followUp, { threadId: "thread:child", runId: "run:9" })!, /\(task node:t2, delegated task: Port the kernel\)/, "a send's task, also with a runId");
+		assert.match(ownChildWait(delegated({ taskId: "node:t3", childThreadId: "thread:asks", status: "running", hasPendingQuestion: true }), { threadId: "thread:asks", untilDelegatedWorkSettled: true })!, /task node:t3/, "a child waiting on a question");
+	});
+
+	test("other threads, a send to a thread no task owns, failed or foreign results and malformed calls are not refused", () => {
+		const branch = delegated();
+		assert.equal(ownChildWait(branch, { threadId: "thread:other" }), undefined);
+		assert.equal(ownChildWait(branch, { threadId: "node:t1" }), undefined, "a task id is no thread (t3's wait takes threads)");
+		assert.equal(ownChildWait(branch, {}), undefined);
+		assert.equal(ownChildWait(branch, null), undefined);
+		assert.equal(ownChildWait([], { threadId: "thread:child" }), undefined);
+		assert.equal(ownChildWait(delegated({ threadId: "thread:top", status: "running", delivery: "started" }, "mcp__t3-code__t3_thread_send"), { threadId: "thread:top" }), undefined, "a top-level thread: its end wakes no one");
+		assert.equal(ownChildWait([assistant({ id: "x", name: "mcp__t3-code__delegate_task" }), result("x", "mcp__t3-code__delegate_task", DELEGATED, true)], { threadId: "thread:child" }), undefined, "a failed start");
+		assert.equal(ownChildWait(delegated(DELEGATED, "bash"), { threadId: "thread:child" }), undefined, "another tool's output");
 	});
 });
 
@@ -201,6 +234,13 @@ function fakeT3(pi: ExtensionAPI, calls: string[]) {
 		},
 	});
 	pi.registerTool({ name: "work", label: "work", description: "Other work.", parameters: Type.Object({}), execute: async () => json("done") });
+	pi.registerTool({
+		name: "mcp__t3-code__delegate_task",
+		label: "delegate_task",
+		description: "Start a child.",
+		parameters: Type.Object({ task: Type.String() }),
+		execute: async () => json({ taskId: "node:t1", childThreadId: "thread:script", link: "[Port](t3-thread://v2/x/thread:script)", status: "running", next: "Completion wakes this thread." }),
+	});
 }
 
 async function newSession(calls: string[]): Promise<AgentSession> {
@@ -244,6 +284,15 @@ describe("the guard in a real session", () => {
 		respond(call(WAIT, { threadId: "thread:a" }), fauxAssistantMessage("again"));
 		await s.prompt("it finished, look");
 		assert.deepEqual(calls, ["thread:a", "thread:b", "thread:a", "thread:a"]);
+	});
+
+	test("a wait on the session's own delegated child is refused and never reaches t3; a script's wait on it is its own", async () => {
+		const calls: string[] = [];
+		const s = await newSession(calls);
+		respond(call("mcp__t3-code__delegate_task", { task: "Port it." }), call(WAIT, { threadId: "thread:script", timeoutMs: 3_600_000 }), call("script"), fauxAssistantMessage("done"));
+		await s.prompt("delegate and wait");
+		assert.match(toolTexts(s)[1]!, /^error: Refused: thread thread:script is your own delegated child \(task node:t1, delegated task: Port\)/);
+		assert.deepEqual(calls, ["thread:script", "thread:script", "thread:script"], "only the script's slices ran");
 	});
 
 	test("a script's own waits (a workflow's slices) are no repeats, and do not count as the model's", async () => {

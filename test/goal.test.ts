@@ -28,6 +28,7 @@ import {
 	parseBudget,
 	parseFlags,
 	pendingText,
+	ownChild,
 	sectionText,
 	statusLine,
 	waitNudgeText,
@@ -106,7 +107,8 @@ describe("goal state", () => {
 		const started = (taskId: string, title?: string) => ({ taskId, childThreadId: `thread:${taskId}`, ...(title ? { link: `[${title}](t3-thread://v2/x/thread:${taskId})` } : {}), status: "running", workState: "working", next: NEXT });
 
 		const a = result("mcp__t3-code__delegate_task", started("node:a", "Review [PR] #1"));
-		assert.deepEqual(delegatedTasks([a]), { running: [{ key: "task node:a", command: "delegated task: Review [PR] #1", ids: ["node:a", "thread:node:a"], startedAt: 2000 }], ended: new Set() });
+		const taskA = { key: "task node:a", command: "delegated task: Review [PR] #1", ids: ["node:a", "thread:node:a"], startedAt: 2000 };
+		assert.deepEqual(delegatedTasks([a]), { running: [taskA], ended: new Set(), known: [taskA] });
 		const branch = [
 			a,
 			result("mcp__t3_code__delegate_task", started("node:b"), false),
@@ -140,6 +142,44 @@ describe("goal state", () => {
 		]);
 		assert.deepEqual(done.running.map((t) => [t.key, t.command, t.ids]), [["task node:c", "delegated task: Again", ["node:c", "thread:node:c"]]]);
 		assert.deepEqual([...done.ended].sort(), ["node:a", "node:asks", "node:b", "node:d", "node:waited"]);
+		assert.deepEqual(
+			done.known.map((t) => t.key),
+			["task node:a", "task node:b", "task node:waited", "task node:asks", "task node:c", "task node:d"],
+			"every delegated task seen, ended ones too; an error, another tool and non-JSON add none",
+		);
+	});
+
+	test("tasks a goal wait resolved through t3 run until their completion message; ownChild finds a thread's newest task", () => {
+		let at = 1000;
+		const entry = (message: Record<string, unknown>): SessionEntry => ({ type: "message", id: `e${++n}`, parentId: null, timestamp: "", message: { timestamp: (at += 1000), ...message } }) as unknown as SessionEntry;
+		const t3 = (toolName: string, data: unknown) => entry({ role: "toolResult", toolCallId: `c${n}`, toolName, content: [{ type: "text", text: JSON.stringify(data) }], isError: false });
+		const goalResult = (details: unknown, isError = false) => entry({ role: "toolResult", toolCallId: `c${n}`, toolName: "goal", content: [{ type: "text", text: "Waiting is fine" }], details, isError });
+		const user = (text: string) => entry({ role: "user", content: [{ type: "text", text }] });
+		const branch = [
+			t3("mcp__t3-code__delegate_task", { taskId: "node:a", childThreadId: "thread:x", link: "[Port](t3-thread://v2/x/thread:x)", status: "running", next: "wakes" }),
+			user("Delegated task node:a (Port) [completed]: half done"),
+		];
+		assert.deepEqual(delegatedTasks(branch).running, []);
+		assert.equal(ownChild(branch, "thread:x")?.key, "task node:a", "an ended task still makes its thread the session's child");
+		assert.equal(ownChild(branch, "thread:other"), undefined);
+		assert.equal(ownChild([], "thread:x"), undefined);
+
+		const resolved = [...branch, goalResult({ tasks: [{ taskId: "node:a2", ids: ["thread:x", "node:a"], title: "Port" }] })];
+		const mid = delegatedTasks(resolved);
+		assert.deepEqual(
+			mid.running.map((t) => [t.key, t.command, t.ids]),
+			[["task node:a2", "delegated task: Port", ["node:a2", "thread:x", "node:a"]]],
+		);
+		assert.equal(ownChild(resolved, "thread:x")?.key, "task node:a2", "the running task of the thread comes first");
+		assert.deepEqual(
+			delegatedTasks([...branch, goalResult(undefined), goalResult({ tasks: "x" }), goalResult({ tasks: [{ taskId: 5 }, { taskId: "node:z" }] }), goalResult({ tasks: [{ taskId: "node:e", ids: [] }] }, true)]).running,
+			[],
+			"no details, malformed ones, and an error's add nothing",
+		);
+		const done = delegatedTasks([...resolved, user("Delegated task node:a2 (Port) [completed]: all done")]);
+		assert.deepEqual(done.running, []);
+		assert.deepEqual([...done.ended].sort(), ["node:a", "node:a2"]);
+		assert.equal(ownChild([...resolved, user("Delegated task node:a2 (Port) [completed]")], "thread:x")?.key, "task node:a2", "the newest task of an idle child");
 	});
 
 	test("the wake-up after idle waiting names the jobs, how long, and what to do instead", () => {
@@ -625,12 +665,25 @@ describe("strict mode: background work pending", () => {
 	});
 });
 
-/** t3's tools as its MCP bridge registers them, answering with the JSON t3 returns: a running task (its completion wakes the caller) or a finished one. */
+/**
+ * t3's tools as its MCP bridge registers them, answering with the JSON t3 returns. Each task runs on
+ * a child thread; `task_status` takes a task id or a child's thread id (its newest task), as t3 does,
+ * and fails for anything else. A child may run again as a new task the session never heard of
+ * (`continueChild`: t3's continuation after the task's result), or wait on a question.
+ */
 function fakeT3(pi: ExtensionAPI) {
 	const NEXT = "Completion wakes this thread, so end your turn. Do not wait on it or poll it.";
 	let count = 0;
-	const finished = new Set<string>();
+	const tasks: { taskId: string; thread: string; title: string; state: "running" | "completed" | "question" }[] = [];
+	const statusCalls: string[] = [];
 	const json = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }], details: { server: "t3-code" } });
+	const view = (t: (typeof tasks)[number]) => {
+		const base = { taskId: t.taskId, childThreadId: t.thread, link: `[${t.title}](t3-thread://v2/x/${t.thread})` };
+		if (t.state === "completed") return { ...base, status: "completed", workState: "result_available", summary: "Done." };
+		if (t.state === "question") return { ...base, status: "running", workState: "working", hasPendingQuestion: true };
+		return { ...base, status: "running", workState: "working", next: NEXT };
+	};
+	const find = (id: string) => tasks.find((t) => t.taskId === id) ?? tasks.filter((t) => t.thread === id).at(-1);
 	pi.registerTool({
 		name: "mcp__t3-code__delegate_task",
 		label: "delegate_task",
@@ -638,7 +691,9 @@ function fakeT3(pi: ExtensionAPI) {
 		parameters: Type.Object({ task: Type.String(), title: Type.Optional(Type.String()) }),
 		execute: async (_id, params) => {
 			const taskId = `node:delegated-task:t${++count}`;
-			return json({ taskId, childThreadId: `thread:${taskId}`, link: `[${params.title ?? "Child"}](t3-thread://v2/x/thread:${taskId})`, status: "running", workState: "working", next: NEXT });
+			const task = { taskId, thread: `thread:${taskId}`, title: params.title ?? "Child", state: "running" as const };
+			tasks.push(task);
+			return json(view(task));
 		},
 	});
 	pi.registerTool({
@@ -646,16 +701,34 @@ function fakeT3(pi: ExtensionAPI) {
 		label: "task_status",
 		description: "Read a task.",
 		parameters: Type.Object({ taskId: Type.String() }),
-		execute: async (_id, { taskId }) => json(finished.has(taskId) ? { taskId, status: "completed", workState: "result_available", summary: "Done." } : { taskId, status: "running", workState: "working", next: NEXT }),
+		execute: async (_id, { taskId }) => {
+			statusCalls.push(taskId);
+			const task = find(taskId);
+			if (!task) throw new Error(`task_not_found: Delegated task ${taskId} does not belong to this thread.`);
+			return json(view(task));
+		},
 	});
-	return { finish: (taskId: string) => finished.add(taskId) };
+	const set = (taskId: string, state: (typeof tasks)[number]["state"]) => void (find(taskId)!.state = state);
+	return {
+		finish: (taskId: string) => set(taskId, "completed"),
+		ask: (taskId: string) => set(taskId, "question"),
+		/** The child of `taskId` runs again: a new running task on its thread; returns its id. */
+		continueChild: (taskId: string) => {
+			const first = find(taskId)!;
+			const next = { taskId: `node:delegated-task:c${++count}`, thread: first.thread, title: first.title, state: "running" as const };
+			tasks.push(next);
+			return next.taskId;
+		},
+		statusCalls,
+	};
 }
 const t3Call = (name: string, args: Parameters<typeof fauxToolCall>[1]) => fauxAssistantMessage([fauxToolCall(`mcp__t3-code__${name}`, args)], { stopReason: "toolUse" });
 const TASK1 = "node:delegated-task:t1";
 
 describe("waiting on delegated tasks", () => {
 	test("a running async task is listed and waitable; the turn ends; its completion message ends it, so waiting on it again is refused", async () => {
-		const { s } = await newSession(undefined, { extensions: [(pi) => void fakeT3(pi)] });
+		let t3!: ReturnType<typeof fakeT3>;
+		const { s } = await newSession(undefined, { extensions: [(pi) => void (t3 = fakeT3(pi))] });
 		const seen: string[] = [];
 		respond(
 			goalCall({ action: "set", objective: "Land the reviewed change." }),
@@ -677,7 +750,10 @@ describe("waiting on delegated tasks", () => {
 		assert.match(texts[3]!, new RegExp(`^Waiting is fine: every remaining step depends on a running job \\("apply the review" → task ${TASK1}; "land it" → task ${TASK1}\\)\\.`));
 		assert.equal(nudges(s).length, 0, "without a goal-free settle, no pending-work message");
 
+		assert.deepEqual(t3.statusCalls, ["node:delegated-task:t9"], "only the name that matched no running job was asked about");
+
 		// t3 wakes the parent with the completion as a user message.
+		t3.finish(TASK1);
 		respond(
 			goalCall({ action: "wait", steps: [{ step: "apply the review", job: `task ${TASK1}` }] }),
 			goalCall({ action: "achieved" }),
@@ -685,8 +761,83 @@ describe("waiting on delegated tasks", () => {
 		);
 		await s.prompt(`Delegated task ${TASK1} (Review the diff) [completed]:\nLooks good.`);
 		assert.ok(settled(s, "Landed.")());
-		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: No background job or delegated task is running, so nothing will wake you\\. Delegated task ${TASK1} ended already`));
+		assert.match(
+			toolTexts(s).at(-2)!,
+			new RegExp(`^error: No background job or delegated task is running, so nothing will wake you\\. Delegated task ${TASK1} does not run, so it will not wake you: its status is completed \\(result_available\\)\\. Its result: Done\\. Continue`),
+		);
+		assert.deepEqual(t3.statusCalls.at(-1), `thread:${TASK1}`, "t3 is asked for the child's newest task, by its thread");
 		assert.equal(current(s)?.status, "achieved");
+	});
+
+	test("a child that runs again under a task the session never saw is waitable by its old task id or its thread; its completion ends it", async () => {
+		let t3!: ReturnType<typeof fakeT3>;
+		const { s } = await newSession(undefined, { extensions: [(pi) => void (t3 = fakeT3(pi))] });
+		respond(goalCall({ action: "set", objective: "Port the module." }), t3Call("delegate_task", { task: "Port it.", title: "Port" }), goalCall({ action: "wait", steps: [{ step: "review the port", job: `task ${TASK1}` }] }));
+		await s.prompt("go");
+		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine/);
+		const statusBefore = t3.statusCalls.length;
+		assert.equal(statusBefore, 0, "a running task in the branch needs no lookup");
+
+		// The task ends with an interim report; t3 then runs the child again (woken by its own job): a new task.
+		t3.finish(TASK1);
+		const again = t3.continueChild(TASK1);
+		respond(
+			goalCall({ action: "wait", steps: [{ step: "review the port", job: `task ${TASK1}` }, { step: "merge it", job: `thread:${TASK1}` }] }),
+		);
+		await s.prompt(`Delegated task ${TASK1} (Port) [completed]:\nHalf done, continuing.`);
+		const accepted = s.messages.at(-1)!;
+		assert.equal(accepted.role, "toolResult", "the run ends on the accepted wait: its settle sees the resolved task running");
+		assert.match(toolTexts(s).at(-1)!, new RegExp(`^Waiting is fine: every remaining step depends on a running job \\("review the port" → task ${again}; "merge it" → task ${again}\\)\\. t3 says task ${again} runs now; its completion wakes you\\.`));
+		assert.deepEqual((accepted as { details?: unknown }).details, { tasks: [{ taskId: again, ids: [`thread:${TASK1}`, TASK1], title: "Port" }] });
+		assert.deepEqual(t3.statusCalls, [`thread:${TASK1}`], "the two names of one child: one lookup");
+		assert.equal(continues(s).length, 0);
+		assert.equal(faux.getPendingResponseCount(), 0);
+		assert.deepEqual(delegatedTasks(s.sessionManager.getBranch()).running.map((t) => t.key), [`task ${again}`], "the branch lists it as running");
+
+		// Waiting on it again right away, by its new id now (no lookup: the branch knows it), needs a reason: the lookup was no work.
+		respond(goalCall({ action: "wait", steps: [{ step: "review the port", job: again }] }), goalCall({ action: "wait", steps: [{ step: "review the port", job: again }], reason: "Only the review is left." }));
+		await s.prompt("status?");
+		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: You have been waiting on task ${again}`));
+		assert.match(toolTexts(s).at(-1)!, /^Waiting is fine: .*Your reason to wait again: Only the review is left\./);
+		assert.equal(t3.statusCalls.length, 1);
+
+		// Its completion ends it: t3 now reports the newest task completed, with its result.
+		t3.finish(again);
+		respond(goalCall({ action: "wait", steps: [{ step: "review the port", job: `thread:${TASK1}` }] }), goalCall({ action: "achieved" }), say("Ported."));
+		await s.prompt(`Delegated task ${again} (Port) [completed]:\nAll done.`);
+		assert.ok(settled(s, "Ported.")());
+		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: No background job or delegated task is running, so nothing will wake you\\. Delegated task ${again} does not run, so it will not wake you: its status is completed`));
+		assert.equal(current(s)?.status, "achieved");
+	});
+
+	test("a child waiting on a question, a name t3 does not know, and a command fragment are refused, naming what t3 said", async () => {
+		let t3!: ReturnType<typeof fakeT3>;
+		const { s } = await newSession(undefined, { extensions: [(pi) => void (t3 = fakeT3(pi))] });
+		respond(
+			goalCall({ action: "set", objective: "Ship." }),
+			t3Call("delegate_task", { task: "Write docs.", title: "Docs" }),
+			t3Call("delegate_task", { task: "Fix lint.", title: "Lint" }),
+			(context) => {
+				t3.ask(TASK1);
+				return t3Call("task_status", { taskId: TASK1 });
+			},
+			goalCall({ action: "wait", steps: [{ step: "merge the docs", job: TASK1 }, { step: "deploy", job: "node:unknown-task" }, { step: "build", job: "npm run build" }, { step: "lint", job: "Lint" }] }),
+			goalCall({ action: "blocked", reason: "the docs child asks" }),
+			say("Blocked."),
+		);
+		await s.prompt("go");
+		const refused = toolTexts(s).at(-2)!;
+		assert.match(refused, /^error: These steps name no running job: "merge the docs" \(node:delegated-task:t1\), "deploy" \(node:unknown-task\), "build" \(npm run build\)\.\n/);
+		assert.match(refused, /\nDelegated task node:delegated-task:t1 does not run, so it will not wake you: it waits on your answer to its question \(t3_pending_request\)\.\nRunning jobs:\n- task node:delegated-task:t2: `delegated task: Lint`/);
+		assert.doesNotMatch(refused, /unknown-task does not|task_not_found/, "a name t3 does not know is just unknown");
+		assert.deepEqual(t3.statusCalls, [TASK1, `thread:${TASK1}`, "node:unknown-task"], "a name with spaces is never sent to t3");
+	});
+
+	test("without t3's tools a wait looks nothing up", async () => {
+		const { s } = await newSession();
+		respond(goalCall({ action: "set", objective: "Ship." }), bash("sleep 20 > /dev/null 2>&1 &"), goalCall({ action: "wait", steps: [{ step: "merge", job: "node:delegated-task:t1" }] }), goalCall({ action: "blocked", reason: "r" }), say("ok"));
+		await s.prompt("go");
+		assert.match(toolTexts(s).at(-2)!, /^error: These steps name no running job: "merge" \(node:delegated-task:t1\)\.\nRunning jobs:\n- pid \d+/);
 	});
 
 	test("a task_status read of a finished task ends it; a running one keeps it; a background job and a task are waited on together", async () => {
@@ -706,7 +857,7 @@ describe("waiting on delegated tasks", () => {
 		t3.finish(TASK1);
 		respond(t3Call("task_status", { taskId: TASK1 }), goalCall({ action: "wait", steps: [{ step: "merge the docs", job: TASK1 }] }), goalCall({ action: "blocked", reason: "stop" }), say("Stopped."));
 		await s.prompt("status?");
-		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: These steps name no running job: "merge the docs" \\(${TASK1}\\)\\.\\nDelegated task ${TASK1} ended already`));
+		assert.match(toolTexts(s).at(-2)!, new RegExp(`^error: These steps name no running job: "merge the docs" \\(${TASK1}\\)\\.\\nDelegated task ${TASK1} does not run, so it will not wake you: its status is completed \\(result_available\\)\\. Its result: Done\\.\\nRunning jobs:`));
 		assert.doesNotMatch(toolTexts(s).at(-2)!, /- task /, "only the build runs");
 	});
 });

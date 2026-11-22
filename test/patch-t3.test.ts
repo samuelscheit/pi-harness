@@ -180,6 +180,7 @@ const ALL = [
 	"bridge-long-calls",
 	"notification-origin",
 	"rollback-registers-thread",
+	"bridge-no-background-wait",
 ];
 
 describe("patchBundle", () => {
@@ -260,6 +261,7 @@ describe("patchBundle", () => {
 		assert.ok(text.includes("stored.event.payload.id === selectedRun.id || stored.event.payload.id === followedRunId ||"), "the wait hears the followed run");
 		assert.ok(text.includes("for a message you sent, pass the `runId` t3_thread_send returned"));
 		assert.ok(text.includes("      signal,\n      ...bridgeDispatch(),\n    });"), "the bridge's calls lift Pi's idle timeout");
+		assert.ok(text.includes('const name = tool.name;\n      // Pi has no provider background tasks to mark awaited (t3 implements it for Claude only).\n      if (name === "t3_background_wait") continue;\n'), "the bridge skips t3_background_wait");
 		assert.deepEqual(patchBundle(text), { text, applied: [] });
 	});
 
@@ -952,6 +954,24 @@ describe("patchBundle", () => {
 			slot[Symbol.for("undici.globalDispatcher.2")] = saved!.value;
 			slot[Symbol.for("undici.globalDispatcher.1")] = legacy;
 		}
+	});
+
+	// t3's Pi bridge as t3 writes it out: its tool registration, run over a catalog, registers every tool but t3_background_wait.
+	test("t3's Pi bridge registers every catalog tool except t3_background_wait, under both names", { skip: !existsSync(original) && "t3 not installed" }, () => {
+		const { texts, fileOf, patched } = patchInstalled();
+		const file = fileOf(PATCHES.find((patch) => patch.name === "bridge-no-background-wait")!);
+		const register = (bundle: string) => {
+			const start = bundle.indexOf("  const registerTools = () => {");
+			const section = bundle.slice(start, bundle.indexOf("  const ensureStarted = () => {", start));
+			const written = new Function(`return \`${section}\`;`)() as string;
+			const names: string[] = [];
+			const pi = { registerTool: (tool: { name: string }) => names.push(tool.name) };
+			const catalog = ["delegate_task", "t3_background_wait", "t3_thread_wait"].map((name) => ({ name, inputSchema: {} }));
+			new Function("pi", "catalog", "supportsExposure", "deferOptionalTools", "directTools", "readOnlyMcpTools", "jsonSchemaToTypebox", "mcpOutputSchema", "client", `${stripTypeScriptTypes(written)}\nregisterTools();`)(pi, catalog, true, true, new Set(), new Set(), () => ({}), () => ({}), {});
+			return names;
+		};
+		assert.deepEqual(register(texts.get(file)!).filter((name) => name.endsWith("t3_background_wait")), ["mcp__t3-code__t3_background_wait", "mcp__t3_code__t3_background_wait"], "unpatched, Pi gets the Claude-only tool");
+		assert.deepEqual(register(patched.get(file)!), ["mcp__t3-code__delegate_task", "mcp__t3_code__delegate_task", "mcp__t3-code__t3_thread_wait", "mcp__t3_code__t3_thread_wait"]);
 	});
 
 	// The Pi adapter's prompt records, as bundled: a message t3 wrote itself carries Pi's notification origin.

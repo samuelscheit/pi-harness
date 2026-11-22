@@ -196,6 +196,13 @@
 //   session has no registered thread", so every rollback of such a thread failed (2026-11-21, thread
 //   mcp:f67b3905). It now switches the runtime to the thread's persisted session file (unpublished:
 //   the rollback service persists the snapshot it returns) and forks from there.
+// - bridge-no-background-wait (Pi gets no `t3_background_wait`): the tool marks a provider's own
+//   background tasks as awaited, which only Claude's adapter implements (`awaitBackgroundTasks`), so
+//   for Pi every call failed with "This provider cannot mark background work as awaited" while the
+//   tool list offered it, and agents told to park on their children with it tried and fell back to
+//   `t3_thread_wait` (2026-11-21). Pi needs no such mark: the harness reports its jobs to t3 as awaited
+//   tasks (background-items) and waits with `goal` `wait`, which also names delegated children. The
+//   bridge no longer registers the tool. Inside the template literal t3 writes out as Pi's extension.
 //
 // Usage: node scripts/patch-t3.ts [path/to/T3 Code.app]   (default: T3 Code (Nightly))
 // Idempotent per patch: one already applied (its marker present) is skipped. The original archive
@@ -1395,6 +1402,17 @@ export const PATCHES: Patch[] = [
 					"\t\t\t\t\tconst state = threadState;",
 					"",
 				].join("\n"),
+			],
+		],
+	},
+	{
+		name: "bridge-no-background-wait",
+		// Inside the template literal t3 writes out as Pi's extension: no backslash, backtick or `${` here.
+		marker: "// Pi has no provider background tasks to mark awaited",
+		edits: [
+			[
+				"    for (const tool of catalog) {\n      const name = tool.name;\n",
+				"    for (const tool of catalog) {\n      const name = tool.name;\n      // Pi has no provider background tasks to mark awaited (t3 implements it for Claude only).\n      if (name === \"t3_background_wait\") continue;\n",
 			],
 		],
 	},

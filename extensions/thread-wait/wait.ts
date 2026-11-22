@@ -13,6 +13,7 @@
 // model decisions: the hook skips them (index.ts), and they never appear in the branch.
 
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { ownChild } from "../goal/goal.ts";
 import { ago, contentText, parseObject, str, T3_TOOL } from "../lib/t3-result.ts";
 
 /** t3's wait tool as the bridge registers it (also under the canonical name). */
@@ -98,6 +99,30 @@ function lastResult(earlier: TimedOut): string {
 	if (holding.length > 0) parts.push(`held by ${holding.slice(0, 3).join("; ")}${holding.length > 3 ? `; and ${holding.length - 3} more` : ""}`);
 	const note = str(data.note);
 	return `${parts.join(", ")}${note ? `. t3 said: ${note}` : ""}`;
+}
+
+/**
+ * Why a wait on the session's own delegated child is refused, or undefined for any other thread.
+ *
+ * Every run of such a child is a task whose end t3 delivers to the session as a message that wakes
+ * it, so a wait on it only blocks the turn: t3 ends it after 60 min at most, and a delegated
+ * coordinator then ended its turn with an empty report ("wait ran out, waiting again"), which t3
+ * took as its task's end and woke its own parent with, dozens of times with large contexts
+ * (2026-11-21, the user: "das kann kein Zustand sein"). The children are read from the branch
+ * (goal.ts `delegatedTasks`); a script's own waits on the children it manages never reach the hook.
+ */
+export function ownChildWait(branch: readonly SessionEntry[], input: unknown): string | undefined {
+	const call = waitCall(input);
+	const task = call && ownChild(branch, call.threadId);
+	if (!task) return undefined;
+	return [
+		`Refused: thread ${call.threadId} is your own delegated child (${task.key}, ${task.command}). Its run's end wakes you with a "Delegated task …" message, and t3 ends a t3_thread_wait after 60 minutes at most, so waiting on it only blocks your turn and ends it on a timeout instead of the child's result.`,
+		"",
+		"Instead:",
+		"- Do the remaining work that does not depend on the child now.",
+		`- When every remaining step depends on it: with an active goal, call \`goal\` with action \`wait\` naming \`${task.key}\` (or the child's thread id; a child that runs again under a new task is found); without a goal, end your turn with one line naming what you wait for.`,
+		`- To see where it stands without blocking: task_status with taskId ${call.threadId}.`,
+	].join("\n");
 }
 
 /**
